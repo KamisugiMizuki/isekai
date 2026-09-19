@@ -289,8 +289,38 @@
 
 ## 十、待模块设计项（残余）
 
-- 世界包字段的实现级冻结（JSON schema）。
+- 世界包字段的**实现级**冻结（设计级见附录 A）。
 - 生成器提示词与生成流程细节。
-- 导出包的具体布局。
-- 实例元数据的存放位置。
+- 导出容器的具体格式与布局（设计级见附录 B）。
+- 实例元数据的存放位置（设计级见附录 B）。
 - 跨版本转换工具的具体形态。
+
+## 附录 A：世界包字段（设计级）
+
+结构示意（实现级 schema 在实现时冻结）：
+
+```json
+{
+  "meta": {"name": "…", "density": "sparse | normal | rich", "description": "…"},
+  "calendar": {"epoch_name": "…", "day_seconds": 0, "months": [{"name": "…", "days": 0}], "week_length_days": 0},
+  "background": {"rules": "…", "geography": "…", "society": "…", "channels": ["…"], "naming": "…"},
+  "history": {"truth": ["…"], "narrative": ["…"]},
+  "events": {"sources": ["…"]},
+  "roles": {"templates": ["…"]},
+  "contact": {"mechanism": "…", "limits": "…"},
+  "initial": {"events": ["…"], "rumors": ["…"], "mysteries": ["…"]}
+}
+```
+
+- `history.truth` / `history.narrative` = 双轨两层（实情 / 公共叙事，见 §2.2）。
+- `meta.density` **必填**（事件密度，见 `EVENT_ENGINE_SPEC.md` §四）。
+- `calendar.day_seconds` 不假设 24 小时制（见 `WORLD_RUNTIME_SPEC.md` §2.1）。
+
+## 附录 B：导出容器与实例元数据（设计级）
+
+- **导出容器**：单一文件（容器格式实现时定）；内含：
+  - manifest（格式版本、项目版本、导出时间）；
+  - 世界包快照（含原始名称记录）；
+  - 运行状态（时间线、提交历史、角色状态含记忆）；
+  - **不含**激活状态（导入端设置）。
+- **实例元数据**：名称、来源、创建时间、激活时间线、schema 版本——随实例存储（位置实现时定）。

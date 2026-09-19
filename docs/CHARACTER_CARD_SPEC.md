@@ -138,6 +138,23 @@
 
 ## 十、待模块设计项（残余）
 
-- 角色卡字段的实现级冻结（JSON schema）。
-- 初始性格单元集合的格式与初始置信度默认值。
+- 角色卡字段的**实现级**冻结（设计级见附录 A）。
 - 生成提示词与用户检查交互的细节。
+
+## 附录 A：角色卡字段与初始单元（设计级）
+
+```json
+{
+  "identity": {"name": "…", "age": 0, "gender": "…", "occupation": "…", "background": "…"},
+  "region": "生活区域（叙事描述）",
+  "info_channels": ["…"],
+  "contact": {"mechanism": "…", "limits": "…"},
+  "initial_units": [{"text": "…", "drive": "anchor | event | dialog | time", "confidence": 0.0}],
+  "cognition": {"mode": "soft | hard", "notes": "…"},
+  "life_template": {"occupation_blocks": ["…"], "ritual": "作息惯例"},
+  "appearance": "（可选）"
+}
+```
+
+- **初始锚点集合** = `initial_units` 中 `drive = anchor` 的子集（跨时间线识别起点）。
+- 初始置信度落在对应驱动的生成区间内；锚点单元建议 ≥ 0.75（区间下限，见 `WORLD_RUNTIME_SPEC.md` §十）。
