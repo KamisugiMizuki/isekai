@@ -210,6 +210,7 @@
 |---|---|---|
 | 通道插件层 | 统一消息协议、插件式通道、第三方插件开放与进程隔离、内建聊天窗口 | [`CHANNEL_PLUGIN_SPEC.md`](CHANNEL_PLUGIN_SPEC.md) |
 | 会话核心层 | 会话管理、消息路由、绑定关系（世界 / 角色 / 时间线）、对话上下文隔离、披露管理、回复生成链路（Agent 层）、主动发言（世界源）、角色记忆子系统 | [`SESSION_CORE_SPEC.md`](SESSION_CORE_SPEC.md) |
+| 角色记忆 | 三层数据域、提取与写入、混合召回（全文 + 向量）、衰减与整理（以角色经历为中心） | [`MEMORY_SPEC.md`](MEMORY_SPEC.md) |
 | 世界运行层 | 世界时钟（时间基元 + 历法 + 倍率）、时间线、版本管理（提交 / diff / 回滚 / 压缩）、角色状态（性格单元引擎 / 生活线 / 记忆载体）、事件日志、认知接口 | [`WORLD_RUNTIME_SPEC.md`](WORLD_RUNTIME_SPEC.md) |
 | 世界事件引擎 | 事件模型、确定性生成、事件族与密度（世界包必填）、可见性、用户引入事件（世界修改） | [`EVENT_ENGINE_SPEC.md`](EVENT_ENGINE_SPEC.md) |
 | 世界设定层 | 世界包（结构 / 双轨内容 / 生成）、世界实例（创建、锁死、黑箱）、多世界、导入导出、跨端同步 | [`WORLD_SETTING_SPEC.md`](WORLD_SETTING_SPEC.md) |
