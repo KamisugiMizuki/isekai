@@ -22,11 +22,14 @@
       <main id="content">
         <header id="topbar">
           <div id="title">未连接</div>
-          <div id="status" class="chip pending">启动中…</div>
+          <div class="row">
+            <button id="restart" class="hidden">重启核心</button>
+            <div id="status" class="chip pending">启动中…</div>
+          </div>
         </header>
 
         <section id="pane-chat" class="pane">
-          <ol id="messages"></ol>
+          <ol id="messages" aria-live="polite"></ol>
           <form id="composer">
             <textarea id="input" rows="1" placeholder="Enter 发送，Shift+Enter 换行"></textarea>
             <button type="submit" id="send">发送</button>

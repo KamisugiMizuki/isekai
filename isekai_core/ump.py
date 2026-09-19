@@ -51,6 +51,18 @@ ACCEPT_STATES = frozenset({"queued", "processing", "done", "failed", "cancelled"
 CORE_STATES = frozenset({"ready", "catching_up", "compatibility_blocked", "persistence_blocked", "failed"})
 
 
+class Stage:
+    """错误所属阶段（CHANNEL_PLUGIN_SPEC §六：错误须明确属于接收 / 生成 / 投递阶段）。"""
+
+    RECEIVE = "receive"
+    GENERATE = "generate"
+    DELIVERY = "delivery"
+    PROTOCOL = "protocol"
+    AUTH = "auth"
+
+    ALL = frozenset({RECEIVE, GENERATE, DELIVERY, PROTOCOL, AUTH})
+
+
 class UmpError(Exception):
     """协议 / 业务错误，可直接序列化为 error 信封。"""
 
@@ -62,6 +74,7 @@ class UmpError(Exception):
         retryable: bool = False,
         ref: str | None = None,
         close: bool = False,
+        stage: str = Stage.PROTOCOL,
     ) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
@@ -69,9 +82,16 @@ class UmpError(Exception):
         self.retryable = retryable
         self.ref = ref
         self.close = close
+        self.stage = stage
 
     def to_payload(self) -> dict[str, Any]:
-        return {"code": self.code, "message": self.message, "retryable": self.retryable, "ref": self.ref}
+        return {
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+            "ref": self.ref,
+            "stage": self.stage,
+        }
 
 
 def new_id(prefix: str) -> str:
@@ -179,6 +199,9 @@ def _validate_payload(env_type: str, payload: dict[str, Any], max_text_len: int)
             raise UmpError(Err.PROTOCOL, "error.message must be a string")
         if not isinstance(payload.get("retryable", False), bool):
             raise UmpError(Err.PROTOCOL, "error.retryable must be a boolean")
+        stage = payload.get("stage")
+        if stage is not None and stage not in Stage.ALL:
+            raise UmpError(Err.PROTOCOL, "error.stage must be receive|generate|delivery|protocol|auth")
     elif env_type == "accepted":
         _require_str(payload, "ref", max_len=64)
         if payload.get("state") not in ACCEPT_STATES:

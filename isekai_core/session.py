@@ -16,9 +16,12 @@ from .config import Config
 from .llm import LLMError
 from .log import get_logger
 from .store import EnvelopeConflict, Store
-from .ump import Envelope, Err, UmpError
+from .ump import Envelope, Err, Stage, UmpError
 
 log = get_logger("isekai.session")
+
+#: 单批发送的现实上限：通道端不读数据时不能把轮次拖死（发送结果按未知处理）
+SEND_TIMEOUT_S = 15.0
 
 #: (channel_id, thread_id, envelope) -> 是否已发出
 Deliver = Callable[[str, str, dict[str, Any]], Awaitable[bool]]
@@ -76,7 +79,9 @@ class SessionService:
         text = env.payload["text"].strip()
 
         if self.store.void_has(channel_id, thread_id, env_id):
-            raise UmpError(Err.VOIDED, "该输入已因回滚 / 重绑作废", retryable=False, ref=env_id)
+            raise UmpError(
+                Err.VOIDED, "该输入已因回滚 / 重绑作废", retryable=False, ref=env_id, stage=Stage.RECEIVE
+            )
 
         try:
             row, created = self.store.inbound_put(
@@ -89,7 +94,11 @@ class SessionService:
             )
         except EnvelopeConflict as exc:
             raise UmpError(
-                Err.CONFLICT, "同一信封标识但正文不同，拒绝执行", retryable=False, ref=env_id
+                Err.CONFLICT,
+                "同一信封标识但正文不同，拒绝执行",
+                retryable=False,
+                ref=env_id,
+                stage=Stage.RECEIVE,
             ) from exc
 
         if created:
@@ -106,17 +115,17 @@ class SessionService:
     async def retry(self, *, channel_id: str, thread_id: str, ref: str, kind: str | None = None) -> dict[str, Any]:
         """显式重试：入站生成失败恢复同一轮次；投递失败 / 未知只重发固化结果。"""
         if self.store.void_has(channel_id, thread_id, ref):
-            raise UmpError(Err.VOIDED, "该请求已作废，不能重放", retryable=False, ref=ref)
+            raise UmpError(Err.VOIDED, "该请求已作废，不能重放", retryable=False, ref=ref, stage=Stage.RECEIVE)
 
         outbound = self.store.outbound_by_message_id(ref) if kind == "outbound" else None
         if outbound is None:
             outbound = self.store.inbound_find(channel_id, thread_id, ref)
         if outbound is None:
-            raise UmpError(Err.NOT_FOUND, "找不到对应的输入或回复", retryable=False, ref=ref)
+            raise UmpError(Err.NOT_FOUND, "找不到对应的输入或回复", retryable=False, ref=ref, stage=Stage.RECEIVE)
 
         if outbound["role"] in ("character", "notice"):
             if outbound["channel_id"] != channel_id:
-                raise UmpError(Err.NOT_FOUND, "该回复不属于当前通道", retryable=False, ref=ref)
+                raise UmpError(Err.NOT_FOUND, "该回复不属于当前通道", retryable=False, ref=ref, stage=Stage.RECEIVE)
             await self._send_batches(outbound)
             rollup = self.store.delivery_rollup(outbound["seq"])
             return {"ref": ref, "state": rollup, "message_id": outbound["message_id"]}
@@ -130,7 +139,7 @@ class SessionService:
                 await self._send_batches(fixed)
             return {"ref": ref, "state": "done", "message_id": outbound["message_id"]}
         if state == "cancelled":
-            raise UmpError(Err.VOIDED, "该输入已作废", retryable=False, ref=ref)
+            raise UmpError(Err.VOIDED, "该输入已作废", retryable=False, ref=ref, stage=Stage.RECEIVE)
         # failed：恢复同一逻辑轮次的新尝试
         self.store.inbound_set_state(outbound["seq"], "queued", error_code=None)
         self._schedule(outbound["seq"])
@@ -156,28 +165,37 @@ class SessionService:
 
     async def _generate(self, row: dict[str, Any]) -> None:
         seq = row["seq"]
+        started = time.monotonic()
         self.store.inbound_set_state(seq, "processing")
         await self._status(row, "thinking")
         try:
             text = await self.llm.chat(self._build_messages(row))
         except LLMError as exc:
-            log.warning("generation failed seq=%s code=%s", seq, exc.code)
+            log.warning(
+                "generation failed seq=%s stage=%s code=%s elapsed=%.1fs",
+                seq,
+                Stage.GENERATE,
+                exc.code,
+                time.monotonic() - started,
+            )
             self.store.inbound_set_state(seq, "failed", error_code=exc.code)
             await self._status(row, "idle")
-            await self._error(row, UmpError(exc.code, exc.message, retryable=exc.retryable))
+            await self._error(row, UmpError(exc.code, exc.message, retryable=exc.retryable, stage=Stage.GENERATE))
             return
         except Exception:  # 兜底：异常不得被当成成功文本
             log.exception("generation crashed seq=%s", seq)
             self.store.inbound_set_state(seq, "failed", error_code=Err.INTERNAL)
             await self._status(row, "idle")
-            await self._error(row, UmpError(Err.INTERNAL, "生成失败", retryable=True))
+            await self._error(row, UmpError(Err.INTERNAL, "生成失败", retryable=True, stage=Stage.GENERATE))
             return
 
         parts = split_parts(text, self._limits(row["channel_id"])[0])
         if not parts:
             self.store.inbound_set_state(seq, "failed", error_code="empty_completion")
             await self._status(row, "idle")
-            await self._error(row, UmpError(Err.GENERATION_FAILED, "空回复", retryable=True))
+            await self._error(
+                row, UmpError(Err.GENERATION_FAILED, "空回复", retryable=True, stage=Stage.GENERATE)
+            )
             return
 
         thread = self.store.thread_get(row["channel_id"], row["thread_id"])
@@ -268,7 +286,16 @@ class SessionService:
                 binding_token=token,
                 id=ump.new_id("s"),
             )
-            delivered = await self.deliver(msg["channel_id"], msg["thread_id"], envelope)
+            delivered = False
+            try:
+                delivered = await asyncio.wait_for(
+                    self.deliver(msg["channel_id"], msg["thread_id"], envelope), timeout=SEND_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                # 通道在现实中不读数据：发送结果按未知处理，不假称成功（§2.3）
+                log.warning("delivery timeout msg=%s batch=%s", msg["message_id"], index)
+                self.store.delivery_set(msg["seq"], index, "unknown")
+                continue
             if delivered:
                 self.store.delivery_set(msg["seq"], index, "sent")
 
@@ -282,6 +309,7 @@ class SessionService:
                         "既有分段计划超出当前协商的通道能力，保留历史不重排",
                         retryable=False,
                         ref=msg["message_id"],
+                        stage=Stage.DELIVERY,
                     ),
                     thread_id=msg["thread_id"],
                 ),

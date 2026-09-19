@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass
@@ -24,6 +25,10 @@ log = get_logger("isekai.app")
 
 class OwnershipError(RuntimeError):
     """同一数据目录已有活跃的核心写入者。"""
+
+
+class PersistenceError(RuntimeError):
+    """存储不可用：拒绝推进，等待恢复（DESKTOP_SPEC §2）。"""
 
 
 def pid_alive(pid: int) -> bool:
@@ -69,7 +74,8 @@ class Ownership:
             pid = info.get("pid")
             if isinstance(pid, int) and pid != os.getpid() and pid_alive(pid):
                 raise OwnershipError(f"另一个核心进程正在使用该数据目录（pid={pid}）")
-            log.warning("接管陈旧锁文件 pid=%s", pid)
+            if isinstance(pid, int) and pid != os.getpid():
+                log.warning("接管陈旧锁文件 pid=%s", pid)
         self.path.write_text(
             json.dumps({"pid": os.getpid(), "started_at": time.time(), "app": APP_VERSION}),
             encoding="utf-8",
@@ -114,6 +120,11 @@ async def build_runtime(
 ) -> Runtime:
     store = Store(cfg.paths.db)
     store.ensure_schema()
+    try:
+        store.write_probe()  # 存储不可用时不进入正常运行（壳显示存储错误）
+    except (sqlite3.Error, OSError) as exc:
+        store.close()
+        raise PersistenceError(str(exc)) from exc
     interrupted = store.interrupt_open_turns()
     if interrupted:
         log.warning("上次进程留下 %s 条未完成轮次：已标记中断，可显式重试", interrupted)
@@ -165,11 +176,40 @@ async def _watch_parent(parent_pid: int, stop: asyncio.Event) -> None:
 
 async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | None = None) -> None:
     ownership = Ownership(cfg.paths.lock)
-    ownership.acquire()
-    runtime = await build_runtime(cfg, ownership=ownership)
     stop = asyncio.Event()
     if parent_pid is not None:
         asyncio.create_task(_watch_parent(parent_pid, stop))
+
+    runtime: Runtime | None = None
+    while runtime is None and not stop.is_set():
+        try:
+            ownership.acquire()  # data 目录 / 锁文件不可写也算存储问题
+            runtime = await build_runtime(cfg, ownership=ownership)
+        except OwnershipError:
+            raise  # 另一个核心在写：不是存储问题，按 already_running 退出
+        except (PersistenceError, OSError) as exc:
+            log.error("存储不可用：%s", exc)
+            if print_ready:
+                # 仍给就绪握手（状态=persistence_blocked）：壳据此显示存储错误并停止新工作
+                blocked = {
+                    "event": "ready",
+                    "state": "persistence_blocked",
+                    "endpoint": None,
+                    "app": APP_VERSION,
+                    "data_format": DATA_FORMAT_VERSION,
+                    "rules": RULES_VERSION,
+                    "error": str(exc),
+                    "pid": os.getpid(),
+                    "data_dir": str(cfg.paths.data),
+                }
+                sys.stdout.buffer.write((json.dumps(blocked, ensure_ascii=False) + "\n").encode("utf-8"))
+                sys.stdout.buffer.flush()
+                print_ready = False
+            await asyncio.sleep(10)  # 有界重试：恢复写入后继续
+    if runtime is None:
+        ownership.release()
+        return
+
     try:
         await runtime.server.start()
         if print_ready:

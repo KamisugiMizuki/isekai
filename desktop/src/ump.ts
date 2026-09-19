@@ -35,6 +35,7 @@ export class UmpClient {
   private ws: WebSocket | null = null;
   private waiters: Waiter[] = [];
   private listeners = new Set<(env: Envelope) => void>();
+  private closeHandlers = new Set<() => void>();
   helloAck: Record<string, unknown> | null = null;
   negotiated: Record<string, number | boolean> = {};
 
@@ -46,6 +47,11 @@ export class UmpClient {
 
   onMessage(fn: (env: Envelope) => void): void {
     this.listeners.add(fn);
+  }
+
+  /** 连接断开（非本地主动关闭）：客户端据此做有界退避重连（§六）。 */
+  onClose(fn: () => void): void {
+    this.closeHandlers.add(fn);
   }
 
   async connect(opts: { credential?: string | null; bootstrap?: string | null }): Promise<Record<string, unknown>> {
@@ -69,6 +75,9 @@ export class UmpClient {
         }
       }
       for (const listener of this.listeners) listener(env);
+    };
+    ws.onclose = () => {
+      for (const handler of this.closeHandlers) handler();
     };
 
     const auth: Record<string, string> = {};
@@ -126,6 +135,7 @@ export class UmpClient {
   }
 
   close(): void {
+    this.closeHandlers.clear(); // 主动关闭不触发重连
     this.ws?.close();
     this.ws = null;
   }

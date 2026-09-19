@@ -59,6 +59,8 @@ const state = {
 let ump: UmpClient | null = null;
 let mgmt: MgmtClient | null = null;
 let shellStatus: CoreStatus | null = null;
+let reconnectAttempt = 0;
+let reconnectToken = 0; // 递增即作废在途的重连链（例如同时发生了核心重启）
 
 /* ---------- 渲染 ---------- */
 
@@ -194,9 +196,119 @@ function toMessage(row: HistoryRow): Message {
   };
 }
 
+//: 有界退避重连（§六：核心暂时不可用 / 网络断线时保留历史，不清空）
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
+
+function showRestart(): void {
+  $("restart").classList.remove("hidden");
+}
+
+function hideRestart(): void {
+  $("restart").classList.add("hidden");
+}
+
+function applyHello(ack: Record<string, unknown>): void {
+  // 握手回带已有 thread 令牌：重连不必再问管理面（§2.2）
+  const threads = (ack.threads as Array<{ id: string; binding_token: string }>) ?? [];
+  const mine = threads.find((item) => item.id === state.threadId);
+  if (mine) state.token = mine.binding_token;
+}
+
+async function openChannel(endpoint: string, opts: { credential?: string | null; bootstrap?: string | null }): Promise<void> {
+  ump?.close(); // 旧连接（若有）先关：避免同一通道挂两条连接
+  const client = new UmpClient(endpoint, "builtin", "内建聊天窗口");
+  client.onMessage(onEnvelope);
+  client.onClose(onChannelClosed);
+  let ack: Record<string, unknown>;
+  try {
+    ack = await client.connect(opts);
+  } catch (error) {
+    if (!opts.bootstrap) throw error;
+    // 持久凭据失效：退回一次性引导凭据重新登记（受信启动通路）
+    const fresh = new UmpClient(endpoint, "builtin", "内建聊天窗口");
+    fresh.onMessage(onEnvelope);
+    fresh.onClose(onChannelClosed);
+    ack = await fresh.connect({ bootstrap: opts.bootstrap });
+    ump = fresh;
+    client.close();
+    if (ack.credential) localStorage.setItem("isekai.credential", String(ack.credential));
+    applyHello(ack);
+    return;
+  }
+  ump = client;
+  if (ack.credential) localStorage.setItem("isekai.credential", String(ack.credential));
+  applyHello(ack);
+}
+
+function onChannelClosed(): void {
+  if (state.phase !== "ready") return;
+  state.phase = "starting";
+  setStatus("连接已断开，正在重连…", "pending");
+  void scheduleReconnect();
+}
+
+async function scheduleReconnect(): Promise<void> {
+  const mine = reconnectToken;
+  if (!shellStatus?.endpoint) {
+    setStatus("核心未在运行，可使用「重启核心」", "bad");
+    showRestart();
+    return;
+  }
+  if (reconnectAttempt >= RECONNECT_DELAYS_MS.length) {
+    setStatus("重连失败：核心可能已退出（可重启核心）", "bad");
+    showRestart();
+    return;
+  }
+  const delay = RECONNECT_DELAYS_MS[reconnectAttempt];
+  reconnectAttempt += 1;
+  await new Promise((resolve) => setTimeout(resolve, delay));
+  if (mine !== reconnectToken) return; // 已被新的连接流程接管
+  try {
+    await openChannel(shellStatus.endpoint, {
+      credential: localStorage.getItem("isekai.credential"),
+      bootstrap: shellStatus.bootstrap ?? null,
+    });
+    await loadHistory(); // 重连后以核心持久记录为准重载
+    state.phase = "ready";
+    reconnectAttempt = 0;
+    setStatus("已重新连接", "ok");
+    hideRestart();
+  } catch (error) {
+    setStatus(`重连中…（第 ${reconnectAttempt} 次失败：${error}）`, "pending");
+    void scheduleReconnect();
+  }
+}
+
+async function restartCore(): Promise<void> {
+  setStatus("重启核心中…", "pending");
+  hideRestart();
+  state.phase = "starting";
+  reconnectToken += 1; // 作废在途重连链
+  try {
+    await invoke("core_restart");
+  } catch (error) {
+    setStatus(`重启失败：${error}`, "bad");
+    showRestart();
+    return;
+  }
+  const status = await waitForCore();
+  if (status.state !== "ready") {
+    setStatus(`核心未就绪：${status.error ?? status.state}`, "bad");
+    showRestart();
+    return;
+  }
+  try {
+    await connectChat(status);
+  } catch (error) {
+    setStatus(`连接失败：${error}`, "bad");
+    showRestart();
+  }
+}
+
 async function connectChat(status: CoreStatus): Promise<void> {
   if (!status.endpoint || !status.mgmt) {
     setStatus(`核心未就绪：${status.error ?? status.state}`, "bad");
+    showRestart();
     return;
   }
   mgmt = new MgmtClient(status.endpoint, status.mgmt);
@@ -225,29 +337,24 @@ async function connectChat(status: CoreStatus): Promise<void> {
   }
   localStorage.setItem("isekai.credential", credential);
 
-  const thread = ((await mgmt.call("thread.bind", {
-    channel: "builtin",
-    thread_id: state.threadId,
-    session_id: state.sessionId,
-  })).thread ?? {}) as Record<string, unknown>;
-  state.token = String(thread.binding_token ?? "");
-
-  ump = new UmpClient(status.endpoint, "builtin", "内建聊天窗口");
-  ump.onMessage(onEnvelope);
-  try {
-    await ump.connect({ credential });
-  } catch {
-    // 持久凭据失效：退回一次性引导凭据重新登记（受信启动通路）
-    const fresh = new UmpClient(status.endpoint, "builtin", "内建聊天窗口");
-    fresh.onMessage(onEnvelope);
-    const ack = await fresh.connect({ bootstrap: status.bootstrap ?? null });
-    if (ack.credential) localStorage.setItem("isekai.credential", String(ack.credential));
-    ump = fresh;
+  state.token = "";
+  await openChannel(status.endpoint, { credential, bootstrap: status.bootstrap ?? null });
+  if (!state.token) {
+    // 该通道尚无此 thread 的绑定：由受信管理面创建（阶段 0 的占位会话）
+    const thread = ((await mgmt.call("thread.bind", {
+      channel: "builtin",
+      thread_id: state.threadId,
+      session_id: state.sessionId,
+    })).thread ?? {}) as Record<string, unknown>;
+    state.token = String(thread.binding_token ?? "");
   }
 
   await loadHistory();
   state.phase = "ready";
+  reconnectAttempt = 0;
+  reconnectToken += 1;
   renderTopbar();
+  hideRestart();
   setStatus("已就绪", "ok");
   renderManagePane(overview);
 }
@@ -292,6 +399,15 @@ function findUserMessage(envId: string | undefined): Message | undefined {
 
 function onEnvelope(env: Envelope): void {
   const payload = env.payload as Record<string, unknown>;
+  if (env.type === "binding") {
+    // 管理面换代通知：更新令牌并按真值重载历史（旧令牌的视图作废）
+    if (String(payload.thread_id ?? "") === state.threadId) {
+      state.token = String(payload.binding_token ?? state.token);
+      void loadHistory().then(() => setStatus("已就绪", "ok"));
+      setStatus("绑定已更新，正在重载历史…", "pending");
+    }
+    return;
+  }
   if (env.type === "accepted") {
     const target = findUserMessage(payload.ref as string);
     if (target) {
@@ -477,18 +593,29 @@ async function boot(): Promise<void> {
   bindNav();
   $("settings-form").addEventListener("submit", (event) => void saveSettings(event));
   $("settings-reload").addEventListener("click", () => void loadSettings());
+  $("restart").addEventListener("click", () => void restartCore());
   await listen("core-status", (event) => {
     shellStatus = event.payload as CoreStatus;
+    if (shellStatus.state === "ready") return;
+    state.phase = "starting";
+    if (shellStatus.state === "persistence_blocked") {
+      setStatus(`存储不可用：${shellStatus.error ?? ""}`, "bad");
+    } else {
+      setStatus(`核心未就绪：${shellStatus.error ?? shellStatus.state}`, "bad");
+    }
+    showRestart();
   });
   const status = await waitForCore();
   if (status.state !== "ready") {
     setStatus(`核心未就绪：${status.error ?? status.state}`, "bad");
+    showRestart();
     return;
   }
   try {
     await connectChat(status);
   } catch (error) {
     setStatus(`连接失败：${error}`, "bad");
+    showRestart();
   }
 }
 

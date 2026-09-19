@@ -9,7 +9,7 @@ import logging
 import sys
 from typing import Sequence
 
-from .app import OwnershipError, run_core
+from .app import OwnershipError, PersistenceError, run_core
 from .config import load_config
 from .log import setup_logging
 
@@ -29,6 +29,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OwnershipError as exc:
         print(json.dumps({"event": "failed", "code": "already_running", "message": str(exc)}, ensure_ascii=False), flush=True)
         return 3
+    except (PersistenceError, FileExistsError, NotADirectoryError) as exc:
+        print(json.dumps({"event": "failed", "code": "persistence_blocked", "message": str(exc)}, ensure_ascii=False), flush=True)
+        return 4
     except KeyboardInterrupt:
         return 0
     return 0

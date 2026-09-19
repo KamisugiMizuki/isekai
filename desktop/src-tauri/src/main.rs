@@ -130,7 +130,11 @@ fn spawn_core(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
             match event {
                 "ready" => {
                     let mut status = state.status.lock().unwrap();
-                    status.state = "ready".to_string();
+                    status.state = value
+                        .get("state")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("ready")
+                        .to_string();
                     status.endpoint = value.get("endpoint").and_then(|item| item.as_str()).map(str::to_string);
                     status.bootstrap = value.get("bootstrap").and_then(|item| item.as_str()).map(str::to_string);
                     status.mgmt = value.get("mgmt").and_then(|item| item.as_str()).map(str::to_string);
@@ -159,10 +163,10 @@ fn spawn_core(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
                 _ => {}
             }
         }
-        // stdout 关闭 = 核心退出：未就绪时给明确错误，运行中则提示需要重启
+        // stdout 关闭 = 核心退出：就绪前或运行中给明确错误；已报告过的终态（如存储不可用）保持不变
         let state = handle.state::<AppState>();
         let mut status = state.status.lock().unwrap();
-        if status.state != "failed" {
+        if status.state == "starting" || status.state == "ready" {
             status.state = "failed".to_string();
             status.error = Some("核心进程已退出".to_string());
         }

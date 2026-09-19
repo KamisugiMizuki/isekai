@@ -573,3 +573,10 @@ class Store:
             "channels": one("SELECT COUNT(*) FROM channel_instance"),
             "messages": one("SELECT COUNT(*) FROM message"),
         }
+
+    def write_probe(self) -> None:
+        """写盘自检：不可写时抛 sqlite3.Error（调用方据此进入 persistence_blocked）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('write_probe', ?)", (str(time.time()),)
+            )

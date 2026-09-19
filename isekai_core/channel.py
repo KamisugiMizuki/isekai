@@ -22,7 +22,7 @@ from .config import Config, SettingsError, mask_api_key, save_llm_settings
 from .log import get_logger
 from .session import SessionService
 from .store import Store
-from .ump import Envelope, Err, UmpError
+from .ump import Envelope, Err, Stage, UmpError
 from .version import (
     APP_VERSION,
     DATA_FORMAT_VERSION,
@@ -196,6 +196,15 @@ class CoreServer:
             "negotiated": caps,
             "protocol": UMP_VERSION,
             "state": self.state,
+            # 握手回带该通道已有的 thread 令牌：重连不必再问管理面（§2.2）
+            "threads": [
+                {
+                    "id": row["thread_id"],
+                    "binding_version": row["binding_version"],
+                    "binding_token": row["binding_token"],
+                }
+                for row in self.store.thread_list(channel_row["id"])
+            ],
         }
         if credential is not None:
             payload["credential"] = credential
@@ -212,7 +221,9 @@ class CoreServer:
         name = hello["channel"]["id"]
         if hello["bootstrap"] is not None:
             if self._bootstrap_used or not hmac.compare_digest(hello["bootstrap"], self.bootstrap_token):
-                raise UmpError(Err.AUTH_FAILED, "引导凭据无效或已使用", retryable=False, close=True)
+                raise UmpError(
+                    Err.AUTH_FAILED, "引导凭据无效或已使用", retryable=False, close=True, stage=Stage.AUTH
+                )
             self._bootstrap_used = True
             row, credential = self.store.channel_register(
                 name=name,
@@ -224,7 +235,7 @@ class CoreServer:
             return row, credential
         row = self.store.channel_verify_credential(name, hello["credential"] or "")
         if row is None:
-            raise UmpError(Err.AUTH_FAILED, "通道凭据无效", retryable=False, close=True)
+            raise UmpError(Err.AUTH_FAILED, "通道凭据无效", retryable=False, close=True, stage=Stage.AUTH)
         self.store.channel_touch(row["id"])
         return row, None
 
@@ -262,7 +273,12 @@ class CoreServer:
             if envelope.type == "pong":
                 return
             if self.state != "ready" and envelope.type != "delivery":
-                raise UmpError(Err.STATE_BLOCKED, f"核心状态 {self.state}，暂不接受新消息", retryable=True)
+                raise UmpError(
+                    Err.STATE_BLOCKED,
+                    f"核心状态 {self.state}，暂不接受新消息",
+                    retryable=True,
+                    stage=Stage.RECEIVE,
+                )
             if envelope.type == "user_message":
                 await self._on_user_message(conn, envelope)
             elif envelope.type == "retry":
@@ -281,9 +297,11 @@ class CoreServer:
         thread_id = envelope.thread_id or ""
         thread = self.store.thread_get(conn.channel_id or "", thread_id)
         if thread is None:
-            raise UmpError(Err.UNKNOWN_THREAD, "thread 未绑定到任何会话", retryable=False)
+            raise UmpError(Err.UNKNOWN_THREAD, "thread 未绑定到任何会话", retryable=False, stage=Stage.RECEIVE)
         if envelope.binding_token != thread["binding_token"]:
-            raise UmpError(Err.BINDING_EXPIRED, "绑定令牌已失效，需重新取得绑定", retryable=False)
+            raise UmpError(
+                Err.BINDING_EXPIRED, "绑定令牌已失效，需重新取得绑定", retryable=False, stage=Stage.RECEIVE
+            )
         result = await self.service.accept(
             channel_id=conn.channel_id or "", thread_row=thread, env=envelope
         )
@@ -302,9 +320,9 @@ class CoreServer:
         thread_id = envelope.thread_id or ""
         thread = self.store.thread_get(conn.channel_id or "", thread_id)
         if thread is None:
-            raise UmpError(Err.UNKNOWN_THREAD, "thread 未绑定到任何会话", retryable=False)
+            raise UmpError(Err.UNKNOWN_THREAD, "thread 未绑定到任何会话", retryable=False, stage=Stage.RECEIVE)
         if envelope.binding_token != thread["binding_token"]:
-            raise UmpError(Err.BINDING_EXPIRED, "绑定令牌已失效", retryable=False)
+            raise UmpError(Err.BINDING_EXPIRED, "绑定令牌已失效", retryable=False, stage=Stage.RECEIVE)
         result = await self.service.retry(
             channel_id=conn.channel_id or "",
             thread_id=thread_id,
@@ -326,14 +344,16 @@ class CoreServer:
         message_id = envelope.payload["message_id"]
         msg = self.store.outbound_by_message_id(message_id)
         if msg is None or msg["channel_id"] != conn.channel_id:
-            raise UmpError(Err.NOT_FOUND, "找不到对应的出站消息", retryable=False)
+            raise UmpError(Err.NOT_FOUND, "找不到对应的出站消息", retryable=False, stage=Stage.DELIVERY)
         if envelope.binding_token != msg["binding_token"]:
             # 旧回执不能作用于新绑定（§2.3）
-            raise UmpError(Err.BINDING_EXPIRED, "回执的绑定令牌与固化时不一致", retryable=False)
+            raise UmpError(
+                Err.BINDING_EXPIRED, "回执的绑定令牌与固化时不一致", retryable=False, stage=Stage.DELIVERY
+            )
         index = envelope.payload.get("batch_index", 0)
         batches = json.loads(msg["parts"] or "[]")
         if index >= len(batches):
-            raise UmpError(Err.PROTOCOL, "batch_index 超出范围", retryable=False)
+            raise UmpError(Err.PROTOCOL, "batch_index 超出范围", retryable=False, stage=Stage.DELIVERY)
         rollup = self.store.delivery_set(msg["seq"], index, envelope.payload["state"])
         log.info(
             "delivery msg=%s batch=%s state=%s rollup=%s",
@@ -367,6 +387,8 @@ class CoreServer:
                     op = str(frame.get("op"))
                     if op == "settings.set":
                         result = await self._settings_set(dict(frame.get("args") or {}))
+                    elif op == "thread.bind":
+                        result = await self._thread_bind(dict(frame.get("args") or {}))
                     else:
                         result = self._mgmt_call(op, dict(frame.get("args") or {}))
                     await self._send_raw(ws, _mgmt_reply(frame, ok=True, result=result))
@@ -380,6 +402,28 @@ class CoreServer:
         return sorted(self._conns)
 
     # ---------- 设置面 ----------
+
+    async def _thread_bind(self, args: dict[str, Any]) -> dict[str, Any]:
+        """管理面绑定 / 重绑：换代表令并通知在线通道（§2.2 binding 通知）。"""
+        result = self._mgmt_call("thread.bind", args)
+        row = result["thread"]
+        conn = self._conns.get(row["channel_id"])
+        if conn is not None:
+            await self._send_conn(
+                conn,
+                ump.make(
+                    "binding",
+                    {
+                        "thread_id": row["thread_id"],
+                        "binding_version": row["binding_version"],
+                        "binding_token": row["binding_token"],
+                        "state": "active",
+                    },
+                    thread_id=row["thread_id"],
+                    id=ump.new_id("s"),
+                ),
+            )
+        return result
 
     def _settings_get(self) -> dict[str, Any]:
         cfg = self.cfg

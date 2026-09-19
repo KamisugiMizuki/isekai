@@ -28,6 +28,10 @@
   box-sizing: border-box;
 }
 
+.hidden {
+  display: none;
+}
+
 html,
 body {
   margin: 0;
@@ -268,6 +272,17 @@ nav {
   background: var(--surface);
   color: var(--ink);
   font: inherit;
+}
+
+#restart {
+  padding: 3px 12px;
+  border: 1px solid var(--ink);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
 }
 
 #send,
