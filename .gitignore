@@ -10,6 +10,7 @@ exports/
 logs/
 config/*
 !config/README.md
+!config/config.example.yaml
 
 # 本地工具与编辑器
 .hermes/

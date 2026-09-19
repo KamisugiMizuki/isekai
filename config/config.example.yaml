@@ -1,0 +1,28 @@
+# isekai 核心进程本地配置
+#
+# 用法：复制为 config/config.yaml 后按需修改；config.yaml 不入库（.gitignore）。
+# 环境变量覆盖：ISEKAI_LLM_API_KEY（API Key）、ISEKAI_ROOT（数据根目录）。
+
+llm:
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  api_key: ""            # UI / 手编写入；不会进入日志、插件环境或导出件
+  timeout_s: 60
+  max_tokens: 1024       # 只限输出；推理型模型把预算烧在 reasoning 时会按空回复重试一次
+  temperature: 0.8
+
+core:
+  host: 127.0.0.1
+  port: 0                # 0 = 随机端口（推荐；壳按就绪握手拿端点）
+  max_text_len: 4000     # 单段字符上限，与通道协商取小
+  max_parts: 10          # 单批最大段数，与通道协商取小
+  context_history_max: 20 # 生成上下文里带多少条历史往来
+
+# 阶段 0 占位会话：世界与角色尚未接入，阶段 1 起被真实实例 / 角色卡取代
+placeholder:
+  instance_id: ph-instance
+  timeline_id: main
+  character_id: ph-character
+  system_prompt: |
+    你是 isekai 核心进程的占位对话端（阶段 0：世界与角色尚未接入）。
+    只做简短、平实的回应，不要虚构世界设定、经历或身份。
