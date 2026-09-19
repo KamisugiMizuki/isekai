@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+
+# 本地数据与配置（运行时/私有，不入库）
+data/
+exports/
+logs/
+config/*
+!config/README.md
+
+# 本地工具与编辑器
+.hermes/
+.idea/
+.vscode/
+*.swp
+
+# 大文件
+*.gguf
+*.safetensors
+*.ckpt
