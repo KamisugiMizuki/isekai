@@ -18,6 +18,12 @@ config/*
 .vscode/
 *.swp
 
+# 桌面壳（Tauri）
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+
 # 大文件
 *.gguf
 *.safetensors

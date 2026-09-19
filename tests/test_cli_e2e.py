@@ -72,6 +72,28 @@ def test_second_core_refuses_to_write_same_data_dir(tmp_path):
         first.wait(timeout=10)
 
 
+def test_core_exits_when_parent_dies(tmp_path):
+    """壳被硬杀时不留孤儿写入者：父进程消失 → 核心自行停止。"""
+    parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)"])
+    core = subprocess.Popen(
+        [sys.executable, "-m", "isekai_core", "--root", str(tmp_path), "--parent-pid", str(parent.pid)],
+        cwd=REPO,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=_env(),
+    )
+    try:
+        assert core.stdout is not None
+        ready = json.loads(core.stdout.readline().decode("utf-8"))
+        assert ready["event"] == "ready"
+        assert core.wait(timeout=40) == 0  # 父进程 3s 后退出，看门狗 5s 轮询
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+        if core.poll() is None:
+            core.kill()
+
+
 def test_stale_lock_is_taken_over(tmp_path):
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
     # 一个已经不存在的 pid 留下的锁文件：应被接管而不是永久阻塞

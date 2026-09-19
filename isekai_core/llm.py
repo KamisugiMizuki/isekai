@@ -109,6 +109,7 @@ class FakeLLM:
         self.calls: list[list[dict[str, Any]]] = []
         self.fail_with = fail_with
         self.delay_s = 0.0
+        self.cfg: Any = None  # 由设置面写入（settings.set 生效路径与真实客户端一致）
 
     async def chat(self, messages: list[dict[str, Any]], *, max_tokens: int | None = None) -> str:
         self.calls.append(messages)

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>isekai</title>
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="brand">isekai</div>
+        <div class="section-title">会话</div>
+        <ul id="sessions"></ul>
+        <div class="spacer"></div>
+        <nav>
+          <button class="nav active" data-pane="chat">聊天</button>
+          <button class="nav" data-pane="manage">管理</button>
+          <button class="nav" data-pane="settings">设置</button>
+        </nav>
+      </aside>
+
+      <main id="content">
+        <header id="topbar">
+          <div id="title">未连接</div>
+          <div id="status" class="chip pending">启动中…</div>
+        </header>
+
+        <section id="pane-chat" class="pane">
+          <ol id="messages"></ol>
+          <form id="composer">
+            <textarea id="input" rows="1" placeholder="Enter 发送，Shift+Enter 换行"></textarea>
+            <button type="submit" id="send">发送</button>
+          </form>
+        </section>
+
+        <section id="pane-manage" class="pane hidden">
+          <h2>管理</h2>
+          <p class="muted">
+            阶段 0 仅提供必要占位：世界包、世界实例、角色卡、时间线与版本管理在阶段 1–4 接入；
+            当前会话是占位会话，不代表已存在世界或角色。
+          </p>
+          <dl id="manage-facts" class="facts"></dl>
+        </section>
+
+        <section id="pane-settings" class="pane hidden">
+          <h2>设置</h2>
+          <p class="muted">凭据只保存在本机配置文件，读取时打码；写入立即生效，不进入日志与导出件。</p>
+          <form id="settings-form">
+            <label>服务地址<input id="set-base-url" autocomplete="off" /></label>
+            <label>模型<input id="set-model" autocomplete="off" /></label>
+            <label>API Key<input id="set-api-key" type="password" autocomplete="off" placeholder="留空表示不修改" /></label>
+            <label>超时（秒）<input id="set-timeout" type="number" min="1" step="1" /></label>
+            <label>输出上限（token）<input id="set-max-tokens" type="number" min="1" step="128" /></label>
+            <label>温度<input id="set-temperature" type="number" min="0" max="2" step="0.1" /></label>
+            <div class="row">
+              <button type="submit">保存</button>
+              <button type="button" id="settings-reload">重新读取</button>
+              <span id="settings-note" class="muted"></span>
+            </div>
+          </form>
+          <dl id="settings-facts" class="facts"></dl>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

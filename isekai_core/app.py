@@ -153,10 +153,23 @@ def ready_line(runtime: Runtime) -> dict[str, Any]:
     }
 
 
-async def run_core(cfg: Config, *, print_ready: bool = True) -> None:
+async def _watch_parent(parent_pid: int, stop: asyncio.Event) -> None:
+    """父进程（壳）消失即自行退出：硬杀壳时不留孤儿写入者（DESKTOP_SPEC §2）。"""
+    while not stop.is_set():
+        await asyncio.sleep(5)
+        if not pid_alive(parent_pid):
+            log.warning("父进程 %s 已退出：核心随之停止", parent_pid)
+            stop.set()
+            return
+
+
+async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | None = None) -> None:
     ownership = Ownership(cfg.paths.lock)
     ownership.acquire()
     runtime = await build_runtime(cfg, ownership=ownership)
+    stop = asyncio.Event()
+    if parent_pid is not None:
+        asyncio.create_task(_watch_parent(parent_pid, stop))
     try:
         await runtime.server.start()
         if print_ready:
@@ -165,8 +178,9 @@ async def run_core(cfg: Config, *, print_ready: bool = True) -> None:
             sys.stdout.buffer.write(line.encode("utf-8"))
             sys.stdout.buffer.flush()
         log.info("core ready state=%s", runtime.server.state)
-        await asyncio.Event().wait()
+        await stop.wait()
     finally:
+        stop.set()
         await runtime.service.shutdown()
         await runtime.server.close()
         await runtime.llm.aclose()

@@ -93,6 +93,62 @@ def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+class SettingsError(ValueError):
+    """设置项非法：保留原值，不写盘。"""
+
+
+def mask_api_key(key: str) -> str:
+    """读取打码：不回显完整 Key。"""
+    if not key:
+        return ""
+    return "•" * 8 + key[-4:] if len(key) > 4 else "•" * 8
+
+
+def validate_llm_updates(updates: dict[str, Any]) -> dict[str, Any]:
+    """校验并归一化 llm 段的可写字段；非法即抛 SettingsError（调用方保留原值）。"""
+    allowed = {"base_url", "model", "api_key", "timeout_s", "max_tokens", "temperature"}
+    unknown = set(updates) - allowed
+    if unknown:
+        raise SettingsError(f"不支持的设置项：{', '.join(sorted(unknown))}")
+    cleaned: dict[str, Any] = {}
+    for key, value in updates.items():
+        if key in ("base_url", "model"):
+            if not isinstance(value, str) or not value.strip():
+                raise SettingsError(f"{key} 不能为空")
+            cleaned[key] = value.strip()
+        elif key == "api_key":
+            if not isinstance(value, str):
+                raise SettingsError("api_key 必须是字符串")
+            cleaned[key] = value.strip()
+        elif key == "temperature":
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= float(value) <= 2:
+                raise SettingsError("temperature 必须在 0–2 之间")
+            cleaned[key] = float(value)
+        else:
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or float(value) <= 0:
+                raise SettingsError(f"{key} 必须是正数")
+            cleaned[key] = float(value)
+    return cleaned
+
+
+def save_llm_settings(cfg: Config, updates: dict[str, Any]) -> Config:
+    """把 llm 段的修改写回 config.yaml（保留其它段与未知键），返回重新加载后的配置。"""
+    cleaned = validate_llm_updates(updates)
+    raw: dict[str, Any] = {}
+    if cfg.paths.config_file.exists():
+        loaded = yaml.safe_load(cfg.paths.config_file.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            raw = loaded
+    llm_raw = _section(raw, "llm")
+    llm_raw.update(cleaned)
+    raw["llm"] = llm_raw
+    cfg.paths.config_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg.paths.config_file.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    return load_config(cfg.paths.root)
+
+
 def load_config(root: str | os.PathLike[str] | None = None) -> Config:
     paths = paths_for(resolve_root(root))
     raw: dict[str, Any] = {}

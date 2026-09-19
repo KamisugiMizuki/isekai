@@ -1,0 +1,20 @@
+[package]
+name = "isekai-desktop"
+version = "0.1.0"
+description = "isekai 桌面壳（Tauri v2）：核心进程监督 + 内建聊天客户端"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# 生产 / 自包含运行：使用内嵌前端资源而不是 devUrl（不带该 feature 的 debug 构建会去找 dev 服务器）
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.dev]
+incremental = true

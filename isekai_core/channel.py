@@ -18,7 +18,7 @@ from websockets.asyncio.server import Server, serve
 from websockets.exceptions import ConnectionClosed
 
 from . import ump
-from .config import Config
+from .config import Config, SettingsError, mask_api_key, save_llm_settings
 from .log import get_logger
 from .session import SessionService
 from .store import Store
@@ -364,7 +364,11 @@ class CoreServer:
                     await self._send_raw(ws, {"mgmt": "1", "ok": False, "error": {"code": Err.BAD_FRAME, "message": "非法管理帧"}})
                     continue
                 try:
-                    result = self._mgmt_call(str(frame.get("op")), dict(frame.get("args") or {}))
+                    op = str(frame.get("op"))
+                    if op == "settings.set":
+                        result = await self._settings_set(dict(frame.get("args") or {}))
+                    else:
+                        result = self._mgmt_call(op, dict(frame.get("args") or {}))
                     await self._send_raw(ws, _mgmt_reply(frame, ok=True, result=result))
                 except UmpError as exc:
                     await self._send_raw(ws, _mgmt_reply(frame, ok=False, error=exc.to_payload()))
@@ -374,6 +378,45 @@ class CoreServer:
     def connected_channels(self) -> list[str]:
         """当前在线的通道实例（诊断 / 管理面状态）。"""
         return sorted(self._conns)
+
+    # ---------- 设置面 ----------
+
+    def _settings_get(self) -> dict[str, Any]:
+        cfg = self.cfg
+        return {
+            "llm": {
+                "base_url": cfg.llm.base_url,
+                "model": cfg.llm.model,
+                "api_key": mask_api_key(cfg.llm.api_key),
+                "api_key_set": bool(cfg.llm.api_key),
+                "timeout_s": cfg.llm.timeout_s,
+                "max_tokens": cfg.llm.max_tokens,
+                "temperature": cfg.llm.temperature,
+            },
+            "core": {
+                "host": cfg.host,
+                "max_text_len": cfg.max_text_len,
+                "max_parts": cfg.max_parts,
+                "context_history_max": cfg.context_history_max,
+                "config_file": str(cfg.paths.config_file),
+            },
+        }
+
+    async def _settings_set(self, args: dict[str, Any]) -> dict[str, Any]:
+        """写入本地配置并即时生效；校验失败保留原值、错误不回显 Key。"""
+        updates = args.get("llm")
+        if not isinstance(updates, dict):
+            raise UmpError(Err.PROTOCOL, "settings.set 需要 llm 段", retryable=False)
+        try:
+            reloaded = save_llm_settings(self.cfg, updates)
+        except SettingsError as exc:
+            raise UmpError(Err.PROTOCOL, str(exc), retryable=False) from exc
+        self.cfg.llm = reloaded.llm  # 与 session 共用同一个 Config 对象
+        await self.service.llm.aclose()  # base_url / key 可能变化，丢弃缓存的连接
+        self.service.llm.cfg = reloaded.llm
+        log.info("settings updated: model=%s base_url=%s key=%s",
+                 reloaded.llm.model, reloaded.llm.base_url, bool(reloaded.llm.api_key))
+        return self._settings_get()
 
     def _mgmt_call(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
         if op == "status":
@@ -387,6 +430,7 @@ class CoreServer:
                 "counts": self.store.counts(),
                 "channels_connected": self.connected_channels(),
                 "sessions": self.store.session_list(),
+                "placeholder": dict(self.cfg.placeholder),  # 阶段 0 占位会话三元组
             }
         if op == "session.ensure":
             row = self.store.session_ensure(
@@ -422,6 +466,8 @@ class CoreServer:
             return {"thread": row}
         if op == "thread.list":
             return {"threads": self.store.thread_list(args.get("channel_id"))}
+        if op == "settings.get":
+            return self._settings_get()
         if op == "history.page":
             session = self.store.session_get(str(args.get("session_id") or ""))
             if session is None:
@@ -448,6 +494,7 @@ def _public_message(row: dict[str, Any]) -> dict[str, Any]:
         "role": row["role"],
         "text": row["text"],
         "parts": json.loads(parts) if parts else None,
+        "env_id": row["env_id"],
         "message_id": row["message_id"],
         "reply_message_id": row.get("reply_message_id"),
         "reply_to": row["reply_to"],
