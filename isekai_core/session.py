@@ -241,10 +241,18 @@ class SessionService:
         token = msg["binding_token"]
         if not token or not msg["channel_id"] or not msg["thread_id"]:
             return
+        max_len, max_parts = self._limits(msg["channel_id"])
         batches = json.loads(msg["parts"] or "[]")
         states = {r["batch_index"]: r["state"] for r in self.store.delivery_rows(msg["seq"])}
+        incompatible = False
         for index, batch in enumerate(batches):
             if states.get(index) == "accepted":  # 部分成功不重发已确认批次
+                continue
+            if len(batch) > max_parts or any(len(part) > max_len for part in batch):
+                # 协商限额变小：只报告投递能力不兼容，不重排 / 裁剪 / 重新生成（§2.4）
+                if states.get(index) != "incompatible":
+                    self.store.delivery_set(msg["seq"], index, "incompatible")
+                incompatible = True
                 continue
             envelope = ump.make(
                 "reply",
@@ -263,6 +271,21 @@ class SessionService:
             delivered = await self.deliver(msg["channel_id"], msg["thread_id"], envelope)
             if delivered:
                 self.store.delivery_set(msg["seq"], index, "sent")
+
+        if incompatible:
+            await self.deliver(
+                msg["channel_id"],
+                msg["thread_id"],
+                ump.error_envelope(
+                    UmpError(
+                        Err.UNSUPPORTED_CAPABILITY,
+                        "既有分段计划超出当前协商的通道能力，保留历史不重排",
+                        retryable=False,
+                        ref=msg["message_id"],
+                    ),
+                    thread_id=msg["thread_id"],
+                ),
+            )
 
     async def resend_pending(self, channel_id: str, thread_id: str, limit: int = 20) -> int:
         """重连后有界补投仍在投递资格内的已固化回复；不重新生成。"""

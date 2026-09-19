@@ -114,6 +114,9 @@ async def build_runtime(
 ) -> Runtime:
     store = Store(cfg.paths.db)
     store.ensure_schema()
+    interrupted = store.interrupt_open_turns()
+    if interrupted:
+        log.warning("上次进程留下 %s 条未完成轮次：已标记中断，可显式重试", interrupted)
     llm = llm or build_llm(cfg)
     holder: dict[str, CoreServer] = {}
 

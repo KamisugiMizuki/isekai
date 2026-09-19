@@ -118,6 +118,70 @@ async def test_negotiated_text_limit_is_enforced(tmp_path):
             await mgmt.close()
 
 
+async def test_delivery_receipt_with_stale_token_is_rejected(tmp_path):
+    """回执必须按固化时捕获的绑定令牌核对：换绑后的令牌不能触碰原投递记录。"""
+    async with running_core(tmp_path, replies=["回了。"]) as h:
+        mgmt = await open_mgmt(h)
+        client, info = await bind_thread(h, mgmt, channel_id="builtin", thread_id="dm-1")
+        token = info["thread"]["binding_token"]
+        try:
+            await client.send_user_message(thread_id="dm-1", binding_token=token, text="在吗")
+            reply = await client.expect(lambda e: e.type == "reply")
+            message_id = reply.payload["message_id"]
+            seq = h.store.outbound_by_message_id(message_id)["seq"]
+            assert h.store.delivery_rollup(seq) == "sent"
+
+            # 换代之后拿「新绑定」的令牌给旧回复补回执：不得写进原记录
+            rebound = await mgmt.call(
+                "thread.bind", channel="builtin", thread_id="dm-1", session_id=info["session"]["id"]
+            )
+            await client.report_delivery(
+                thread_id="dm-1",
+                binding_token=rebound["thread"]["binding_token"],
+                message_id=message_id,
+                batch_index=0,
+                state="accepted",
+            )
+            error = await client.expect(lambda e: e.type == "error")
+            assert error.payload["code"] == ump.Err.BINDING_EXPIRED
+            assert h.store.delivery_rollup(seq) == "sent"
+        finally:
+            await client.close()
+            await mgmt.close()
+
+
+async def test_channel_ensure_does_not_rotate_existing_credential(tmp_path):
+    async with running_core(tmp_path) as h:
+        mgmt = await open_mgmt(h)
+        try:
+            first = await mgmt.call("channel.ensure", name="builtin")
+            assert first["credential"]
+            second = await mgmt.call("channel.ensure", name="builtin")
+            assert second.get("credential") is None  # 不轮换：既有凭据继续有效
+            assert second["channel"]["id"] == first["channel"]["id"]
+
+            client = UmpClient(
+                endpoint=h.endpoint, channel_id="builtin", name="builtin",
+                credential=first["credential"],
+            )
+            ack = await client.connect()
+            assert ack["channel_instance"] == first["channel"]["id"]
+            await client.close()
+
+            rotated = await mgmt.call("channel.ensure", name="builtin", rotate=True)
+            assert rotated["credential"] and rotated["credential"] != first["credential"]
+            stale = UmpClient(
+                endpoint=h.endpoint, channel_id="builtin", name="builtin",
+                credential=first["credential"],
+            )
+            with pytest.raises(UmpError) as excinfo:
+                await stale.connect()
+            assert excinfo.value.code == ump.Err.AUTH_FAILED
+            await stale.close()
+        finally:
+            await mgmt.close()
+
+
 async def test_status_only_sent_to_capable_channels(tmp_path):
     async with running_core(tmp_path, replies=["好。"]) as h:
         mgmt = await open_mgmt(h)

@@ -234,7 +234,14 @@ async def amain(args: argparse.Namespace, cfg: Config) -> int:
             mgmt = MgmtClient(endpoint, mgmt_token)
             info = await mgmt.connect()
             issued = await mgmt.call("channel.ensure", name=args.channel_id, version=APP_VERSION)
-            _save_credential(cfg, args.channel_id, issued["credential"])
+            credential = issued.get("credential") or _load_credential(cfg, args.channel_id)
+            if credential is None:
+                # 本机没有可用凭据（例如客户端目录被删）：显式轮换一份新的
+                issued = await mgmt.call(
+                    "channel.ensure", name=args.channel_id, version=APP_VERSION, rotate=True
+                )
+                credential = issued["credential"]
+            _save_credential(cfg, args.channel_id, credential)
             binding = await ensure_binding(cfg, mgmt, args.channel_id, args.thread)
             session, thread = binding["session"], binding["thread"]
             client = await connect_channel(

@@ -174,8 +174,13 @@ class Store:
         version: str,
         protocol: str,
         capabilities: dict[str, Any],
-    ) -> tuple[dict[str, Any], str]:
-        """注册（或重新登记并轮换凭据）一个通道实例，返回 (行, 明文凭据)。"""
+        rotate: bool = True,
+    ) -> tuple[dict[str, Any], str | None]:
+        """登记通道实例并签发凭据，返回 (行, 明文凭据)。
+
+        `rotate=False` 且实例已存在时不轮换：凭据只在首次签发或显式轮换时更新，
+        否则多个调用方会互相把对方踢下线。返回的凭据为 None 表示沿用既有凭据。
+        """
         credential = new_credential()
         now = time.time()
         with self._lock, self._conn:
@@ -197,8 +202,10 @@ class Store:
                         now,
                     ),
                 )
-            else:
-                channel_id = row["id"]
+                self._conn.commit()
+                return self.channel_get(channel_id), credential  # type: ignore[return-value]
+            channel_id = row["id"]
+            if rotate:
                 self._conn.execute(
                     """UPDATE channel_instance SET version=?, protocol=?, capabilities=?,
                                                    credential_hash=?, last_seen_at=? WHERE id=?""",
@@ -211,7 +218,14 @@ class Store:
                         channel_id,
                     ),
                 )
-        return self.channel_get(channel_id), credential  # type: ignore[return-value]
+                issued: str | None = credential
+            else:
+                self._conn.execute(
+                    "UPDATE channel_instance SET version=?, last_seen_at=? WHERE id=?",
+                    (version, now, channel_id),
+                )
+                issued = None
+        return self.channel_get(channel_id), issued  # type: ignore[return-value]
 
     def channel_verify_credential(self, name: str, credential: str) -> dict[str, Any] | None:
         row = self.channel_by_name(name)
@@ -351,6 +365,19 @@ class Store:
                 (state, error_code, reply_message_id, seq),
             )
 
+    def interrupt_open_turns(self) -> int:
+        """启动时收尾上次进程留下的未完成轮次：标记中断，等待显式重试。
+
+        提交是单事务（状态与产物一起发布），因此 queued / processing 的行必然没有
+        已固化的结果，标记为 interrupted 可重试不会造成漏单或执行两次（SESSION_CORE §4.3）。
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """UPDATE message SET state='failed', error_code='interrupted'
+                   WHERE role='user' AND state IN ('queued','processing')"""
+            )
+            return int(cur.rowcount or 0)
+
     # ---------- 出站 ----------
 
     def outbound_put(
@@ -473,6 +500,8 @@ class Store:
             return "unknown"
         if any(s == "failed" for s in states):
             return "failed"
+        if any(s == "incompatible" for s in states):
+            return "incompatible"
         if all(s in ("sent", "accepted") for s in states):
             return "sent"
         return "pending"

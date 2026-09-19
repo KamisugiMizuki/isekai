@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from conftest import bind_thread, open_mgmt, running_core
 from isekai_core import ump
+from isekai_core.client import UmpClient
 from isekai_core.llm import LLMError
 
 
@@ -158,6 +160,72 @@ async def test_late_result_is_dropped_when_thread_rebound(tmp_path):
             await mgmt.close()
 
 
+async def test_interrupted_turn_survives_restart_and_can_be_retried(tmp_path):
+    async with running_core(tmp_path, replies=["慢回复"]) as h:
+        h.fake.delay_s = 3.0
+        mgmt = await open_mgmt(h)
+        client, info = await bind_thread(h, mgmt, channel_id="builtin", thread_id="dm-1")
+        token = info["thread"]["binding_token"]
+        credential = info["credential"]
+        channel_id = info["thread"]["channel_id"]
+        env_id = await client.send_user_message(thread_id="dm-1", binding_token=token, text="在吗")
+        await client.expect(lambda e: e.type == "accepted")
+        await asyncio.sleep(0.2)
+        assert h.store.inbound_find(channel_id, "dm-1", env_id)["state"] == "processing"
+        await client.close()
+        await mgmt.close()
+    # 进程关闭时该轮次仍未完成 —— 重启后必须可恢复，而不是永久卡在「处理中」
+    async with running_core(tmp_path, replies=["恢复后的回复"]) as h2:
+        row = h2.store.inbound_find(channel_id, "dm-1", env_id)
+        assert row["state"] == "failed"
+        assert row["error_code"] == "interrupted"
+        client = UmpClient(endpoint=h2.endpoint, channel_id="builtin", name="builtin", credential=credential)
+        await client.connect()
+        try:
+            await client.request_retry(thread_id="dm-1", binding_token=token, ref=env_id)
+            reply = await client.expect(lambda e: e.type == "reply")
+            assert reply.payload["reply_to"] == env_id
+            assert reply.payload["parts"] == [{"text": "恢复后的回复"}]
+            assert h2.store.inbound_find(channel_id, "dm-1", env_id)["state"] == "done"
+        finally:
+            await client.close()
+
+
+async def test_resume_reports_incompatibility_when_limits_shrink(tmp_path):
+    long_text = "\n".join(f"第{index}行：" + "内容" * 20 for index in range(300))
+    async with running_core(tmp_path, replies=[long_text]) as h:
+        mgmt = await open_mgmt(h)
+        client, info = await bind_thread(h, mgmt, channel_id="builtin", thread_id="dm-1", max_parts=10)
+        token = info["thread"]["binding_token"]
+        credential = info["credential"]
+        try:
+            env_id = await client.send_user_message(thread_id="dm-1", binding_token=token, text="说多点")
+            message_id = ""
+            while True:
+                reply = await client.expect(lambda e: e.type == "reply")
+                message_id = reply.payload["message_id"]
+                assert reply.payload["batch_count"] == 1
+                if reply.payload["batch_index"] == reply.payload["batch_count"] - 1:
+                    break
+            await client.close()  # 不回执：回复处于「已发出未确认」
+
+            parts_before = json.loads(h.store.outbound_by_message_id(message_id)["parts"])
+            shrink = UmpClient(
+                endpoint=h.endpoint, channel_id="builtin", name="builtin", credential=credential, max_parts=1
+            )
+            ack = await shrink.connect()
+            assert ack["negotiated"]["max_parts"] == 1
+            error = await shrink.expect(lambda e: e.type == "error", timeout=10)
+            assert error.payload["code"] == ump.Err.UNSUPPORTED_CAPABILITY
+            assert error.payload["ref"] == message_id
+            stored = h.store.outbound_by_message_id(message_id)
+            assert h.store.delivery_rollup(stored["seq"]) == "incompatible"
+            assert json.loads(stored["parts"]) == parts_before  # 不重排、不裁剪、不重新生成
+            await shrink.close()
+        finally:
+            await mgmt.close()
+
+
 async def test_reply_is_resent_after_reconnect_without_regenerating(tmp_path):
     async with running_core(tmp_path, replies=["离线时说的话。"]) as h:
         mgmt = await open_mgmt(h)
@@ -168,8 +236,6 @@ async def test_reply_is_resent_after_reconnect_without_regenerating(tmp_path):
             await client.send_user_message(thread_id="dm-1", binding_token=token, text="在吗")
             first = await client.expect(lambda e: e.type == "reply")
             await client.close()  # 模拟断线：回复已固化但未回执
-
-            from isekai_core.client import UmpClient
 
             again = UmpClient(
                 endpoint=h.endpoint, channel_id="builtin", name="builtin", credential=credential

@@ -327,6 +327,9 @@ class CoreServer:
         msg = self.store.outbound_by_message_id(message_id)
         if msg is None or msg["channel_id"] != conn.channel_id:
             raise UmpError(Err.NOT_FOUND, "找不到对应的出站消息", retryable=False)
+        if envelope.binding_token != msg["binding_token"]:
+            # 旧回执不能作用于新绑定（§2.3）
+            raise UmpError(Err.BINDING_EXPIRED, "回执的绑定令牌与固化时不一致", retryable=False)
         index = envelope.payload.get("batch_index", 0)
         batches = json.loads(msg["parts"] or "[]")
         if index >= len(batches):
@@ -405,6 +408,7 @@ class CoreServer:
                 version=str(args.get("version") or "0"),
                 protocol=UMP_VERSION,
                 capabilities=dict(args.get("capabilities") or {}),
+                rotate=bool(args.get("rotate", False)),
             )
             return {"channel": row, "credential": credential}
         if op == "thread.bind":
