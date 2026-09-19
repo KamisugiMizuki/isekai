@@ -1,4 +1,4 @@
-# Veranima World 总设计对话 · 全文存档
+# isekai 总设计对话 · 全文存档
 
 > 来源：https://chat.deepseek.com/share/frb9jtt16rpdu9a7tj（公开分享页，DeepSeek）
 > 抓取：2026-09-19，通过分享内容 API 全量拉取（40 条消息；20 轮问答）。

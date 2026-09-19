@@ -1,4 +1,4 @@
-# Veranima World 总设计迭代记录（V0.1 → V1.9）
+# isekai 总设计迭代记录（V0.1 → V1.9）
 
 > 来源：2026-09-19 DeepSeek 总设计对话。每条 = 该版修订范围（原文声明）＋ 对应用户裁定（原文）。
 > 对话全文：`design_chat_2026-09-19.md` · 原始 JSON：`design_chat_2026-09-19.raw.json`。
