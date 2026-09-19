@@ -212,8 +212,8 @@
 | 会话核心层 | 会话管理、消息路由、绑定关系（世界 / 角色 / 时间线）、对话上下文隔离、披露管理、回复生成链路（Agent 层）、主动发言（世界源）、角色记忆子系统 | [`SESSION_CORE_SPEC.md`](SESSION_CORE_SPEC.md) |
 | 世界运行层 | 世界时钟（时间基元 + 历法 + 倍率）、时间线、版本管理（提交 / diff / 回滚 / 压缩）、角色状态（性格单元引擎 / 生活线 / 记忆载体）、事件日志、认知接口 | [`WORLD_RUNTIME_SPEC.md`](WORLD_RUNTIME_SPEC.md) |
 | 世界设定层 | 世界包（结构 / 双轨内容 / 生成）、世界实例（创建、锁死、黑箱）、多世界、导入导出、跨端同步 | [`WORLD_SETTING_SPEC.md`](WORLD_SETTING_SPEC.md) |
-| 角色卡 | 角色卡结构、生成流程、初始性格单元集合、认知边界 | [`CHARACTER_CARD_SPEC.md`](CHARACTER_CARD_SPEC.md) |
-| 安卓端 | 内建聊天实现、共享生成器、跨端导入导出、无插件策略 | [`ANDROID_SPEC.md`](ANDROID_SPEC.md) |
+| 角色卡 | 角色卡结构、生成流程、初始性格单元集合（含锚点）、认知边界、生活线模板 | [`CHARACTER_CARD_SPEC.md`](CHARACTER_CARD_SPEC.md) |
+| 安卓端 | 内建聊天实现、共享生成器、跨端导入导出、无插件策略（技术路线待评估） | [`ANDROID_SPEC.md`](ANDROID_SPEC.md) |
 
 维护约定：总设计层面结论变化 → 更新本文与对应 SPEC；模块设计层面的细化 → 只改对应 SPEC 文档。
 
