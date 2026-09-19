@@ -18,6 +18,10 @@ from .log import get_logger
 
 log = get_logger("isekai.llm")
 
+#: 单次补全的预算上限。推理型模型会把预算烧在 reasoning 上并返回空文本，
+#: 重试时按倍加预算（生成世界包这类长产物需要 ≥8K 预算）。
+MAX_COMPLETION_BUDGET = 32768
+
 
 class LLMError(Exception):
     def __init__(self, code: str, message: str, *, retryable: bool = True) -> None:
@@ -42,21 +46,33 @@ class LLMClient:
             )
         return self._client
 
-    async def chat(self, messages: list[dict[str, Any]], *, max_tokens: int | None = None) -> str:
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+        temperature: float | None = None,
+    ) -> str:
         if not self.cfg.api_key:
             raise LLMError("llm_not_configured", "未配置 LLM API Key", retryable=False)
 
         budget = max_tokens or self.cfg.max_tokens
+        # 生成整份世界包这类长产物需要更长的等待；按调用覆盖超时
+        request_timeout = timeout or self.cfg.timeout_s
+        # 结构化产物用更低的温度（默认温度按对话场景设定，JSON 容易出残句）
+        heat = self.cfg.temperature if temperature is None else temperature
         last: LLMError | None = None
         for attempt in (0, 1):
             try:
                 response = await self._http().post(
                     "/chat/completions",
+                    timeout=request_timeout,
                     json={
                         "model": self.cfg.model,
                         "messages": messages,
                         "max_tokens": budget,
-                        "temperature": self.cfg.temperature,
+                        "temperature": heat,
                         "stream": False,
                     },
                 )
@@ -81,14 +97,24 @@ class LLMClient:
 
             try:
                 data = json.loads(response.content.decode("utf-8", "replace"))
-                content = data["choices"][0]["message"]["content"] or ""
+                choice = data["choices"][0]
+                content = choice["message"]["content"] or ""
+                finish = choice.get("finish_reason")
             except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
                 raise LLMError("llm_bad_response", "响应缺少 choices[0].message.content") from exc
 
+            log.debug("llm done len=%s finish=%s budget=%s", len(content), finish, budget)
             if not content.strip():
                 last = LLMError("empty_completion", "模型返回空文本", retryable=True)
                 if attempt == 0:
-                    budget = min(budget * 2, 4096)
+                    budget = min(budget * 2, MAX_COMPLETION_BUDGET)
+                    continue
+                raise last
+            if finish == "length":
+                # 被长度上限截断：整段产物不可用，按可重试错误处理并提高预算
+                last = LLMError("truncated_completion", f"输出被截断（{len(content)} 字符，预算 {budget}）", retryable=True)
+                if attempt == 0:
+                    budget = min(budget * 2, MAX_COMPLETION_BUDGET)
                     continue
                 raise last
             return content.strip()
@@ -111,7 +137,14 @@ class FakeLLM:
         self.delay_s = 0.0
         self.cfg: Any = None  # 由设置面写入（settings.set 生效路径与真实客户端一致）
 
-    async def chat(self, messages: list[dict[str, Any]], *, max_tokens: int | None = None) -> str:
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+        temperature: float | None = None,
+    ) -> str:
         self.calls.append(messages)
         if self.delay_s:
             await asyncio.sleep(self.delay_s)

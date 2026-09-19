@@ -23,6 +23,7 @@ class Err:
     UNSUPPORTED_TYPE = "unsupported_type"
     AUTH_REQUIRED = "auth_required"
     AUTH_FAILED = "auth_failed"
+    INVALID = "invalid_input"
     UNKNOWN_THREAD = "unknown_thread"
     BINDING_EXPIRED = "binding_expired"
     CONFLICT = "conflict"

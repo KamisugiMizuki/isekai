@@ -363,3 +363,48 @@ h2 {
   margin: 0;
   font-size: 16px;
 }
+
+/* 世界管理面（阶段 1） */
+#pane-manage h3 {
+  margin: 18px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+#pane-manage .row input,
+#pane-manage .row select {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  min-width: 0;
+}
+
+#pane-manage .row input {
+  flex: 1 1 160px;
+}
+
+#pane-manage .row select {
+  flex: 0 1 240px;
+}
+
+#pane-manage .row select[multiple] {
+  flex: 0 1 240px;
+  min-height: 62px;
+}
+
+#pane-manage #pkg-errors,
+#pane-manage #card-errors {
+  margin: 6px 0 0;
+  font-size: 12px;
+  white-space: pre-wrap;
+  font-family: inherit;
+}
+
+.muted.bad {
+  color: var(--danger, #b3261e);
+}

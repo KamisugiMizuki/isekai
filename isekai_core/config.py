@@ -37,6 +37,15 @@ class Paths:
     def lock(self) -> Path:
         return self.data / "core.lock"
 
+    @property
+    def packages(self) -> Path:
+        """世界包 / 角色卡创作目录（管理面与桌面的默认落盘位置）。"""
+        return self.root / "packages"
+
+    @property
+    def exports(self) -> Path:
+        return self.root / "exports"
+
 
 def resolve_root(explicit: str | os.PathLike[str] | None = None) -> Path:
     if explicit:

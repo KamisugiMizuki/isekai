@@ -37,12 +37,59 @@
         </section>
 
         <section id="pane-manage" class="pane hidden">
-          <h2>管理</h2>
-          <p class="muted">
-            阶段 0 仅提供必要占位：世界包、世界实例、角色卡、时间线与版本管理在阶段 1–4 接入；
-            当前会话是占位会话，不代表已存在世界或角色。
-          </p>
-          <dl id="manage-facts" class="facts"></dl>
+          <h2>世界</h2>
+          <div class="row">
+            <button id="world-refresh">刷新</button>
+            <span id="world-note" class="muted"></span>
+          </div>
+
+          <h3>世界包</h3>
+          <div class="row">
+            <select id="pkg-select"></select>
+            <button id="pkg-check">校验</button>
+            <input id="pkg-file" placeholder="文件名，如 greytide.json" />
+            <button id="pkg-template">新建骨架</button>
+          </div>
+          <div class="row">
+            <input id="pkg-brief" placeholder="用一段话描述这个世界，交给 AI 生成" />
+            <input id="pkg-name" placeholder="世界包名称（可留空）" />
+            <button id="pkg-generate">AI 生成</button>
+          </div>
+          <pre id="pkg-errors" class="muted"></pre>
+
+          <h3>角色卡</h3>
+          <div class="row">
+            <select id="card-select"></select>
+            <button id="card-confirm">确认卡片</button>
+            <input id="card-file" placeholder="文件名，如 tihe.card.json" />
+            <button id="card-template">新建骨架</button>
+          </div>
+          <div class="row">
+            <input id="card-brief" placeholder="角色描述，如：盐滩上记水位尺的年轻堤务吏" />
+            <input id="card-name-input" placeholder="角色名（可留空）" />
+            <button id="card-generate">AI 生成</button>
+          </div>
+          <pre id="card-errors" class="muted"></pre>
+
+          <h3>世界实例</h3>
+          <div class="row">
+            <select id="inst-select"></select>
+            <input id="inst-rename-input" placeholder="新名称" />
+            <button id="inst-rename-btn">重命名</button>
+            <button id="inst-export">导出</button>
+            <button id="inst-delete">删除</button>
+          </div>
+          <div class="row">
+            <select id="inst-package-select"></select>
+            <select id="inst-cards-select" multiple size="3"></select>
+            <input id="inst-name-input" placeholder="实例显示名（可留空）" />
+            <button id="inst-create">创建实例</button>
+          </div>
+          <div class="row">
+            <select id="import-select"></select>
+            <button id="inst-import">导入为实例</button>
+          </div>
+          <dl id="world-facts" class="facts"></dl>
         </section>
 
         <section id="pane-settings" class="pane hidden">

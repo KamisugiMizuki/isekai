@@ -15,6 +15,18 @@ UMP_MAJOR = "1"
 DATA_FORMAT_VERSION = "0.1"
 RULES_VERSION = "0.1"
 
+#: 导出容器格式版本（导入兼容性判定的主版本；主版本不同需要转换工具）
+CONTAINER_FORMAT = "isekai.instance"
+CONTAINER_VERSION = "1.0"
+
+#: 本端能力声明：导入件要求的每项能力都必须在此列表内（WORLD_SETTING §7.3）
+CAPABILITIES = (
+    "world.package.v1",
+    "cards.v1",
+    "instance.v1",
+    "message.delivery.v1",
+)
+
 #: 协议限额（默认值；握手时与通道取交集）
 DEFAULT_MAX_TEXT_LEN = 4000
 DEFAULT_MAX_PARTS = 10

@@ -528,6 +528,7 @@ function bindNav(): void {
         pane.classList.toggle("hidden", pane.id !== `pane-${button.dataset.pane}`);
       }
       if (button.dataset.pane === "settings") void loadSettings();
+      if (button.dataset.pane === "manage") void loadWorld();
     });
   }
 }
@@ -586,11 +587,301 @@ async function saveSettings(event: SubmitEvent): Promise<void> {
   }
 }
 
+/* ---------- 世界管理面（阶段 1：世界包 / 角色卡 / 实例 / 导入导出） ---------- */
+
+interface PackageEntry {
+  file: string;
+  name: string | null;
+  density?: string;
+  valid: boolean;
+  errors?: string[];
+}
+interface CardEntry {
+  file: string;
+  name: string | null;
+  confirmed: boolean;
+}
+interface InstanceEntry {
+  id: string;
+  name: string;
+  original_name: string;
+  moment: number;
+  timelines: number;
+  sessions: number;
+  imported: boolean;
+}
+
+interface WorldCache {
+  packages: PackageEntry[];
+  cards: CardEntry[];
+  instances: InstanceEntry[];
+  containers: Array<{ file: string }>;
+}
+
+const world: WorldCache = { packages: [], cards: [], instances: [], containers: [] };
+const GENERATE_TIMEOUT_MS = 600000;
+
+function fillSelect(select: HTMLSelectElement, entries: Array<[string, string]>): void {
+  const previous = select.value;
+  select.innerHTML = "";
+  for (const [value, label] of entries) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  }
+  if (entries.some(([value]) => value === previous)) select.value = previous;
+}
+
+function worldNote(text: string, bad = false): void {
+  const note = $("world-note");
+  note.textContent = text;
+  note.className = bad ? "muted bad" : "muted";
+}
+
+function showErrors(target: string, errors: string[] | undefined): void {
+  $(target).textContent = errors && errors.length ? `未通过校验：\n${errors.map((item) => `· ${item}`).join("\n")}` : "";
+}
+
+async function loadWorld(): Promise<void> {
+  if (!mgmt) return;
+  try {
+    const [pkgs, cards, instances] = await Promise.all([
+      mgmt.call("world.package.list"),
+      mgmt.call("world.card.list"),
+      mgmt.call("instance.list"),
+    ]);
+    world.packages = (pkgs.packages ?? []) as unknown as PackageEntry[];
+    world.containers = (pkgs.containers ?? []) as unknown as Array<{ file: string }>;
+    world.cards = (cards.cards ?? []) as unknown as CardEntry[];
+    world.instances = (instances.instances ?? []) as unknown as InstanceEntry[];
+    worldNote("");
+  } catch (error) {
+    worldNote(String(error), true);
+    return;
+  }
+  const packageOptions = world.packages.map((item) => [
+    item.file,
+    `${item.file}｜${item.name ?? "未命名"}${item.valid ? "" : "（未通过校验）"}`,
+  ]);
+  const cardOptions = world.cards.map((item) => [
+    item.file,
+    `${item.file}｜${item.name ?? "未命名"}${item.confirmed ? "" : "（未确认）"}`,
+  ]);
+  const instanceOptions = world.instances.map((item) => [
+    item.id,
+    `${item.name}｜${item.timelines} 线 / ${item.sessions} 会话｜时刻 ${item.moment}`,
+  ]);
+  fillSelect($<HTMLSelectElement>("pkg-select"), packageOptions as Array<[string, string]>);
+  fillSelect($<HTMLSelectElement>("card-select"), cardOptions as Array<[string, string]>);
+  fillSelect($<HTMLSelectElement>("inst-select"), instanceOptions as Array<[string, string]>);
+  fillSelect($<HTMLSelectElement>("inst-package-select"), packageOptions as Array<[string, string]>);
+  fillSelect($<HTMLSelectElement>("inst-cards-select"), cardOptions as Array<[string, string]>);
+  const importOptions = world.containers.map((item) => [item.file, item.file] as [string, string]);
+  fillSelect($<HTMLSelectElement>("import-select"), importOptions);
+  const selected = $<HTMLSelectElement>("inst-select").value;
+  if (selected) void showInstance(selected);
+  else renderFacts($("world-facts"), [["实例", "还没有实例"]]);
+}
+
+async function showInstance(instanceId: string): Promise<void> {
+  if (!mgmt) return;
+  try {
+    const detail = await mgmt.call("instance.info", { id: instanceId });
+    const info = detail.instance as unknown as InstanceEntry;
+    const characters = (detail.characters ?? []) as Array<Record<string, string>>;
+    const timelines = (detail.timelines ?? []) as Array<Record<string, string>>;
+    renderFacts($("world-facts"), [
+      ["实例", `${info.name}（原始名称：${info.original_name}${info.imported ? "，导入" : ""}）`],
+      ["初始世界时刻", `${info.moment} 世界秒`],
+      ["角色", characters.map((item) => `${item.name}｜${item.occupation}`).join("；") || "无"],
+      ["时间线", timelines.map((item) => `${item.name}（${item.state === "frozen" ? "冻结" : "激活"}）`).join("；")],
+      ["世界内部", "不可浏览：管理面只暴露元数据与公开时钟"],
+    ]);
+  } catch (error) {
+    worldNote(String(error), true);
+  }
+}
+
+async function worldAction(action: () => Promise<string | void>): Promise<void> {
+  try {
+    const message = await action();
+    await loadWorld();
+    if (message) worldNote(message);
+  } catch (error) {
+    worldNote(String(error), true);
+  }
+}
+
+function bindWorld(): void {
+  $("world-refresh").addEventListener("click", () => void loadWorld());
+  $<HTMLSelectElement>("inst-select").addEventListener("change", (event) => {
+    void showInstance((event.target as HTMLSelectElement).value);
+  });
+
+  $("pkg-check").addEventListener("click", () =>
+    void worldAction(async () => {
+      const file = $<HTMLSelectElement>("pkg-select").value;
+      if (!file) return "还没有世界包";
+      const result = await mgmt!.call("world.package.validate", { path: file });
+      const errors = (result.errors ?? []) as string[];
+      showErrors("pkg-errors", errors);
+      return errors.length ? "" : `${file} 通过校验`;
+    }),
+  );
+
+  $("pkg-template").addEventListener("click", () =>
+    void worldAction(async () => {
+      const file = $<HTMLInputElement>("pkg-file").value.trim();
+      if (!file) throw new Error("先填一个文件名");
+      const created = await mgmt!.call("world.package.template", { name: file.replace(/\.json$/, "") });
+      await mgmt!.call("world.package.save", { path: file, package: created.package });
+      showErrors("pkg-errors", created.errors as string[]);
+      return `已写入 ${file}（骨架还需填内容）`;
+    }),
+  );
+
+  $("pkg-generate").addEventListener("click", () =>
+    void worldAction(async () => {
+      const brief = $<HTMLInputElement>("pkg-brief").value.trim();
+      if (!brief) throw new Error("先写一段世界描述");
+      const file = $<HTMLInputElement>("pkg-file").value.trim() || "world.json";
+      worldNote("AI 生成中，可能需要一两分钟…");
+      const result = await mgmt!.call(
+        "world.package.generate",
+        { brief, name: $<HTMLInputElement>("pkg-name").value.trim() || file.replace(/\.json$/, "") },
+        GENERATE_TIMEOUT_MS,
+      );
+      const errors = (result.errors ?? []) as string[];
+      if (errors.length) {
+        showErrors("pkg-errors", errors);
+        return "生成结果未通过校验，未写入";
+      }
+      await mgmt!.call("world.package.save", { path: file, package: result.candidate });
+      showErrors("pkg-errors", []);
+      return `已生成并写入 ${file}`;
+    }),
+  );
+
+  $("card-template").addEventListener("click", () =>
+    void worldAction(async () => {
+      const pkg = $<HTMLSelectElement>("pkg-select").value;
+      const file = $<HTMLInputElement>("card-file").value.trim() || "card.json";
+      if (!pkg) throw new Error("先选一个世界包");
+      const created = await mgmt!.call("world.card.template", {
+        package_path: pkg,
+        name: $<HTMLInputElement>("card-name-input").value.trim() || "未命名角色",
+      });
+      await mgmt!.call("world.card.save", { card_path: file, card: created.card });
+      return `已写入 ${file}（骨架未确认）`;
+    }),
+  );
+
+  $("card-generate").addEventListener("click", () =>
+    void worldAction(async () => {
+      const pkg = $<HTMLSelectElement>("pkg-select").value;
+      const brief = $<HTMLInputElement>("card-brief").value.trim();
+      const file = $<HTMLInputElement>("card-file").value.trim() || "card.json";
+      if (!pkg) throw new Error("先选一个世界包");
+      if (!brief) throw new Error("先写一段角色描述");
+      worldNote("AI 生成角色卡中…");
+      const result = await mgmt!.call(
+        "world.card.generate",
+        { package_path: pkg, brief },
+        GENERATE_TIMEOUT_MS,
+      );
+      const errors = (result.errors ?? []) as string[];
+      if (errors.length) {
+        showErrors("card-errors", errors);
+        return "生成结果未通过校验，未写入";
+      }
+      await mgmt!.call("world.card.save", { card_path: file, card: result.candidate });
+      showErrors("card-errors", []);
+      return `已生成并写入 ${file}（仍需确认）`;
+    }),
+  );
+
+  $("card-confirm").addEventListener("click", () =>
+    void worldAction(async () => {
+      const pkg = $<HTMLSelectElement>("pkg-select").value;
+      const card = $<HTMLSelectElement>("card-select").value;
+      if (!pkg || !card) throw new Error("先选世界包与角色卡");
+      await mgmt!.call("world.card.confirm", { package_path: pkg, card_path: card });
+      showErrors("card-errors", []);
+      return `${card} 已确认，可用于创建实例`;
+    }),
+  );
+
+  $("inst-create").addEventListener("click", () =>
+    void worldAction(async () => {
+      const pkg = $<HTMLSelectElement>("inst-package-select").value;
+      const cards = Array.from($<HTMLSelectElement>("inst-cards-select").selectedOptions).map(
+        (option) => option.value,
+      );
+      if (!pkg) throw new Error("先选世界包");
+      if (!cards.length) throw new Error("至少选一张已确认的角色卡");
+      const result = await mgmt!.call("instance.create", {
+        package_path: pkg,
+        card_paths: cards,
+        ...($<HTMLInputElement>("inst-name-input").value.trim()
+          ? { display_name: $<HTMLInputElement>("inst-name-input").value.trim() }
+          : {}),
+      });
+      const info = result.instance as unknown as InstanceEntry;
+      return `已创建实例「${info.name}」（默认冻结）`;
+    }),
+  );
+
+  $("inst-rename-btn").addEventListener("click", () =>
+    void worldAction(async () => {
+      const id = $<HTMLSelectElement>("inst-select").value;
+      const name = $<HTMLInputElement>("inst-rename-input").value.trim();
+      if (!id || !name) throw new Error("先选实例并填新名称");
+      await mgmt!.call("instance.rename", { id, name });
+      return `已重命名为「${name}」`;
+    }),
+  );
+
+  $("inst-export").addEventListener("click", () =>
+    void worldAction(async () => {
+      const id = $<HTMLSelectElement>("inst-select").value;
+      if (!id) throw new Error("先选实例");
+      const entry = world.instances.find((item) => item.id === id);
+      const file = `${(entry?.name ?? id).replace(/[^\w\u4e00-\u9fa5-]/g, "_")}.isekai.json`;
+      const result = await mgmt!.call("instance.export", { id, path: file });
+      const manifest = result.manifest as Record<string, unknown>;
+      return `已导出 ${file}（设置 + ${JSON.stringify(manifest.counts ?? {})}）`;
+    }),
+  );
+
+  $("inst-import").addEventListener("click", () =>
+    void worldAction(async () => {
+      const file = $<HTMLSelectElement>("import-select").value;
+      if (!file) throw new Error("创作目录里没有导出件");
+      const result = await mgmt!.call("instance.import", { path: file });
+      const info = result.instance as unknown as InstanceEntry;
+      return `已导入为「${info.name}」（默认冻结）`;
+    }),
+  );
+
+  $("inst-delete").addEventListener("click", () =>
+    void worldAction(async () => {
+      const id = $<HTMLSelectElement>("inst-select").value;
+      if (!id) throw new Error("先选实例");
+      const entry = world.instances.find((item) => item.id === id);
+      if (!window.confirm(`删除实例「${entry?.name ?? id}」及其对话？此操作不可撤销。`)) return "";
+      await mgmt!.call("instance.delete", { id });
+      return "已删除";
+    }),
+  );
+}
+
 /* ---------- 启动 ---------- */
 
 async function boot(): Promise<void> {
   bindComposer();
   bindNav();
+  bindWorld();
   $("settings-form").addEventListener("submit", (event) => void saveSettings(event));
   $("settings-reload").addEventListener("click", () => void loadSettings());
   $("restart").addEventListener("click", () => void restartCore());

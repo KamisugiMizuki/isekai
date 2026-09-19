@@ -98,6 +98,46 @@ CREATE TABLE IF NOT EXISTS voided(
   at REAL NOT NULL,
   PRIMARY KEY(channel_id, thread_id, env_id)
 );
+
+-- ---------- 世界设定层（阶段 1）：实例、锁定设定、时间线与提交 ----------
+
+CREATE TABLE IF NOT EXISTS instance(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  original_name TEXT NOT NULL,
+  package_id TEXT NOT NULL,
+  data_format TEXT NOT NULL,
+  rules_version TEXT NOT NULL,
+  app_version TEXT NOT NULL,
+  seed TEXT NOT NULL,
+  moment INTEGER NOT NULL,           -- 初始世界时刻（世界秒）
+  setting TEXT NOT NULL,             -- 锁定设定快照 JSON：{world_package, original_name, cards}
+  imported INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS timeline(
+  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'frozen',   -- frozen|active
+  source_commit TEXT,
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS commit_log(
+  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  kind TEXT NOT NULL,                     -- initial|manual|auto|import
+  moment INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_timeline_instance ON timeline(instance_id);
+CREATE INDEX IF NOT EXISTS ix_commit_instance ON commit_log(instance_id, timeline_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_session_instance ON session(instance_id);
 """
 
 
@@ -572,7 +612,139 @@ class Store:
             "threads": one("SELECT COUNT(*) FROM thread"),
             "channels": one("SELECT COUNT(*) FROM channel_instance"),
             "messages": one("SELECT COUNT(*) FROM message"),
+            "instances": one("SELECT COUNT(*) FROM instance"),
         }
+
+    # ---------- 实例（世界设定层） ----------
+
+    def instance_names(self) -> list[str]:
+        rows = self._conn.execute("SELECT name FROM instance").fetchall()
+        return [str(row["name"]) for row in rows]
+
+    def instance_get(self, instance_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM instance WHERE id=?", (instance_id,)).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def instance_by_name(self, name: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM instance WHERE name=?", (name,)).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def instance_list(self) -> list[dict[str, Any]]:
+        """管理面列表：只有公开元数据，不含世界内部内容（§3.5）。"""
+        rows = self._conn.execute(
+            """SELECT i.id, i.name, i.original_name, i.package_id, i.data_format, i.rules_version,
+                      i.seed, i.moment, i.imported, i.created_at,
+                      (SELECT COUNT(*) FROM timeline t WHERE t.instance_id=i.id) AS timelines,
+                      (SELECT COUNT(*) FROM session s WHERE s.instance_id=i.id) AS sessions
+               FROM instance i ORDER BY i.created_at"""
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def instance_create(self, row: dict[str, Any], *, timelines: list[dict[str, Any]], commits: list[dict[str, Any]]) -> None:
+        """原子固化：实例行 + 初始时间线 + 初始提交一起落入，失败不留半个实例（§3.4）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO instance(id, name, original_name, package_id, data_format, rules_version,
+                                        app_version, seed, moment, setting, imported, created_at)
+                   VALUES(:id, :name, :original_name, :package_id, :data_format, :rules_version,
+                          :app_version, :seed, :moment, :setting, :imported, :created_at)""",
+                row,
+            )
+            for timeline in timelines:
+                self._conn.execute(
+                    """INSERT INTO timeline(id, instance_id, name, state, source_commit, created_at)
+                       VALUES(:id, :instance_id, :name, :state, :source_commit, :created_at)""",
+                    timeline,
+                )
+            for commit in commits:
+                self._conn.execute(
+                    """INSERT INTO commit_log(id, instance_id, timeline_id, kind, moment, note, created_at)
+                       VALUES(:id, :instance_id, :timeline_id, :kind, :moment, :note, :created_at)""",
+                    commit,
+                )
+
+    def instance_rename(self, instance_id: str, name: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE instance SET name=? WHERE id=?", (name, instance_id))
+
+    def instance_delete(self, instance_id: str) -> None:
+        """删除实例及其会话 / 线程绑定 / 消息 / 时间线 / 提交；凭据与通道不连带删除。"""
+        with self._lock, self._conn:
+            session_ids = [
+                row["id"]
+                for row in self._conn.execute("SELECT id FROM session WHERE instance_id=?", (instance_id,)).fetchall()
+            ]
+            for session_id in session_ids:
+                self._conn.execute(
+                    "DELETE FROM delivery WHERE msg_seq IN (SELECT seq FROM message WHERE session_id=?)",
+                    (session_id,),
+                )
+                self._conn.execute("DELETE FROM message WHERE session_id=?", (session_id,))
+                self._conn.execute("DELETE FROM thread WHERE session_id=?", (session_id,))
+                self._conn.execute("DELETE FROM session WHERE id=?", (session_id,))
+            self._conn.execute("DELETE FROM commit_log WHERE instance_id=?", (instance_id,))
+            self._conn.execute("DELETE FROM timeline WHERE instance_id=?", (instance_id,))
+            self._conn.execute("DELETE FROM instance WHERE id=?", (instance_id,))
+
+    def timeline_list(self, instance_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM timeline WHERE instance_id=? ORDER BY created_at", (instance_id,)
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def instance_sessions(self, instance_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM session WHERE instance_id=? ORDER BY created_at", (instance_id,)
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def instance_messages(self, instance_id: str) -> list[dict[str, Any]]:
+        """导出用的完整对话：不含投递回执、去重作废记录与通道凭据（§7.1）。"""
+        rows = self._conn.execute(
+            """SELECT m.session_id, m.role, m.text, m.state, m.binding_version, m.created_at, m.message_id
+               FROM message m JOIN session s ON s.id = m.session_id
+               WHERE s.instance_id=? ORDER BY m.seq""",
+            (instance_id,),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def instance_import_messages(self, session_id: str, messages: list[dict[str, Any]]) -> None:
+        with self._lock, self._conn:
+            for item in messages:
+                self._conn.execute(
+                    """INSERT INTO message(session_id, role, channel_id, thread_id, env_id, binding_version,
+                                            binding_token, text, state, message_id, created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        session_id,
+                        str(item.get("role") or "character"),
+                        None,
+                        None,
+                        None,
+                        0,
+                        None,
+                        str(item.get("text") or ""),
+                        str(item.get("state") or "fixed"),
+                        item.get("message_id"),
+                        float(item.get("created_at") or 0.0),
+                    ),
+                )
+
+    def timeline_set_state(self, timeline_id: str, state: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE timeline SET state=? WHERE id=?", (state, timeline_id))
+
+    def commit_list(self, instance_id: str, timeline_id: str | None = None) -> list[dict[str, Any]]:
+        if timeline_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM commit_log WHERE instance_id=? ORDER BY created_at", (instance_id,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM commit_log WHERE instance_id=? AND timeline_id=? ORDER BY created_at",
+                (instance_id, timeline_id),
+            ).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
     def write_probe(self) -> None:
         """写盘自检：不可写时抛 sqlite3.Error（调用方据此进入 persistence_blocked）。"""

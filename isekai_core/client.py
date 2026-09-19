@@ -185,13 +185,14 @@ class MgmtClient:
         except ConnectionClosed:
             pass
 
-    async def call(self, op: str, **args: Any) -> dict[str, Any]:
+    async def call(self, op: str, *, timeout: float = 30.0, **args: Any) -> dict[str, Any]:
+        """管理调用。生成类操作会等模型返回，调用方给足 timeout（桌面端同款参数）。"""
         self._counter += 1
         ref = f"r-{self._counter}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[ref] = future
         await self._ws.send(json.dumps({"mgmt": "1", "op": op, "id": ref, "args": args}, ensure_ascii=False))
-        frame = await asyncio.wait_for(future, timeout=30)
+        frame = await asyncio.wait_for(future, timeout=timeout)
         if not frame.get("ok"):
             error = frame.get("error") or {}
             raise UmpError(error.get("code", "mgmt_error"), error.get("message", "管理操作失败"))

@@ -23,6 +23,7 @@ from .log import get_logger
 from .session import SessionService
 from .store import Store
 from .ump import Envelope, Err, Stage, UmpError
+from .world import ops as world_ops
 from .version import (
     APP_VERSION,
     DATA_FORMAT_VERSION,
@@ -389,11 +390,25 @@ class CoreServer:
                         result = await self._settings_set(dict(frame.get("args") or {}))
                     elif op == "thread.bind":
                         result = await self._thread_bind(dict(frame.get("args") or {}))
+                    elif op in world_ops.ASYNC_OPS:
+                        result = await world_ops.dispatch_async(
+                            self.cfg, self.service.llm, op, dict(frame.get("args") or {})
+                        )
                     else:
                         result = self._mgmt_call(op, dict(frame.get("args") or {}))
                     await self._send_raw(ws, _mgmt_reply(frame, ok=True, result=result))
                 except UmpError as exc:
                     await self._send_raw(ws, _mgmt_reply(frame, ok=False, error=exc.to_payload()))
+                except Exception as exc:  # noqa: BLE001 —— 单个操作出错不得拖垮管理连接
+                    log.exception("mgmt op failed op=%s", frame.get("op"))
+                    await self._send_raw(
+                        ws,
+                        _mgmt_reply(
+                            frame,
+                            ok=False,
+                            error={"code": Err.INTERNAL, "message": f"操作内部错误：{type(exc).__name__}", "retryable": False},
+                        ),
+                    )
         except ConnectionClosed:
             pass
 
@@ -512,6 +527,8 @@ class CoreServer:
             return {"threads": self.store.thread_list(args.get("channel_id"))}
         if op == "settings.get":
             return self._settings_get()
+        if op in world_ops.SYNC_OPS:
+            return world_ops.dispatch(self.cfg, self.store, op, args)
         if op == "history.page":
             session = self.store.session_get(str(args.get("session_id") or ""))
             if session is None:

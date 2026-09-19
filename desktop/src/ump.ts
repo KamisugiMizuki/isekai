@@ -178,7 +178,7 @@ export class MgmtClient {
     return this.info;
   }
 
-  private send(frame: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private send(frame: Record<string, unknown>, timeoutMs = 30000): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
         reject(new Error("未连接核心"));
@@ -189,13 +189,13 @@ export class MgmtClient {
       this.ws.send(JSON.stringify(frame));
       setTimeout(() => {
         if (this.pending.delete(id)) reject(new Error("管理面响应超时"));
-      }, 30000);
+      }, timeoutMs);
     });
   }
 
-  async call(op: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  async call(op: string, args: Record<string, unknown> = {}, timeoutMs = 30000): Promise<Record<string, unknown>> {
     this.counter += 1;
-    const reply = await this.send({ mgmt: "1", op, id: `r-${this.counter}`, args });
+    const reply = await this.send({ mgmt: "1", op, id: `r-${this.counter}`, args }, timeoutMs);
     if (!reply.ok) {
       const error = reply.error as { code?: string; message?: string } | undefined;
       throw new Error(`${error?.code ?? "mgmt_error"}：${error?.message ?? "管理操作失败"}`);

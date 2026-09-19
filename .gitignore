@@ -7,6 +7,7 @@ __pycache__/
 # 本地数据与配置（运行时/私有，不入库）
 data/
 exports/
+packages/
 logs/
 config/*
 !config/README.md
