@@ -8,7 +8,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem};
@@ -16,6 +18,10 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, State};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// 退出握手①：界面完成「退出前保存」（管理面 op app.shutdown）的上限（DESKTOP_SPEC §五）。
+const FLUSH_WAIT_MS: u64 = 3000;
+/// 退出握手②：等核心自行退出的上限；超时才硬杀。
+const EXIT_WAIT_MS: u64 = 3000;
 
 #[derive(Clone, Default, Serialize)]
 struct CoreStatus {
@@ -34,6 +40,10 @@ struct AppState {
     root: PathBuf,
     status: Mutex<CoreStatus>,
     child: Mutex<Option<Child>>,
+    //: 退出握手：界面做完「退出前保存」后的确认（说明文字, 是否已请求核心退出）
+    exit_ready: Mutex<Option<(String, bool)>>,
+    //: 退出序列只跑一次
+    quitting: AtomicBool,
 }
 
 fn log_line(root: &Path, message: &str) {
@@ -142,7 +152,8 @@ fn spawn_core(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
                     status.app = value.get("app").and_then(|item| item.as_str()).map(str::to_string);
                     status.data_format = value.get("data_format").and_then(|item| item.as_str()).map(str::to_string);
                     status.rules = value.get("rules").and_then(|item| item.as_str()).map(str::to_string);
-                    status.error = None;
+                    // 非 ready 的就绪帧（persistence_blocked 等）带原因：别丢，界面要显示它
+                    status.error = value.get("error").and_then(|item| item.as_str()).map(str::to_string);
                     let snapshot = status.clone();
                     drop(status);
                     log_line(
@@ -193,6 +204,120 @@ fn core_restart(app: tauri::AppHandle, state: State<AppState>) -> Result<(), Str
     spawn_core(&state.root, &app)
 }
 
+/// 日志目录：壳与核心的日志都在数据根的 logs/ 下（DESKTOP_SPEC §3.3「关于」）。
+#[tauri::command]
+fn log_dir(state: State<AppState>) -> String {
+    state.root.join("logs").to_string_lossy().to_string()
+}
+
+/// 打开目录（日志 / 备份）：只用资源管理器，不引新依赖。
+#[tauri::command]
+fn open_dir(path: String) -> Result<(), String> {
+    let folder = PathBuf::from(path.trim());
+    if !folder.is_dir() {
+        return Err(format!("目录还不存在：{}", folder.display()));
+    }
+    Command::new("explorer")
+        .arg(folder.as_os_str())
+        .spawn()
+        .map_err(|error| format!("打开目录失败：{error}"))?;
+    Ok(())
+}
+
+/// 原生文件对话框（恢复备份选文件）：用系统自带 PowerShell 的 OpenFileDialog。
+#[tauri::command]
+fn pick_backup_file(dir: Option<String>) -> Result<Option<String>, String> {
+    let script = concat!(
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
+        "Add-Type -AssemblyName System.Windows.Forms;",
+        "$d=New-Object System.Windows.Forms.OpenFileDialog;",
+        "$d.Title='选择要恢复的备份';",
+        "$d.Filter='备份文件 (*.db)|*.db|所有文件 (*.*)|*.*';",
+        "if($env:ISEKAI_BACKUP_DIR -and (Test-Path $env:ISEKAI_BACKUP_DIR)){$d.InitialDirectory=$env:ISEKAI_BACKUP_DIR};",
+        "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($d.FileName)}"
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .env("ISEKAI_BACKUP_DIR", dir.unwrap_or_default())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("打开文件对话框失败：{error}"))?;
+    let picked = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if picked.is_empty() { None } else { Some(picked) })
+}
+
+/// 界面完成「退出前保存」后的确认（DESKTOP_SPEC §五 第②步）。
+#[tauri::command]
+fn exit_ready(state: State<AppState>, detail: String, saved: bool) {
+    *state.exit_ready.lock().unwrap() = Some((detail, saved));
+}
+
+/// 等核心自己退出（有上限）：成功即说明它走完了 app.py 的 finally。
+fn wait_core_exit(state: &AppState, timeout_ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        {
+            let mut guard = state.child.lock().unwrap();
+            match guard.as_mut() {
+                None => return true, // 没有子进程（没起来或已退出）
+                Some(child) => {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        return true;
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 显式退出（DESKTOP_SPEC §五）：先保存再停进程，全程有上限。
+/// ① 请界面走管理面 op `app.shutdown`（补做退出前备份 + 请求核心自行退出），上限 3 秒；
+/// ② 等核心自行退出（finally 会收尾会话 / 关服务 / 释放写库锁），上限 3 秒；
+/// ③ 界面不可用、保存失败或②超时，才回落到 taskkill /F /T 硬杀。
+fn begin_quit(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    if state.quitting.swap(true, Ordering::SeqCst) {
+        return; // 退出序列只跑一次
+    }
+    log_line(&state.root, "exit requested: 先保存再停进程");
+    let _ = app.emit("exit-request", ());
+
+    let deadline = Instant::now() + Duration::from_millis(FLUSH_WAIT_MS);
+    let mut confirmed: Option<(String, bool)> = None;
+    while Instant::now() < deadline {
+        if let Some(value) = state.exit_ready.lock().unwrap().clone() {
+            confirmed = Some(value);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (detail, asked) = confirmed.unwrap_or_else(|| {
+        ("界面未在 3 秒内确认（按已有持久化水位退出）".to_string(), false)
+    });
+    log_line(&state.root, &format!("exit save: {detail}"));
+
+    if asked && wait_core_exit(&state, EXIT_WAIT_MS) {
+        let exited = state.child.lock().unwrap().take();
+        let code = exited.and_then(|mut child| child.wait().ok()).and_then(|status| status.code());
+        log_line(&state.root, &format!("core exited on its own code={code:?}（未硬杀）"));
+    } else {
+        kill_core(&state); // 兜底：别留孤儿写入者
+    }
+}
+
+/// 退出入口：托盘菜单调用它；同一序列也可由界面 invoke 触发（便于无人值守验收）。
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        begin_quit(&app);
+        app.exit(0);
+    });
+}
+
 fn main() {
     let root = find_project_root();
     log_line(&root, &format!("shell starting, root={}", root.display()));
@@ -200,11 +325,21 @@ fn main() {
         root,
         status: Mutex::new(CoreStatus { state: "starting".to_string(), ..Default::default() }),
         child: Mutex::new(None),
+        exit_ready: Mutex::new(None),
+        quitting: AtomicBool::new(false),
     };
 
     tauri::Builder::default()
         .manage(state)
-        .invoke_handler(tauri::generate_handler![core_status, core_restart])
+        .invoke_handler(tauri::generate_handler![
+            core_status,
+            core_restart,
+            log_dir,
+            open_dir,
+            pick_backup_file,
+            exit_ready,
+            quit_app
+        ])
         .setup(|app| {
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let restart_item = MenuItem::with_id(app, "restart", "重启核心", true, None::<&str>)?;
@@ -240,7 +375,7 @@ fn main() {
                             status.error = Some(error);
                         }
                     }
-                    "quit" => app.exit(0),
+                    "quit" => quit_app(app.clone()),
                     _ => {}
                 })
                 .build(app)?;

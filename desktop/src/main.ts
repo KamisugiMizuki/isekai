@@ -48,7 +48,7 @@ interface Message {
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
 const state = {
-  phase: "starting" as "starting" | "ready" | "failed",
+  phase: "starting" as "starting" | "ready" | "stopping" | "failed",
   threadId: "main",
   token: "",
   sessionId: "",
@@ -58,7 +58,16 @@ const state = {
   bootstrap: null as string | null,
   messages: [] as Message[],
   thinking: false,
+  //: 历史分页：只取最新一页，更早的按 before_seq 续取（DESKTOP_SPEC §3.1）
+  hasMore: false,
+  oldestSeq: 0,
+  loadingMore: false,
+  //: 壳给的日志目录：未就绪 / 超时文案里要点出来（§2「等待超时给日志位置」）
+  logDir: "",
+  backupDir: "",
 };
+
+const HISTORY_PAGE = 200;
 
 let ump: UmpClient | null = null;
 let mgmt: MgmtClient | null = null;
@@ -67,6 +76,16 @@ let reconnectAttempt = 0;
 let reconnectToken = 0; // 递增即作废在途的重连链（例如同时发生了核心重启）
 
 /* ---------- 渲染 ---------- */
+
+function logHint(): string {
+  return state.logDir ? `；日志：${state.logDir}` : "";
+}
+
+function formatSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
 
 function setStatus(text: string, kind: "pending" | "ok" | "bad"): void {
   const chip = $("status");
@@ -97,7 +116,7 @@ const ACCEPT_LABEL: Record<string, string> = {
   fixed: "已固化",
 };
 
-function renderMessages(): void {
+function renderMessages(anchor?: number): void {
   const list = $("messages");
   list.innerHTML = "";
   if (state.messages.length === 0) {
@@ -166,7 +185,8 @@ function renderMessages(): void {
     item.textContent = "思考中…";
     list.appendChild(item);
   }
-  list.scrollTop = list.scrollHeight;
+  // anchor = 渲染前「距底部」的距离：更早的消息接在前面时用它把视口钉在原处，不让视图跳走
+  list.scrollTop = anchor === undefined ? list.scrollHeight : list.scrollHeight - anchor;
 }
 
 function chip(text: string, kind: string): HTMLElement {
@@ -202,7 +222,7 @@ async function waitForCore(): Promise<CoreStatus> {
     setStatus("启动中…（等待核心就绪握手）", "pending");
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  return { state: "failed", error: "等待核心就绪超时" };
+  return { state: "failed", error: `等待核心就绪超时（30 秒）${logHint()}` };
 }
 
 function toMessage(row: HistoryRow): Message {
@@ -274,12 +294,12 @@ function onChannelClosed(): void {
 async function scheduleReconnect(): Promise<void> {
   const mine = reconnectToken;
   if (!shellStatus?.endpoint) {
-    setStatus("核心未在运行，可使用「重启核心」", "bad");
+    setStatus(`核心未在运行，可使用「重启核心」${logHint()}`, "bad");
     showRestart();
     return;
   }
   if (reconnectAttempt >= RECONNECT_DELAYS_MS.length) {
-    setStatus("重连失败：核心可能已退出（可重启核心）", "bad");
+    setStatus(`重连失败：核心可能已退出（可重启核心）${logHint()}`, "bad");
     showRestart();
     return;
   }
@@ -317,21 +337,21 @@ async function restartCore(): Promise<void> {
   }
   const status = await waitForCore();
   if (status.state !== "ready") {
-    setStatus(`核心未就绪：${status.error ?? status.state}`, "bad");
+    setStatus(`核心未就绪：${status.error ?? status.state}${logHint()}`, "bad");
     showRestart();
     return;
   }
   try {
     await connectChat(status);
   } catch (error) {
-    setStatus(`连接失败：${error}`, "bad");
+    setStatus(`连接失败：${error}${logHint()}`, "bad");
     showRestart();
   }
 }
 
 async function connectChat(status: CoreStatus): Promise<void> {
   if (!status.endpoint || !status.mgmt) {
-    setStatus(`核心未就绪：${status.error ?? status.state}`, "bad");
+    setStatus(`核心未就绪：${status.error ?? status.state}${logHint()}`, "bad");
     showRestart();
     return;
   }
@@ -390,10 +410,47 @@ async function connectChat(status: CoreStatus): Promise<void> {
 
 async function loadHistory(): Promise<void> {
   if (!mgmt) return;
-  const page = await mgmt.call("history.page", { session_id: state.sessionId, limit: 200 });
+  const page = await mgmt.call("history.page", { session_id: state.sessionId, limit: HISTORY_PAGE });
   const rows = (page.messages as HistoryRow[]) ?? [];
   state.messages = rows.map(toMessage);
+  state.hasMore = Boolean(page.has_more);
+  state.oldestSeq = Number(page.next_before_seq ?? 0);
   renderMessages();
+  renderHistoryMore();
+}
+
+function renderHistoryMore(): void {
+  $("history-more").classList.toggle("hidden", !state.hasMore);
+  $("history-note").textContent = state.hasMore ? `已加载最近 ${state.messages.length} 条` : "";
+}
+
+/// 更早的历史按 before_seq 续取，接在前面；视口按距底部距离锚定，不跳（§4「长历史分页」）
+async function loadMoreHistory(): Promise<void> {
+  const button = $<HTMLButtonElement>("history-more");
+  if (!mgmt || !state.hasMore || state.loadingMore) return;
+  state.loadingMore = true;
+  button.disabled = true;
+  $("history-note").textContent = "正在读取更早的记录…";
+  const list = $("messages");
+  const anchor = list.scrollHeight - list.scrollTop;
+  try {
+    const page = await mgmt.call("history.page", {
+      session_id: state.sessionId,
+      before_seq: state.oldestSeq,
+      limit: HISTORY_PAGE,
+    });
+    const rows = (page.messages as HistoryRow[]) ?? [];
+    state.messages = [...rows.map(toMessage), ...state.messages];
+    state.hasMore = Boolean(page.has_more);
+    state.oldestSeq = Number(page.next_before_seq ?? 0);
+    renderMessages(anchor);
+  } catch (error) {
+    $("history-note").textContent = String(error);
+  } finally {
+    state.loadingMore = false;
+    button.disabled = false;
+    renderHistoryMore();
+  }
 }
 
 function renderSessionList(session: Record<string, unknown>): void {
@@ -593,6 +650,141 @@ async function loadSettings(): Promise<void> {
   } catch (error) {
     $("settings-note").textContent = String(error);
   }
+  await loadBackups();
+  await loadAbout();
+}
+
+/* ---------- 备份组（DESKTOP_SPEC §3.3）：入口与展示在壳里，备份由核心执行 ---------- */
+
+interface BackupEntry {
+  file: string;
+  name: string;
+  bytes: number;
+  mtime: number;
+  ok: boolean;
+  reason?: string;
+}
+
+function stamp(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleString("zh-CN", { hour12: false });
+}
+
+async function loadBackups(): Promise<void> {
+  if (!mgmt) return;
+  try {
+    const listed = await mgmt.call("backup.list");
+    const backups = (listed.backups ?? []) as unknown as BackupEntry[];
+    state.backupDir = String(listed.dir ?? "");
+    renderFacts($("backup-facts"), [
+      ["备份目录", state.backupDir || "-"],
+      ["检查间隔", `${listed.interval_hours ?? "-"} 小时（到期由核心补做）`],
+      ["保留份数", String(listed.keep ?? "-")],
+      [
+        "最近一份",
+        backups.length
+          ? `${stamp(backups[0].mtime)}　${formatSize(backups[0].bytes)}　${backups[0].ok ? "完整" : "校验未通过"}`
+          : "还没有备份",
+      ],
+    ]);
+    const list = $("backup-list");
+    list.innerHTML = "";
+    for (const item of backups) {
+      const row = document.createElement("li");
+      // 只显示时间、大小、完整性与原因，不做内容浏览（§3.3）
+      row.textContent =
+        `${stamp(item.mtime)}　${formatSize(item.bytes)}　${item.ok ? "完整" : `校验未通过：${item.reason ?? "未知原因"}`}`;
+      list.appendChild(row);
+    }
+  } catch (error) {
+    $("backup-note").textContent = String(error);
+  }
+}
+
+async function backupNow(): Promise<void> {
+  if (!mgmt) return;
+  $("backup-note").textContent = "备份中…";
+  try {
+    const result = await mgmt.call("backup.create", { note: "手动" }, 120000);
+    const info = result.backup as { ok?: boolean; bytes?: number } | undefined;
+    $("backup-note").textContent = info?.ok
+      ? `已备份（${formatSize(info.bytes ?? 0)}）`
+      : "备份未通过完整性校验，旧备份保留";
+  } catch (error) {
+    $("backup-note").textContent = `备份失败（旧备份保留）：${error}`;
+  }
+  await loadBackups();
+}
+
+async function restoreBackup(): Promise<void> {
+  if (!mgmt) return;
+  $("backup-note").textContent = "等待选择备份文件…";
+  let picked: string | null = null;
+  try {
+    picked = await invoke<string | null>("pick_backup_file", { dir: state.backupDir });
+  } catch (error) {
+    $("backup-note").textContent = `打开文件对话框失败：${error}`;
+    return;
+  }
+  if (!picked) {
+    $("backup-note").textContent = "已取消选择";
+    return;
+  }
+  const ok = window.confirm(
+    `将用「${picked}」替换整套受管数据（不是实例导入）：\n` +
+      "· 完成后全部世界线先冻结，需要你明确激活\n" +
+      "· 旧连接、绑定令牌与在途任务一并失效，需重新握手\n" +
+      "· 当前库会先留一份安全副本在备份目录（isekai-restore-safety.db）\n" +
+      "继续？",
+  );
+  if (!ok) {
+    $("backup-note").textContent = "已取消，未改动任何数据";
+    return;
+  }
+  $("backup-note").textContent = "恢复中…";
+  try {
+    const result = await mgmt.call("backup.restore", { path: picked }, 120000);
+    const info = result.restore as { restored?: boolean; timelines?: number; safety?: string } | undefined;
+    $("backup-note").textContent = info?.restored
+      ? `已恢复：${info.timelines ?? 0} 条线已冻结（安全副本 ${info.safety ?? ""}）`
+      : "恢复未完成，现有数据保留";
+  } catch (error) {
+    $("backup-note").textContent = `恢复失败，现有数据保留：${error}`;
+  }
+  await loadBackups();
+}
+
+/* ---------- 关于 / 诊断（§3.3）：版本、日志目录与打开入口 ---------- */
+
+async function loadAbout(): Promise<void> {
+  let overview: Record<string, unknown> = {};
+  if (mgmt) {
+    try {
+      overview = await mgmt.call("status");
+    } catch (error) {
+      $("about-note").textContent = String(error);
+    }
+  }
+  renderFacts($("about-facts"), [
+    ["应用版本", String(overview.app ?? shellStatus?.app ?? "-")],
+    ["数据格式版本", String(overview.data_format ?? shellStatus?.data_format ?? "-")],
+    ["世界规则版本", String(overview.rules ?? shellStatus?.rules ?? "-")],
+    ["日志目录", state.logDir || "（壳未提供）"],
+    ["脱敏诊断", "只含阶段 / 耗时 / 错误码；不含对话正文、实情、角色卡秘密、记忆与凭据"],
+  ]);
+}
+
+/// 打开目录（日志 / 备份）：走壳的 open_dir，不新增依赖
+async function openDir(path: string, note: HTMLElement): Promise<void> {
+  if (!path) {
+    note.textContent = "还不知道目录位置：先连上核心或做一次备份";
+    return;
+  }
+  try {
+    await invoke("open_dir", { path });
+    note.textContent = `已用资源管理器打开 ${path}`;
+  } catch (error) {
+    note.textContent = String(error);
+  }
 }
 
 async function saveSettings(event: SubmitEvent): Promise<void> {
@@ -749,6 +941,7 @@ async function loadWorld(): Promise<void> {
   world.instanceId = selected;
   if (selected) void showInstance(selected);
   else renderFacts($("world-facts"), [["实例", "还没有实例"]]);
+  void loadDrafts();
 }
 
 async function showInstance(instanceId: string): Promise<void> {
@@ -766,6 +959,11 @@ async function showInstance(instanceId: string): Promise<void> {
     }
     renderRoleControls();
     await renderDisclosures();
+    // 补卡的目标时间线：跟当前查看的实例走（§3.2 角色行「选择目标时间线」）
+    fillSelect(
+      $<HTMLSelectElement>("card-add-timeline"),
+      timelines.map((item) => [item.id, `${item.name}（${item.state === "frozen" ? "冻结" : "激活"}）`]),
+    );
     renderFacts($("world-facts"), [
       ["实例", `${info.name}（原始名称：${info.original_name}${info.imported ? "，导入" : ""}）`],
       ["初始世界时刻", `${info.moment} 世界秒`],
@@ -992,8 +1190,103 @@ async function worldAction(action: () => Promise<string | void>): Promise<void> 
   }
 }
 
+/// 补卡：把一张已审定的卡锚定补入目标实例 / 时间线（DESKTOP_SPEC §3.2 角色行）
+async function addCharacter(): Promise<string> {
+  const card = $<HTMLSelectElement>("card-select").value;
+  const timeline = $<HTMLSelectElement>("card-add-timeline").value;
+  const note = $<HTMLInputElement>("card-add-note").value.trim();
+  if (!world.instanceId) throw new Error("先在世界实例里选一个实例");
+  if (!timeline) throw new Error("先选目标时间线");
+  if (!card) throw new Error("先在角色卡里选一张卡");
+  const instanceName =
+    world.instances.find((item) => item.id === world.instanceId)?.name ?? world.instanceId;
+  const confirmed = window.confirm(
+    `把「${card}」补入「${instanceName} / ${timeline}」？\n` +
+      "· 补入只决定她自哪一刻起出现在本线，加入点不晚于已完成水位\n" +
+      "· 预算与调用上限沿用本条线既有限额（不因补入重新计）\n" +
+      "· 补入本身不激活冻结线；失败或取消不会留下半个角色",
+  );
+  if (!confirmed) return "";
+  const result = await mgmt!.call("runtime.card.add", {
+    instance_id: world.instanceId,
+    timeline_id: timeline,
+    card_path: card,
+    ...(note ? { note } : {}),
+  });
+  const join = (result.join ?? {}) as {
+    name?: string;
+    joined_world?: number;
+    joined_label?: string;
+    timeline_state?: string;
+    note?: string;
+  };
+  renderFacts($("card-add-facts"), [
+    ["最近补入", `${join.name ?? card} @ ${join.joined_label ?? "（核心未回标签）"}`],
+    ["加入点", `世界 ${join.joined_world ?? "?"} 秒（不晚于已完成水位）`],
+    ["线状态", join.timeline_state === "active" ? "激活（补入未改动）" : "冻结（要对话需显式激活）"],
+    ["加入说明", join.note || "（未填）"],
+  ]);
+  return `已补入 ${join.name ?? card}：加入于 ${join.joined_label ?? ""}`;
+}
+
+/// 草稿：候选世界包 / 角色卡单独保存，可显式继续，只有「丢弃草稿」才删除（§3.2）
+async function loadDrafts(): Promise<void> {
+  if (!mgmt) return;
+  try {
+    const listed = await mgmt.call("world.draft.list");
+    const drafts = (listed.drafts ?? []) as Array<{
+      file: string;
+      name: string | null;
+      kind: string | null;
+      updated_at: number | null;
+    }>;
+    fillSelect(
+      $<HTMLSelectElement>("draft-select"),
+      drafts.map((item) => [
+        String(item.name ?? item.file),
+        `${item.name ?? item.file}｜${item.kind === "card" ? "角色卡" : "世界包"}｜${
+          item.updated_at ? stamp(Number(item.updated_at)) : "时间未知"
+        }`,
+      ]),
+    );
+    $("draft-note").textContent = drafts.length ? "" : "没有未完成的草稿";
+  } catch (error) {
+    $("draft-note").textContent = String(error);
+  }
+}
+
+async function continueDraft(): Promise<string> {
+  const name = $<HTMLSelectElement>("draft-select").value;
+  if (!name) throw new Error("没有可继续的草稿");
+  const loaded = await mgmt!.call("world.draft.load", { name });
+  const draft = (loaded.draft ?? {}) as { kind?: string; payload?: unknown; errors?: string[] };
+  const isCard = draft.kind === "card";
+  showErrors(isCard ? "card-errors" : "pkg-errors", (draft.errors ?? []) as string[]);
+  if (isCard) {
+    const target = $<HTMLInputElement>("card-file").value.trim() || `${name}.card.json`;
+    await mgmt!.call("world.card.save", { card_path: target, card: draft.payload });
+    $<HTMLInputElement>("card-file").value = target;
+  } else {
+    const target = $<HTMLInputElement>("pkg-file").value.trim() || `${name}.json`;
+    await mgmt!.call("world.package.save", { path: target, package: draft.payload, force: true });
+    $<HTMLInputElement>("pkg-file").value = target;
+  }
+  return `草稿「${name}」已载回创作目录（未过校验的项照旧列出），可继续改文件或再走一次 AI 生成`;
+}
+
+async function discardDraft(): Promise<string> {
+  const name = $<HTMLSelectElement>("draft-select").value;
+  if (!name) throw new Error("没有可丢弃的草稿");
+  if (!window.confirm(`丢弃草稿「${name}」？只删这份草稿，不动已有世界包 / 角色卡与实例。`)) return "";
+  await mgmt!.call("world.draft.discard", { name });
+  return `已丢弃草稿「${name}」`;
+}
+
 function bindWorld(): void {
   $("world-refresh").addEventListener("click", () => void loadWorld());
+  $("card-add").addEventListener("click", () => void worldAction(addCharacter));
+  $("draft-continue").addEventListener("click", () => void worldAction(continueDraft));
+  $("draft-discard").addEventListener("click", () => void worldAction(discardDraft));
   $<HTMLSelectElement>("inst-select").addEventListener("change", (event) => {
     void showInstance((event.target as HTMLSelectElement).value);
   });
@@ -1211,6 +1504,33 @@ function bindWorld(): void {
   );
 }
 
+/* ---------- 显式退出握手（DESKTOP_SPEC §五）：先保存再停进程 ---------- */
+
+/// 壳要退出时叫我们：停掉新工作 → 走管理面 op app.shutdown（一致水位备份 + 请求核心自行退出）
+/// → 回报壳，让壳按上限等核心退出，超时才硬杀。退出前保存失败也照实回报，不拖着不退。
+async function flushBeforeExit(): Promise<void> {
+  state.phase = "stopping";
+  $<HTMLTextAreaElement>("input").disabled = true;
+  $<HTMLButtonElement>("send").disabled = true;
+  setStatus("正在保存并退出…", "pending");
+  if (!mgmt) {
+    await invoke("exit_ready", { detail: "管理面未连接：没有可保存的连接（按已有持久化水位退出）", saved: false });
+    return;
+  }
+  try {
+    const result = await mgmt.call("app.shutdown", {}, 10000);
+    const saved = result.saved as { ok?: boolean; bytes?: number } | undefined;
+    const detail = saved?.ok
+      ? `退出前备份 ${formatSize(saved.bytes ?? 0)}（一致水位），已请求核心自行退出`
+      : "退出前备份未通过完整性校验，已请求核心自行退出";
+    await invoke("exit_ready", { detail, saved: Boolean(saved?.ok) });
+    setStatus("已保存，核心正在退出…", "ok");
+  } catch (error) {
+    await invoke("exit_ready", { detail: `退出前保存失败：${error}`, saved: false });
+    setStatus("保存失败，仍将退出", "bad");
+  }
+}
+
 /* ---------- 启动 ---------- */
 
 async function boot(): Promise<void> {
@@ -1218,17 +1538,33 @@ async function boot(): Promise<void> {
   bindNav();
   bindWorld();
   bindDisclosure();
+  try {
+    state.logDir = await invoke<string>("log_dir");
+  } catch {
+    state.logDir = ""; // 非 Tauri 环境（纯浏览器调试）没有这个命令，不影响主流程
+  }
+  $("history-more").addEventListener("click", () => void loadMoreHistory());
+  $("backup-now").addEventListener("click", () => void backupNow());
+  $("backup-restore").addEventListener("click", () => void restoreBackup());
+  $("backup-open").addEventListener("click", () =>
+    void openDir(state.backupDir, $("backup-note")),
+  );
+  $("open-log-dir").addEventListener("click", () =>
+    void openDir(state.logDir, $("about-note")),
+  );
   $("settings-form").addEventListener("submit", (event) => void saveSettings(event));
   $("settings-reload").addEventListener("click", () => void loadSettings());
   $("restart").addEventListener("click", () => void restartCore());
+  // 壳的退出请求：先保存再让它停核心（有上限，超时由壳硬杀）
+  await listen("exit-request", () => void flushBeforeExit());
   await listen("core-status", (event) => {
     shellStatus = event.payload as CoreStatus;
     if (shellStatus.state === "ready") return;
     state.phase = "starting";
     if (shellStatus.state === "persistence_blocked") {
-      setStatus(`存储不可用：${shellStatus.error ?? ""}`, "bad");
+      setStatus(`存储不可用：${shellStatus.error ?? ""}${logHint()}`, "bad");
     } else {
-      setStatus(`核心未就绪：${shellStatus.error ?? shellStatus.state}`, "bad");
+      setStatus(`核心未就绪：${shellStatus.error ?? shellStatus.state}${logHint()}`, "bad");
     }
     showRestart();
   });

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -78,6 +79,7 @@ SYNC_OPS = frozenset(
         "instance.export",
         "instance.import",
         "instance.setting",
+        "app.shutdown",
         "backup.create",
         "backup.restore",
         "backup.list",
@@ -451,21 +453,32 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 "commits": store.commit_list(row["id"]),
             }
         if op == "backup.create":
-            folder = _backup_folder(cfg, store)
-            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-            result = store.backup_create(folder / f"isekai-{stamp}.db", note=str(args.get("note") or ""))
-            if result["ok"]:
-                store.backup_prune(folder, keep=int(cfg.backup.keep))
-            return {"backup": result}
+            return {"backup": _backup_once(cfg, store, note=str(args.get("note") or ""))}
+        if op == "app.shutdown":
+            # 显式退出握手（DESKTOP_SPEC §五）：「先保存再停进程」的核心半边。
+            # 保存 = 补做一次退出前备份（一致水位快照）；停进程 = 请求核心自行退出，
+            # 由 app.py 的 finally 收尾（会话收尾 / 关服务 / 释放写库锁），不走 taskkill 硬杀。
+            saved = _backup_once(cfg, store, note="退出前补做")
+            _request_exit()
+            return {"saved": saved}
         if op == "backup.restore":
             folder = _backup_folder(cfg, store)
+            backup_path = resolve_path(cfg, args.get("path"))
+            ok, reason = store.backup_check(backup_path)  # 坏件先判清楚，别落成 internal 错误
+            if not ok:
+                raise UmpError(Err.INVALID, f"备份不可用：{reason}", retryable=False)
             result = store.backup_restore(
-                resolve_path(cfg, args.get("path")), safety=folder / "isekai-restore-safety.db"
+                backup_path, safety=folder / "isekai-restore-safety.db"
             )
             return {"restore": result}
         if op == "backup.list":
-            return {"backups": store.backup_list(_backup_folder(cfg, store)),
-                    "dir": str(_backup_folder(cfg, store))}
+            folder = _backup_folder(cfg, store)
+            return {
+                "backups": store.backup_list(folder),
+                "dir": str(folder),
+                "keep": int(getattr(cfg.backup, "keep", 7)),
+                "interval_hours": int(getattr(cfg.backup, "interval_hours", 0)),
+            }
         if op == "proactive.list":
             return {"log": store.proactive_list(str(args.get("instance_id") or ""),
                                                 str(args.get("timeline_id") or ""))}
@@ -893,6 +906,28 @@ def _backup_folder(cfg: Any, store: Any) -> Path:
     if not path.is_absolute():
         path = Path(store.path).parent / path
     return path
+
+
+def _backup_once(cfg: Any, store: Any, *, note: str = "") -> dict[str, Any]:
+    """落一份一致水位备份并按保留数轮转（backup.create 与退出前补做共用同一路径）。"""
+    folder = _backup_folder(cfg, store)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    result = store.backup_create(folder / f"isekai-{stamp}.db", note=note)
+    if result["ok"]:
+        store.backup_prune(folder, keep=int(getattr(cfg.backup, "keep", 7)))
+    return result
+
+
+def _request_exit(delay: float = 0.5) -> None:
+    """请求核心自行退出：隔一拍再抛 SystemExit，让本帧回复先送出。
+
+    核心没有别的退出通路（app.py 只在父进程消失时停），这一抛会中断事件循环，
+    由 app.py 的 finally 收尾——不经过 taskkill /F，写库锁会被正常释放。
+    """
+    def raise_exit() -> None:
+        raise SystemExit(0)
+
+    asyncio.get_running_loop().call_later(delay, raise_exit)
 
 
 async def _proactive_tick(cfg: Any, llm: Any, store: Any, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:

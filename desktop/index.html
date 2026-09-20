@@ -29,6 +29,10 @@
         </header>
 
         <section id="pane-chat" class="pane">
+          <div class="row">
+            <button id="history-more" class="link hidden">加载更多（更早的消息）</button>
+            <span id="history-note" class="muted"></span>
+          </div>
           <ol id="messages" aria-live="polite"></ol>
           <form id="composer">
             <textarea id="input" rows="1" placeholder="Enter 发送，Shift+Enter 换行"></textarea>
@@ -71,6 +75,21 @@
             <button id="card-generate">AI 生成</button>
           </div>
           <pre id="card-errors" class="muted"></pre>
+          <div class="row">
+            <select id="card-add-timeline"></select>
+            <input id="card-add-note" placeholder="加入说明（可留空，如：从北岸调来）" />
+            <button id="card-add">补卡：补入上面的实例 / 时间线</button>
+          </div>
+          <p class="muted">补入用上面「世界实例」选中的实例与上面「角色卡」选中的卡片；加入点不早于实例初始时刻、不晚于已完成水位，补入本身不激活冻结线。</p>
+          <dl id="card-add-facts" class="facts"></dl>
+
+          <h3>草稿（未完成的创作）</h3>
+          <div class="row">
+            <select id="draft-select"></select>
+            <button id="draft-continue">继续编辑</button>
+            <button id="draft-discard">丢弃草稿</button>
+            <span id="draft-note" class="muted"></span>
+          </div>
 
           <h3>世界实例</h3>
           <div class="row">
@@ -137,6 +156,23 @@
             </div>
           </form>
           <dl id="settings-facts" class="facts"></dl>
+
+          <h3>备份</h3>
+          <dl id="backup-facts" class="facts"></dl>
+          <div class="row">
+            <button id="backup-now">立即备份</button>
+            <button id="backup-restore">恢复备份…（选文件）</button>
+            <button id="backup-open">打开备份目录</button>
+            <span id="backup-note" class="muted"></span>
+          </div>
+          <ul id="backup-list"></ul>
+
+          <h3>关于 / 诊断</h3>
+          <dl id="about-facts" class="facts"></dl>
+          <div class="row">
+            <button id="open-log-dir">打开日志目录</button>
+            <span id="about-note" class="muted">日志与诊断只含阶段、耗时与错误码，不含对话正文、实情、记忆或凭据。</span>
+          </div>
         </section>
       </main>
     </div>
