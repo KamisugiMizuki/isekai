@@ -35,3 +35,12 @@ placeholder:
   system_prompt: |
     你是 isekai 核心进程的占位对话端（阶段 0：世界与角色尚未接入）。
     只做简短、平实的回应，不要虚构世界设定、经历或身份。
+  # 角色记忆（MEMORY_SPEC）：提取 / 简报 / 衰减配额
+  memory_extract_per_day: 40      # 每日提取调用上限（单次最多 8 条材料）
+  memory_recall_limit: 6          # 单轮简报条数上限
+  memory_brief_tokens: 900        # 单轮简报预算（字符量级）
+  memory_decay_per_day: 0.02      # 每世界日强度衰减率
+  # 远程 embedding（§5.2）：留空即只用全文召回；地址需 OpenAI 兼容 /v1/embeddings
+  memory_embedding_model: ""
+  memory_embedding_base_url: ""
+  memory_embedding_api_key: ""

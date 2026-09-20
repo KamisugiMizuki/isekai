@@ -15,7 +15,7 @@ from typing import Any
 from ..log import get_logger
 from ..store import Store
 from . import budget as budget_mod
-from . import cognition, environment, events, intents, life, memory as memory_mod, personality, planning
+from . import cognition, embedding as embedding_mod, environment, events, intents, life, memory as memory_mod, personality, planning
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
 
@@ -43,6 +43,9 @@ class RuntimeService:
         memory_recall_limit: int = 6,
         memory_brief_tokens: int = 900,
         memory_decay_per_day: float = 0.02,
+        embedding_model: str = "",
+        embedding_base_url: str = "",
+        embedding_api_key: str = "",
     ) -> None:
         self.store = store
         #: 倍率上限：全局统一、仅开发者可配置（§2.2），默认 2592000 世界秒 / 现实秒
@@ -67,6 +70,10 @@ class RuntimeService:
         self.memory_recall_limit = max(1, int(memory_recall_limit))
         self.memory_brief_tokens = max(0, int(memory_brief_tokens))
         self.memory_decay_per_day = max(0.0, min(1.0, float(memory_decay_per_day)))
+        #: 远程 embedding（MEMORY_SPEC §5.2）：缺配置即退化全文召回
+        self.embedding_model = str(embedding_model or "")
+        self.embedding_base_url = str(embedding_base_url or "")
+        self.embedding_api_key = str(embedding_api_key or "")
 
     # ---------- 基础读取 ----------
 
@@ -311,6 +318,7 @@ class RuntimeService:
         *,
         topic: str = "",
         world_seconds: int | None = None,
+        query_vector: list[float] | None = None,
     ) -> dict[str, Any]:
         """本轮扮演定义 + 记忆简报（§5.1 第 5 步）：简报只进生成上下文，不展示给用户。"""
         prompt = self.system_prompt(session, topic=topic)
@@ -321,7 +329,8 @@ class RuntimeService:
             return {"prompt": prompt, "memory_ids": [], "brief": ""}
         try:
             recalled = self.recall(
-                instance_id, timeline_id, character_id, topic=topic, world_seconds=world_seconds
+                instance_id, timeline_id, character_id, topic=topic, world_seconds=world_seconds,
+                query_vector=query_vector,
             )
         except Exception:  # 召回失败不得阻断对话
             return {"prompt": prompt, "memory_ids": [], "brief": ""}
@@ -329,6 +338,97 @@ class RuntimeService:
         if brief:
             prompt = prompt + chr(10) + chr(10) + "她此刻想得起来的事（按她自己的记性，别当成盘点）：" + chr(10) + brief
         return {"prompt": prompt, "memory_ids": recalled["ids"], "brief": brief}
+
+    # ---------- 远程向量（§5.2） ----------
+
+    @property
+    def embedding_ready(self) -> bool:
+        return bool(self.embedding_model and self.embedding_base_url and self.embedding_api_key)
+
+    async def _embed(self, texts: list[str]) -> list[list[float]]:
+        """发一次远程请求；未配置时直接抛错，调用方退化全文召回。"""
+        return await embedding_mod.embed(
+            texts,
+            model=self.embedding_model,
+            base_url=self.embedding_base_url,
+            api_key=self.embedding_api_key,
+        )
+
+    async def embed_memories(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        llm: Any = None,
+        now_real: float | None = None,
+        limit: int = 16,
+    ) -> dict[str, Any]:
+        """把缺向量 / 指纹不符的条目补齐（§5.2）：受共享预算约束，失败保留待嵌入状态。"""
+        import time as _time
+
+        now = _time.time() if now_real is None else float(now_real)
+        if not self.embedding_ready:
+            return {"embedded": 0, "skipped": "not_configured"}
+        rows = self.store.memory_missing_embeddings(
+            instance_id, timeline_id, model=self.embedding_model
+        )[: max(1, int(limit))]
+        if not rows:
+            return {"embedded": 0}
+        reservation = self.reserve_call(
+            instance_id,
+            timeline_id,
+            "embedding",
+            tokens_est=sum(len(str(item["text"])) for item in rows) // 3 + 64,
+            now_real=now,
+        )
+        if not reservation.get("ok"):
+            return {"embedded": 0, "paused": True, "blocked": reservation.get("blocked")}
+        try:
+            vectors = await self._embed([str(item["text"]) for item in rows])
+        except Exception as exc:
+            self.settle_call(reservation, outcome="error")
+            return {"embedded": 0, "error": type(exc).__name__}
+        self.settle_call(reservation, reply="".join(str(item["text"]) for item in rows))
+        for row, vector in zip(rows, vectors):
+            self.store.memory_embedding_put(
+                str(row["id"]),
+                instance_id=instance_id,
+                model=self.embedding_model,
+                vector=vector,
+                content_hash=embedding_mod.content_hash(str(row["text"])),
+            )
+        return {"embedded": len(vectors), "model": self.embedding_model}
+
+    async def embed_query(
+        self, text: str, *, instance_id: str = "", timeline_id: str = "", now_real: float | None = None
+    ) -> list[float] | None:
+        """查询向量：拿不到就返回 None，召回退化全文（不阻断对话）。
+
+        和补齐任务同受共享预算约束（§2.8 / §5.2）：预算不够就不发请求，别绕过账本。
+        """
+        import time as _time
+
+        if not self.embedding_ready or not str(text or "").strip():
+            return None
+        if instance_id and timeline_id:
+            reservation = self.reserve_call(
+                instance_id, timeline_id, "embedding",
+                tokens_est=len(str(text)) // 3 + 64,
+                now_real=now_real if now_real is not None else _time.time(),
+            )
+            if not reservation.get("ok"):
+                return None
+        else:
+            reservation = None
+        try:
+            vectors = await self._embed([str(text)])
+        except Exception:
+            if reservation:
+                self.settle_call(reservation, outcome="error")
+            return None
+        if reservation:
+            self.settle_call(reservation, reply=str(text))
+        return vectors[0] if vectors else None
 
     def recall(
         self,
@@ -349,7 +449,8 @@ class RuntimeService:
             return {"entries": [], "ids": [], "brief": {"lines": [], "ids": [], "text": ""}}
         day_seconds = self.calendar(self.store.instance_get(instance_id)).day_seconds
         vector_scores = self.store.memory_vector_scores(
-            instance_id, timeline_id, character_id, topic, query_vector=query_vector
+            instance_id, timeline_id, character_id, topic,
+            query_vector=query_vector, model=self.embedding_model,
         )
         ranked = memory_mod.rank(
             query=topic,

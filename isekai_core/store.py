@@ -12,6 +12,7 @@ import json
 import os
 import secrets
 import sqlite3
+import struct
 import threading
 import time
 from pathlib import Path
@@ -1708,8 +1709,9 @@ class Store:
         query: str,
         *,
         query_vector: list[float] | None = None,
+        model: str = "",
     ) -> dict[str, float]:
-        """向量召回分数（§5.2）：没有查询向量或没有可用向量时返回空——调用方退化为全文召回。"""
+        """向量召回分数（§5.2）：没有查询向量 / 模型不符 / 维度不符时返回空——调用方退化全文召回。"""
         if not query_vector:
             return {}
         import math
@@ -1717,8 +1719,8 @@ class Store:
         rows = self._conn.execute(
             """SELECT e.memory_id, e.vector, e.dim FROM memory_embedding e
                JOIN memory m ON m.id = e.memory_id
-               WHERE m.instance_id=? AND m.timeline_id=? AND m.character_id=? AND e.dim=?""",
-            (instance_id, timeline_id, character_id, len(query_vector)),
+               WHERE m.instance_id=? AND m.timeline_id=? AND m.character_id=? AND e.dim=? AND e.model=?""",
+            (instance_id, timeline_id, character_id, len(query_vector), str(model or "")),
         ).fetchall()
         scores: dict[str, float] = {}
         norm = math.sqrt(sum(value * value for value in query_vector)) or 1.0
@@ -1757,6 +1759,44 @@ class Store:
                 )
                 changed += 1
         return changed
+
+    def memory_embedding_put(
+        self, memory_id: str, *, instance_id: str, model: str, vector: list[float], content_hash: str
+    ) -> None:
+        """落一条向量（带模型指纹与源文本版本，§5.2）。"""
+        from .runtime import embedding as embedding_mod
+
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO memory_embedding(memory_id, instance_id, model, dim, vector, source_version, created_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(memory_id) DO UPDATE SET
+                     model=excluded.model, dim=excluded.dim, vector=excluded.vector,
+                     source_version=excluded.source_version, created_at=excluded.created_at""",
+                (
+                    memory_id,
+                    instance_id,
+                    str(model),
+                    len(vector),
+                    embedding_mod.pack(vector),
+                    str(content_hash),
+                    time.time(),
+                ),
+            )
+
+    def memory_missing_embeddings(
+        self, instance_id: str, timeline_id: str, *, model: str, limit: int = 64
+    ) -> list[dict[str, Any]]:
+        """缺向量或指纹不符的条目（模型 / 维度变了就重建，旧向量不再参与召回）。"""
+        rows = self._conn.execute(
+            """SELECT m.id, m.text, m.character_id, e.model AS embed_model, e.source_version
+               FROM memory m LEFT JOIN memory_embedding e ON e.memory_id = m.id
+               WHERE m.instance_id=? AND m.timeline_id=?
+                 AND (e.memory_id IS NULL OR e.model <> ?)
+               ORDER BY m.learned_world, m.id LIMIT ?""",
+            (instance_id, timeline_id, str(model), int(limit)),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
     def memory_count(self, instance_id: str, timeline_id: str, character_id: str) -> int:
         row = self._conn.execute(

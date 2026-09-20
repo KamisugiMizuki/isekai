@@ -278,5 +278,6 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
                 await runtime.world.extract_memories(
                     instance_id, timeline_id, llm=runtime.llm, now_real=time.time(), limit=6
                 )
+                await runtime.world.embed_memories(instance_id, timeline_id, now_real=time.time(), limit=8)
         except Exception:
             log.exception("memory extraction pass failed")

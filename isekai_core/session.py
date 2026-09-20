@@ -175,7 +175,8 @@ class SessionService:
         self.store.inbound_set_state(seq, "processing")
         await self._status(row, "thinking")
         try:
-            messages, recalled = self._build_messages(row)
+            query_vector = await self._query_vector(row)
+            messages, recalled = self._build_messages(row, query_vector=query_vector)
             self._recalled = list(recalled)
             text = await self.llm.chat(messages)
         except LLMError as exc:
@@ -292,23 +293,45 @@ class SessionService:
             log.exception("runtime prompt failed session=%s", session["id"])
             return self.cfg.placeholder["system_prompt"]
 
-    def _system_prompt_with_memory(self, row: dict[str, Any]) -> tuple[str, list[str]]:
+    async def _query_vector(self, row: dict[str, Any]) -> list[float] | None:
+        """查询向量（§5.2）：未配置或失败即 None，召回退化全文，不阻断对话。"""
+        runtime = getattr(self, "runtime", None)
+        if runtime is None or not getattr(runtime, "embedding_ready", False):
+            return None
+        try:
+            session = self.store.session_get(row["session_id"]) or {}
+            return await runtime.embed_query(
+                str(row.get("text") or ""),
+                instance_id=str(session.get("instance_id") or ""),
+                timeline_id=str(session.get("timeline_id") or ""),
+            )
+        except Exception:
+            log.exception("query embedding failed seq=%s", row.get("seq"))
+            return None
+
+    def _system_prompt_with_memory(
+        self, row: dict[str, Any], *, query_vector: list[float] | None = None
+    ) -> tuple[str, list[str]]:
         """真实实例：扮演定义 + 记忆简报；占位会话或无运行层时退回占位提示词。"""
         runtime = getattr(self, "runtime", None)
         session = self.store.session_get(row["session_id"]) if runtime is not None else None
         if runtime is None or session is None or str(session["instance_id"]).startswith("ph-"):
             return self.cfg.placeholder["system_prompt"], []
         try:
-            context = runtime.turn_context(session, topic=str(row.get("text") or ""))
+            context = runtime.turn_context(
+                session, topic=str(row.get("text") or ""), query_vector=query_vector
+            )
         except Exception:  # 运行层不可用不得阻断对话
             log.exception("runtime context failed session=%s", session["id"])
             return self.cfg.placeholder["system_prompt"], []
         return str(context.get("prompt") or ""), list(context.get("memory_ids") or [])
 
-    def _build_messages(self, row: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    def _build_messages(
+        self, row: dict[str, Any], *, query_vector: list[float] | None = None
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         """返回 (消息序列, 本轮注入的记忆标识)；记忆简报只进上下文（§5.1）。"""
         history = self.store.context_window(row["session_id"], self.cfg.context_history_max)
-        prompt, recalled = self._system_prompt_with_memory(row)
+        prompt, recalled = self._system_prompt_with_memory(row, query_vector=query_vector)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": prompt}
         ]
