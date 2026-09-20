@@ -89,6 +89,7 @@ def validate_package(package: dict[str, Any]) -> list[str]:
     _validate_historiography(package, known, errors)
     _validate_events(package, known, errors)
     _validate_event_calendar(package, errors)
+    _validate_environment_observers(package, errors)
     _validate_life_roles(package, errors)
     _validate_initial_state(package, known, errors)
     return errors
@@ -440,7 +441,43 @@ SUPPORTED_EFFECTS: dict[str, str] = {
     "public_notice": "公开通告",
     "rumor_spread": "风闻流传",
     "institution_state": "制度状态",
+    "environment_state": "环境状态（只改已声明的环境类型与取值域）",
 }
+
+
+def _environment_type(package: dict[str, Any], type_id: str) -> dict[str, Any] | None:
+    environment = package.get("environment") if isinstance(package.get("environment"), dict) else {}
+    for item in environment.get("types") or []:
+        if isinstance(item, dict) and str(item.get("id")) == type_id:
+            return item
+    return None
+
+
+def _validate_environment_observers(package: dict[str, Any], errors: list[str]) -> None:
+    """环境类型：观察者名单（可选，缺省即无人可见）——与既有的取值域 / 单位 / 期限校验互补。"""
+    environment = package.get("environment") if isinstance(package.get("environment"), dict) else {}
+    types = environment.get("types") if isinstance(environment.get("types"), list) else []
+    known = _all_ids(package)
+    for index, item in enumerate(types):
+        if not isinstance(item, dict):
+            continue
+        where = f"environment.types[{index}]"
+        observers = item.get("observers")
+        if observers is None:
+            continue
+        # 列表 = 谁能观察到；映射 = {观察者标识: 该观察者的精度说明}
+        names = list(observers.keys()) if isinstance(observers, dict) else observers
+        if not isinstance(observers, (list, dict)):
+            errors.append(f"{where}.observers: 必须是列表（角色 / 种族 / 地区标识）或按观察者的映射")
+            continue
+        for name in names:
+            if not isinstance(name, str):
+                continue
+            value = name.strip()
+            if value in ("all", "亲历"):
+                continue
+            if value not in known:
+                errors.append(f"{where}.observers: 引用不存在的标识 {value!r}")
 
 
 def _validate_events(package: dict[str, Any], known: set[str], errors: list[str]) -> None:
@@ -489,6 +526,16 @@ def _validate_events(package: dict[str, Any], known: set[str], errors: list[str]
                         f"（可用：{' / '.join(SUPPORTED_EFFECTS)}）"
                     )
                 # 效果必须声明失效方式（EVENT_ENGINE_SPEC §二）
+                if str(effect.get("kind")) == "environment_state":
+                    env = _environment_type(package, str(effect.get("target") or ""))
+                    if env is None:
+                        errors.append(
+                            f"{t_where}.effects[{e_index}].target: 环境效果必须指向已声明的环境类型"
+                        )
+                    elif effect.get("value") not in (env.get("values") or []):
+                        errors.append(
+                            f"{t_where}.effects[{e_index}].value: 取值必须是该环境类型取值域内的值"
+                        )
                 expiry = effect.get("expiry")
                 if expiry not in EXPIRY_KINDS:
                     errors.append(

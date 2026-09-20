@@ -160,6 +160,20 @@ CREATE TABLE IF NOT EXISTS timeline_clock(
 
 -- ---------- 事件引擎（阶段 3）：事件 / 说法 / 获知 / 效果状态 ----------
 
+-- 环境事实状态（WORLD_RUNTIME_SPEC §11.2）：可选状态域，未声明的类型没有真值
+CREATE TABLE IF NOT EXISTS environment_state(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  type_id TEXT NOT NULL,
+  value TEXT NOT NULL,
+  unit TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',       -- initial | natural:<名> | event:<事件标识>
+  from_world INTEGER NOT NULL DEFAULT 0,
+  expiry TEXT NOT NULL DEFAULT 'until_cleared',
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, type_id)
+);
+
 -- 外部调用账本（WORLD_RUNTIME_SPEC §2.8）：只记次数与量级，不记正文 / prompt / 密钥
 CREATE TABLE IF NOT EXISTS call_ledger(
   instance_id TEXT NOT NULL,
@@ -251,6 +265,7 @@ CREATE TABLE IF NOT EXISTS effect_state(
   target TEXT NOT NULL DEFAULT '',
   kind TEXT NOT NULL,
   family TEXT NOT NULL DEFAULT '',       -- 事件族：自然恢复按同族后续事件判定（§六）
+  value TEXT,                            -- 环境类效果的取值（取值域内）
   from_world INTEGER NOT NULL,
   expiry TEXT NOT NULL DEFAULT 'until_cleared',
   recovery TEXT NOT NULL DEFAULT '',
@@ -412,6 +427,9 @@ class Store:
         if effect_columns and "family" not in effect_columns:
             log.info("effect_state 增列 family")
             self._conn.execute("ALTER TABLE effect_state ADD COLUMN family TEXT NOT NULL DEFAULT ''")
+        if effect_columns and "value" not in effect_columns:
+            log.info("effect_state 增列 value")
+            self._conn.execute("ALTER TABLE effect_state ADD COLUMN value TEXT")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
@@ -925,6 +943,7 @@ class Store:
                 "effect_state",
                 "intent",
                 "call_ledger",
+                "environment_state",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute("DELETE FROM commit_log WHERE instance_id=?", (instance_id,))
@@ -1030,6 +1049,7 @@ class Store:
         knowledge: Iterable[dict[str, Any]] = (),
         effects: Iterable[dict[str, Any]] = (),
         intents: Iterable[dict[str, Any]] = (),
+        environment: Iterable[dict[str, Any]] = (),
         clear_effects: Iterable[Any] = (),
     ) -> bool:
         """把一批事实转移整体提交（§2.7：一批失败即整批回到批前水位）。
@@ -1100,12 +1120,13 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, character_id, id) DO NOTHING""",
                     row,
                 )
-            for row in effects:
+            for raw in effects:
+                row = {"value": None, "family": "", "recovery": "", "cleared_at": None, **raw}
                 self._conn.execute(
                     """INSERT INTO effect_state(instance_id, timeline_id, id, event_id, target, kind, family,
-                                               from_world, expiry, recovery, active, cleared_at)
+                                               value, from_world, expiry, recovery, active, cleared_at)
                        VALUES(:instance_id, :timeline_id, :id, :event_id, :target, :kind, :family,
-                              :from_world, :expiry, :recovery, :active, :cleared_at)
+                              :value, :from_world, :expiry, :recovery, :active, :cleared_at)
                        ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
                     row,
                 )
@@ -1121,6 +1142,17 @@ class Store:
                          object=:object, basis=:basis, strength=:strength, window_from=:window_from,
                          window_to=:window_to, preconditions=:preconditions, effect=:effect,
                          stage=:stage, note=:note, updated_world=:updated_world""",
+                    row,
+                )
+            for row in environment:
+                self._conn.execute(
+                    """INSERT INTO environment_state(instance_id, timeline_id, type_id, value, unit, source,
+                                                    from_world, expiry, updated_world)
+                       VALUES(:instance_id, :timeline_id, :type_id, :value, :unit, :source,
+                              :from_world, :expiry, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, type_id) DO UPDATE SET
+                         value=:value, unit=:unit, source=:source, from_world=:from_world,
+                         expiry=:expiry, updated_world=:updated_world""",
                     row,
                 )
             for item in clear_effects:
@@ -1199,6 +1231,13 @@ class Store:
                 timeline_id,
                 watermark,
             ),
+            "environment": rows(
+                """SELECT * FROM environment_state WHERE instance_id=? AND timeline_id=? AND updated_world<=?
+                   ORDER BY type_id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
             "intents": rows(
                 """SELECT * FROM intent WHERE instance_id=? AND timeline_id=? AND source_world<=?
                    ORDER BY character_id, id""",
@@ -1272,10 +1311,19 @@ class Store:
             for row in payload.get("effects") or []:
                 self._conn.execute(
                     """INSERT INTO effect_state(instance_id, timeline_id, id, event_id, target, kind, family,
-                                               from_world, expiry, recovery, active, cleared_at)
+                                               value, from_world, expiry, recovery, active, cleared_at)
                        VALUES(:instance_id, :timeline_id, :id, :event_id, :target, :kind, :family,
-                              :from_world, :expiry, :recovery, :active, :cleared_at)
+                              :value, :from_world, :expiry, :recovery, :active, :cleared_at)
                        ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
+                    row,
+                )
+            for row in payload.get("environment") or []:
+                self._conn.execute(
+                    """INSERT INTO environment_state(instance_id, timeline_id, type_id, value, unit, source,
+                                                    from_world, expiry, updated_world)
+                       VALUES(:instance_id, :timeline_id, :type_id, :value, :unit, :source,
+                              :from_world, :expiry, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, type_id) DO NOTHING""",
                     row,
                 )
             for row in payload.get("intents") or []:
@@ -1309,8 +1357,31 @@ class Store:
                 "knowledge",
                 "effects",
                 "intents",
+                "environment",
             )
         )
+
+    # ---------- 环境事实状态 ----------
+
+    def environment_put(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO environment_state(instance_id, timeline_id, type_id, value, unit, source,
+                                                 from_world, expiry, updated_world)
+                   VALUES(:instance_id, :timeline_id, :type_id, :value, :unit, :source,
+                          :from_world, :expiry, :updated_world)
+                   ON CONFLICT(instance_id, timeline_id, type_id) DO UPDATE SET
+                     value=:value, unit=:unit, source=:source, from_world=:from_world,
+                     expiry=:expiry, updated_world=:updated_world""",
+                row,
+            )
+
+    def environment_list(self, instance_id: str, timeline_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM environment_state WHERE instance_id=? AND timeline_id=? ORDER BY type_id",
+            (instance_id, timeline_id),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
     # ---------- 表述与展开所需的存储 ----------
 

@@ -14,7 +14,7 @@ from typing import Any
 
 from ..log import get_logger
 from ..store import Store
-from . import cognition, events, intents, life, personality
+from . import cognition, environment, events, intents, life, personality
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
 
@@ -358,6 +358,15 @@ class RuntimeService:
             death_rows = self._death_rows(
                 instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
             )
+            environment_rows = self._environment_rows(
+                instance,
+                instance_id,
+                timeline_id,
+                calendar,
+                world_rows["effects"] + [dict(item) for item in []],
+                from_world=processed,
+                to_world=stop,
+            )
             intent_rows = self._revise_intents(
                 instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
             )
@@ -378,6 +387,7 @@ class RuntimeService:
                 knowledge=world_rows['knowledge'] + death_rows['knowledge'] + spread['knowledge'],
                 effects=world_rows['effects'] + intent_rows['effects'],
                 intents=intent_rows['intents'],
+                environment=environment_rows,
                 clear_effects=spread['clear_effects'],
             )
             if not committed:
@@ -478,6 +488,36 @@ class RuntimeService:
                         item["source_ref"] = constraints[0]["id"] if constraints else None
                 experiences.extend(items)
         return plans, units, experiences
+
+    def _environment_rows(
+        self,
+        instance: dict[str, Any],
+        instance_id: str,
+        timeline_id: str,
+        calendar: Calendar,
+        effects: list[dict[str, Any]],
+        *,
+        from_world: int,
+        to_world: int,
+    ) -> list[dict[str, Any]]:
+        """环境状态推进（§11.2）：声明的自然变化 + 本批事件里的环境效果，同一批提交。"""
+        package = self.setting(instance)["world_package"]
+        types = environment.env_types(package)
+        if not types:
+            return []
+        rows = self.store.environment_list(instance_id, timeline_id)
+        if not rows:
+            rows = environment.initial_rows(
+                package, instance_id=instance_id, timeline_id=timeline_id, world_seconds=from_world
+            )
+        changed: dict[str, dict[str, Any]] = {}
+        for row in environment.advance_rows(
+            rows, types, from_world=from_world, to_world=to_world, day_seconds=calendar.day_seconds
+        ):
+            changed[str(row["type_id"])] = row
+        for row in environment.apply_effects(rows, effects, types, world_seconds=to_world):
+            changed[str(row["type_id"])] = row
+        return list(changed.values())
 
     def _revise_intents(
         self,
@@ -812,6 +852,14 @@ class RuntimeService:
                 ):
                     self.store.unit_put(row)
                     units += 1
+            if not self.store.environment_list(instance_id, timeline_id):
+                for row in environment.initial_rows(
+                    self.setting(instance)["world_package"],
+                    instance_id=instance_id,
+                    timeline_id=timeline_id,
+                    world_seconds=world_seconds,
+                ):
+                    self.store.environment_put(row)
             for row in intents.initial_rows(
                 card, instance_id=instance_id, timeline_id=timeline_id, world_seconds=world_seconds
             ):
@@ -883,6 +931,12 @@ class RuntimeService:
                 for row in self.store.intent_list(instance_id, timeline_id, character_id)
                 if str(row["stage"]) in ("adopted", "waiting", "deferred")
             ],
+            "observations": environment.observations(
+                self.store.environment_list(instance_id, timeline_id),
+                environment.env_types(self.setting(self.store.instance_get(instance_id) or {}).get("world_package", {})),
+                card,
+                world_seconds=world_seconds,
+            ),
         }
 
     def backfill(self, instance_id: str, timeline_id: str) -> int:
@@ -1167,5 +1221,6 @@ class RuntimeService:
             experiences=snapshot["experiences"],
             knowledge=snapshot["knowledge"],
             intents=snapshot["intents"],
+            observations=snapshot["observations"],
         )
         return cognition.render_prompt(context)

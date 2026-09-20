@@ -33,7 +33,7 @@ GENERATOR_TEMPERATURE = 0.4
 PACKAGE_SEGMENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("设定核心", ("meta", "calendar", "world")),
     ("双轨与名册", ("sources", "canon", "narratives", "races", "entities")),
-    ("机制与现状", ("historiography", "events", "life", "roles", "comms", "initial_state")),
+    ("机制与现状", ("historiography", "environment", "events", "life", "roles", "comms", "initial_state")),
 )
 
 STRUCTURE_HINT = (
@@ -47,7 +47,8 @@ MIN_CONTENT = (
     "至少一份史料，含贡献者角色与时段、覆盖区间与非空条目；至少一个事件族及其模板与事实效果"
     "（效果 target 只能填已存在的标识，且每条效果必须给 expiry：with_cause / until_cleared / "
     "natural_recovery 三选一，natural_recovery 还要给 recovery 条件）；"
-    "events.density 必填（稀疏 / 常规 / 丰盛 三选一）；"
+    "events.density 必填（稀疏 / 常规 / 丰盛 三选一）；环境效果（environment_state）只能引用本包 "
+    "environment.types 里已声明的类型与取值域内的值，先声明类型再引用；"
     "至少一个生活线模板（显式声明是否睡眠）与一个可装配的角色模板；至少一种与外界联络的机制。"
     "声明了制度就必须写明职权、适用范围、延续与承接规则；声明了惯例就必须写明适用群体、当前做法、形成依据与允许变化范围。"
 )

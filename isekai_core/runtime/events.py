@@ -183,6 +183,7 @@ def effect_rows(
                 "target": str(effect.get("target") or ""),
                 "kind": kind,
                 "family": str(family),
+                "value": None if effect.get("value") is None else str(effect.get("value")),
                 "from_world": int(world_seconds),
                 "expiry": expiry,
                 "recovery": str(effect.get("recovery") or ""),

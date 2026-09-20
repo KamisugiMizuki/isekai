@@ -153,6 +153,15 @@ def knowledge_slice(
                 "stance": STANCE_LABEL.get(str(row.get("stance")), STANCE_LABEL["recorded"]),
             }
         )
+    seen: set[tuple[str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in reversed(out):  # 新的在后 → 倒序保留最近一条，同文同源只留一份
+        key = (str(item.get("text")), str(item.get("source")))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    out = list(reversed(deduped))
     if topic:
         needle = topic.strip().lower()
         out.sort(key=lambda item: 0 if needle and needle in str(item.get("text", "")).lower() else 1)
@@ -201,6 +210,11 @@ def render_prompt(context: dict[str, Any]) -> str:
             lines.append(f"- {item['object']}——{stage}{detail}")
     for item in context.get("comms") or []:
         lines.append(f"联络方式：{item.get('name', '')}（限制：{item.get('limits', '')}）")
+    observed = context.get("observations") or []
+    if observed:
+        lines.append("她此刻能直接观察到的环境（只能按这里的精度说，不能加数字、不能扩大范围）：")
+        for item in observed:
+            lines.append(f"- {item['name']}：{item['value']}{item['unit']}（{item['observe']}）")
     knowledge = context.get("knowledge") or []
     if knowledge:
         lines.append("她已能接触到以下内容（引用时只按这里的范围与口气，不要扩写）：")
@@ -212,6 +226,7 @@ def render_prompt(context: dict[str, Any]) -> str:
         [
             "约束：不确定就说不确定，不知道就说不知道；不要提到你未列出的世界内幕、他人私聊或未来事件；",
             "不要把「听说」说成亲历，不要把推测说成事实；只输出角色要说的话，不解释规则、不输出内部结构。",
+            "未列入上面的环境信息她并不知道：可以给有依据的主观感受或不确切的说法，但不能说成确数或全局事实；",
         ]
     )
     return "\n".join(lines)
@@ -227,6 +242,7 @@ def play_context(
     current_activity: str = "",
     knowledge: list[dict[str, Any]] | None = None,
     intents: list[dict[str, Any]] | None = None,
+    observations: list[dict[str, Any]] | None = None,
     units: list[dict[str, Any]] | None = None,
     experiences: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -268,6 +284,15 @@ def play_context(
         "voice": voice,
         "comms": comms,
         "topic": topic or "",
+        "observations": [
+            {
+                "name": str(item.get("name") or ""),
+                "value": str(item.get("value") or ""),
+                "unit": str(item.get("unit") or ""),
+                "observe": str(item.get("observe") or ""),
+            }
+            for item in observations or []
+        ],
         "intents": [
             {
                 "object": str(item.get("object") or ""),

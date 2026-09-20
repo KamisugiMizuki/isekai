@@ -137,11 +137,45 @@ def example_package(name: str = "灰潮纪", *, moment: int = DAY * 1500) -> dic
                                 "expiry": "natural_recovery",
                                 "recovery": "下一轮大潮退去后自行恢复",
                             },
+                            {
+                                "kind": "environment_state",
+                                "target": "env-2",
+                                "value": "西",
+                                "expiry": "until_cleared",
+                            },
                         ],
                         "weight": 1,
                     }
                 ],
             }
+        ]
+    }
+    package["environment"] = {
+        "types": [
+            {
+                "id": "env-1",
+                "name": "潮位",
+                "unit": "尺",
+                "values": [0, 1, 2, 3, 4, 5],
+                "initial": 2,
+                "sources": ["natural:潮汐"],
+                "observe": "在滩口值守且有水位尺时能读到刻线；城里只听到信报转述，说不了具体数字",
+                "scope": "滩口一带（城内只能听到转述）",
+                "observers": ["rl-1"],
+                "expiry": "natural_recovery",
+            },
+            {
+                "id": "env-2",
+                "name": "风信",
+                "unit": "向",
+                "values": ["北", "东", "南", "西"],
+                "initial": "北",
+                "sources": ["event"],
+                "observe": "在开阔处能直接感到风向；屋里只能从别人口中知道",
+                "scope": "开阔地（屋里只能听说）",
+                "observers": {"rl-1": "她站在滩口，风向是直接感受到的，报得出方向"},
+                "expiry": "until_cleared",
+            },
         ]
     }
     package["life"] = [
