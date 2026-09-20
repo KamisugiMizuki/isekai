@@ -49,6 +49,14 @@ def example_package(name: str = "灰潮纪", *, moment: int = DAY * 1500) -> dic
                 "scope": "三条沿岸城邦",
                 "succession": "堤长身故或去职时由同城邦议席推举接任，空缺期间日常堤务照旧、通行牌暂停发放",
                 "validity": "自崩塌后第 2 年沿用至今",
+                "offices": [
+                    {"id": "off-1", "name": "堤长", "holder": "en-1"},
+                    {"id": "off-2", "name": "守碑人", "holder": ""},
+                ],
+                "vacancy_policy": {
+                    "continues": ["日常堤务"],
+                    "suspended": ["通行牌发放", "碑文校订"],
+                },
             }
         ],
         "customs": [
@@ -59,6 +67,10 @@ def example_package(name: str = "灰潮纪", *, moment: int = DAY * 1500) -> dic
                 "practice": "大退潮首日在滩口设盐与旧堤砖，读水位尺后散去",
                 "basis": "崩堤后为记住水位而设",
                 "variation": "城邦之间可换用本地盐样，环节顺序不改",
+                "forms": [
+                    "大退潮首日在滩口设盐与旧堤砖，读水位尺后散去",
+                    "改在城邦石阶设本地盐样，环节顺序不改",
+                ],
             }
         ],
     }
@@ -141,6 +153,13 @@ def example_package(name: str = "灰潮纪", *, moment: int = DAY * 1500) -> dic
                                 "kind": "environment_state",
                                 "target": "env-2",
                                 "value": "西",
+                                "expiry": "until_cleared",
+                            },
+                            {
+                                # 制度变化只落在声明范围内：职位与在任者，或惯例的允许做法
+                                "kind": "institution_state",
+                                "target": "off-2",
+                                "value": "en-1",
                                 "expiry": "until_cleared",
                             },
                         ],

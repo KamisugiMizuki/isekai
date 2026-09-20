@@ -16,7 +16,19 @@ from typing import Any
 from ..log import get_logger
 from ..store import Store
 from . import budget as budget_mod
-from . import cognition, disclosure, drafts, embedding as embedding_mod, environment, events, intents, life
+from ..world.validate import custom_index as _custom_index, office_index as _office_index
+
+from . import (
+    cognition,
+    disclosure,
+    drafts,
+    embedding as embedding_mod,
+    environment,
+    events,
+    institutions,
+    intents,
+    life,
+)
 from . import memory as memory_mod, personality, planning, versioning
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
@@ -38,6 +50,23 @@ def from_config(cfg: Any, store: Store) -> "RuntimeService":
     wanted = set(inspect.signature(RuntimeService.__init__).parameters) - {"self", "store"}
     params = {name: getattr(runtime_cfg, name) for name in wanted if hasattr(runtime_cfg, name)}
     return RuntimeService(store, **params)
+
+
+def _known_event_ids(
+    store: Any, instance_id: str, timeline_id: str, knowledge: list[dict[str, Any]]
+) -> set[str]:
+    """她能触达的事件标识：直接获知的、以及她掌握的说法所归属的事件。
+
+    制度 / 惯例的变化由事件产生；「听说这件事」与「听说了关于它的说法」都算知道。
+    """
+    known = {str(row.get("target") or "") for row in knowledge}
+    known |= {str(row.get("id") or "") for row in knowledge}
+    for claim in store.claim_list(instance_id, timeline_id):
+        if str(claim.get("id") or "") in known:
+            known.add(str(claim.get("event_id") or ""))
+    known.discard("")
+    return known
+
 
 
 class RuntimeService:
@@ -1468,6 +1497,17 @@ class RuntimeService:
             death_rows = self._death_rows(
                 instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
             )
+            prelim_intents = self._revise_intents(
+                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
+            )
+            institution_rows = self._institution_rows(
+                instance,
+                instance_id,
+                timeline_id,
+                world_rows["effects"] + prelim_intents["effects"],
+                from_world=processed,
+                to_world=stop,
+            )
             environment_rows = self._environment_rows(
                 instance,
                 instance_id,
@@ -1477,9 +1517,7 @@ class RuntimeService:
                 from_world=processed,
                 to_world=stop,
             )
-            intent_rows = self._revise_intents(
-                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
-            )
+            intent_rows = prelim_intents
             spread = self._propagate_and_clear(
                 instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
             )
@@ -1498,6 +1536,8 @@ class RuntimeService:
                 effects=world_rows['effects'] + intent_rows['effects'],
                 intents=intent_rows['intents'],
                 environment=environment_rows,
+                institution=institution_rows["institution"],
+                customs=institution_rows["customs"],
                 clear_effects=spread['clear_effects'],
             )
             if not committed:
@@ -1631,6 +1671,42 @@ class RuntimeService:
         for row in environment.apply_effects(rows, effects, types, world_seconds=to_world):
             changed[str(row["type_id"])] = row
         return list(changed.values())
+
+    def _institution_rows(
+        self,
+        instance: dict[str, Any],
+        instance_id: str,
+        timeline_id: str,
+        effects: list[dict[str, Any]],
+        *,
+        from_world: int,
+        to_world: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """制度与惯例状态（阶段 6）：只吃合法事件效果，变化带来源与发生时刻。
+
+        没有合法候选就什么都不写——不用配额或话术造变化。
+        """
+        package = self.setting(instance)["world_package"]
+        offices = institutions.office_index(package)
+        customs = institutions.custom_index(package)
+        if not offices and not customs:
+            return {"institution": [], "customs": []}
+        rows = self.store.institution_list(instance_id, timeline_id)
+        custom_state = self.store.custom_list(instance_id, timeline_id)
+        if not rows and offices:
+            rows = institutions.office_rows(
+                package, instance_id=instance_id, timeline_id=timeline_id, world_seconds=from_world
+            )
+        if not custom_state and customs:
+            custom_state = institutions.custom_rows(
+                package, instance_id=instance_id, timeline_id=timeline_id, world_seconds=from_world
+            )
+        new_rows, new_customs = institutions.apply_effects(
+            rows, custom_state, effects, package, world_seconds=to_world
+        )
+        changed_rows = [row for row in new_rows if int(row["updated_world"]) == int(to_world)]
+        changed_customs = [row for row in new_customs if int(row["updated_world"]) == int(to_world)]
+        return {"institution": changed_rows, "customs": changed_customs}
 
     def _revise_intents(
         self,
@@ -1965,6 +2041,23 @@ class RuntimeService:
                 ):
                     self.store.unit_put(row)
                     units += 1
+            package_for_state = self.setting(instance)["world_package"]
+            if not self.store.institution_list(instance_id, timeline_id):
+                for row in institutions.office_rows(
+                    package_for_state,
+                    instance_id=instance_id,
+                    timeline_id=timeline_id,
+                    world_seconds=world_seconds,
+                ):
+                    self.store.institution_put(row)
+            if not self.store.custom_list(instance_id, timeline_id):
+                for row in institutions.custom_rows(
+                    package_for_state,
+                    instance_id=instance_id,
+                    timeline_id=timeline_id,
+                    world_seconds=world_seconds,
+                ):
+                    self.store.custom_put(row)
             if not self.store.environment_list(instance_id, timeline_id):
                 for row in environment.initial_rows(
                     self.setting(instance)["world_package"],
@@ -2031,6 +2124,7 @@ class RuntimeService:
         )
         if note and activity:
             activity = f"{activity}（受影响的后果：{note}）"
+        world_package = self.setting(self.store.instance_get(instance_id) or {})["world_package"]
         return {
             "units": personality.visible(units),
             "all_units": units,
@@ -2044,6 +2138,40 @@ class RuntimeService:
                 for row in self.store.intent_list(instance_id, timeline_id, character_id)
                 if str(row["stage"]) in ("adopted", "waiting", "deferred")
             ],
+            "institutions": institutions.observations(
+                self.store.institution_list(instance_id, timeline_id),
+                self.store.custom_list(instance_id, timeline_id),
+                _known_event_ids(self.store, instance_id, timeline_id, knowledge),
+                world_seconds=world_seconds,
+                effects=self.store.effect_window(
+                    instance_id,
+                    timeline_id,
+                    until=world_seconds,
+                    targets=[
+                        str(row["office_id"])
+                        for row in self.store.institution_list(instance_id, timeline_id)
+                    ]
+                    + [
+                        str(row["custom_id"])
+                        for row in self.store.custom_list(instance_id, timeline_id)
+                    ],
+                ),
+                declared_offices={
+                    office_id: str(office.get("holder") or "")
+                    for office_id, office in _office_index(world_package).items()
+                },
+                declared_customs={
+                    custom_id: str(custom.get("practice") or "")
+                    for custom_id, custom in _custom_index(world_package).items()
+                },
+                holder_names={
+                    str(item.get("id")): str(item.get("name"))
+                    for item in self.setting(self.store.instance_get(instance_id) or {})[
+                        "world_package"
+                    ].get("entities") or []
+                    if isinstance(item, dict) and item.get("id")
+                },
+            ),
             "observations": environment.observations(
                 self.store.environment_list(instance_id, timeline_id),
                 environment.env_types(self.setting(self.store.instance_get(instance_id) or {}).get("world_package", {})),

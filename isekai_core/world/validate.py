@@ -26,8 +26,17 @@ def _text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _str_value(value: Any) -> str:
+    """取字符串值（_text 只回答「是不是非空字符串」，不返回值）。"""
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _ids(items: Any) -> list[str]:
-    return [str(item.get("id")) for item in items if isinstance(item, dict) and _text(item.get("id"))]
+    return [
+        str(item.get("id"))
+        for item in (items if isinstance(items, list) else [])
+        if isinstance(item, dict) and _text(item.get("id"))
+    ]
 
 
 def _check_unique(items: Any, where: str, errors: list[str]) -> None:
@@ -216,6 +225,7 @@ def _validate_world(world: Any, errors: list[str]) -> None:
                 for field, hint in (("mandate", "职权"), ("scope", "适用范围"), ("succession", "延续与承接规则")):
                     if not _text(item.get(field)):
                         errors.append(f"{where}.{field}: 已声明制度必须写明{hint}")
+                _validate_offices(item, where, errors)
             else:
                 for field, hint in (
                     ("applies_to", "适用群体"),
@@ -225,6 +235,119 @@ def _validate_world(world: Any, errors: list[str]) -> None:
                 ):
                     if not _text(item.get(field)):
                         errors.append(f"{where}.{field}: 已声明惯例必须写明{hint}")
+                _validate_custom_forms(item, where, errors)
+
+
+def _validate_offices(institution: dict[str, Any], where: str, errors: list[str]) -> None:
+    """职位与空缺规则：职位标识唯一、在任者可空（= 空缺）；空缺期间事务必须可判定。"""
+    offices = institution.get("offices")
+    if offices is None:
+        return
+    if not isinstance(offices, list):
+        errors.append(f"{where}.offices: 必须是列表")
+        return
+    seen: set[str] = set()
+    for index, office in enumerate(offices):
+        spot = f"{where}.offices[{index}]"
+        if not isinstance(office, dict):
+            errors.append(f"{spot}: 条目必须是对象")
+            continue
+        office_id = _str_value(office.get("id"))
+        if not office_id:
+            errors.append(f"{spot}: 缺少职位标识")
+        elif office_id in seen:
+            errors.append(f"{spot}.id: 职位标识重复 {office_id!r}")
+        else:
+            seen.add(office_id)
+        if not _text(office.get("name")):
+            errors.append(f"{spot}.name: 缺少职位名称")
+        holder = office.get("holder")
+        if holder is not None and not isinstance(holder, str):
+            errors.append(f"{spot}.holder: 在任者必须是登记实体标识或留空")
+    policy = institution.get("vacancy_policy")
+    if policy is None:
+        return
+    if not isinstance(policy, dict):
+        errors.append(f"{where}.vacancy_policy: 必须是对象")
+        return
+    for key in ("continues", "suspended"):
+        items = policy.get(key)
+        if items is None:
+            errors.append(f"{where}.vacancy_policy.{key}: 空缺规则必须显式写明（可空列表，但不能缺）")
+            continue
+        if not isinstance(items, list) or any(not _text(entry) for entry in items):
+            errors.append(f"{where}.vacancy_policy.{key}: 必须是事务名列表")
+
+
+def _validate_custom_forms(custom: dict[str, Any], where: str, errors: list[str]) -> None:
+    """惯例的可选变化范围：现行做法必须在范围内。"""
+    forms = custom.get("forms")
+    if forms is None:
+        return
+    if not isinstance(forms, list) or any(not _text(entry) for entry in forms):
+        errors.append(f"{where}.forms: 必须是做法名列表")
+        return
+    practice = _str_value(custom.get("practice"))
+    if practice and practice not in [str(entry) for entry in forms]:
+        errors.append(f"{where}.practice: 现行做法必须落在允许变化范围 forms 内")
+
+
+def office_index(package: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """职位扁平索引：职位标识 → 职位（含所属制度与空缺期间的规则）。"""
+    world = package.get("world") if isinstance(package.get("world"), dict) else {}
+    out: dict[str, dict[str, Any]] = {}
+    for institution in world.get("institutions") or []:
+        if not isinstance(institution, dict):
+            continue
+        inst_id = _str_value(institution.get("id"))
+        policy = institution.get("vacancy_policy") if isinstance(institution.get("vacancy_policy"), dict) else {}
+        for office in institution.get("offices") or []:
+            if not isinstance(office, dict) or not _text(office.get("id")):
+                continue
+            out[str(office["id"])] = {
+                **office,
+                "institution_id": inst_id,
+                "institution_name": str(institution.get("name") or inst_id),
+                "continues": [str(entry) for entry in policy.get("continues") or []],
+                "suspended": [str(entry) for entry in policy.get("suspended") or []],
+            }
+    return out
+
+
+def custom_index(package: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    world = package.get("world") if isinstance(package.get("world"), dict) else {}
+    return {
+        str(item["id"]): item
+        for item in world.get("customs") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+
+
+def change_allowed(package: dict[str, Any], *, kind: str, target: str, value: str) -> tuple[bool, str]:
+    """变化是否落在声明范围内（阶段 6：不能由文本凭空增删制度与公理）。"""
+    if kind == "institution_state":
+        if office_index(package).get(str(target)) is None:
+            return False, "未声明的职位"
+        if str(value) and str(value) not in _entity_ids(package):
+            return False, "在任者不是已登记的实体"
+        return True, ""
+    if kind == "custom_state":
+        custom = custom_index(package).get(str(target))
+        if custom is None:
+            return False, "未声明的惯例"
+        forms = [str(entry) for entry in custom.get("forms") or []]
+        if str(value) not in forms:
+            return False, "做法不在声明的允许变化范围内"
+        return True, ""
+    return False, "不是制度或惯例类变化"
+
+
+def _entity_ids(package: dict[str, Any]) -> set[str]:
+    return {
+        _str_value(item.get("id"))
+        for item in package.get("entities") or []
+        if isinstance(item, dict) and item.get("id")
+    }
 
 
 def _validate_environment(environment: Any, errors: list[str]) -> None:
@@ -406,6 +529,9 @@ def _all_ids(package: dict[str, Any]) -> set[str]:
             items = world.get(key)
             if isinstance(items, list):
                 found |= set(_ids(items))
+        for institution in world.get("institutions") or []:
+            if isinstance(institution, dict):
+                found |= set(_ids(institution.get("offices")))
         lexicon = world.get("lexicon")
         if isinstance(lexicon, dict):
             found |= set(_ids(lexicon.get("terms")))
@@ -440,7 +566,8 @@ SUPPORTED_EFFECTS: dict[str, str] = {
     "activity_constraint": "活动受限",
     "public_notice": "公开通告",
     "rumor_spread": "风闻流传",
-    "institution_state": "制度状态",
+    "institution_state": "制度状态（只改已声明的职位与在任者）",
+    "custom_state": "文化惯例的现行做法（须落在声明的允许范围内）",
     "environment_state": "环境状态（只改已声明的环境类型与取值域）",
 }
 
@@ -526,6 +653,15 @@ def _validate_events(package: dict[str, Any], known: set[str], errors: list[str]
                         f"（可用：{' / '.join(SUPPORTED_EFFECTS)}）"
                     )
                 # 效果必须声明失效方式（EVENT_ENGINE_SPEC §二）
+                if str(effect.get("kind")) in ("institution_state", "custom_state"):
+                    ok, reason = change_allowed(
+                        package,
+                        kind=str(effect.get("kind")),
+                        target=str(effect.get("target") or ""),
+                        value=str(effect.get("value") or ""),
+                    )
+                    if not ok:
+                        errors.append(f"{t_where}.effects[{e_index}]: {reason}")
                 if str(effect.get("kind")) == "environment_state":
                     env = _environment_type(package, str(effect.get("target") or ""))
                     if env is None:

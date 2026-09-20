@@ -38,17 +38,24 @@ def allowed_targets(
     roles = {str(item.get("id")) for item in card.get("roles") or []}
     channels = {str(item.get("source_id")) for item in card.get("channels") or [] if item.get("source_id")}
     env_types = {str(item.get("type_id")) for item in observations if item.get("type_id")}
-    institutions = {
-        str(item.get("id"))
-        for item in (package.get("world") or {}).get("institutions") or []
-        if isinstance(item, dict)
-    } if isinstance(package.get("world"), dict) else set()
+    world = package.get("world") if isinstance(package.get("world"), dict) else {}
+    institutions = [item for item in world.get("institutions") or [] if isinstance(item, dict)]
+    offices = {
+        str(office.get("id"))
+        for institution in institutions
+        for office in institution.get("offices") or []
+        if isinstance(office, dict) and office.get("id")
+    }
+    customs = {
+        str(item.get("id")) for item in world.get("customs") or [] if isinstance(item, dict)
+    }
     targets: dict[str, list[str]] = {
         "activity_constraint": sorted({role, region} - {""}),
         "route_blocked": sorted({region} - {""}),
         "public_notice": sorted(channels),
         "rumor_spread": sorted(channels),
-        "institution_state": sorted(institutions),
+        "institution_state": sorted(offices),
+        "custom_state": sorted(customs),
     }
     roles.clear()
     _ = knowledge

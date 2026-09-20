@@ -229,6 +229,39 @@ CREATE TABLE IF NOT EXISTS environment_state(
   PRIMARY KEY(instance_id, timeline_id, type_id)
 );
 
+-- 制度状态（阶段 6）：职位与在任者；空缺期间的事务规则随行（列表字段存 JSON）
+CREATE TABLE IF NOT EXISTS institution_state(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  office_id TEXT NOT NULL,
+  institution_id TEXT NOT NULL DEFAULT '',
+  institution_name TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '',
+  holder TEXT NOT NULL DEFAULT '',        -- 登记实体标识；空串 = 空缺
+  continues_json TEXT NOT NULL DEFAULT '[]',
+  suspended_json TEXT NOT NULL DEFAULT '[]',
+  source TEXT NOT NULL DEFAULT '',        -- initial | 事件标识
+  from_world INTEGER NOT NULL DEFAULT 0,
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, office_id)
+);
+
+-- 文化惯例状态（阶段 6）：当前做法必须落在声明的允许范围内
+CREATE TABLE IF NOT EXISTS custom_state(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  custom_id TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  applies_to TEXT NOT NULL DEFAULT '',
+  form TEXT NOT NULL DEFAULT '',
+  forms_json TEXT NOT NULL DEFAULT '[]',
+  basis TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  from_world INTEGER NOT NULL DEFAULT 0,
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, custom_id)
+);
+
 -- 外部调用账本（WORLD_RUNTIME_SPEC §2.8）：只记次数与量级，不记正文 / prompt / 密钥
 CREATE TABLE IF NOT EXISTS call_ledger(
   instance_id TEXT NOT NULL,
@@ -514,7 +547,38 @@ def _relabel_payload(payload: dict[str, Any], instance_id: str, timeline_id: str
     return out
 
 
-def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _office_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """制度行 → 存储形态（列表字段走 JSON 列）。"""
+    payload = dict(row)
+    for key in ("continues", "suspended"):
+        payload[f"{key}_json"] = json.dumps(
+            [str(item) for item in payload.get(key) or []], ensure_ascii=False
+        )
+    return payload
+
+
+def _custom_payload(row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    payload["forms_json"] = json.dumps(
+        [str(item) for item in payload.get("forms") or []], ensure_ascii=False
+    )
+    return payload
+
+
+def _institution_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = _row_to_dict(row)
+    for key in ("continues", "suspended"):
+        item[key] = json.loads(str(item.pop(f"{key}_json") or "[]"))
+    return item
+
+
+def _custom_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = _row_to_dict(row)
+    item["forms"] = json.loads(str(item.pop("forms_json") or "[]"))
+    return item
+
+
+def _row_to_dict(row: Any) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
@@ -1193,6 +1257,8 @@ class Store:
                 "budget_reserve",
                 "budget_policy",
                 "environment_state",
+                "institution_state",
+                "custom_state",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute(
@@ -1460,7 +1526,8 @@ class Store:
         """回滚 / 分叉前清空该线的运行状态（保留线身份与时钟）。"""
         for table in (
             "unit", "life_plan", "experience", "claim", "knowledge", "effect_state", "intent",
-            "event", "environment_state", "memory", "memory_task", "memory_citation",
+            "event", "environment_state", "institution_state", "custom_state",
+            "memory", "memory_task", "memory_citation",
             "character_join",   # 跨越补卡点的回滚要让补入角色在本线退出（§七）
             "rate_command",     # 历史里的待生效倍率不是现时控制命令（§七）
             "pending_event",    # 回滚撤销待执行状态及其后果（§八 末条）
@@ -1578,6 +1645,8 @@ class Store:
         effects: Iterable[dict[str, Any]] = (),
         intents: Iterable[dict[str, Any]] = (),
         environment: Iterable[dict[str, Any]] = (),
+        institution: Iterable[dict[str, Any]] = (),
+        customs: Iterable[dict[str, Any]] = (),
         clear_effects: Iterable[Any] = (),
     ) -> bool:
         """把一批事实转移整体提交（§2.7：一批失败即整批回到批前水位）。
@@ -1683,6 +1752,31 @@ class Store:
                          expiry=:expiry, updated_world=:updated_world""",
                     row,
                 )
+            for item in institution:
+                row = _office_payload(item)
+                self._conn.execute(
+                    """INSERT INTO institution_state(instance_id, timeline_id, office_id, institution_id,
+                                                    institution_name, name, holder, continues_json,
+                                                    suspended_json, source, from_world, updated_world)
+                       VALUES(:instance_id, :timeline_id, :office_id, :institution_id, :institution_name,
+                              :name, :holder, :continues_json, :suspended_json, :source, :from_world,
+                              :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, office_id) DO UPDATE SET
+                         holder=:holder, source=:source, from_world=:from_world,
+                         updated_world=:updated_world""",
+                    row,
+                )
+            for item in customs:
+                row = _custom_payload(item)
+                self._conn.execute(
+                    """INSERT INTO custom_state(instance_id, timeline_id, custom_id, name, applies_to, form,
+                                               forms_json, basis, source, from_world, updated_world)
+                       VALUES(:instance_id, :timeline_id, :custom_id, :name, :applies_to, :form,
+                              :forms_json, :basis, :source, :from_world, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, custom_id) DO UPDATE SET
+                         form=:form, source=:source, from_world=:from_world, updated_world=:updated_world""",
+                    row,
+                )
             for item in clear_effects:
                 effect_id, instance_id_ = item if isinstance(item, tuple) else (item, None)
                 self._conn.execute(
@@ -1776,6 +1870,20 @@ class Store:
             "environment": rows(
                 """SELECT * FROM environment_state WHERE instance_id=? AND timeline_id=? AND updated_world<=?
                    ORDER BY type_id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "institution": rows(
+                """SELECT * FROM institution_state WHERE instance_id=? AND timeline_id=? AND updated_world<=?
+                   ORDER BY office_id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "customs": rows(
+                """SELECT * FROM custom_state WHERE instance_id=? AND timeline_id=? AND updated_world<=?
+                   ORDER BY custom_id""",
                 instance_id,
                 timeline_id,
                 watermark,
@@ -1877,6 +1985,26 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, type_id) DO NOTHING""",
                     row,
                 )
+            for row in payload.get("institution") or []:
+                self._conn.execute(
+                    """INSERT INTO institution_state(instance_id, timeline_id, office_id, institution_id,
+                                                    institution_name, name, holder, continues_json,
+                                                    suspended_json, source, from_world, updated_world)
+                       VALUES(:instance_id, :timeline_id, :office_id, :institution_id, :institution_name,
+                              :name, :holder, :continues_json, :suspended_json, :source, :from_world,
+                              :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, office_id) DO NOTHING""",
+                    row,
+                )
+            for row in payload.get("customs") or []:
+                self._conn.execute(
+                    """INSERT INTO custom_state(instance_id, timeline_id, custom_id, name, applies_to, form,
+                                               forms_json, basis, source, from_world, updated_world)
+                       VALUES(:instance_id, :timeline_id, :custom_id, :name, :applies_to, :form,
+                              :forms_json, :basis, :source, :from_world, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, custom_id) DO NOTHING""",
+                    row,
+                )
             for row in payload.get("memories") or []:
                 self._conn.execute(
                     """INSERT INTO memory(id, instance_id, timeline_id, character_id, text, kind, sources,
@@ -1955,6 +2083,49 @@ class Store:
             (instance_id, timeline_id),
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
+
+    def institution_put(self, row: dict[str, Any]) -> None:
+        payload = _office_payload(row)
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO institution_state(instance_id, timeline_id, office_id, institution_id,
+                                                institution_name, name, holder, continues_json,
+                                                suspended_json, source, from_world, updated_world)
+                   VALUES(:instance_id, :timeline_id, :office_id, :institution_id, :institution_name,
+                          :name, :holder, :continues_json, :suspended_json, :source, :from_world,
+                          :updated_world)
+                   ON CONFLICT(instance_id, timeline_id, office_id) DO UPDATE SET
+                     holder=:holder, source=:source, from_world=:from_world,
+                     updated_world=:updated_world""",
+                payload,
+            )
+
+    def institution_list(self, instance_id: str, timeline_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM institution_state WHERE instance_id=? AND timeline_id=? ORDER BY office_id",
+            (instance_id, timeline_id),
+        ).fetchall()
+        return [_institution_row(r) for r in rows]
+
+    def custom_put(self, row: dict[str, Any]) -> None:
+        payload = _custom_payload(row)
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO custom_state(instance_id, timeline_id, custom_id, name, applies_to, form,
+                                           forms_json, basis, source, from_world, updated_world)
+                   VALUES(:instance_id, :timeline_id, :custom_id, :name, :applies_to, :form,
+                          :forms_json, :basis, :source, :from_world, :updated_world)
+                   ON CONFLICT(instance_id, timeline_id, custom_id) DO UPDATE SET
+                     form=:form, source=:source, from_world=:from_world, updated_world=:updated_world""",
+                payload,
+            )
+
+    def custom_list(self, instance_id: str, timeline_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM custom_state WHERE instance_id=? AND timeline_id=? ORDER BY custom_id",
+            (instance_id, timeline_id),
+        ).fetchall()
+        return [_custom_row(r) for r in rows]
 
     # ---------- 表述与展开所需的存储 ----------
 

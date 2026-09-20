@@ -279,6 +279,11 @@ def test_declared_institutions_and_customs_must_be_explicable() -> None:
     package = sample_package()
     package["world"]["institutions"] = []
     package["world"]["customs"] = []
+    # 未声明制度 / 惯例时，引用它们的制度类效果一并去掉（效果不能指向没声明的对象）
+    effects = package["events"]["families"][0]["templates"][0]["effects"]
+    package["events"]["families"][0]["templates"][0]["effects"] = [
+        item for item in effects if item.get("kind") != "institution_state"
+    ]
     assert validate_package(package) == [], "未声明即不适用，不因缺少制度拒绝合法题材"
 
 
