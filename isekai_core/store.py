@@ -614,6 +614,139 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
 
+    # ---------- 整库备份 / 恢复（DESKTOP_SPEC §3.3） ----------
+
+    def backup_create(self, target: str | Path, *, note: str = "") -> dict[str, Any]:
+        """一致快照：用 SQLite 在线备份 API 落一份副本，再抹掉明文绑定令牌。
+
+        不复制文件——核心在跑，直接拷文件会带到半截 WAL。备份不含 API Key（它在配置里、不在库内）
+        与可重放的连接令牌（副本里清空并抬版本，恢复后必须重新握手）。
+        """
+        path = Path(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        dest = sqlite3.connect(str(path))
+        try:
+            with self._lock:
+                self._conn.backup(dest)
+            dest.execute("UPDATE thread SET binding_token='', binding_version=binding_version+1")
+            dest.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('backup_at', ?)",
+                (str(time.time()),),
+            )
+            if note:
+                dest.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('backup_note', ?)", (note,))
+            dest.commit()
+            check = dest.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            dest.close()
+        ok = bool(check) and str(check[0]) == "ok"
+        return {
+            "file": str(path),
+            "bytes": path.stat().st_size if path.exists() else 0,
+            "created_at": time.time(),
+            "ok": ok,
+        }
+
+    def backup_check(self, source: str | Path) -> tuple[bool, str]:
+        """暂存库校验：能打开、完整、有受管元数据。恢复前必须过这一关。"""
+        path = Path(source)
+        if not path.exists():
+            return False, "备份文件不存在"
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            return False, f"打不开：{exc}"
+        try:
+            # 不是数据库的文件在第一条查询上才报错：整段都要接住
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+            if not row or str(row[0]) != "ok":
+                return False, "完整性检查未通过"
+            tables = {
+                str(item[0])
+                for item in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            if not {"meta", "instance", "timeline"} <= tables:
+                return False, "不像本项目的受管数据库（缺关键表）"
+            version_row = conn.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
+            version = str(version_row[0]) if version_row else ""
+            if version and version != str(SCHEMA_VERSION):
+                return False, f"模式版本不符（备份 {version}，本端 {SCHEMA_VERSION}）"
+            return True, ""
+        except sqlite3.Error as exc:
+            return False, f"不是可用的数据库：{exc}"
+        finally:
+            conn.close()
+
+    def backup_restore(self, source: str | Path, *, safety: str | Path | None = "auto") -> dict[str, Any]:
+        """整库恢复：先保留现库副本，再把暂存库原子切换进来，然后全线冻结 + 令牌失效。
+
+        恢复不是实例导入——它替换整套受管数据（草稿、实例登记、控制记录都按备份来）。
+        """
+        ok, reason = self.backup_check(source)
+        if not ok:
+            raise ValueError(f"备份不可用：{reason}")
+        if safety == "auto":
+            safety = self.backup_dir_default() / "isekai-restore-safety.db"
+        kept = self.backup_create(safety, note="restore-before") if safety else None
+        src = sqlite3.connect(str(source))
+        try:
+            with self._lock, self._conn:
+                src.backup(self._conn)
+                # 恢复后：所有线先冻结（不自动补算旧间隔）、世代提升（在途任务一律作废）、
+                # 明文令牌与待生效控制命令失效，必须重新握手与明确激活。
+                self._conn.execute("UPDATE timeline SET state='frozen'")
+                self._conn.execute("UPDATE timeline_clock SET generation = generation + 1")
+                self._conn.execute("DELETE FROM rate_command")
+                self._conn.execute("UPDATE thread SET binding_token='', binding_version=binding_version+1")
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('restored_at', ?)",
+                    (str(time.time()),),
+                )
+        finally:
+            src.close()
+        lines = self._conn.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
+        return {"restored": True, "timelines": int(lines), "safety": (kept or {}).get("file", "")}
+
+    def backup_list(self, directory: str | Path) -> list[dict[str, Any]]:
+        """只给时间、大小与完整性——不做内容浏览。"""
+        folder = Path(directory)
+        if not folder.exists():
+            return []
+        out: list[dict[str, Any]] = []
+        for path in sorted(folder.glob("isekai-*.db"), key=lambda item: item.stat().st_mtime, reverse=True):
+            row = self._conn.execute("SELECT 1").fetchone()  # 保持同连接语义，避免误用
+            _ = row
+            ok, reason = self.backup_check(path)
+            out.append(
+                {
+                    "file": str(path),
+                    "name": path.name,
+                    "bytes": path.stat().st_size,
+                    "mtime": path.stat().st_mtime,
+                    "ok": ok,
+                    "reason": reason,
+                }
+            )
+        return out
+
+    def backup_prune(self, directory: str | Path, *, keep: int) -> list[str]:
+        """轮转：只删最旧的、且不删当前这一份；删除失败不影响新备份的可用性。"""
+        folder = Path(directory)
+        if not folder.exists() or keep <= 0:
+            return []
+        files = sorted(folder.glob("isekai-*.db"), key=lambda item: item.stat().st_mtime, reverse=True)
+        removed: list[str] = []
+        for path in files[keep:]:
+            try:
+                path.unlink()
+                removed.append(str(path))
+            except OSError:
+                continue
+        return removed
+
+    def backup_dir_default(self) -> Path:
+        return Path(self.path).parent / "backups"
+
     # ---------- 生命周期 ----------
 
     def _migrate_memory_tables(self) -> None:

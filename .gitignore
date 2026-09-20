@@ -32,3 +32,4 @@ desktop/src-tauri/gen/
 
 # 一次性补丁脚本
 _patch_*.py
+_fix_*.py

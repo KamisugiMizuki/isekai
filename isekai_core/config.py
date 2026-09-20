@@ -109,6 +109,15 @@ class RuntimeConfig:
 
 
 @dataclass
+class BackupConfig:
+    """备份：目录、间隔、保留数（DESKTOP_SPEC §三 设置行）。"""
+
+    dir: str = "backups"          # 相对数据根
+    interval_hours: int = 24      # 到期检查间隔；0 = 只在显式退出前补做
+    keep: int = 7                 # 保留份数
+
+
+@dataclass
 class Config:
     paths: Paths
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -118,6 +127,7 @@ class Config:
     max_parts: int = DEFAULT_MAX_PARTS
     context_history_max: int = 20
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    backup: BackupConfig = field(default_factory=BackupConfig)
     #: 阶段 0 占位会话三元组与提示词；阶段 1 起被真实实例 / 角色卡取代
     placeholder: dict[str, str] = field(
         default_factory=lambda: {
@@ -129,20 +139,16 @@ class Config:
     )
 
 
-def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
-    """运行层参数：只读 config.yaml 的 `runtime` 段。
-
-    按 dataclass 字段通用映射——新增运行层参数只要加字段就会生效，不用在这里再抄一遍
-    （逐字段手抄漏过头：memory_* / embedding_* / autocommit_* 曾被静默滤掉）。
-    """
-    section = _section(raw, "runtime")
-    base = RuntimeConfig()
+def _mapped(model: Any, raw: dict[str, Any], section: str) -> Any:
+    """按 dataclass 字段通用映射一个配置段——新字段只要同名就生效。"""
     values: dict[str, Any] = {}
-    for field_info in dataclasses.fields(RuntimeConfig):
+    section_raw = _section(raw, section)
+    base = model()
+    for field_info in dataclasses.fields(model):
         name = field_info.name
-        if name not in section:
+        if name not in section_raw:
             continue
-        raw_value = section[name]
+        raw_value = section_raw[name]
         default = getattr(base, name)
         try:
             if isinstance(default, bool):
@@ -155,7 +161,14 @@ def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
                 values[name] = str(raw_value or "")
         except (TypeError, ValueError):
             continue  # 坏值退回默认，不让配置挡住启动
-    return RuntimeConfig(**values)
+    return model(**values)
+
+
+def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
+    """运行层参数：只读 config.yaml 的 `runtime` 段（通用映射，新字段自动生效）。"""
+    return _mapped(RuntimeConfig, raw, "runtime")
+
+
 def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
     value = raw.get(key)
     return value if isinstance(value, dict) else {}
@@ -245,6 +258,7 @@ def load_config(root: str | os.PathLike[str] | None = None) -> Config:
         max_parts=int(core_raw.get("max_parts") or DEFAULT_MAX_PARTS),
         context_history_max=int(core_raw.get("context_history_max") or 20),
         runtime=_runtime_config(raw),
+        backup=_mapped(BackupConfig, raw, "backup"),
     )
 
     placeholder = _section(raw, "placeholder")

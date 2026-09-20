@@ -78,6 +78,9 @@ SYNC_OPS = frozenset(
         "instance.export",
         "instance.import",
         "instance.setting",
+        "backup.create",
+        "backup.restore",
+        "backup.list",
     }
 )
 ASYNC_OPS = frozenset(
@@ -444,6 +447,22 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 "timelines": store.timeline_list(row["id"]),
                 "commits": store.commit_list(row["id"]),
             }
+        if op == "backup.create":
+            folder = _backup_folder(cfg, store)
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+            result = store.backup_create(folder / f"isekai-{stamp}.db", note=str(args.get("note") or ""))
+            if result["ok"]:
+                store.backup_prune(folder, keep=int(cfg.backup.keep))
+            return {"backup": result}
+        if op == "backup.restore":
+            folder = _backup_folder(cfg, store)
+            result = store.backup_restore(
+                resolve_path(cfg, args.get("path")), safety=folder / "isekai-restore-safety.db"
+            )
+            return {"restore": result}
+        if op == "backup.list":
+            return {"backups": store.backup_list(_backup_folder(cfg, store)),
+                    "dir": str(_backup_folder(cfg, store))}
         if op == "instance.setting":
             return {"setting": get_setting(store, str(args.get("id") or ""))}
         if op == "instance.rename":
@@ -847,3 +866,12 @@ async def dispatch_async(
 
 def describe_ops() -> dict[str, Any]:
     return {"sync": sorted(SYNC_OPS), "async_": sorted(ASYNC_OPS)}
+
+
+def _backup_folder(cfg: Any, store: Any) -> Path:
+    """备份目录：配置里给相对路径就挂在数据根下。"""
+    raw = str(getattr(getattr(cfg, "backup", None), "dir", "") or "backups")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(store.path).parent / path
+    return path
