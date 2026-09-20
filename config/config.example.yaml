@@ -25,6 +25,7 @@ runtime:
   max_active_timelines: 4    # 同时激活的时间线数量上限
   catch_up_batches: 8        # 单次推进批数上限（每批推进一个世界日）
   catch_up_lag_seconds: 172800  # 滞后超过 2 世界日即记为「追赶受限」并如实上报
+  render_calls_per_day: 20   # 事件表述 / 史料展开的现实日调用上限（超出即退回模板，不重复调用）
 
 # 阶段 0 占位会话：世界与角色尚未接入，阶段 1 起被真实实例 / 角色卡取代
 placeholder:

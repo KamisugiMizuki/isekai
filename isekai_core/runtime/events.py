@@ -418,3 +418,77 @@ def dump_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def as_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+# ---------- 生死事件（§四：寿终由寿命模型与世界时刻推出，单独记账） ----------
+
+
+def death_moment(card: dict[str, Any], package: dict[str, Any], calendar: Any) -> int | None:
+    """角色的寿终世界时刻：卡片固化的死亡优先，否则按种族寿命上限与出生时刻推出。
+
+    种族声明 `mode`（long / unbounded）时不推寿终——不能替设定发明死亡。
+    """
+    identity = card.get("identity") if isinstance(card.get("identity"), dict) else {}
+    fixed = identity.get("died")
+    if isinstance(fixed, int):
+        return int(fixed)
+    born = identity.get("born")
+    if not isinstance(born, int):
+        return None
+    race_id = identity.get("race_id")
+    races = {str(item.get("id")): item for item in package.get("races") or [] if isinstance(item, dict)}
+    race = races.get(str(race_id))
+    if race is None:
+        return None
+    lifespan = race.get("lifespan") if isinstance(race.get("lifespan"), dict) else {}
+    if lifespan.get("mode") is not None:
+        return None
+    max_years = lifespan.get("max_years")
+    if not isinstance(max_years, int) or max_years <= 0:
+        return None
+    return int(born) + int(max_years) * int(calendar.year_seconds)
+
+
+def is_dead(instance_id: str, timeline_id: str, character_id: str, rows: list[dict[str, Any]]) -> bool:
+    """该角色是否已有身故记录（按事件模板内的角色标识判定，不另立字段）。"""
+    marker = f"death:{character_id}"
+    return any(
+        str(item.get("template")) == marker and int(item.get("world_seconds") or 0) > 0 for item in rows
+    )
+
+
+def death_event(
+    card: dict[str, Any],
+    *,
+    instance_id: str,
+    timeline_id: str,
+    world_seconds: int,
+    calendar: Any,
+    seed: str,
+) -> dict[str, Any]:
+    """身故事件：单独记账（不占每日随机密度），可产生死讯说法。"""
+    character_id = str((card.get("meta") or {}).get("card_id") or "")
+    identity = card.get("identity") if isinstance(card.get("identity"), dict) else {}
+    born = int(identity.get("born") or 0)
+    name = str(identity.get("name") or "某人")
+    age = max(0, (int(world_seconds) - born) // max(1, int(calendar.year_seconds)))
+    ident = f"ev-death-{stable_key(instance_id, timeline_id, character_id)[:10]}"
+    return {
+        "id": ident,
+        "instance_id": instance_id,
+        "timeline_id": timeline_id,
+        "world_seconds": int(world_seconds),
+        "seq": 0,
+        "kind": "character",
+        "family": "",
+        "template": f"death:{character_id}",
+        "source": "engine",
+        "summary": f"{name}身故，享年 {age}",
+        "detail": f"{name}身故，享年 {age}",
+        "text_source": "template",
+        "effects": "[]",
+        "share_value": 0,
+        "importance": 0.8,
+        "created_real": 0.0,
+        "_seed": seed,
+    }

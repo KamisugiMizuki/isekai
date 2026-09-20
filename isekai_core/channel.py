@@ -392,7 +392,11 @@ class CoreServer:
                         result = await self._thread_bind(dict(frame.get("args") or {}))
                     elif op in world_ops.ASYNC_OPS:
                         result = await world_ops.dispatch_async(
-                            self.cfg, self.service.llm, op, dict(frame.get("args") or {})
+                            self.cfg,
+                            self.service.llm,
+                            op,
+                            dict(frame.get("args") or {}),
+                            store=self.store,
                         )
                     else:
                         result = self._mgmt_call(op, dict(frame.get("args") or {}))

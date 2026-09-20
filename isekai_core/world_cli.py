@@ -56,6 +56,8 @@ OP_BY_COMMAND = {
     ("runtime", "advance"): "runtime.advance",
     ("runtime", "card-add"): "runtime.card.add",
     ("runtime", "backfill"): "runtime.backfill",
+    ("event", "render"): "event.render",
+    ("event", "expand"): "event.expand",
 }
 
 
@@ -95,6 +97,16 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             return {**args, "card_path": ns.file, **({"moment": int(ns.moment)} if ns.moment else {})}
         if cmd == "generate":
             return {**args, "brief": ns.brief or ""}
+    if group == "event":
+        args = {"instance_id": ns.id, "timeline_id": ns.timeline}
+        if cmd == "render":
+            args["event_id"] = ns.file
+        if cmd == "expand":
+            args["claim_id"] = ns.file
+            args["character_id"] = ns.card
+            if ns.note:
+                args["question"] = ns.note
+        return args
     if group == "runtime":
         args: dict[str, Any] = {"instance_id": ns.id, "timeline_id": ns.timeline}
         if cmd == "rate":
@@ -191,7 +203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--root", default=None, help="数据根目录")
     parser.add_argument("--endpoint", default=None, help="连接已有核心（默认自行拉起）")
     parser.add_argument("--mgmt", default=None, help="已有核心的管理凭据")
-    parser.add_argument("group", choices=["package", "card", "instance", "runtime"])
+    parser.add_argument("group", choices=["package", "card", "instance", "runtime", "event"])
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
     parser.add_argument("--name", default=None)
     parser.add_argument("--density", default=None)

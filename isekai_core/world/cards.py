@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from .package import new_package_id
+from .validate import EXPIRY_KINDS, SUPPORTED_EFFECTS, _all_ids
 
 DRIVERS = ("anchor", "event", "dialog", "time")
 CONFIDENCE_BANDS = {
@@ -60,6 +61,8 @@ def template_card(package: dict[str, Any], *, name: str = "未命名角色") -> 
         "comms": [{"mechanism_id": comms[0].get("id"), "note": ""}] if comms else [],
         "first_contact": {"stance": "", "intent": ""},
         "initial_units": [{"id": "iu-1", "semantic": "", "driver": "anchor", "confidence": 0.85, "basis": ""}],
+        # 打算（可选）：角色自己惦记着的事，附受支持的行动效果（WORLD_RUNTIME_SPEC §11.3）
+        "intents": [],
         "cognition": {"mode": "soft", "sources": ["self_experience", "user_contact"]},
         "life_template": {
             "sleep": True,
@@ -132,6 +135,7 @@ def validate_card(card: dict[str, Any], package: dict[str, Any], *, moment: int)
     errors.extend(_validate_knowledge(card, package, moment=moment))
     errors.extend(_validate_cognition(card))
     errors.extend(_validate_units(card))
+    errors.extend(_validate_intents(card, package, calendar))
     errors.extend(_validate_life(card, package, day=day))
     if not isinstance(card.get("first_contact"), dict):
         errors.append("first_contact: 缺少初见设定（姿态与意向）")
@@ -204,6 +208,50 @@ def _validate_cognition(card: dict[str, Any]) -> list[str]:
     for index, source in enumerate(sources):
         if source not in HARD_ALLOWED:
             errors.append(f"cognition.sources[{index}]: 硬约束不得开放 {source!r}（仅限自身经历 / 小环境 / 用户通讯）")
+    return errors
+
+
+def _validate_intents(card: dict[str, Any], package: dict[str, Any], calendar: dict[str, Any]) -> list[str]:
+    """打算：对象 / 依据 / 强度 / 目标时间窗 / 前置条件 / 受支持的行动效果（§11.3）。"""
+    intents = card.get("intents")
+    if intents is None:
+        return []
+    if not isinstance(intents, list):
+        return ["intents: 必须是列表"]
+    errors: list[str] = []
+    day = int(calendar.get("day_seconds") or 0)
+    known = _all_ids(package)
+    for index, item in enumerate(intents):
+        where = f"intents[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{where}: 条目必须是对象")
+            continue
+        if not _text(item.get("object")):
+            errors.append(f"{where}.object: 缺打算的对象")
+        if not _text(item.get("basis")):
+            errors.append(f"{where}.basis: 缺角色已知依据（打算必须有可知来源）")
+        strength = item.get("strength")
+        if not isinstance(strength, (int, float)) or not 0 <= float(strength) <= 1:
+            errors.append(f"{where}.strength: 需要 0..1 的意向强度")
+        window = item.get("window") if isinstance(item.get("window"), dict) else {}
+        start, end = window.get("from"), window.get("to")
+        if not isinstance(start, int) or not isinstance(end, int) or end <= start:
+            errors.append(f"{where}.window: 需要 from < to 的世界秒时间窗")
+        elif day and (start % day > day or end % day > day):
+            errors.append(f"{where}.window: 时间窗必须能按锁定历法解释")
+        for ref in item.get("preconditions") or []:
+            if str(ref) not in known:
+                errors.append(f"{where}.preconditions: 引用不存在的标识 {ref!r}")
+        effect = item.get("effect")
+        if not isinstance(effect, dict) or not _text(effect.get("kind")):
+            errors.append(f"{where}.effect: 打算必须挂一个受支持的行动效果（没有可执行效果就不能提交事件）")
+            continue
+        if str(effect.get("kind")) not in SUPPORTED_EFFECTS:
+            errors.append(f"{where}.effect.kind: 未支持的效果类型 {effect.get('kind')!r}")
+        if effect.get("target") is not None and str(effect.get("target")) not in known:
+            errors.append(f"{where}.effect.target: 指向未登记对象 {effect.get('target')!r}")
+        if str(effect.get("expiry")) not in EXPIRY_KINDS:
+            errors.append(f"{where}.effect.expiry: 必须是 {' / '.join(EXPIRY_KINDS)} 之一")
     return errors
 
 

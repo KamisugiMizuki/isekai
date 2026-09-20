@@ -214,6 +214,17 @@ def example_card(
             {"id": "iu-1", "semantic": "先量再说话", "driver": "anchor", "confidence": 0.9, "basis": "十年记水位尺养成的习惯"},
             {"id": "iu-2", "semantic": "对议会的说法留一半", "driver": "dialog", "confidence": 0.45, "basis": "父辈的告诫"},
         ],
+        "intents": [
+            {
+                "id": "in-1",
+                "object": "把今年春汛的通行牌发放延误记进抄存，等信报来对一遍",
+                "basis": "她自己经手的通行牌与信使交接记录",
+                "strength": 0.7,
+                "window": {"from": DAY * 1501, "to": DAY * 1510},
+                "preconditions": ["cf-1"],
+                "effect": {"kind": "public_notice", "target": "src-1", "expiry": "with_cause"},
+            }
+        ],
         "cognition": {"mode": "soft", "sources": ["self_experience", "small_env", "user_contact"]},
         "life_template": {
             "sleep": True,

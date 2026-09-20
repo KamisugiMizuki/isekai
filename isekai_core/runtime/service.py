@@ -14,7 +14,7 @@ from typing import Any
 
 from ..log import get_logger
 from ..store import Store
-from . import cognition, events, life, personality
+from . import cognition, events, intents, life, personality
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
 
@@ -355,6 +355,12 @@ class RuntimeService:
             world_rows = self._world_event_rows(
                 instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
             )
+            death_rows = self._death_rows(
+                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
+            )
+            intent_rows = self._revise_intents(
+                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
+            )
             spread = self._propagate_and_clear(
                 instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
             )
@@ -366,11 +372,12 @@ class RuntimeService:
                 limited=limited,
                 plans=plans,
                 units=units,
-                experiences=experiences,
-                events=world_rows['events'],
-                claims=world_rows['claims'],
-                knowledge=world_rows['knowledge'] + spread['knowledge'],
-                effects=world_rows['effects'],
+                experiences=experiences + intent_rows['experiences'],
+                events=world_rows['events'] + intent_rows['events'] + death_rows['events'],
+                claims=world_rows['claims'] + death_rows['claims'],
+                knowledge=world_rows['knowledge'] + death_rows['knowledge'] + spread['knowledge'],
+                effects=world_rows['effects'] + intent_rows['effects'],
+                intents=intent_rows['intents'],
                 clear_effects=spread['clear_effects'],
             )
             if not committed:
@@ -408,10 +415,20 @@ class RuntimeService:
         units: list[dict[str, Any]] = []
         experiences: list[dict[str, Any]] = []
         day_seconds = calendar.day_seconds
+        dead = {
+            str((card.get("meta") or {}).get("card_id"))
+            for card in cards
+            if events.is_dead(
+                instance_id,
+                timeline_id,
+                str((card.get("meta") or {}).get("card_id") or ""),
+                self.store.event_window(instance_id, timeline_id, until=to_world, limit=400),
+            )
+        }
         for card in cards:
             character_id = str((card.get("meta") or {}).get("card_id") or "")
-            if not character_id:
-                continue
+            if not character_id or character_id in dead:
+                continue  # 已身故的角色不再产生计划与经历
             # 当前日与下一日的计划（世界日界由历法决定，不由入睡重新定义）
             for day_index in {calendar.day_index(from_world), calendar.day_index(to_world)}:
                 if self.store.plan_get(instance_id, timeline_id, character_id, day_index) is None:
@@ -461,6 +478,117 @@ class RuntimeService:
                         item["source_ref"] = constraints[0]["id"] if constraints else None
                 experiences.extend(items)
         return plans, units, experiences
+
+    def _revise_intents(
+        self,
+        instance: dict[str, Any],
+        instance_id: str,
+        timeline_id: str,
+        cards: list[dict[str, Any]],
+        calendar: Calendar,
+        *,
+        from_world: int,
+        to_world: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """打算重议与受支持行动（§11.3）：条件不足就等，窗口过了先延期后放弃，条件满足才提交事件。"""
+        rows: dict[str, list[dict[str, Any]]] = {"intents": [], "events": [], "effects": [], "experiences": []}
+        known_events = self.store.event_ids(instance_id, timeline_id)
+        active_effects = self.store.effect_window(instance_id, timeline_id, until=to_world)
+        for card in cards:
+            character_id = str((card.get("meta") or {}).get("card_id") or "")
+            if not character_id:
+                continue
+            dead = events.is_dead(
+                instance_id,
+                timeline_id,
+                character_id,
+                self.store.event_window(instance_id, timeline_id, until=to_world, limit=400),
+            )
+            for row in self.store.intent_list(instance_id, timeline_id, character_id):
+                if str(row["stage"]) in ("done", "abandoned"):
+                    continue
+                if dead:
+                    rows["intents"].append(
+                        {**row, "stage": "abandoned", "note": "她已不在了", "updated_world": int(to_world)}
+                    )
+                    continue
+                decision = intents.decide(
+                    row,
+                    world_seconds=to_world,
+                    events_present=known_events,
+                    active_effects=active_effects,
+                )
+                if decision == "keep":
+                    continue
+                updated = {**row, "updated_world": int(to_world)}
+                if decision == "wait":
+                    _, effect = intents.parse(row)
+                    blocked = intents.blockers(row, active_effects)
+                    reasons = []
+                    unmet = events.unmet_preconditions(
+                        intents.parse(row)[0], events=known_events, effects=set()
+                    )
+                    if unmet:
+                        reasons.append(f"条件未到：{', '.join(unmet)}")
+                    if blocked:
+                        reasons.append(f"受阻于：{', '.join(str(item['kind']) for item in blocked)}")
+                    note = "；".join(reasons) or str(row.get("note") or "")
+                    if str(row["stage"]) != "waiting" or note != str(row.get("note") or ""):
+                        updated["stage"] = "waiting"
+                        updated["note"] = note
+                        rows["intents"].append(updated)
+                    continue
+                if decision == "defer":
+                    updated["stage"] = "deferred"
+                    updated["note"] = determined_note = "目标时间窗已过且条件未满足：延期"
+                    rows["intents"].append(updated)
+                    _ = determined_note
+                    continue
+                if decision == "abandon":
+                    updated["stage"] = "abandoned"
+                    updated["note"] = "延期后仍未满足条件：放弃"
+                    rows["intents"].append(updated)
+                    continue
+                if decision == "act":
+                    _, effect = intents.parse(row)
+                    action = intents.action_event(
+                        row,
+                        instance_id=instance_id,
+                        timeline_id=timeline_id,
+                        world_seconds=int(to_world),
+                        calendar=calendar,
+                    )
+                    action.pop("_calendar", None)
+                    rows["events"].append(action)
+                    known_events.add(str(action["id"]))
+                    if effect:
+                        rows["effects"].extend(
+                            events.effect_rows(
+                                {"effects": [effect]},
+                                instance_id=instance_id,
+                                timeline_id=timeline_id,
+                                event_ident=str(action["id"]),
+                                world_seconds=int(to_world),
+                                family="",
+                            )
+                        )
+                    rows["experiences"].append(
+                        {
+                            "id": f"xp-act-{character_id}-{row['id']}",
+                            "instance_id": instance_id,
+                            "timeline_id": timeline_id,
+                            "character_id": character_id,
+                            "world_seconds": int(to_world),
+                            "kind": "action",
+                            "summary": f"自己动手了：{row.get('object')}",
+                            "source_ref": str(row["id"]),
+                            "confidence": "experienced",
+                        }
+                    )
+                    updated["stage"] = "done"
+                    updated["note"] = "已按受支持的行动效果提交事件"
+                    rows["intents"].append(updated)
+        return rows
 
     def _world_event_rows(
         self,
@@ -543,6 +671,58 @@ class RuntimeService:
                 out["knowledge"].extend(events.grants(row, claims, card, world_seconds=at, calendar=calendar))
         return out
 
+    def _death_rows(
+        self,
+        instance: dict[str, Any],
+        instance_id: str,
+        timeline_id: str,
+        cards: list[dict[str, Any]],
+        calendar: Calendar,
+        *,
+        from_world: int,
+        to_world: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """寿终事件（§四）：由寿命模型与世界时刻推出，单独记账、可产生死讯说法。"""
+        out: dict[str, list[dict[str, Any]]] = {"events": [], "claims": [], "knowledge": []}
+        package = self.setting(instance)["world_package"]
+        known = self.store.event_window(instance_id, timeline_id, until=to_world, limit=400)
+        for card in cards:
+            character_id = str((card.get("meta") or {}).get("card_id") or "")
+            if not character_id or events.is_dead(instance_id, timeline_id, character_id, known):
+                continue
+            moment = events.death_moment(card, package, calendar)
+            if moment is None or not (from_world < moment <= to_world):
+                continue
+            row = events.death_event(
+                card,
+                instance_id=instance_id,
+                timeline_id=timeline_id,
+                world_seconds=moment,
+                calendar=calendar,
+                seed=self.seed_of(instance),
+            )
+            row.pop("_seed", None)
+            out["events"].append(row)
+            claims = events.dump_rows(
+                events.claim_rows(
+                    {"summary": row["summary"], "effects": []},
+                    package=package,
+                    instance_id=instance_id,
+                    timeline_id=timeline_id,
+                    event_ident=str(row["id"]),
+                    world_seconds=moment,
+                    calendar=calendar,
+                )
+            )
+            out["claims"].extend(claims)
+            for other in cards:
+                if str((other.get("meta") or {}).get("card_id")) == character_id:
+                    continue  # 死者不需要自己的死讯
+                out["knowledge"].extend(
+                    events.grants(row, claims, other, world_seconds=moment, calendar=calendar)
+                )
+        return out
+
     def _propagate_and_clear(
         self,
         instance: dict[str, Any],
@@ -621,6 +801,7 @@ class RuntimeService:
         instance, _ = self._rows(instance_id, timeline_id)
         calendar = self.calendar(instance)
         units = plans = 0
+        intents_created = 0
         for card in self.cards(instance, timeline_id=timeline_id, world_seconds=world_seconds):
             character_id = str((card.get("meta") or {}).get("card_id") or "")
             if not character_id:
@@ -631,6 +812,12 @@ class RuntimeService:
                 ):
                     self.store.unit_put(row)
                     units += 1
+            for row in intents.initial_rows(
+                card, instance_id=instance_id, timeline_id=timeline_id, world_seconds=world_seconds
+            ):
+                if not self.store.intent_list(instance_id, timeline_id, character_id):
+                    self.store.intent_put(row)
+                    intents_created += 1
             day_index = calendar.day_index(world_seconds)
             if self.store.plan_get(instance_id, timeline_id, character_id, day_index) is None:
                 self.store.plan_put(
@@ -691,6 +878,11 @@ class RuntimeService:
             "experiences": experiences,
             "knowledge": knowledge,
             "effects": effects,
+            "intents": [
+                row
+                for row in self.store.intent_list(instance_id, timeline_id, character_id)
+                if str(row["stage"]) in ("adopted", "waiting", "deferred")
+            ],
         }
 
     def backfill(self, instance_id: str, timeline_id: str) -> int:
@@ -974,5 +1166,6 @@ class RuntimeService:
             units=snapshot["units"],
             experiences=snapshot["experiences"],
             knowledge=snapshot["knowledge"],
+            intents=snapshot["intents"],
         )
         return cognition.render_prompt(context)

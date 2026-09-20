@@ -245,6 +245,7 @@ def _restore_runtime_state(
             "claims": _remap_rows(payload.get("claims"), instance_id, new_id),
             "knowledge": _remap_rows(payload.get("knowledge"), instance_id, new_id),
             "effects": _remap_rows(payload.get("effects"), instance_id, new_id),
+            "intents": _remap_rows(payload.get("intents"), instance_id, new_id),
         }
         loaded += store.runtime_load(instance_id, new_id, rows)
         store.clock_put(

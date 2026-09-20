@@ -192,6 +192,13 @@ def render_prompt(context: dict[str, Any]) -> str:
         lines.append(f"与联络者初见的姿态：{first.get('stance', '')}；意向：{first.get('intent', '')}")
     if context.get("voice"):
         lines.append("表达倾向：" + "；".join(context["voice"][:6]))
+    aims = context.get("intents") or []
+    if aims:
+        lines.append("她自己惦记着的事（她自己的打算，进度只有她知道；问到了可以按这个说，不必主动播报）：")
+        for item in aims[:4]:
+            stage = {"adopted": "在办", "waiting": "等条件", "deferred": "暂且搁着"}.get(item["stage"], item["stage"])
+            detail = f"（{item['note']}）" if item.get("note") else ""
+            lines.append(f"- {item['object']}——{stage}{detail}")
     for item in context.get("comms") or []:
         lines.append(f"联络方式：{item.get('name', '')}（限制：{item.get('limits', '')}）")
     knowledge = context.get("knowledge") or []
@@ -219,6 +226,7 @@ def play_context(
     topic: str | None = None,
     current_activity: str = "",
     knowledge: list[dict[str, Any]] | None = None,
+    intents: list[dict[str, Any]] | None = None,
     units: list[dict[str, Any]] | None = None,
     experiences: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -260,6 +268,14 @@ def play_context(
         "voice": voice,
         "comms": comms,
         "topic": topic or "",
+        "intents": [
+            {
+                "object": str(item.get("object") or ""),
+                "stage": str(item.get("stage") or ""),
+                "note": str(item.get("note") or ""),
+            }
+            for item in intents or []
+        ],
         "knowledge": knowledge_slice(
             package,
             card,

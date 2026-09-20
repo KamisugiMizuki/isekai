@@ -88,6 +88,7 @@ class RuntimeConfig:
     max_active_timelines: int = 4       # 同时激活的时间线数量上限
     catch_up_batches: int = 8           # 单次推进批数上限（每批一个世界日）
     catch_up_lag_seconds: int = 172800  # 滞后超过 2 世界日即记为「追赶受限」
+    render_calls_per_day: int = 20      # 事件表述 / 展开的现实日调用上限（§2.8 单任务预算）
 
 
 @dataclass
@@ -123,6 +124,11 @@ def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
             int(section["catch_up_lag_seconds"])
             if "catch_up_lag_seconds" in section
             else base.catch_up_lag_seconds
+        ),
+        render_calls_per_day=(
+            int(section["render_calls_per_day"])
+            if "render_calls_per_day" in section
+            else base.render_calls_per_day
         ),
     )
 

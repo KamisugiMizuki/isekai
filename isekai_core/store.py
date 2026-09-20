@@ -160,6 +160,17 @@ CREATE TABLE IF NOT EXISTS timeline_clock(
 
 -- ---------- 事件引擎（阶段 3）：事件 / 说法 / 获知 / 效果状态 ----------
 
+-- 外部调用账本（WORLD_RUNTIME_SPEC §2.8）：只记次数与量级，不记正文 / prompt / 密钥
+CREATE TABLE IF NOT EXISTS call_ledger(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  task TEXT NOT NULL,
+  bucket INTEGER NOT NULL,               -- 现实日窗口（UTC 日序）
+  calls INTEGER NOT NULL DEFAULT 0,
+  tokens INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, task, bucket)
+);
+
 CREATE TABLE IF NOT EXISTS event(
   instance_id TEXT NOT NULL,
   timeline_id TEXT NOT NULL,
@@ -191,6 +202,7 @@ CREATE TABLE IF NOT EXISTS claim(
   audience TEXT NOT NULL DEFAULT '公开',
   earliest_world INTEGER NOT NULL,       -- 最早可传播时刻
   credibility TEXT NOT NULL DEFAULT 'recorded',
+  derived_from TEXT,                     -- 派生记录：展开自哪条说法（不原地改写原条目）
   PRIMARY KEY(instance_id, timeline_id, id)
 );
 CREATE INDEX IF NOT EXISTS ix_claim_event ON claim(instance_id, timeline_id, event_id);
@@ -209,6 +221,27 @@ CREATE TABLE IF NOT EXISTS knowledge(
   PRIMARY KEY(instance_id, timeline_id, character_id, id)
 );
 CREATE INDEX IF NOT EXISTS ix_knowledge_character ON knowledge(instance_id, timeline_id, character_id, world_seconds);
+
+-- 角色打算（WORLD_RUNTIME_SPEC §11.3）：角色状态，不是世界事实
+CREATE TABLE IF NOT EXISTS intent(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  object TEXT NOT NULL,
+  basis TEXT NOT NULL DEFAULT '',
+  strength REAL NOT NULL DEFAULT 0.5,
+  window_from INTEGER NOT NULL DEFAULT 0,
+  window_to INTEGER NOT NULL DEFAULT 0,
+  preconditions TEXT NOT NULL DEFAULT '[]',
+  effect TEXT NOT NULL DEFAULT '{}',
+  stage TEXT NOT NULL DEFAULT 'adopted',   -- candidate|adopted|waiting|done|deferred|abandoned
+  note TEXT NOT NULL DEFAULT '',
+  source_world INTEGER NOT NULL DEFAULT 0,
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, character_id, id)
+);
+CREATE INDEX IF NOT EXISTS ix_intent_character ON intent(instance_id, timeline_id, character_id, stage);
 
 CREATE TABLE IF NOT EXISTS effect_state(
   instance_id TEXT NOT NULL,
@@ -371,6 +404,10 @@ class Store:
             if clock_columns and name not in clock_columns:
                 log.info("timeline_clock 增列 %s", name)
                 self._conn.execute(f"ALTER TABLE timeline_clock ADD COLUMN {name} {ddl}")
+        claim_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(claim)")}
+        if claim_columns and "derived_from" not in claim_columns:
+            log.info("claim 增列 derived_from")
+            self._conn.execute("ALTER TABLE claim ADD COLUMN derived_from TEXT")
         effect_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(effect_state)")}
         if effect_columns and "family" not in effect_columns:
             log.info("effect_state 增列 family")
@@ -886,6 +923,8 @@ class Store:
                 "claim",
                 "knowledge",
                 "effect_state",
+                "intent",
+                "call_ledger",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute("DELETE FROM commit_log WHERE instance_id=?", (instance_id,))
@@ -990,6 +1029,7 @@ class Store:
         claims: Iterable[dict[str, Any]] = (),
         knowledge: Iterable[dict[str, Any]] = (),
         effects: Iterable[dict[str, Any]] = (),
+        intents: Iterable[dict[str, Any]] = (),
         clear_effects: Iterable[Any] = (),
     ) -> bool:
         """把一批事实转移整体提交（§2.7：一批失败即整批回到批前水位）。
@@ -1069,6 +1109,20 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
                     row,
                 )
+            for row in intents:
+                self._conn.execute(
+                    """INSERT INTO intent(instance_id, timeline_id, character_id, id, object, basis, strength,
+                                          window_from, window_to, preconditions, effect, stage, note,
+                                          source_world, updated_world)
+                       VALUES(:instance_id, :timeline_id, :character_id, :id, :object, :basis, :strength,
+                              :window_from, :window_to, :preconditions, :effect, :stage, :note,
+                              :source_world, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, character_id, id) DO UPDATE SET
+                         object=:object, basis=:basis, strength=:strength, window_from=:window_from,
+                         window_to=:window_to, preconditions=:preconditions, effect=:effect,
+                         stage=:stage, note=:note, updated_world=:updated_world""",
+                    row,
+                )
             for item in clear_effects:
                 effect_id, instance_id_ = item if isinstance(item, tuple) else (item, None)
                 self._conn.execute(
@@ -1145,6 +1199,13 @@ class Store:
                 timeline_id,
                 watermark,
             ),
+            "intents": rows(
+                """SELECT * FROM intent WHERE instance_id=? AND timeline_id=? AND source_world<=?
+                   ORDER BY character_id, id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
         }
 
     def runtime_load(self, instance_id: str, timeline_id: str, payload: dict[str, Any]) -> int:
@@ -1217,6 +1278,17 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
                     row,
                 )
+            for row in payload.get("intents") or []:
+                self._conn.execute(
+                    """INSERT INTO intent(instance_id, timeline_id, character_id, id, object, basis, strength,
+                                          window_from, window_to, preconditions, effect, stage, note,
+                                          source_world, updated_world)
+                       VALUES(:instance_id, :timeline_id, :character_id, :id, :object, :basis, :strength,
+                              :window_from, :window_to, :preconditions, :effect, :stage, :note,
+                              :source_world, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, character_id, id) DO NOTHING""",
+                    row,
+                )
             for item in payload.get("experiences") or []:
                 self._conn.execute(
                     """INSERT OR IGNORE INTO experience(id, instance_id, timeline_id, character_id, world_seconds,
@@ -1236,8 +1308,125 @@ class Store:
                 "claims",
                 "knowledge",
                 "effects",
+                "intents",
             )
         )
+
+    # ---------- 表述与展开所需的存储 ----------
+
+    def event_get(self, instance_id: str, timeline_id: str, event_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM event WHERE instance_id=? AND timeline_id=? AND id=?",
+            (instance_id, timeline_id, event_id),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def event_render_save(
+        self, instance_id: str, timeline_id: str, event_id: str, *, detail: str, claims: dict[str, str]
+    ) -> None:
+        """固化表述（§3.2）：写后不重生成，读取 / 重启 / 换消费者都用它。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """UPDATE event SET detail=?, text_source='llm'
+                   WHERE instance_id=? AND timeline_id=? AND id=?""",
+                (detail, instance_id, timeline_id, event_id),
+            )
+            for source_id, text in claims.items():
+                self._conn.execute(
+                    """UPDATE claim SET text=? WHERE instance_id=? AND timeline_id=? AND event_id=?
+                       AND source_id=? AND derived_from IS NULL""",
+                    (text, instance_id, timeline_id, event_id, source_id),
+                )
+
+    def claim_derived(
+        self, instance_id: str, timeline_id: str, original_id: str
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT * FROM claim WHERE instance_id=? AND timeline_id=? AND derived_from=?
+               ORDER BY id LIMIT 1""",
+            (instance_id, timeline_id, original_id),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def claim_put(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO claim(instance_id, timeline_id, id, event_id, source_id, text,
+                                     audience, earliest_world, credibility, derived_from)
+                   VALUES(:instance_id, :timeline_id, :id, :event_id, :source_id, :text,
+                          :audience, :earliest_world, :credibility, :derived_from)
+                   ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
+                row,
+            )
+
+    def knowledge_holders(self, instance_id: str, timeline_id: str, target: str) -> list[str]:
+        """已经掌握该记载的角色（展开只能返回他们原本掌握范围内的内容，§3.4）。"""
+        rows = self._conn.execute(
+            """SELECT DISTINCT character_id FROM knowledge
+               WHERE instance_id=? AND timeline_id=? AND target=?""",
+            (instance_id, timeline_id, target),
+        ).fetchall()
+        return [str(row["character_id"]) for row in rows]
+
+    def call_ledger_add(
+        self, instance_id: str, timeline_id: str, task: str, *, bucket: int, calls: int = 1, tokens: int = 0
+    ) -> int:
+        """调用账本（§2.8）：按实例 / 线 / 任务 / 现实日窗口记次数与量级，不记正文。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO call_ledger(instance_id, timeline_id, task, bucket, calls, tokens)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(instance_id, timeline_id, task, bucket) DO UPDATE SET
+                     calls = calls + excluded.calls, tokens = tokens + excluded.tokens""",
+                (instance_id, timeline_id, task, int(bucket), int(calls), int(tokens)),
+            )
+            row = self._conn.execute(
+                """SELECT calls FROM call_ledger WHERE instance_id=? AND timeline_id=? AND task=? AND bucket=?""",
+                (instance_id, timeline_id, task, int(bucket)),
+            ).fetchone()
+        return int(row["calls"]) if row else 0
+
+    def call_ledger_get(self, instance_id: str, timeline_id: str, task: str, *, bucket: int) -> int:
+        row = self._conn.execute(
+            """SELECT calls FROM call_ledger WHERE instance_id=? AND timeline_id=? AND task=? AND bucket=?""",
+            (instance_id, timeline_id, task, int(bucket)),
+        ).fetchone()
+        return int(row["calls"]) if row else 0
+
+    # ---------- 角色打算 ----------
+
+    def intent_put(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO intent(instance_id, timeline_id, character_id, id, object, basis, strength,
+                                      window_from, window_to, preconditions, effect, stage, note,
+                                      source_world, updated_world)
+                   VALUES(:instance_id, :timeline_id, :character_id, :id, :object, :basis, :strength,
+                          :window_from, :window_to, :preconditions, :effect, :stage, :note,
+                          :source_world, :updated_world)
+                   ON CONFLICT(instance_id, timeline_id, character_id, id) DO UPDATE SET
+                     object=:object, basis=:basis, strength=:strength, window_from=:window_from,
+                     window_to=:window_to, preconditions=:preconditions, effect=:effect,
+                     stage=:stage, note=:note, updated_world=:updated_world""",
+                row,
+            )
+
+    def intent_list(
+        self, instance_id: str, timeline_id: str, character_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        if character_id is None:
+            rows = self._conn.execute(
+                """SELECT * FROM intent WHERE instance_id=? AND timeline_id=?
+                   ORDER BY character_id, id""",
+                (instance_id, timeline_id),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT * FROM intent WHERE instance_id=? AND timeline_id=? AND character_id=?
+                   ORDER BY id""",
+                (instance_id, timeline_id, character_id),
+            ).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
     # ---------- 事件 / 说法 / 获知 / 效果 ----------
 

@@ -70,6 +70,8 @@ SYNC_OPS = frozenset(
 )
 ASYNC_OPS = frozenset(
     {
+        "event.render",
+        "event.expand",
         "world.package.generate",
         "world.package.revise",
         "world.package.fill",
@@ -413,14 +415,139 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
     except OSError as exc:
         raise UmpError(Err.INTERNAL, f"文件操作失败：{type(exc).__name__}", retryable=False) from exc
     raise UmpError(Err.UNSUPPORTED_TYPE, f"未知管理操作 {op}", retryable=False)
+def _day_bucket(now_real: float) -> int:
+    """现实日窗口（UTC）：账本按它切片，不用世界时间（§2.8 按现实时间窗口记录）。"""
+    return int(now_real // 86400)
 
 
-async def dispatch_async(cfg: Config, llm: Any, op: str, args: dict[str, Any]) -> dict[str, Any]:
+async def _render_event(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
+    """把既定骨架表述成人话（§3.2）：校验不过有界重试，仍不过就退回模板，不改任何事实。"""
+    from ..runtime import render as render_mod
+
+    if store is None:
+        raise UmpError(Err.STATE_BLOCKED, "缺少存储上下文", retryable=False)
+    instance_id, timeline_id = str(args.get("instance_id") or ""), str(args.get("timeline_id") or "")
+    event_id = str(args.get("event_id") or "")
+    event = store.event_get(instance_id, timeline_id, event_id)
+    if event is None:
+        raise UmpError(Err.INVALID, f"没有该事件：{event_id}", retryable=False)
+    if str(event.get("text_source")) == "llm":
+        return {"event": event_id, "detail": event["detail"], "text_source": "llm", "calls": 0, "reused": True}
+    claims = [item for item in store.claim_list(instance_id, timeline_id, event_id=event_id)
+              if item.get("derived_from") is None]
+    bucket = _day_bucket(time.time())
+    used = store.call_ledger_get(instance_id, timeline_id, "event_render", bucket=bucket)
+    limit = int(cfg.runtime.render_calls_per_day)
+    if used >= limit:
+        return {
+            "event": event_id,
+            "detail": str(event.get("detail") or ""),
+            "text_source": "template",
+            "calls": 0,
+            "budget": {"paused": True, "calls": used, "limit": limit},
+        }
+    messages = render_mod.skeleton_prompt(event, claims)
+    detail, rendered_claims, calls = str(event.get("detail") or ""), {}, 0
+    for attempt in range(2):
+        calls += 1
+        text = await llm.chat(messages, temperature=0.4, timeout=60.0)
+        parsed = render_mod.parse_render(text, claims)
+        if parsed and render_mod.facts_preserved(parsed["detail"], str(event.get("summary") or "")):
+            detail, rendered_claims = parsed["detail"], parsed["claims"]
+            break
+    if not rendered_claims:
+        store.call_ledger_add(instance_id, timeline_id, "event_render", bucket=bucket, calls=calls)
+        return {
+            "event": event_id,
+            "detail": str(event.get("detail") or ""),
+            "text_source": "template",
+            "calls": calls,
+            "note": "表述未过校验，保留模板（不新增事实）",
+        }
+    store.event_render_save(instance_id, timeline_id, event_id, detail=detail, claims=rendered_claims)
+    total = store.call_ledger_add(instance_id, timeline_id, "event_render", bucket=bucket, calls=calls)
+    return {
+        "event": event_id,
+        "detail": detail,
+        "claims": rendered_claims,
+        "text_source": "llm",
+        "calls": calls,
+        "budget": {"paused": False, "calls": total, "limit": limit},
+    }
+
+
+async def _expand_claim(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
+    """惰性展开（§3.4）：只展开既定内容、产出派生记录、不假装读书经历。"""
+    from ..runtime import render as render_mod
+
+    if store is None:
+        raise UmpError(Err.STATE_BLOCKED, "缺少存储上下文", retryable=False)
+    instance_id, timeline_id = str(args.get("instance_id") or ""), str(args.get("timeline_id") or "")
+    claim_id, character_id = str(args.get("claim_id") or ""), str(args.get("character_id") or "")
+    question = str(args.get("question") or "这条记载还写了什么？")
+    rows = [item for item in store.claim_list(instance_id, timeline_id) if str(item["id"]) == claim_id]
+    if not rows:
+        raise UmpError(Err.INVALID, f"没有该记载：{claim_id}", retryable=False)
+    original = rows[0]
+    holders = store.knowledge_holders(instance_id, timeline_id, claim_id)
+    if character_id and character_id not in holders:
+        raise UmpError(Err.INVALID, "该角色没有这条记载，不能凭空展开（物化不等于获知）", retryable=False)
+    existing = store.claim_derived(instance_id, timeline_id, claim_id)
+    if existing is not None:
+        return {"claim": claim_id, "derived": existing["id"], "text": existing["text"], "calls": 0, "reused": True}
+    bucket = _day_bucket(time.time())
+    used = store.call_ledger_get(instance_id, timeline_id, "claim_expand", bucket=bucket)
+    limit = int(cfg.runtime.render_calls_per_day)
+    if used >= limit:
+        return {"claim": claim_id, "text": "", "calls": 0, "budget": {"paused": True, "calls": used, "limit": limit}}
+    text = await llm.chat(render_mod.expand_prompt(original, question=question), temperature=0.6, timeout=60.0)
+    total = store.call_ledger_add(instance_id, timeline_id, "claim_expand", bucket=bucket, calls=1)
+    if not render_mod.expansion_is_grounded(text, original):
+        return {
+            "claim": claim_id,
+            "text": "",
+            "calls": 1,
+            "note": "展开引入了原记载之外的事实，已丢弃（保留不知道）",
+            "budget": {"paused": False, "calls": total, "limit": limit},
+        }
+    derived_id = f"cl-x-{str(original['id']).replace('cl-', '')}-{int(time.time())}"
+    store.claim_put(
+        {
+            "instance_id": instance_id,
+            "timeline_id": timeline_id,
+            "id": derived_id,
+            "event_id": str(original["event_id"]),
+            "source_id": str(original["source_id"]),
+            "text": text.strip(),
+            "audience": str(original.get("audience") or "公开"),
+            "earliest_world": int(original.get("earliest_world") or 0),
+            "credibility": str(original.get("credibility") or "recorded"),
+            "derived_from": claim_id,
+        }
+    )
+    return {
+        "claim": claim_id,
+        "derived": derived_id,
+        "text": text.strip(),
+        "calls": 1,
+        "budget": {"paused": False, "calls": total, "limit": limit},
+    }
+
+
+
+
+async def dispatch_async(
+    cfg: Config, llm: Any, op: str, args: dict[str, Any], *, store: Store | None = None
+) -> dict[str, Any]:
     """异步操作：涉及模型调用（生成 / 修订 / 补全）。候选一律不落盘，并带回调用用量。"""
     limit = args.get("max_calls")
     max_calls = int(limit) if isinstance(limit, int) and limit > 0 else None
     kwargs = {"max_calls": max_calls} if max_calls else {}
     try:
+        if op == "event.render":
+            return await _render_event(cfg, llm, store, args)
+        if op == "event.expand":
+            return await _expand_claim(cfg, llm, store, args)
         if op == "world.package.generate":
             package, errors, usage = await generate_package(
                 llm, str(args.get("brief") or ""), name=str(args.get("name") or "未命名世界"), **kwargs
