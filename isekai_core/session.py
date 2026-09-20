@@ -73,6 +73,8 @@ class SessionService:
         self.runtime = runtime
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
+        #: 本轮注入的记忆标识（§5.3：只有实际被采纳的一轮才强化）
+        self._recalled: list[str] = []
 
     # ---------- 入站 ----------
 
@@ -173,7 +175,9 @@ class SessionService:
         self.store.inbound_set_state(seq, "processing")
         await self._status(row, "thinking")
         try:
-            text = await self.llm.chat(self._build_messages(row))
+            messages, recalled = self._build_messages(row)
+            self._recalled = list(recalled)
+            text = await self.llm.chat(messages)
         except LLMError as exc:
             log.warning(
                 "generation failed seq=%s stage=%s code=%s elapsed=%.1fs",
@@ -225,8 +229,40 @@ class SessionService:
                 "binding_token": thread["binding_token"],
             },
         )
+        self._settle_memory(row, message_id=str(message_id), reply_text=chr(10).join(parts))
         await self._send_batches(msg)
         await self._status(row, "idle")
+
+    def _settle_memory(self, row: dict[str, Any], *, message_id: str, reply_text: str) -> None:
+        """已固化回复的后续记账（§4.1 / §5.3）：登记来源待提取 + 本轮实际用到的记忆强化。
+
+        失败不影响投递：记忆是派生数据，不能反向拖住已接受的回复。
+        """
+        runtime = getattr(self, "runtime", None)
+        session = self.store.session_get(row["session_id"])
+        if runtime is None or session is None:
+            return
+        instance_id = str(session.get("instance_id") or "")
+        timeline_id = str(session.get("timeline_id") or "")
+        character_id = str(session.get("character_id") or "")
+        if not (instance_id and timeline_id and character_id):
+            return
+        try:
+            world_seconds = runtime.world_moment(instance_id, timeline_id)
+            runtime.cite_memories(
+                instance_id, timeline_id, character_id,
+                turn_id=str(message_id), memory_ids=list(self._recalled), world_seconds=world_seconds,
+            )
+            runtime.queue_dialog_turn(
+                instance_id, timeline_id, character_id,
+                world_seconds=world_seconds,
+                user_ref=str(row.get("env_id") or ""),
+                user_text=str(row.get("text") or ""),
+                reply_message_id=str(message_id),
+                reply_text=str(reply_text or ""),
+            )
+        except Exception:
+            log.exception("memory settle failed session=%s", session["id"])
 
     def _limits(self, channel_id: str) -> tuple[int, int]:
         """按通道协商结果取分段限额；未协商多段时每批一段。"""
@@ -256,10 +292,25 @@ class SessionService:
             log.exception("runtime prompt failed session=%s", session["id"])
             return self.cfg.placeholder["system_prompt"]
 
-    def _build_messages(self, row: dict[str, Any]) -> list[dict[str, Any]]:
+    def _system_prompt_with_memory(self, row: dict[str, Any]) -> tuple[str, list[str]]:
+        """真实实例：扮演定义 + 记忆简报；占位会话或无运行层时退回占位提示词。"""
+        runtime = getattr(self, "runtime", None)
+        session = self.store.session_get(row["session_id"]) if runtime is not None else None
+        if runtime is None or session is None or str(session["instance_id"]).startswith("ph-"):
+            return self.cfg.placeholder["system_prompt"], []
+        try:
+            context = runtime.turn_context(session, topic=str(row.get("text") or ""))
+        except Exception:  # 运行层不可用不得阻断对话
+            log.exception("runtime context failed session=%s", session["id"])
+            return self.cfg.placeholder["system_prompt"], []
+        return str(context.get("prompt") or ""), list(context.get("memory_ids") or [])
+
+    def _build_messages(self, row: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+        """返回 (消息序列, 本轮注入的记忆标识)；记忆简报只进上下文（§5.1）。"""
         history = self.store.context_window(row["session_id"], self.cfg.context_history_max)
+        prompt, recalled = self._system_prompt_with_memory(row)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._system_prompt(row)}
+            {"role": "system", "content": prompt}
         ]
         for item in history:
             if item["seq"] >= row["seq"]:
@@ -269,7 +320,7 @@ class SessionService:
             elif item["role"] == "character":
                 messages.append({"role": "assistant", "content": _flatten(item["parts"])})
         messages.append({"role": "user", "content": row["text"] or ""})
-        return messages
+        return messages, recalled
 
     # ---------- 投递 ----------
 

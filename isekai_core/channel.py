@@ -145,15 +145,18 @@ class CoreServer:
             await _safe_close(ws, 1008, "handshake timeout")
             return
 
+        mgmt: dict[str, Any] | None = None
         try:
             envelope = ump.parse(first, direction="c2s", max_text_len=self.cfg.max_text_len)
         except UmpError as first_error:
             mgmt = _parse_mgmt(first)
-            if mgmt is not None:
-                await self._mgmt_loop(ws, mgmt)
+            if mgmt is None:
+                await self._send_raw(ws, ump.error_envelope(first_error))
+                await _safe_close(ws, 1008, "expected hello")
                 return
-            await self._send_raw(ws, ump.error_envelope(first_error))
-            await _safe_close(ws, 1008, "expected hello")
+        if mgmt is not None:
+            # 管理帧不是 UMP 信封：在 except 之外进循环，免得后续异常被挂上无关的 __context__（日志里看着像协议故障）
+            await self._mgmt_loop(ws, mgmt)
             return
 
         if envelope.type != "hello":

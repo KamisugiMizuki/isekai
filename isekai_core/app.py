@@ -271,3 +271,12 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
                 )
         except Exception:
             log.exception("intent proposal pass failed")
+        # 证据充分后提取记忆：有界、按现实日预算、失败留待处理（§4.1）
+        try:
+            for instance_id, timeline_id in runtime.world.active_timelines():
+                runtime.world.queue_world_sources(instance_id, timeline_id)
+                await runtime.world.extract_memories(
+                    instance_id, timeline_id, llm=runtime.llm, now_real=time.time(), limit=6
+                )
+        except Exception:
+            log.exception("memory extraction pass failed")

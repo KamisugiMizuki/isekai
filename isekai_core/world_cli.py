@@ -56,6 +56,7 @@ OP_BY_COMMAND = {
     ("runtime", "advance"): "runtime.advance",
     ("runtime", "card-add"): "runtime.card.add",
     ("runtime", "propose"): "runtime.propose",
+    ("runtime", "extract"): "runtime.extract",
     ("runtime", "budget"): "runtime.budget",
     ("runtime", "budget-set"): "runtime.budget.set",
     ("runtime", "backfill"): "runtime.backfill",

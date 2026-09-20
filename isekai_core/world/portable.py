@@ -247,6 +247,8 @@ def _restore_runtime_state(
             "effects": _remap_rows(payload.get("effects"), instance_id, new_id),
             "intents": _remap_rows(payload.get("intents"), instance_id, new_id),
             "environment": _remap_rows(payload.get("environment"), instance_id, new_id),
+            "memories": _remap_rows(payload.get("memories"), instance_id, new_id),
+            "memory_tasks": _remap_rows(payload.get("memory_tasks"), instance_id, new_id),
         }
         loaded += store.runtime_load(instance_id, new_id, rows)
         store.clock_put(

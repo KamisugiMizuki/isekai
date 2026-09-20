@@ -93,6 +93,14 @@ class RuntimeConfig:
     timeline_tokens_per_day: int = 150_000   # 时间线预算（防一条高倍率线占尽资源）
     task_tokens_per_day: int = 60_000        # 单任务预算（防重试或坏输入耗尽整条线）
     priority_reserve_ratio: float = 0.25     # 给更高优先级任务留出的额度比例
+    #: 角色记忆（MEMORY_SPEC §十：配额由运行层统一决定）
+    memory_extract_per_day: int = 40     # 每日提取的现实日调用上限
+    memory_recall_limit: int = 6         # 单轮简报条数上限
+    memory_brief_tokens: int = 900       # 简报预算（字符量级）
+    memory_decay_per_day: float = 0.02   # 每世界日强度衰减率
+    memory_embedding_model: str = ""     # 远程 embedding 模型（空 = 只用全文召回）
+    memory_embedding_base_url: str = ""
+    memory_embedding_api_key: str = ""
 
 
 @dataclass

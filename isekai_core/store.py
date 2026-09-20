@@ -186,6 +186,64 @@ CREATE TABLE IF NOT EXISTS call_ledger(
   PRIMARY KEY(instance_id, timeline_id, task, bucket)
 );
 
+CREATE TABLE IF NOT EXISTS memory(
+  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  sources TEXT NOT NULL DEFAULT '[]',
+  happened_world INTEGER,
+  learned_world INTEGER NOT NULL,
+  recorded_world INTEGER NOT NULL,
+  semantic_watermark INTEGER NOT NULL,
+  strength REAL NOT NULL DEFAULT 0.6,
+  confidence REAL NOT NULL DEFAULT 0.7,
+  state TEXT NOT NULL DEFAULT 'active',
+  version INTEGER NOT NULL DEFAULT 1,
+  supersedes TEXT,
+  superseded_by TEXT,
+  source_key TEXT,
+  decay_world INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS memory_task(
+  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL,
+  source_ref TEXT NOT NULL,
+  source_world INTEGER NOT NULL,
+  created_world INTEGER NOT NULL,
+  text TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  UNIQUE(character_id, source_kind, source_ref)
+);
+
+CREATE TABLE IF NOT EXISTS memory_citation(
+  turn_id TEXT NOT NULL,
+  memory_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  world_seconds INTEGER NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY(turn_id, memory_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_embedding(
+  memory_id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  model TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  vector BLOB NOT NULL,
+  source_version INTEGER NOT NULL,
+  created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS budget_reserve(
   id TEXT PRIMARY KEY,
   instance_id TEXT NOT NULL,
@@ -967,11 +1025,18 @@ class Store:
                 "effect_state",
                 "intent",
                 "call_ledger",
+                "memory",
+                "memory_task",
+                "memory_embedding",
                 "budget_reserve",
                 "budget_policy",
                 "environment_state",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
+            self._conn.execute(
+                "DELETE FROM memory_citation WHERE timeline_id IN (SELECT id FROM timeline WHERE instance_id=?)",
+                (instance_id,),
+            )
             self._conn.execute("DELETE FROM commit_log WHERE instance_id=?", (instance_id,))
             self._conn.execute("DELETE FROM timeline WHERE instance_id=?", (instance_id,))
             self._conn.execute("DELETE FROM instance WHERE id=?", (instance_id,))
@@ -1222,6 +1287,20 @@ class Store:
                 timeline_id,
                 watermark,
             ),
+            "memories": rows(
+                """SELECT * FROM memory WHERE instance_id=? AND timeline_id=? AND semantic_watermark<=?
+                   ORDER BY character_id, learned_world""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "memory_tasks": rows(
+                """SELECT * FROM memory_task WHERE instance_id=? AND timeline_id=? AND source_world<=?
+                   ORDER BY character_id, source_world""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
             "experiences": rows(
                 """SELECT * FROM experience WHERE instance_id=? AND timeline_id=? AND world_seconds<=?
                    ORDER BY character_id, world_seconds""",
@@ -1352,6 +1431,28 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, type_id) DO NOTHING""",
                     row,
                 )
+            for row in payload.get("memories") or []:
+                self._conn.execute(
+                    """INSERT INTO memory(id, instance_id, timeline_id, character_id, text, kind, sources,
+                                          happened_world, learned_world, recorded_world, semantic_watermark,
+                                          strength, confidence, state, version, supersedes, superseded_by,
+                                          source_key, decay_world)
+                       VALUES(:id, :instance_id, :timeline_id, :character_id, :text, :kind, :sources,
+                              :happened_world, :learned_world, :recorded_world, :semantic_watermark,
+                              :strength, :confidence, :state, :version, :supersedes, :superseded_by,
+                              :source_key, :decay_world)
+                       ON CONFLICT(id) DO NOTHING""",
+                    row,
+                )
+            for row in payload.get("memory_tasks") or []:
+                self._conn.execute(
+                    """INSERT INTO memory_task(id, instance_id, timeline_id, character_id, source_kind,
+                                               source_ref, source_world, created_world, text, state, attempts, note)
+                       VALUES(:id, :instance_id, :timeline_id, :character_id, :source_kind, :source_ref,
+                              :source_world, :created_world, :text, :state, :attempts, :note)
+                       ON CONFLICT(id) DO NOTHING""",
+                    row,
+                )
             for row in payload.get("intents") or []:
                 self._conn.execute(
                     """INSERT INTO intent(instance_id, timeline_id, character_id, id, object, basis, strength,
@@ -1464,6 +1565,205 @@ class Store:
             (instance_id, timeline_id, target),
         ).fetchall()
         return [str(row["character_id"]) for row in rows]
+
+    # ---------- 角色记忆（MEMORY_SPEC） ----------
+
+    def memory_scope(
+        self, instance_id: str, timeline_id: str, character_id: str, *, until: int | None = None
+    ) -> list[dict[str, Any]]:
+        """可召回集合（§5.1 第一步）：实例 + 线 + 角色 + 查询水位；来源状态与归档不豁免隔离。"""
+        sql = """SELECT * FROM memory WHERE instance_id=? AND timeline_id=? AND character_id=?
+                 AND learned_world<=? ORDER BY learned_world, id"""
+        rows = self._conn.execute(
+            sql, (instance_id, timeline_id, character_id, int(until) if until is not None else 10**15)
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def memory_add(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        """写入一条规范记忆：同源幂等 + 同事实去重（同角色同线内）+ 相反说法建替代关系。"""
+        from .runtime import memory as memory_mod
+
+        character_id = str(row["character_id"])
+        source_key = str(row.get("source_key") or "")
+        if source_key:
+            dup = self._conn.execute(
+                "SELECT * FROM memory WHERE character_id=? AND source_key=?", (character_id, source_key)
+            ).fetchone()
+            if dup is not None:
+                return None  # 同源重复提取：不重复写、不重复强化
+        siblings = [
+            item
+            for item in self.memory_scope(str(row["instance_id"]), str(row["timeline_id"]), character_id)
+            if str(item["kind"]) == str(row["kind"])
+        ]
+        supersedes = None
+        for item in siblings:
+            if memory_mod.contradicts(str(item["text"]), str(row["text"])):
+                supersedes = str(item["id"])
+                break
+            if memory_mod.same_fact(str(item["text"]), str(row["text"])):
+                return None  # 同事实：合并来源即可，不新增条目
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO memory(id, instance_id, timeline_id, character_id, text, kind, sources,
+                                      happened_world, learned_world, recorded_world, semantic_watermark,
+                                      strength, confidence, state, version, supersedes, superseded_by, source_key)
+                   VALUES(:id,:instance_id,:timeline_id,:character_id,:text,:kind,:sources,
+                          :happened_world,:learned_world,:recorded_world,:semantic_watermark,
+                          :strength,:confidence,:state,1,:supersedes,NULL,:source_key)""",
+                {
+                    "sources": json.dumps(row.get("sources") or [], ensure_ascii=False),
+                    "state": memory_mod.state_for(float(row.get("strength") or 0.6)),
+                    "supersedes": supersedes,
+                    **{key: row.get(key) for key in (
+                        "id", "instance_id", "timeline_id", "character_id", "text", "kind",
+                        "happened_world", "learned_world", "recorded_world", "semantic_watermark",
+                        "strength", "confidence", "source_key",
+                    )},
+                },
+            )
+            if supersedes:
+                # 明确纠正：新条目替代旧的，旧条目保留（历史可查当时认知）
+                self._conn.execute(
+                    "UPDATE memory SET superseded_by=?, state='archived' WHERE id=?", (row["id"], supersedes)
+                )
+        saved = self.memory_get(str(row["id"]))
+        return saved
+
+    def memory_get(self, memory_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM memory WHERE id=?", (memory_id,)).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def memory_update_strength(self, memory_id: str, strength: float, *, state: str | None = None) -> None:
+        with self._lock, self._conn:
+            if state is None:
+                self._conn.execute("UPDATE memory SET strength=? WHERE id=?", (float(strength), memory_id))
+            else:
+                self._conn.execute(
+                    "UPDATE memory SET strength=?, state=? WHERE id=?", (float(strength), state, memory_id)
+                )
+
+    def memory_task_add(self, row: dict[str, Any]) -> bool:
+        """登记一条待提取来源（同角色同来源幂等，§4.1）。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO memory_task(id, instance_id, timeline_id, character_id, source_kind,
+                                                     source_ref, source_world, created_world, text,
+                                                     state, attempts, note)
+                   VALUES(?,?,?,?,?,?,?,?,?, 'pending', 0, '')""",
+                (
+                    row["id"], row["instance_id"], row["timeline_id"], row["character_id"],
+                    row["source_kind"], row["source_ref"], int(row["source_world"]), int(row["created_world"]),
+                    str(row.get("text") or ""),
+                ),
+            )
+        return bool(cur.rowcount)
+
+    def memory_tasks(self, instance_id: str, timeline_id: str, *, state: str = "pending") -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT * FROM memory_task WHERE instance_id=? AND timeline_id=? AND state=?
+               ORDER BY source_world, id""",
+            (instance_id, timeline_id, state),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def memory_task_set(self, task_id: str, *, state: str, note: str = "") -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE memory_task SET state=?, note=?, attempts=attempts+1 WHERE id=?", (state, note, task_id)
+            )
+
+    def memory_cite(self, turn_id: str, memory_id: str, *, timeline_id: str, character_id: str, world_seconds: int) -> bool:
+        """实际被采纳一轮用到的条目才强化：同一轮幂等（§5.3）。"""
+        from .runtime import memory as memory_mod
+
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO memory_citation(turn_id, memory_id, timeline_id, character_id,
+                                                         world_seconds, created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (turn_id, memory_id, timeline_id, character_id, int(world_seconds), time.time()),
+            )
+            if not cur.rowcount:
+                return False
+            row = self._conn.execute("SELECT strength FROM memory WHERE id=?", (memory_id,)).fetchone()
+            if row is None:
+                return False
+            strength = memory_mod.reinforce(float(row["strength"]))
+            self._conn.execute(
+                "UPDATE memory SET strength=?, state=? WHERE id=?",
+                (strength, memory_mod.state_for(strength), memory_id),
+            )
+        return True
+
+    def timeline_get(self, timeline_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM timeline WHERE id=?", (timeline_id,)).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def memory_vector_scores(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str,
+        query: str,
+        *,
+        query_vector: list[float] | None = None,
+    ) -> dict[str, float]:
+        """向量召回分数（§5.2）：没有查询向量或没有可用向量时返回空——调用方退化为全文召回。"""
+        if not query_vector:
+            return {}
+        import math
+
+        rows = self._conn.execute(
+            """SELECT e.memory_id, e.vector, e.dim FROM memory_embedding e
+               JOIN memory m ON m.id = e.memory_id
+               WHERE m.instance_id=? AND m.timeline_id=? AND m.character_id=? AND e.dim=?""",
+            (instance_id, timeline_id, character_id, len(query_vector)),
+        ).fetchall()
+        scores: dict[str, float] = {}
+        norm = math.sqrt(sum(value * value for value in query_vector)) or 1.0
+        for row in rows:
+            blob = row["vector"]
+            dim = int(row["dim"])
+            if len(blob) != dim * 4:
+                continue
+            values = struct.unpack(f"<{dim}f", blob)
+            other = math.sqrt(sum(value * value for value in values)) or 1.0
+            dot = sum(a * b for a, b in zip(query_vector, values))
+            scores[str(row["memory_id"])] = dot / (norm * other)
+        return scores
+
+    def memory_decay(self, *, timeline_id: str, to_world: int, day_seconds: int, per_day: float) -> int:
+        """按世界时长衰减（§六）：从每条的 decay_world 推到 to_world；同一水位重跑无副作用。"""
+        from .runtime import memory as memory_mod
+
+        rows = self._conn.execute(
+            "SELECT id, strength, decay_world, state FROM memory WHERE timeline_id=? AND state<>'archived'",
+            (timeline_id,),
+        ).fetchall()
+        changed = 0
+        with self._lock, self._conn:
+            for row in rows:
+                start = int(row["decay_world"] or 0)
+                if int(to_world) <= start:
+                    continue
+                strength = memory_mod.decayed_strength(
+                    float(row["strength"]), from_world=start, to_world=int(to_world),
+                    day_seconds=day_seconds, per_day=per_day,
+                )
+                self._conn.execute(
+                    "UPDATE memory SET strength=?, state=?, decay_world=? WHERE id=?",
+                    (strength, memory_mod.state_for(strength), int(to_world), row["id"]),
+                )
+                changed += 1
+        return changed
+
+    def memory_count(self, instance_id: str, timeline_id: str, character_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) n FROM memory WHERE instance_id=? AND timeline_id=? AND character_id=?",
+            (instance_id, timeline_id, character_id),
+        ).fetchone()
+        return int(row["n"] if row is not None else 0)
 
     # ---------- 三层预算（§2.8） ----------
 

@@ -75,6 +75,7 @@ ASYNC_OPS = frozenset(
         "event.render",
         "event.expand",
         "runtime.propose",
+        "runtime.extract",
         "world.package.generate",
         "world.package.revise",
         "world.package.fill",
@@ -436,6 +437,10 @@ def _world_service(cfg: Config, store: Store) -> Any:
     return RuntimeService(
         store,
         render_calls_per_day=int(cfg.runtime.render_calls_per_day),
+        memory_extract_per_day=int(cfg.runtime.memory_extract_per_day),
+        memory_recall_limit=int(cfg.runtime.memory_recall_limit),
+        memory_brief_tokens=int(cfg.runtime.memory_brief_tokens),
+        memory_decay_per_day=float(cfg.runtime.memory_decay_per_day),
         instance_tokens_per_day=int(cfg.runtime.instance_tokens_per_day),
         timeline_tokens_per_day=int(cfg.runtime.timeline_tokens_per_day),
         task_tokens_per_day=int(cfg.runtime.task_tokens_per_day),
@@ -474,6 +479,23 @@ def _budget_set(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, An
     if "paused_tasks" in fields:
         policy = store.budget_policy_set(instance_id, paused_tasks=fields["paused_tasks"])
     return {"policy": policy, "view": _world_service(cfg, store).budget_view(instance_id)}
+
+
+async def _extract_memories(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
+    """触发一次记忆提取（写侧；不回传任何记忆内容——界面不提供浏览入口，MEMORY_SPEC §一）。"""
+    if store is None:
+        raise UmpError(Err.STATE_BLOCKED, "缺少存储上下文", retryable=False)
+    instance_id = str(args.get("instance_id") or "")
+    timeline_id = str(args.get("timeline_id") or "")
+    if not instance_id or not timeline_id:
+        raise UmpError(Err.INVALID, "缺少实例或时间线", retryable=False)
+    world = _world_service(cfg, store)
+    queued = world.queue_world_sources(instance_id, timeline_id)
+    result = await world.extract_memories(
+        instance_id, timeline_id, llm=llm, now_real=time.time(),
+        limit=int(cfg.runtime.memory_extract_per_day),
+    )
+    return {**result, "queued": queued}
 
 
 async def _propose_intents(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
@@ -627,6 +649,8 @@ async def dispatch_async(
             return await _expand_claim(cfg, llm, store, args)
         if op == "runtime.propose":
             return await _propose_intents(cfg, llm, store, args)
+        if op == "runtime.extract":
+            return await _extract_memories(cfg, llm, store, args)
         if op == "world.package.generate":
             package, errors, usage = await generate_package(
                 llm, str(args.get("brief") or ""), name=str(args.get("name") or "未命名世界"), **kwargs

@@ -15,7 +15,7 @@ from typing import Any
 from ..log import get_logger
 from ..store import Store
 from . import budget as budget_mod
-from . import cognition, environment, events, intents, life, personality, planning
+from . import cognition, environment, events, intents, life, memory as memory_mod, personality, planning
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
 
@@ -39,6 +39,10 @@ class RuntimeService:
         timeline_tokens_per_day: int = 150_000,
         task_tokens_per_day: int = 60_000,
         priority_reserve_ratio: float = 0.25,
+        memory_extract_per_day: int = 40,
+        memory_recall_limit: int = 6,
+        memory_brief_tokens: int = 900,
+        memory_decay_per_day: float = 0.02,
     ) -> None:
         self.store = store
         #: 倍率上限：全局统一、仅开发者可配置（§2.2），默认 2592000 世界秒 / 现实秒
@@ -58,8 +62,347 @@ class RuntimeService:
             "task_tokens_per_day": max(0, int(task_tokens_per_day)),
         }
         self.priority_reserve_ratio = max(0.0, min(1.0, float(priority_reserve_ratio)))
+        #: 角色记忆参数（MEMORY_SPEC §十）
+        self.memory_extract_per_day = max(0, int(memory_extract_per_day))
+        self.memory_recall_limit = max(1, int(memory_recall_limit))
+        self.memory_brief_tokens = max(0, int(memory_brief_tokens))
+        self.memory_decay_per_day = max(0.0, min(1.0, float(memory_decay_per_day)))
 
     # ---------- 基础读取 ----------
+
+    def describe_world(self, instance_id: str, world_seconds: int) -> str:
+        """世界时刻的人话标签（历法视图，§2.1）。"""
+        instance = self.store.instance_get(instance_id) or {}
+        return self.calendar(instance).describe(int(world_seconds))
+
+    # ---------- 角色记忆（MEMORY_SPEC） ----------
+
+    def queue_dialog_turn(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str,
+        *,
+        world_seconds: int,
+        user_ref: str,
+        user_text: str,
+        reply_message_id: str = "",
+        reply_text: str = "",
+    ) -> int:
+        """把一轮已固化的来往登记成待提取来源（§4.1）。
+
+        多条入站共享一份回复时：输入按各自来源分别登记，回复按本轮唯一标识登记一次。
+        """
+        added = 0
+        if user_ref:
+            added += int(self.store.memory_task_add({
+                "id": f"mt-dlg-{events.stable_key(instance_id, timeline_id, character_id, 'user', user_ref)[:12]}",
+                "instance_id": instance_id, "timeline_id": timeline_id, "character_id": character_id,
+                "source_kind": "dialog", "source_ref": f"user:{user_ref}",
+                "source_world": int(world_seconds), "created_world": int(world_seconds),
+                "text": str(user_text or ""),
+            }))
+        if reply_message_id:
+            added += int(self.store.memory_task_add({
+                "id": f"mt-dlg-{events.stable_key(instance_id, timeline_id, character_id, 'reply', reply_message_id)[:12]}",
+                "instance_id": instance_id, "timeline_id": timeline_id, "character_id": character_id,
+                "source_kind": "dialog", "source_ref": f"reply:{reply_message_id}",
+                "source_world": int(world_seconds), "created_world": int(world_seconds),
+                "text": str(reply_text or ""),
+            }))
+        return added
+
+    def queue_world_sources(self, instance_id: str, timeline_id: str, *, since_world: int = 0) -> int:
+        """世界侧来源（§4.1）：她的经历、她已获知的说法、她自己的打算——不传未过滤实情。"""
+        added = 0
+        for card in self.cards(self.store.instance_get(instance_id) or {}, timeline_id=timeline_id):
+            character_id = str((card.get("meta") or {}).get("card_id") or "")
+            if not character_id:
+                continue
+            rows: list[tuple[str, str, int]] = []
+            for row in self.store.experience_window(
+                instance_id, timeline_id, character_id, until=10**15, limit=200
+            ):
+                rows.append(("experience", str(row["id"]), int(row["world_seconds"])))
+            for row in self.store.knowledge_window(
+                instance_id, timeline_id, character_id, until=10**15, limit=200
+            ):
+                rows.append(("claim", str(row["id"]), int(row["world_seconds"])))
+            for row in self.store.intent_list(instance_id, timeline_id, character_id):
+                rows.append(("intent", str(row["id"]), int(row["source_world"])))
+            for kind, ref, world in rows:
+                if int(world) <= int(since_world):
+                    continue
+                added += int(self.store.memory_task_add({
+                    "id": f"mt-{kind[:3]}-{events.stable_key(instance_id, timeline_id, character_id, kind, ref)[:12]}",
+                    "instance_id": instance_id, "timeline_id": timeline_id, "character_id": character_id,
+                    "source_kind": kind, "source_ref": ref,
+                    "source_world": int(world), "created_world": int(world), "text": "",
+                }))
+        return added
+
+    def _source_material(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        """按来源取材料；来源不可达（回滚 / 删除 / 迟到）时返回 None，任务标 dropped（§4.1）。"""
+        instance_id, timeline_id = str(task["instance_id"]), str(task["timeline_id"])
+        ref, kind = str(task["source_ref"]), str(task["source_kind"])
+        when = self.describe_world(instance_id, int(task["source_world"]))
+        if kind == "dialog":
+            role = "user" if ref.startswith("user:") else "character"
+            text = str(task.get("text") or "")
+            if not text:
+                return None
+            return {
+                "text": text,
+                "source": "对话·联络者" if role == "user" else "对话·她自己说",
+                "when": when,
+                "sources": [{"kind": "dialog", "ref": ref, "source_role": role}],
+                "world": int(task["source_world"]),
+            }
+        if kind == "experience":
+            row = next(
+                (item for item in self.store.experience_window(
+                    instance_id, timeline_id, str(task["character_id"]), until=10**15, limit=500
+                ) if str(item["id"]) == ref),
+                None,
+            )
+            if row is None:
+                return None
+            return {
+                "text": str(row.get("activity") or ""),
+                "source": "经历",
+                "when": self.describe_world(instance_id, int(row["world_seconds"])),
+                "sources": [{"kind": "experience", "ref": ref}],
+                "world": int(row["world_seconds"]),
+            }
+        if kind == "claim":
+            row = next(
+                (item for item in self.store.knowledge_window(
+                    instance_id, timeline_id, str(task["character_id"]), until=10**15, limit=500
+                ) if str(item["id"]) == ref),
+                None,
+            )
+            if row is None:
+                return None
+            return {
+                "text": str(row.get("text") or ""),
+                "source": "听说／读到的",
+                "when": self.describe_world(instance_id, int(row["world_seconds"])),
+                "sources": [{"kind": "claim", "ref": ref, "via": row.get("via") or ""}],
+                "world": int(row["world_seconds"]),
+            }
+        row = next(
+            (item for item in self.store.intent_list(instance_id, timeline_id, str(task["character_id"]))
+             if str(item["id"]) == ref),
+            None,
+        )
+        if row is None:
+            return None
+        return {
+            "text": f"{row.get('object')}（依据：{row.get('basis')}）",
+            "source": "她自己的打算",
+            "when": when,
+            "sources": [{"kind": "intent", "ref": ref}],
+            "world": int(row.get("source_world") or 0),
+        }
+
+    async def extract_memories(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        llm: Any,
+        now_real: float,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """有界提取（§4.1）：按来源打包、单次调用、校验不过当没提取过；失败保留待处理。"""
+        from ..log import get_logger
+
+        log = get_logger("isekai.memory")
+        cap = max(1, min(int(limit), memory_mod.BATCH_SIZE))
+        tasks = self.store.memory_tasks(instance_id, timeline_id)[:cap]
+        if not tasks:
+            return {"extracted": 0, "written": 0, "pending": 0, "calls": 0}
+        row = self.clock_row(timeline_id)
+        watermark = int(row["processed_world"])
+        day_seconds = self.calendar(self.store.instance_get(instance_id)).day_seconds
+        written = calls = pending = 0
+        by_character: dict[str, list[dict[str, Any]]] = {}
+        for task in tasks:
+            by_character.setdefault(str(task["character_id"]), []).append(task)
+        for character_id, items in by_character.items():
+            materials: list[dict[str, Any]] = []
+            for task in items:
+                material = self._source_material(task)
+                if material is None:
+                    self.store.memory_task_set(str(task["id"]), state="dropped", note="来源不可达")
+                    continue
+                materials.append({**material, "ref": str(task["id"]), "task": task})
+            if not materials:
+                continue
+            known = self.store.memory_scope(instance_id, timeline_id, character_id, until=watermark)
+            prompt = memory_mod.extraction_prompt(
+                name=self._display_name(instance_id, timeline_id, character_id),
+                world_label=self.describe_world(instance_id, watermark),
+                items=materials,
+                existing=[{"id": item["id"], "text": item["text"]} for item in known[-8:]],
+            )
+            prompt_text = "\n".join(str(item.get("content") or "") for item in prompt)
+            reservation = self.reserve_call(
+                instance_id, timeline_id, "memory_extract", prompt_text=prompt_text, now_real=now_real
+            )
+            if not reservation.get("ok"):
+                pending += len(materials)
+                continue
+            calls += 1
+            try:
+                text = await llm.chat(prompt, temperature=0.3, timeout=90.0)
+                if not str(text or "").strip():
+                    # 推理型模型偶发把预算烧在 reasoning 里返回空正文：原样重试一次，仍空就当失败
+                    text = await llm.chat(prompt, temperature=0.3, timeout=90.0)
+            except Exception:  # 提取失败不阻断对话与世界推进
+                log.exception("memory extraction failed character=%s", character_id)
+                self.settle_call(reservation, prompt_text=prompt_text, outcome="error")
+                for material in materials:
+                    self.store.memory_task_set(str(material["task"]["id"]), state="pending", note="模型不可用")
+                pending += len(materials)
+                continue
+            self.settle_call(reservation, prompt_text=prompt_text, reply=text)
+            entries = memory_mod.parse_extraction(text, {str(item["ref"]) for item in materials})
+            by_ref = {str(item["ref"]): item for item in materials}
+            if not entries:
+                for material in materials:
+                    self.store.memory_task_set(str(material["task"]["id"]), state="done", note="无可记内容")
+                continue
+            for entry in entries:
+                material = by_ref[entry["ref"]]
+                task = material["task"]
+                strength = memory_mod.decayed_strength(
+                    entry["strength"],
+                    from_world=int(task["source_world"]),
+                    to_world=watermark,
+                    day_seconds=day_seconds,
+                    per_day=self.memory_decay_per_day,
+                )
+                saved = self.store.memory_add({
+                    "id": f"mm-{events.stable_key(instance_id, timeline_id, character_id, entry['text'])[:12]}",
+                    "instance_id": instance_id,
+                    "timeline_id": timeline_id,
+                    "character_id": character_id,
+                    "text": entry["text"],
+                    "kind": entry["kind"],
+                    "sources": material["sources"],
+                    "happened_world": material["world"],
+                    "learned_world": int(task["source_world"]),
+                    "recorded_world": watermark,
+                    "semantic_watermark": watermark,
+                    "strength": strength,
+                    "confidence": entry["confidence"],
+                    "source_key": str(task["id"]),
+                    "decay_world": watermark,
+                })
+                if saved is not None:
+                    written += 1
+                self.store.memory_task_set(str(task["id"]), state="done")
+        return {"extracted": len(tasks), "written": written, "pending": pending, "calls": calls}
+
+    def turn_context(
+        self,
+        session: dict[str, Any],
+        *,
+        topic: str = "",
+        world_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """本轮扮演定义 + 记忆简报（§5.1 第 5 步）：简报只进生成上下文，不展示给用户。"""
+        prompt = self.system_prompt(session, topic=topic)
+        instance_id = str(session.get("instance_id") or "")
+        timeline_id = str(session.get("timeline_id") or "")
+        character_id = str(session.get("character_id") or "")
+        if not (instance_id and timeline_id and character_id):
+            return {"prompt": prompt, "memory_ids": [], "brief": ""}
+        try:
+            recalled = self.recall(
+                instance_id, timeline_id, character_id, topic=topic, world_seconds=world_seconds
+            )
+        except Exception:  # 召回失败不得阻断对话
+            return {"prompt": prompt, "memory_ids": [], "brief": ""}
+        brief = recalled["brief"]["text"]
+        if brief:
+            prompt = prompt + chr(10) + chr(10) + "她此刻想得起来的事（按她自己的记性，别当成盘点）：" + chr(10) + brief
+        return {"prompt": prompt, "memory_ids": recalled["ids"], "brief": brief}
+
+    def recall(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str,
+        *,
+        topic: str = "",
+        world_seconds: int | None = None,
+        limit: int | None = None,
+        query_vector: list[float] | None = None,
+    ) -> dict[str, Any]:
+        """混合召回（§5）：先限定可访问集合，再排序，再按预算打包简报；向量不可用即退化全文。"""
+        if world_seconds is None:
+            world_seconds = int(self.clock_row(timeline_id)["processed_world"])
+        entries = self.store.memory_scope(instance_id, timeline_id, character_id, until=int(world_seconds))
+        if not entries:
+            return {"entries": [], "ids": [], "brief": {"lines": [], "ids": [], "text": ""}}
+        day_seconds = self.calendar(self.store.instance_get(instance_id)).day_seconds
+        vector_scores = self.store.memory_vector_scores(
+            instance_id, timeline_id, character_id, topic, query_vector=query_vector
+        )
+        ranked = memory_mod.rank(
+            query=topic,
+            entries=entries,
+            now_world=int(world_seconds),
+            day_seconds=day_seconds,
+            vector_scores=vector_scores,
+        )
+        for item in ranked:
+            item["source_label"] = memory_mod.source_label(json.loads(item.get("sources") or "[]"))
+        ranked = [item for item in ranked if str(item.get("state")) != "archived"][:40]
+        brief = memory_mod.pack_brief(
+            ranked, budget_tokens=self.memory_brief_tokens, limit=limit or self.memory_recall_limit
+        )
+        return {"entries": ranked, "ids": brief["ids"], "brief": brief}
+
+    def cite_memories(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str,
+        *,
+        turn_id: str,
+        memory_ids: list[str],
+        world_seconds: int,
+    ) -> int:
+        """一轮被实际采纳后按 id 强化，同轮幂等（§5.3）。"""
+        strengthened = 0
+        for memory_id in memory_ids:
+            if self.store.memory_cite(
+                turn_id, memory_id, timeline_id=timeline_id, character_id=character_id,
+                world_seconds=int(world_seconds),
+            ):
+                strengthened += 1
+        return strengthened
+
+    def decay_memories(self, timeline_id: str, *, to_world: int) -> int:
+        """按世界时间衰减（§六）：冻结期间不调用即不衰减；按 decay_world 幂等。"""
+        line = self.store.timeline_get(timeline_id)
+        if line is None:
+            return 0
+        day_seconds = self.calendar(self.store.instance_get(str(line["instance_id"]))).day_seconds
+        return self.store.memory_decay(
+            timeline_id=timeline_id, to_world=int(to_world), day_seconds=day_seconds,
+            per_day=self.memory_decay_per_day,
+        )
+
+    def _display_name(self, instance_id: str, timeline_id: str, character_id: str) -> str:
+        instance = self.store.instance_get(instance_id) or {}
+        for card in self.cards(instance, timeline_id=timeline_id):
+            if str((card.get("meta") or {}).get("card_id")) == character_id:
+                return str((card.get("identity") or {}).get("name") or character_id)
+        return character_id
 
     # ---------- 三层预算（§2.8） ----------
 
@@ -497,6 +840,8 @@ class RuntimeService:
             processed = stop
             batches += 1
             produced += len(experiences)
+            # 记忆按世界时长衰减（§六）：冻结期间不推进即不衰减，幂等
+            self.decay_memories(timeline_id, to_world=stop)
         return {
             "state": "current" if processed >= target else "catching_up",
             "processed_world": processed,
