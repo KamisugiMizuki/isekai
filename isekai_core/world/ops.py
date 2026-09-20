@@ -85,6 +85,8 @@ SYNC_OPS = frozenset(
         "claim.coverage",
         "world.backfill.plan",
         "instance.convert",
+        "plugin.scan",
+        "plugin.list",
         "reaction.list",
         "reaction.note",
         "notice.create",
@@ -98,6 +100,9 @@ SYNC_OPS = frozenset(
 ASYNC_OPS = frozenset(
     {
         "event.render",
+        "plugin.enable",
+        "plugin.disable",
+        "plugin.uninstall",
         "event.expand",
         "runtime.proactive",
         "runtime.first_contact",
@@ -494,6 +499,13 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 raise UmpError(Err.NOT_FOUND, f"没有该通知：{ident}", retryable=False)
             target, _issues = store.notice_target(row)
             return {"target": target}
+        if op in ("plugin.scan", "plugin.list"):
+            from .. import plugins as plugins_mod
+
+            host = plugins_mod.HOST
+            if host is None:
+                raise UmpError(Err.STATE_BLOCKED, "插件宿主未挂载（此核心不支持第三方插件）", retryable=False)
+            return {"plugins": host.list_plugins()}
         if op == "reaction.list":
             rows = store.reaction_list(
                 str(args.get("instance_id") or ""),
@@ -1044,6 +1056,18 @@ async def dispatch_async(
     max_calls = int(limit) if isinstance(limit, int) and limit > 0 else None
     kwargs = {"max_calls": max_calls} if max_calls else {}
     try:
+        if op in ("plugin.enable", "plugin.disable", "plugin.uninstall"):
+            from .. import plugins as plugins_mod
+
+            host = plugins_mod.HOST
+            if host is None:
+                raise UmpError(Err.STATE_BLOCKED, "插件宿主未挂载（此核心不支持第三方插件）", retryable=False)
+            ident = str(args.get("id") or "")
+            if op == "plugin.enable":
+                return {"enable": await host.enable(ident)}
+            if op == "plugin.disable":
+                return {"disable": await host.disable(ident, note=str(args.get("note") or ""))}
+            return {"uninstall": await host.uninstall(ident)}
         if op == "event.render":
             return await _render_event(cfg, llm, store, args)
         if op == "event.expand":

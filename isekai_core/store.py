@@ -435,6 +435,18 @@ CREATE TABLE IF NOT EXISTS claim(
 );
 CREATE INDEX IF NOT EXISTS ix_claim_event ON claim(instance_id, timeline_id, event_id);
 
+-- 插件登记（CHANNEL_PLUGIN_SPEC §3.1/§3.2）：只记清单与启停状态；运行进程不跨核心重启存活
+CREATE TABLE IF NOT EXISTS plugin(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  version TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'registered',   -- registered|starting|running|stopped|failed|invalid
+  note TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL DEFAULT 0
+);
+
 -- 管理面通知（CHANNEL_PLUGIN_SPEC §2.5 末条）：只作**已固化主动消息**的入口，不存第二份历史。
 -- 固定引用 (message_id, 原会话版本)；回滚 / 删除 / 归档 / 重绑后解析只返回管理错误，不改投、不激活冻结线。
 CREATE TABLE IF NOT EXISTS notice(
@@ -3030,6 +3042,31 @@ class Store:
             (instance_id, timeline_id, original_id),
         ).fetchone()
         return _row_to_dict(row) if row else None
+
+    def plugin_put(self, row: dict[str, Any]) -> None:
+        payload = {"name": "", "version": "", "path": "", "enabled": 0, "state": "registered", "note": "",
+                   "updated_at": 0.0, **row}
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO plugin(id, name, version, path, enabled, state, note, updated_at)
+                   VALUES(:id, :name, :version, :path, :enabled, :state, :note, :updated_at)
+                   ON CONFLICT(id) DO UPDATE SET
+                     name=:name, version=:version, path=:path, enabled=:enabled,
+                     state=:state, note=:note, updated_at=:updated_at""",
+                {"enabled": int(payload["enabled"]), **payload},
+            )
+
+    def plugin_get(self, plugin_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM plugin WHERE id=?", (str(plugin_id),)).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def plugin_list(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM plugin ORDER BY id").fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def plugin_forget(self, plugin_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM plugin WHERE id=?", (str(plugin_id),))
 
     def notice_put(self, row: dict[str, Any]) -> dict[str, Any]:
         """登记一条通知引用（同一条固化消息只登记一次：唯一键 + 幂等返回既有行）。"""

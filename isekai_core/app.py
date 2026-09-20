@@ -15,6 +15,7 @@ from typing import Any
 from .channel import CoreServer
 from .config import Config
 from .llm import FakeLLM, LLMClient
+from . import plugins as plugins_mod
 from .log import get_logger
 from .runtime.service import RuntimeService
 from .world import ops as world_ops
@@ -147,6 +148,8 @@ async def build_runtime(
         world.ensure_instance(row["id"], now_real=time.time())
     server = CoreServer(cfg=cfg, store=store, service=service, state=state, generation=generation)
     holder["server"] = server
+    # 插件宿主（CHANNEL_PLUGIN_SPEC §三）：登记表在库里，进程按需起停；没挂上时相关 op 明确拒绝
+    plugins_mod.install(plugins_mod.PluginHost(cfg=cfg, store=store, server=server))
     return Runtime(
         cfg=cfg,
         store=store,
@@ -242,6 +245,14 @@ async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | N
             sys.stdout.buffer.write(line.encode("utf-8"))
             sys.stdout.buffer.flush()
         log.info("core ready state=%s", runtime.server.state)
+        resumed_plugins = 0
+        if plugins_mod.HOST is not None:
+            for row in runtime.store.plugin_list():
+                if int(row.get("enabled") or 0):
+                    result = await plugins_mod.HOST.enable(str(row["id"]))
+                    resumed_plugins += 1 if result.get("enabled") else 0
+            if resumed_plugins:
+                log.info("plugins resumed=%s", resumed_plugins)
         if runtime.world is not None:
             # 恢复：只对中断前激活的线补算，冻结线不补（§2.6）
             resumed = runtime.world.catch_up_all(now_real=time.time())
@@ -251,6 +262,13 @@ async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | N
         await stop.wait()
     finally:
         stop.set()
+        if plugins_mod.HOST is not None:
+            try:
+                stopped_plugins = await plugins_mod.HOST.stop_all()
+                if stopped_plugins:
+                    log.info("plugins stopped=%s", stopped_plugins)
+            except Exception:  # noqa: BLE001 - 退出期异常不挡收尾
+                log.exception("stopping plugins failed")
         await runtime.service.shutdown()
         await runtime.server.close()
         await runtime.llm.aclose()
