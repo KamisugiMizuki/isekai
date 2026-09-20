@@ -485,6 +485,8 @@ CREATE TABLE IF NOT EXISTS effect_state(
   recovery TEXT NOT NULL DEFAULT '',
   active INTEGER NOT NULL DEFAULT 1,
   cleared_at INTEGER,
+  priority INTEGER NOT NULL DEFAULT 0,   -- 同刻优先档位（固定规则，见 runtime/events.EFFECT_PRIORITY）
+  seq INTEGER NOT NULL DEFAULT 0,        -- 同刻施加顺序（优先档位 + 稳定标识，不随调用方迭代顺序变）
   PRIMARY KEY(instance_id, timeline_id, id)
 );
 CREATE INDEX IF NOT EXISTS ix_effect_active ON effect_state(instance_id, timeline_id, active, from_world);
@@ -589,6 +591,40 @@ def _relabel_payload(payload: dict[str, Any], instance_id: str, timeline_id: str
                 row["timeline_id"] = timeline_id
             rows.append(row)
         out[key] = rows
+    return out
+
+
+def _row_priority(row: dict[str, Any], key: str = "priority") -> int:
+    """同刻档位：调用方 / 模板显式声明优先，其次按效果类型查同一张固定表。"""
+    declared = row.get(key)
+    if isinstance(declared, int) and not isinstance(declared, bool):
+        return int(declared)
+    from .runtime.events import EFFECT_PRIORITY  # 延迟导入：存储层不反向依赖运行层
+
+    return int(EFFECT_PRIORITY.get(str(row.get("kind") or ""), 0))
+
+
+def _same_instant_order(
+    rows: list[dict[str, Any]], *, at_key: str, priority_key: str = "priority"
+) -> list[dict[str, Any]]:
+    """同刻顺序（EVENT_ENGINE_SPEC §六）：固定优先规则 + 稳定标识排序。
+
+    结果只取决于内容，不取决于调用方的迭代顺序；同刻行统一写 `seq`，
+    读取方按 `(时刻, seq, id)` 拿到的顺序处处一致。
+    """
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(int(row.get(at_key) or 0), []).append(row)
+    out: list[dict[str, Any]] = []
+    for moment in sorted(groups):
+        group = sorted(
+            groups[moment],
+            key=lambda item: (-_row_priority(item, priority_key), str(item.get("id") or "")),
+        )
+        for index, row in enumerate(group):
+            row = dict(row)
+            row["seq"] = index
+            out.append(row)
     return out
 
 
@@ -1091,6 +1127,10 @@ class Store:
         if effect_columns and "value" not in effect_columns:
             log.info("effect_state 增列 value")
             self._conn.execute("ALTER TABLE effect_state ADD COLUMN value TEXT")
+        if effect_columns and "priority" not in effect_columns:
+            log.info("effect_state 增列 priority / seq（同刻顺序，§六）")
+            self._conn.execute("ALTER TABLE effect_state ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+            self._conn.execute("ALTER TABLE effect_state ADD COLUMN seq INTEGER NOT NULL DEFAULT 0")
         message_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(message)")}
         if message_columns and "model_fingerprint" not in message_columns:
             log.info("message 增列：model_fingerprint")
@@ -2153,6 +2193,9 @@ class Store:
 
         返回 False 表示世代已变（冻结 / 回滚后的迟到任务），整批不落盘。
         """
+        # 同刻顺序在入库前定死（§六）：同一批里同刻的多事件 / 多效果，谁的顺序不取决于谁先被迭代到。
+        events = _same_instant_order(list(events), at_key="world_seconds")
+        effects = _same_instant_order(list(effects), at_key="from_world")
         with self._lock, self._conn:  # 单次 with → 一次提交，中途异常整批回滚
             row = self._conn.execute(
                 "SELECT generation, processed_world FROM timeline_clock WHERE timeline_id=?", (timeline_id,)
@@ -2218,12 +2261,17 @@ class Store:
                     row,
                 )
             for raw in effects:
-                row = {"value": None, "family": "", "recovery": "", "cleared_at": None, **raw}
+                row = {
+                    "value": None, "family": "", "recovery": "", "cleared_at": None, "seq": 0, **raw,
+                }
+                row["priority"] = _row_priority(row)  # 没声明的按固定档位补上，读回也看得见
                 self._conn.execute(
                     """INSERT INTO effect_state(instance_id, timeline_id, id, event_id, target, kind, family,
-                                               value, from_world, expiry, recovery, active, cleared_at)
+                                               value, from_world, expiry, recovery, active, cleared_at,
+                                               priority, seq)
                        VALUES(:instance_id, :timeline_id, :id, :event_id, :target, :kind, :family,
-                              :value, :from_world, :expiry, :recovery, :active, :cleared_at)
+                              :value, :from_world, :expiry, :recovery, :active, :cleared_at,
+                              :priority, :seq)
                        ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
                     row,
                 )
@@ -2375,7 +2423,7 @@ class Store:
             ),
             "effects": rows(
                 """SELECT * FROM effect_state WHERE instance_id=? AND timeline_id=? AND from_world<=?
-                   ORDER BY from_world, id""",
+                   ORDER BY from_world, seq, id""",
                 instance_id,
                 timeline_id,
                 watermark,
@@ -3401,7 +3449,7 @@ class Store:
         """仍有效的后果（§六）：过期或已解除的不再参与因果。"""
         rows = self._conn.execute(
             """SELECT * FROM effect_state WHERE instance_id=? AND timeline_id=? AND active=1
-               AND from_world<=? ORDER BY from_world, id""",
+               AND from_world<=? ORDER BY from_world, seq, id""",
             (instance_id, timeline_id, until),
         ).fetchall()
         wanted = {str(item) for item in targets} if targets else None

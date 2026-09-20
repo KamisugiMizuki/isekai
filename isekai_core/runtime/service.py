@@ -2465,6 +2465,7 @@ class RuntimeService:
                 "detail": events.detail_text(candidate),
                 "text_source": "template",
                 "effects": events.as_json(candidate["effects"]),
+                "priority": events.event_priority(candidate),
                 "share_value": 1 if candidate.get("fixed") else 0,
                 "importance": 0.6 if candidate.get("fixed") else 0.4,
                 "created_real": 0.0,

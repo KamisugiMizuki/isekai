@@ -26,6 +26,37 @@ SLOTS_BY_DENSITY: dict[str, int] = {"稀疏": 2, "常规": 4, "丰盛": 8}
 #: 受支持的效果闭集由设定层持有（校验器与引擎共用一份）
 SUPPORTED_EFFECTS = set(SUPPORTED_EFFECT_NAMES)
 
+# 同刻多效果的固定优先规则（EVENT_ENGINE_SPEC §六）：数字大 = 更强。
+# 冲突时按从小到大依次施加、以最强的一条为准：物理通行 > 活动限制 > 环境 > 制度 > 惯例 > 渠道 > 通告 > 风闻
+# （硬约束压过软约束，事实压过传播）。模板 / 世界包可在效果上声明 priority 覆盖（§十一「同刻多效果优先规则」）。
+EFFECT_PRIORITY: dict[str, int] = {
+    "rumor_spread": 10,
+    "public_notice": 20,
+    "source_delay": 30,
+    "custom_state": 40,
+    "institution_state": 50,
+    "environment_state": 60,
+    "activity_constraint": 70,
+    "route_blocked": 80,
+}
+DEFAULT_EFFECT_PRIORITY = 0
+
+
+def effect_priority(effect: dict[str, Any]) -> int:
+    """单条效果的优先值：模板声明优先，其次按效果类型的固定档位。"""
+    declared = effect.get("priority")
+    if isinstance(declared, bool) or not isinstance(declared, int):
+        declared = None
+    if declared is not None:
+        return int(declared)
+    return EFFECT_PRIORITY.get(str(effect.get("kind") or ""), DEFAULT_EFFECT_PRIORITY)
+
+
+def event_priority(event: dict[str, Any]) -> int:
+    """事件在同刻顺序里的档位 = 它最强的一条效果（同一张优先表，不另建一套）。"""
+    values = [effect_priority(item) for item in (event.get("effects") or []) if isinstance(item, dict)]
+    return max(values) if values else DEFAULT_EFFECT_PRIORITY
+
 
 def stable_key(*parts: Any) -> str:
     """固定编码 + 固定哈希：同一输入处处同键，不依赖进程随机化（附录 A）。"""
@@ -184,6 +215,7 @@ def effect_rows(
                 "target": str(effect.get("target") or ""),
                 "kind": kind,
                 "family": str(family),
+                "priority": effect_priority(effect),
                 "value": None if effect.get("value") is None else str(effect.get("value")),
                 "from_world": int(world_seconds),
                 "expiry": expiry,
