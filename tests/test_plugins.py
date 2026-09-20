@@ -94,6 +94,28 @@ async def test_uninstall_keeps_core_history(tmp_path) -> None:
         assert h.runtime.store.timeline_list(info["id"]), "核心会话与角色历史保留"
 
 
+async def test_reference_plugin_handshakes(tmp_path) -> None:
+    """参考实现（examples/channel_plugin_reference.py）能被真宿主拉起来并握手成功。"""
+    async with running_core(tmp_path) as h:
+        folder = tmp_path / "plugins" / "reference"
+        folder.mkdir(parents=True)
+        source = (Path(__file__).resolve().parent.parent / "examples" / "channel_plugin_reference.py").read_text(
+            encoding="utf-8"
+        )
+        (folder / "main.py").write_text(source, encoding="utf-8")
+        (folder / "manifest.json").write_text(
+            json.dumps({"id": "reference-plugin", "name": "参考通道", "version": "0.1.0", "ump": "1.x",
+                        "entry": ["python", "main.py"], "description": "参考实现", "author": "isekai"},
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
+        host = plugins.PluginHost(cfg=h.cfg, store=h.runtime.store, server=h.runtime.server, folder=tmp_path / "plugins")
+        result = await host.enable("reference-plugin", timeout=25.0)
+        assert result.get("enabled") is True, result
+        assert str(h.runtime.store.plugin_get("reference-plugin")["state"]) == "running"
+        assert (await host.disable("reference-plugin"))["state"] == "stopped"
+
+
 def _instance(harness, world):
     from samples import sample_card, sample_package
     from isekai_core.world.instances import create_instance
