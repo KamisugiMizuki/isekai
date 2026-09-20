@@ -487,7 +487,7 @@ def section_static() -> None:
     rust_parts = {
         "通知显示（notify_message 命令）": "fn notify_message",
         "点击落点（open_notice）": "fn open_notice",
-        "系统通知激活回调（wait_for_action）": "wait_for_action",
+        "系统通知激活回调（wait_for_response）": "wait_for_response",
         "把窗口带到前台": "set_focus",
     }
     rust_missing = [name for name, token in rust_parts.items() if token not in rust]
