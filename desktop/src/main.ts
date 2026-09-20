@@ -609,6 +609,8 @@ interface InstanceEntry {
   timelines: number;
   sessions: number;
   imported: boolean;
+  compatibility?: string;
+  compatibility_note?: string;
 }
 
 interface WorldCache {
@@ -616,9 +618,29 @@ interface WorldCache {
   cards: CardEntry[];
   instances: InstanceEntry[];
   containers: Array<{ file: string }>;
+  instanceId: string;
+  timeline: string;
+  clock: ClockView | null;
 }
 
-const world: WorldCache = { packages: [], cards: [], instances: [], containers: [] };
+interface ClockView {
+  state: string;
+  world_seconds?: number;
+  processed_world?: number;
+  label?: string;
+  rate?: number;
+  catching_up?: boolean;
+}
+
+const world: WorldCache = {
+  packages: [],
+  cards: [],
+  instances: [],
+  containers: [],
+  instanceId: "",
+  timeline: "",
+  clock: null,
+};
 const GENERATE_TIMEOUT_MS = 600000;
 
 function fillSelect(select: HTMLSelectElement, entries: Array<[string, string]>): void {
@@ -680,6 +702,7 @@ async function loadWorld(): Promise<void> {
   const importOptions = world.containers.map((item) => [item.file, item.file] as [string, string]);
   fillSelect($<HTMLSelectElement>("import-select"), importOptions);
   const selected = $<HTMLSelectElement>("inst-select").value;
+  world.instanceId = selected;
   if (selected) void showInstance(selected);
   else renderFacts($("world-facts"), [["实例", "还没有实例"]]);
 }
@@ -691,13 +714,59 @@ async function showInstance(instanceId: string): Promise<void> {
     const info = detail.instance as unknown as InstanceEntry;
     const characters = (detail.characters ?? []) as Array<Record<string, string>>;
     const timelines = (detail.timelines ?? []) as Array<Record<string, string>>;
+    world.instanceId = info.id; // 运行面状态跟着渲染的事实走，避免实例与时间线拼成混合参数
+    world.timeline = timelines[0]?.id ?? "";
     renderFacts($("world-facts"), [
       ["实例", `${info.name}（原始名称：${info.original_name}${info.imported ? "，导入" : ""}）`],
       ["初始世界时刻", `${info.moment} 世界秒`],
       ["角色", characters.map((item) => `${item.name}｜${item.occupation}`).join("；") || "无"],
       ["时间线", timelines.map((item) => `${item.name}（${item.state === "frozen" ? "冻结" : "激活"}）`).join("；")],
+      [
+        "兼容性",
+        info.compatibility === "compatible"
+          ? "可运行"
+          : `${info.compatibility}：${info.compatibility_note}`,
+      ],
       ["世界内部", "不可浏览：管理面只暴露元数据与公开时钟"],
     ]);
+    await refreshClock(info.id, world.timeline);
+  } catch (error) {
+    worldNote(String(error), true);
+  }
+}
+
+async function refreshClock(instanceId = world.instanceId, timelineId = world.timeline): Promise<void> {
+  const label = $("clock-label");
+  if (!mgmt || !instanceId || !timelineId) {
+    label.textContent = "未连接或未选择实例";
+    return;
+  }
+  try {
+    const result = await mgmt.call("runtime.clock", {
+      instance_id: instanceId,
+      timeline_id: timelineId,
+    });
+    if (instanceId !== world.instanceId || timelineId !== world.timeline) return; // 已被切走
+    const clock = result.clock as unknown as ClockView;
+    world.clock = clock;
+    if (clock.state !== "active") {
+      label.textContent = `已冻结（已处理 ${clock.processed_world ?? 0} 世界秒）`;
+      return;
+    }
+    label.textContent =
+      `${clock.label}　倍率 ${clock.rate}` +
+      (clock.catching_up ? `　追赶中（已处理 ${clock.processed_world}）` : "");
+  } catch (error) {
+    if (instanceId !== world.instanceId || timelineId !== world.timeline) return;
+    label.textContent = String(error);
+  }
+}
+
+async function clockAction(action: () => Promise<string>, pair?: { instance_id: string; timeline_id: string }): Promise<void> {
+  try {
+    const message = await action();
+    await refreshClock(pair?.instance_id, pair?.timeline_id);
+    worldNote(message);
   } catch (error) {
     worldNote(String(error), true);
   }
@@ -737,6 +806,41 @@ function bindWorld(): void {
   $<HTMLSelectElement>("inst-select").addEventListener("change", (event) => {
     void showInstance((event.target as HTMLSelectElement).value);
   });
+  $("clock-activate").addEventListener("click", () => {
+    const pair = { instance_id: world.instanceId, timeline_id: world.timeline };
+    void clockAction(async () => {
+      if (!pair.instance_id || !pair.timeline_id) throw new Error("先选一个实例");
+      const result = await mgmt!.call("runtime.activate", pair);
+      const clock = result.clock as unknown as ClockView;
+      return `已激活：${clock.label ?? ""}`;
+    }, pair);
+  });
+  $("clock-freeze").addEventListener("click", () => {
+    const pair = { instance_id: world.instanceId, timeline_id: world.timeline };
+    void clockAction(async () => {
+      if (!pair.instance_id || !pair.timeline_id) throw new Error("先选一个实例");
+      const result = await mgmt!.call("runtime.freeze", pair);
+      const clock = result.clock as unknown as ClockView & { cancelled_commands?: number };
+      return `已冻结于 ${clock.label ?? clock.world_seconds}（取消未生效命令 ${clock.cancelled_commands ?? 0} 条）`;
+    }, pair);
+  });
+  $("clock-set-rate").addEventListener("click", () => {
+    const pair = { instance_id: world.instanceId, timeline_id: world.timeline };
+    void clockAction(async () => {
+      if (!pair.instance_id || !pair.timeline_id) throw new Error("先选一个实例");
+      const rate = Number($<HTMLInputElement>("clock-rate").value);
+      if (!Number.isInteger(rate) || rate < 1) throw new Error("倍率必须是正整数");
+      const result = await mgmt!.call("runtime.rate", { ...pair, rate });
+      const changed = result.rate as { changed?: boolean; effective_real?: number; duplicate?: boolean };
+      if (changed.changed === false) return "倍率未变化";
+      return `倍率 ${rate} 将于整秒 ${changed.effective_real} 生效${changed.duplicate ? "（重试未重复登记）" : ""}`;
+    }, pair);
+  });
+
+  // 时钟显示：世界在走，界面每 2 秒跟一次（管理页可见时才请求）
+  setInterval(() => {
+    if (!$("pane-manage").classList.contains("hidden")) void refreshClock();
+  }, 2000);
 
   $("pkg-check").addEventListener("click", () =>
     void worldAction(async () => {

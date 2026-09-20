@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 
 from ..config import Config
 from ..llm import LLMError
+from ..log import get_logger
 from ..store import Store
 from ..ump import Err, UmpError
 from .cards import template_card, validate_assembly, validate_card
@@ -44,6 +45,11 @@ SYNC_OPS = frozenset(
         "world.draft.save",
         "world.draft.load",
         "world.draft.discard",
+        "runtime.clock",
+        "runtime.activate",
+        "runtime.freeze",
+        "runtime.rate",
+        "runtime.advance",
         "world.card.template",
         "world.card.load",
         "world.card.save",
@@ -184,9 +190,66 @@ def _list_files(cfg: Config, kind: str) -> list[dict[str, Any]]:
     return items
 
 
-def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any]) -> dict[str, Any]:
+def _runtime_op(runtime: Any, op: str, args: dict[str, Any], *, now_real: float | None = None) -> dict[str, Any]:
+    """运行层操作：时钟视图 / 激活 / 冻结 / 倍率 / 推进（§2、§3）。"""
+    if runtime is None:
+        raise UmpError(Err.STATE_BLOCKED, "运行层不可用", retryable=False)
+    from ..runtime.service import RuntimeStateError
+
+    now = time.time() if now_real is None else now_real
+    instance_id = str(args.get("instance_id") or args.get("instance") or "")
+    timeline_id = str(args.get("timeline_id") or args.get("timeline") or "")
+    if not instance_id or not timeline_id:
+        raise UmpError(Err.INVALID, "需要 instance_id 与 timeline_id", retryable=False)
+    try:
+        if op == "runtime.clock":
+            return {"clock": runtime.view(instance_id, timeline_id, now_real=now)}
+        if op == "runtime.activate":
+            view = runtime.activate(instance_id, timeline_id, now_real=now)
+            advanced = runtime.advance(instance_id, timeline_id, now_real=now)
+            return {"clock": runtime.view(instance_id, timeline_id, now_real=now), "advance": advanced}
+        if op == "runtime.freeze":
+            return {"clock": runtime.freeze(instance_id, timeline_id, now_real=now)}
+        if op == "runtime.rate":
+            result = runtime.set_rate(instance_id, timeline_id, rate=int(args.get("rate") or 0), now_real=now)
+            return {"rate": result, "clock": runtime.view(instance_id, timeline_id, now_real=now)}
+        if op == "runtime.advance":
+            advanced = runtime.advance(
+                instance_id, timeline_id, now_real=now, max_batches=int(args.get("max_batches") or 16)
+            )
+            return {"advance": advanced, "clock": runtime.view(instance_id, timeline_id, now_real=now)}
+    except RuntimeStateError as exc:
+        get_logger("isekai.world.ops").warning(
+            "runtime op rejected op=%s instance_id=%s timeline_id=%s: %s",
+            op,
+            instance_id,
+            timeline_id,
+            exc,
+        )
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+    raise UmpError(Err.UNSUPPORTED_TYPE, f"未知运行层操作 {op}", retryable=False)
+
+
+def _ensure_runtime(runtime: Any, instance_id: str) -> None:
+    """新建 / 导入后补齐运行层状态（时钟 + 角色初始单元与首日计划）。"""
+    if runtime is None:
+        return
+    try:
+        runtime.ensure_instance(instance_id, now_real=time.time())
+    except Exception:  # 运行层补齐失败不该让创建回滚（下次启动会再补）
+        _log_runtime_failure(instance_id)
+
+
+def _log_runtime_failure(instance_id: str) -> None:
+    get_logger("isekai.world.ops").exception("ensure runtime failed instance=%s", instance_id)
+
+
+def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: Any = None) -> dict[str, Any]:
     """同步操作：只读写文件与库，不调用模型。"""
     try:
+        if op.startswith("runtime."):
+            return _runtime_op(runtime, op, args)
+
         if op == "world.package.template":
             return {
                 "package": template_package(
@@ -281,6 +344,7 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any]) -> dict[s
             info = create_instance(
                 store, package, cards, display_name=args.get("display_name") or None
             )
+            _ensure_runtime(runtime, info["id"])
             return {"instance": info}
         if op == "instance.info":
             row = store.instance_get(str(args.get("id") or ""))
@@ -315,6 +379,7 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any]) -> dict[s
         if op == "instance.import":
             container = read_container(resolve_path(cfg, args.get("path")))
             info = import_instance(store, container, display_name=args.get("display_name") or None)
+            _ensure_runtime(runtime, info["id"])
             return {"instance": info}
     except (InstanceError, PackageError) as exc:
         raise UmpError(Err.INVALID, str(exc), retryable=False) from exc

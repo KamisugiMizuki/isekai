@@ -16,8 +16,10 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from .log import get_logger
 from .version import DATA_FORMAT_VERSION
 
+log = get_logger("isekai.store")
 SCHEMA_VERSION = 1
 
 SCHEMA = """
@@ -140,6 +142,74 @@ CREATE INDEX IF NOT EXISTS ix_commit_instance ON commit_log(instance_id, timelin
 CREATE INDEX IF NOT EXISTS ix_session_instance ON session(instance_id);
 -- 名称唯一：规范化比较在应用层（NFKC + 大小写折叠），这里兜底同名直插（§7.4）
 CREATE UNIQUE INDEX IF NOT EXISTS ux_instance_name ON instance(name);
+
+-- ---------- 世界运行层（阶段 2）：时钟、倍率、水位、角色状态 ----------
+
+CREATE TABLE IF NOT EXISTS timeline_clock(
+  timeline_id TEXT PRIMARY KEY,
+  base_real REAL NOT NULL,               -- 当前倍率段的起点（现实秒，UTC）
+  base_world INTEGER NOT NULL,           -- 当前倍率段的起点（世界秒）
+  rate INTEGER NOT NULL DEFAULT 1,       -- 当前倍率（正整数；冻结用时间线状态表达）
+  high_water_real REAL NOT NULL DEFAULT 0,
+  anchor_real REAL NOT NULL,             -- 激活时的现实锚点
+  processed_world INTEGER NOT NULL,      -- 已处理世界时刻（共同水位）
+  generation INTEGER NOT NULL DEFAULT 1  -- 运行世代：回滚 / 删除使旧任务失效
+);
+
+CREATE TABLE IF NOT EXISTS rate_command(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timeline_id TEXT NOT NULL,
+  input_real REAL NOT NULL,              -- 权威输入时刻
+  effective_real INTEGER NOT NULL,       -- 生效整秒
+  rate INTEGER NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'pending'  -- pending|applied|cancelled
+);
+CREATE INDEX IF NOT EXISTS ix_rate_pending ON rate_command(timeline_id, state, effective_real);
+
+CREATE TABLE IF NOT EXISTS unit(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  mode TEXT NOT NULL,                    -- anchor|event|dialog|time
+  semantic TEXT NOT NULL,
+  basis TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  stability REAL NOT NULL DEFAULT 0,     -- 累积稳定度（驱动迁移的隐式依据，不对用户可见）
+  archived INTEGER NOT NULL DEFAULT 0,
+  consumed TEXT NOT NULL DEFAULT '[]',   -- 已消费来源键（同一来源只消费一次）
+  updated_world INTEGER NOT NULL,
+  PRIMARY KEY(instance_id, timeline_id, character_id, id)
+);
+CREATE INDEX IF NOT EXISTS ix_unit_character ON unit(instance_id, timeline_id, character_id);
+
+CREATE TABLE IF NOT EXISTS life_plan(
+  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  day_index INTEGER NOT NULL,
+  windows TEXT NOT NULL,                 -- 展开后的世界时间窗（含跨日）
+  state TEXT NOT NULL DEFAULT 'fixed',
+  created_world INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  UNIQUE(instance_id, timeline_id, character_id, day_index)
+);
+
+CREATE TABLE IF NOT EXISTS experience(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  world_seconds INTEGER NOT NULL,
+  kind TEXT NOT NULL,                    -- life|knowledge|dialog
+  summary TEXT NOT NULL,
+  source_ref TEXT,                       -- 来源稳定标识（亲历为空）
+  confidence TEXT NOT NULL DEFAULT 'experienced',
+  PRIMARY KEY(instance_id, timeline_id, character_id, id)
+);
+CREATE INDEX IF NOT EXISTS ix_experience_window ON experience(instance_id, timeline_id, character_id, world_seconds);
 """
 
 
@@ -183,6 +253,7 @@ class Store:
     def ensure_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate_runtime_tables()
             row = self._conn.execute("SELECT value FROM meta WHERE key='data_format'").fetchone()
             if row is None:
                 self._conn.execute(
@@ -192,6 +263,22 @@ class Store:
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema', ?)", (str(SCHEMA_VERSION),)
             )
             self._conn.commit()
+
+    def _migrate_runtime_tables(self) -> None:
+        """运行层表的主键形态迁移：旧的单列主键会让不同实例互相覆盖，按派生数据重建。"""
+        expected = {"unit": ("instance_id", "timeline_id", "character_id", "id"),
+                    "experience": ("instance_id", "timeline_id", "character_id", "id")}
+        for table, columns in expected.items():
+            rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            if not rows:
+                continue
+            primary = tuple(row["name"] for row in rows if row["pk"])
+            if primary == columns:
+                continue
+            log.warning("重建运行层表 %s（主键形态升级：%s → %s）", table, primary, columns)
+            self._conn.executescript(f"DROP TABLE {table};")
+        self._conn.executescript(SCHEMA)
+        self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -746,6 +833,153 @@ class Store:
                 "SELECT * FROM commit_log WHERE instance_id=? AND timeline_id=? ORDER BY created_at",
                 (instance_id, timeline_id),
             ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    # ---------- 运行层：时钟 / 倍率 / 水位 ----------
+
+    def clock_get(self, timeline_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM timeline_clock WHERE timeline_id=?", (timeline_id,)).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def clock_put(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO timeline_clock(timeline_id, base_real, base_world, rate, high_water_real,
+                                              anchor_real, processed_world, generation)
+                   VALUES(:timeline_id, :base_real, :base_world, :rate, :high_water_real,
+                          :anchor_real, :processed_world, :generation)
+                   ON CONFLICT(timeline_id) DO UPDATE SET
+                     base_real=:base_real, base_world=:base_world, rate=:rate,
+                     high_water_real=:high_water_real, anchor_real=:anchor_real,
+                     processed_world=:processed_world, generation=:generation""",
+                row,
+            )
+
+    def clock_set_processed(self, timeline_id: str, processed_world: int, *, generation: int | None = None) -> bool:
+        """推进水位：世代不符即拒（迟到任务不得写回旧水位，§2.6/§7.1）。"""
+        with self._lock, self._conn:
+            if generation is None:
+                cursor = self._conn.execute(
+                    "UPDATE timeline_clock SET processed_world=? WHERE timeline_id=? AND processed_world<?",
+                    (processed_world, timeline_id, processed_world),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """UPDATE timeline_clock SET processed_world=?
+                       WHERE timeline_id=? AND generation=? AND processed_world<?""",
+                    (processed_world, timeline_id, generation, processed_world),
+                )
+            return cursor.rowcount > 0
+
+    def rate_add(
+        self, timeline_id: str, *, input_real: float, effective_real: int, rate: int, seq: int
+    ) -> int:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """INSERT INTO rate_command(timeline_id, input_real, effective_real, rate, seq, state)
+                   VALUES(?,?,?,?,?, 'pending')""",
+                (timeline_id, input_real, effective_real, rate, seq),
+            )
+            return int(cursor.lastrowid)
+
+    def rate_pending(self, timeline_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM rate_command WHERE timeline_id=? AND state='pending' ORDER BY effective_real, seq",
+            (timeline_id,),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def rate_apply(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        with self._lock, self._conn:
+            self._conn.executemany("UPDATE rate_command SET state='applied' WHERE id=?", [(i,) for i in ids])
+
+    def rate_cancel_pending(self, timeline_id: str) -> int:
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE rate_command SET state='cancelled' WHERE timeline_id=? AND state='pending'",
+                (timeline_id,),
+            )
+            return int(cursor.rowcount)
+
+    # ---------- 运行层：角色状态 ----------
+
+    def unit_put(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO unit(id, instance_id, timeline_id, character_id, mode, semantic, basis,
+                                    confidence, stability, archived, consumed, updated_world)
+                   VALUES(:id, :instance_id, :timeline_id, :character_id, :mode, :semantic, :basis,
+                          :confidence, :stability, :archived, :consumed, :updated_world)
+                   ON CONFLICT(instance_id, timeline_id, character_id, id) DO UPDATE SET
+                     confidence=:confidence, stability=:stability, archived=:archived,
+                     consumed=:consumed, updated_world=:updated_world""",
+                row,
+            )
+
+    def unit_list(self, instance_id: str, timeline_id: str, character_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT * FROM unit WHERE instance_id=? AND timeline_id=? AND character_id=?
+               ORDER BY archived, id""",
+            (instance_id, timeline_id, character_id),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def plan_put(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO life_plan(id, instance_id, timeline_id, character_id, day_index,
+                                                   windows, state, created_world, note)
+                   VALUES(:id, :instance_id, :timeline_id, :character_id, :day_index,
+                          :windows, :state, :created_world, :note)""",
+                row,
+            )
+
+    def plan_get(self, instance_id: str, timeline_id: str, character_id: str, day_index: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT * FROM life_plan WHERE instance_id=? AND timeline_id=? AND character_id=? AND day_index=?""",
+            (instance_id, timeline_id, character_id, day_index),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def plan_latest(self, instance_id: str, timeline_id: str, character_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT * FROM life_plan WHERE instance_id=? AND timeline_id=? AND character_id=?
+               ORDER BY day_index DESC LIMIT 1""",
+            (instance_id, timeline_id, character_id),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def experience_add(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO experience(id, instance_id, timeline_id, character_id, world_seconds,
+                                                    kind, summary, source_ref, confidence)
+                   VALUES(:id, :instance_id, :timeline_id, :character_id, :world_seconds,
+                          :kind, :summary, :source_ref, :confidence)""",
+                row,
+            )
+
+    def experience_window(
+        self, instance_id: str, timeline_id: str, character_id: str, *, until: int, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT * FROM experience WHERE instance_id=? AND timeline_id=? AND character_id=?
+               AND world_seconds<=? ORDER BY world_seconds DESC LIMIT ?""",
+            (instance_id, timeline_id, character_id, until, limit),
+        ).fetchall()
+        return [_row_to_dict(r) for r in reversed(rows)]
+
+    def experience_added_since(
+        self, instance_id: str, timeline_id: str, *, since: int, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """水位推进期间新增的经历（按角色分组由调用方处理）。"""
+        rows = self._conn.execute(
+            """SELECT * FROM experience WHERE instance_id=? AND timeline_id=? AND world_seconds>?
+               ORDER BY world_seconds LIMIT ?""",
+            (instance_id, timeline_id, since, limit),
+        ).fetchall()
         return [_row_to_dict(r) for r in rows]
 
     def write_probe(self) -> None:

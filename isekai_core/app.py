@@ -16,6 +16,7 @@ from .channel import CoreServer
 from .config import Config
 from .llm import FakeLLM, LLMClient
 from .log import get_logger
+from .runtime.service import RuntimeService
 from .session import SessionService
 from .store import Store
 from .version import APP_VERSION, DATA_FORMAT_VERSION, RULES_VERSION
@@ -101,6 +102,7 @@ class Runtime:
     service: SessionService
     server: CoreServer
     ownership: Ownership
+    world: Any = None  # 世界运行层（阶段 2 起）
 
 
 def build_llm(cfg: Config) -> Any:
@@ -136,6 +138,10 @@ async def build_runtime(
         return bool(server and await server.deliver(channel_id, thread_id, envelope))
 
     service = SessionService(store=store, cfg=cfg, llm=llm, deliver=deliver)
+    world = RuntimeService(store)
+    service.runtime = world  # 会话层经运行层构造扮演定义
+    for row in store.instance_list():
+        world.ensure_instance(row["id"], now_real=time.time())
     server = CoreServer(cfg=cfg, store=store, service=service, state=state, generation=generation)
     holder["server"] = server
     return Runtime(
@@ -145,6 +151,7 @@ async def build_runtime(
         service=service,
         server=server,
         ownership=ownership or Ownership(cfg.paths.lock),
+        world=world,
     )
 
 
@@ -218,6 +225,12 @@ async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | N
             sys.stdout.buffer.write(line.encode("utf-8"))
             sys.stdout.buffer.flush()
         log.info("core ready state=%s", runtime.server.state)
+        if runtime.world is not None:
+            # 恢复：只对中断前激活的线补算，冻结线不补（§2.6）
+            resumed = runtime.world.catch_up_all(now_real=time.time())
+            if resumed:
+                log.info("resumed timelines=%s", ",".join(resumed))
+            ticker = asyncio.create_task(_clock_tick(runtime, stop))
         await stop.wait()
     finally:
         stop.set()
@@ -227,3 +240,19 @@ async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | N
         runtime.store.close()
         ownership.release()
         log.info("core stopped")
+
+
+async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float = 5.0) -> None:
+    """世界时钟自己走：周期性推进激活线（冻结线跳过，单线失败不影响其他线）。"""
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+        if runtime.world is None:
+            continue
+        try:
+            runtime.world.catch_up_all(now_real=time.time(), max_batches=4)
+        except Exception:  # 推进失败不该让核心退出
+            log.exception("clock tick failed")

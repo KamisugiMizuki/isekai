@@ -73,22 +73,24 @@ def spawn_core(root: str | None) -> tuple[subprocess.Popen[bytes], dict[str, Any
     return proc, ready
 
 
-async def ensure_binding(cfg: Config, mgmt: MgmtClient, channel_id: str, thread_id: str) -> dict[str, Any]:
-    """取（或建立）占位会话与 thread 绑定；阶段 0 由开发工具代管理面完成。"""
+async def ensure_binding(
+    cfg: Config, mgmt: MgmtClient, channel_id: str, thread_id: str, *, triple: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """取（或建立）会话与 thread 绑定；默认占位三元组，传 `triple` 时绑定真实实例。"""
     sessions = (await mgmt.call("session.list")).get("sessions") or []
-    placeholder = cfg.placeholder
+    wanted = dict(triple or cfg.placeholder)
     session = next(
         (
             s
             for s in sessions
-            if s["instance_id"] == placeholder["instance_id"]
-            and s["timeline_id"] == placeholder["timeline_id"]
-            and s["character_id"] == placeholder["character_id"]
+            if s["instance_id"] == wanted["instance_id"]
+            and s["timeline_id"] == wanted["timeline_id"]
+            and s["character_id"] == wanted["character_id"]
         ),
         None,
     )
     if session is None:
-        session = (await mgmt.call("session.ensure", **placeholder))["session"]
+        session = (await mgmt.call("session.ensure", **wanted))["session"]
     threads = (await mgmt.call("thread.list")).get("threads") or []
     thread = next(
         (t for t in threads if t["channel_id"] and t["thread_id"] == thread_id and t["session_id"] == session["id"]),
@@ -242,7 +244,44 @@ async def amain(args: argparse.Namespace, cfg: Config) -> int:
                 )
                 credential = issued["credential"]
             _save_credential(cfg, args.channel_id, credential)
-            binding = await ensure_binding(cfg, mgmt, args.channel_id, args.thread)
+            triple = None
+            if args.instance:
+                info = await mgmt.call("instance.info", id=args.instance)
+                timeline_id = args.timeline or (info["timelines"][0]["id"] if info.get("timelines") else "")
+                if not timeline_id:
+                    raise SystemExit("实例没有可用时间线")
+                if args.character:
+                    character_id = args.character
+                else:
+                    characters = info.get("characters") or []
+                    if not characters:
+                        raise SystemExit("实例没有可对话角色")
+                    character_id = characters[0]["card_id"]
+                triple = {
+                    "instance_id": args.instance,
+                    "timeline_id": timeline_id,
+                    "character_id": character_id,
+                }
+                if args.activate:
+                    actions = await mgmt.call(
+                        "runtime.activate", instance_id=args.instance, timeline_id=timeline_id
+                    )
+                    print(
+                        f"· 已激活 {timeline_id}：{actions['clock'].get('label')}"
+                        f"（倍率 {actions['clock'].get('rate')}）"
+                    )
+                if args.rate:
+                    changed = await mgmt.call(
+                        "runtime.rate",
+                        instance_id=args.instance,
+                        timeline_id=timeline_id,
+                        rate=int(args.rate),
+                    )
+                    print(
+                        f"· 倍率 {args.rate} 将于 {changed['rate'].get('effective_real')} 生效"
+                        f"（原倍率 {changed['rate'].get('rate_at_effect')}）"
+                    )
+            binding = await ensure_binding(cfg, mgmt, args.channel_id, args.thread, triple=triple)
             session, thread = binding["session"], binding["thread"]
             client = await connect_channel(
                 cfg,
@@ -296,6 +335,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--name", default="开发 CLI")
     parser.add_argument("--thread", default="dm-cli")
     parser.add_argument("--say", default=None, help="单轮模式：发送该文本并打印回复")
+    parser.add_argument("--instance", default=None, help="绑定真实世界实例（默认占位会话）")
+    parser.add_argument("--timeline", default=None, help="时间线标识（默认取实例首条）")
+    parser.add_argument("--character", default=None, help="角色标识（默认取实例首位角色）")
+    parser.add_argument("--activate", action="store_true", help="先激活该时间线（以当下现实时间重锚）")
+    parser.add_argument("--rate", default=None, help="激活后设置倍率（世界秒 / 现实秒）")
     parser.add_argument("--quiet", action="store_true", help="单轮模式只打印回复正文")
     parser.add_argument("--keep-core", action="store_true", help="退出后保留核心进程")
     args = parser.parse_args(argv)

@@ -89,6 +89,18 @@
             <select id="import-select"></select>
             <button id="inst-import">导入为实例</button>
           </div>
+
+          <h3>运行（当前查看的实例）</h3>
+          <div class="row">
+            <span id="clock-label" class="muted">未连接或未选择实例</span>
+          </div>
+          <div class="row">
+            <button id="clock-activate">激活</button>
+            <button id="clock-freeze">冻结</button>
+            <input id="clock-rate" type="number" min="1" step="1" placeholder="倍率（世界秒 / 现实秒）" />
+            <button id="clock-set-rate">设定倍率</button>
+            <span id="clock-note" class="muted"></span>
+          </div>
           <dl id="world-facts" class="facts"></dl>
         </section>
 

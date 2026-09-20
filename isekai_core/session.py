@@ -62,11 +62,15 @@ def plan_batches(parts: list[str], max_parts: int) -> list[list[str]]:
 
 
 class SessionService:
-    def __init__(self, *, store: Store, cfg: Config, llm: Any, deliver: Deliver) -> None:
+    def __init__(
+        self, *, store: Store, cfg: Config, llm: Any, deliver: Deliver, runtime: Any = None
+    ) -> None:
         self.store = store
         self.cfg = cfg
         self.llm = llm
         self.deliver = deliver
+        #: 世界运行层（阶段 2 起）：真实实例的会话用它构造扮演定义
+        self.runtime = runtime
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
 
@@ -238,10 +242,24 @@ class SessionService:
             return max_len, 1
         return max_len, min(int(caps.get("max_parts") or self.cfg.max_parts), self.cfg.max_parts)
 
+    def _system_prompt(self, row: dict[str, Any]) -> str:
+        """扮演定义：真实实例走运行层（已过滤的认知切片），占位会话仍用占位提示词。"""
+        runtime = getattr(self, "runtime", None)
+        if runtime is None:
+            return self.cfg.placeholder["system_prompt"]
+        session = self.store.session_get(row["session_id"])
+        if session is None or str(session["instance_id"]).startswith("ph-"):
+            return self.cfg.placeholder["system_prompt"]
+        try:
+            return runtime.system_prompt(session)
+        except Exception:  # 运行层不可用不得阻断对话
+            log.exception("runtime prompt failed session=%s", session["id"])
+            return self.cfg.placeholder["system_prompt"]
+
     def _build_messages(self, row: dict[str, Any]) -> list[dict[str, Any]]:
         history = self.store.context_window(row["session_id"], self.cfg.context_history_max)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.cfg.placeholder["system_prompt"]}
+            {"role": "system", "content": self._system_prompt(row)}
         ]
         for item in history:
             if item["seq"] >= row["seq"]:

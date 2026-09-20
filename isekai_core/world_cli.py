@@ -49,6 +49,11 @@ OP_BY_COMMAND = {
     ("instance", "delete"): "instance.delete",
     ("instance", "export"): "instance.export",
     ("instance", "import"): "instance.import",
+    ("runtime", "clock"): "runtime.clock",
+    ("runtime", "activate"): "runtime.activate",
+    ("runtime", "freeze"): "runtime.freeze",
+    ("runtime", "rate"): "runtime.rate",
+    ("runtime", "advance"): "runtime.advance",
 }
 
 
@@ -88,6 +93,13 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             return {**args, "card_path": ns.file, **({"moment": int(ns.moment)} if ns.moment else {})}
         if cmd == "generate":
             return {**args, "brief": ns.brief or ""}
+    if group == "runtime":
+        args: dict[str, Any] = {"instance_id": ns.id, "timeline_id": ns.timeline}
+        if cmd == "rate":
+            args["rate"] = int(ns.rate or 0)
+        if cmd == "advance":
+            args["max_batches"] = int(ns.max_batches or 16)
+        return args
     if group == "instance":
         if cmd == "list":
             return {}
@@ -170,7 +182,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--root", default=None, help="数据根目录")
     parser.add_argument("--endpoint", default=None, help="连接已有核心（默认自行拉起）")
     parser.add_argument("--mgmt", default=None, help="已有核心的管理凭据")
-    parser.add_argument("group", choices=["package", "card", "instance"])
+    parser.add_argument("group", choices=["package", "card", "instance", "runtime"])
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
     parser.add_argument("--name", default=None)
     parser.add_argument("--density", default=None)
@@ -183,6 +195,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--card", default=None, help="角色卡文件（多个用逗号分隔）")
     parser.add_argument("--display-name", dest="display_name", default=None)
     parser.add_argument("--id", default=None, help="实例标识")
+    parser.add_argument("--timeline", default=None, help="时间线标识（运行层命令）")
+    parser.add_argument("--rate", default=None, help="倍率（世界秒 / 现实秒）")
+    parser.add_argument("--max-batches", dest="max_batches", default=None, help="单次推进的最大批数")
     parser.add_argument("--moment", default=None, help="校验基准时刻（世界秒）")
     parser.add_argument("--candidate", default=None, help="把文件内容当作候选对象提交")
     ns = parser.parse_args(argv)
