@@ -23,6 +23,7 @@ DESK_ARGS = {"static": ["static"], "main": [], "restore": ["restore"], "notify":
 
 TOTAL_RE = re.compile(r"TOTAL (\d+) PASS (\d+) FAIL (\d+) DEFERRED (\d+)")
 DESK_RE = re.compile(r"PASS=(\d+) FAIL=(\d+) DEFERRED=(\d+)")
+DESK_LINE = "[{label}]{tail}PASS={p} FAIL={f} DEFERRED={d}"  # 段名锚定的汇总行（见下方 _desk_counts）
 COUNT_RE = re.compile(r"^\[(PASS|FAIL|DEFERRED)\s*\]", re.MULTILINE)
 
 
@@ -66,10 +67,12 @@ def main() -> int:
         rows_desk: list[tuple[str, int, int, int, str]] = []
         for label, extra in DESK_ARGS.items():
             text, code = _run([PY, str(ROOT / "scripts" / "_audit2_desk.py"), *extra])
-            match = DESK_RE.search(text)
+            # 段名锚定：先在该段自己的汇总行里找，找不到才退回第一条匹配（裸跑 last 行可能是别的段）
+            labelled = re.search(rf"\[{re.escape(label)}\][^\n]*PASS=(\d+) FAIL=(\d+) DEFERRED=(\d+)", text)
+            match = labelled or DESK_RE.search(text)
             if match:
                 passed, failed, deferred = (int(item) for item in match.groups())
-                rows_desk.append((f"desk:{label}", passed, failed, deferred, ""))
+                rows_desk.append((f"desk:{label}", passed, failed, deferred, "" if labelled else "按第一条汇总行计数（未锚定到段名）"))
             else:
                 passed, failed, deferred = _counts(text)
                 rows_desk.append((f"desk:{label}", passed, failed, deferred, "未取到汇总行（按条目行计数）"))
