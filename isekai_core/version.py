@@ -34,3 +34,15 @@ DEFAULT_MAX_PARTS = 10
 MAX_FRAME_BYTES = 1 << 20  # 1 MiB：恶意大帧直接断，不进解析
 PROTOCOL_ERROR_LIMIT = 5  # 连续协议错误上限，超过断开连接
 HANDSHAKE_TIMEOUT_S = 10.0
+
+
+def generator_fingerprint(*, segments: tuple, hints: tuple, model: str = "") -> str:
+    """生成器 / 提示词 / 文本模型指纹：只负责新文本产物的边界（§5.7）。
+
+    文本产物（世界包 / 角色卡）的「谁在什么时候用什么生成」要可追溯，但**不**参与
+    事实推进或存储可读性的判定。同一个生成器与同一模型必须得到同一个值。
+    """
+    import hashlib
+
+    payload = "|".join([*map(str, segments), *map(str, hints), str(model or "")])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

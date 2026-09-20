@@ -57,6 +57,16 @@ MIN_CONTENT = (
 )
 
 
+def stamp_generator_meta(package: dict[str, Any], *, model: str = "") -> dict[str, Any]:
+    """给生成出来的包 / 卡打上生成器指纹与文本模型（管理元数据，不是世界事实）。"""
+    meta = package.get("meta") if isinstance(package.get("meta"), dict) else {}
+    meta["generator_fingerprint"] = _fingerprint(model)
+    if model:
+        meta["generator_model"] = str(model)
+    package["meta"] = meta
+    return package
+
+
 def _available_ids(package: dict[str, Any]) -> dict[str, list[str]]:
     """已有段落的稳定标识：分段生成时后续段落必须引用它们，而不是自己另造。"""
     out: dict[str, list[str]] = {}
@@ -109,6 +119,17 @@ def _merge_structure(candidate: dict[str, Any], skeleton: dict[str, Any]) -> dic
 
 
 #: 单次生成请求的默认调用上限（含重试）：三段各两次 / 卡片两次（§2.4 用量预算）
+def _fingerprint(model: str = "") -> str:
+    """本生成器的指纹（段定义 + 结构/最小内容提示 + 模型名）。"""
+    from ..version import generator_fingerprint
+
+    return generator_fingerprint(
+        segments=tuple(f"{name}:{','.join(keys)}" for name, keys in PACKAGE_SEGMENTS),
+        hints=(STRUCTURE_HINT, MIN_CONTENT),
+        model=model,
+    )
+
+
 DEFAULT_PACKAGE_CALLS = len(PACKAGE_SEGMENTS) * 2
 DEFAULT_CARD_CALLS = 2
 
@@ -175,6 +196,8 @@ async def generate_package(
             return {**package, **candidate}, [f"{label}：{item}" for item in errors], _usage(budget, paused=False)
         for key in keys:
             package[key] = candidate.get(key, package[key])
+    # 文本产物的边界：谁、用什么模型生成的（管理元数据；不参与事实与可读性判定）
+    stamp_generator_meta(package, model=str(getattr(llm, "model", "") or ""))
     return package, validate_package(package), _usage(budget, paused=False)
 
 
