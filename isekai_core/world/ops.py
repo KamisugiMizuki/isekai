@@ -421,7 +421,16 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             if row is None:
                 raise UmpError(Err.NOT_FOUND, "实例不存在", retryable=False)
             setting = json.loads(row["setting"])
-            cards = setting.get("cards") or []
+            cards = list(setting.get("cards") or [])
+            # 补卡的角色也要列出来（与运行层 cards() 同一口径：按该线当前水位）
+            for timeline in store.timeline_list(row["id"]):
+                clock = store.clock_get(timeline["id"])
+                until = int(clock["processed_world"]) if clock else 0
+                for joined in store.character_join_list(row["id"], timeline["id"], until=until):
+                    try:
+                        cards.append(json.loads(str(joined["card"])))
+                    except json.JSONDecodeError:
+                        continue
             return {
                 "instance": public_info(row),
                 "characters": [

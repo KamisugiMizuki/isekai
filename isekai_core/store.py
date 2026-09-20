@@ -1490,6 +1490,18 @@ class Store:
             self.void_put(str(row["channel_id"] or ""), str(row["thread_id"] or ""), str(row["env_id"]), reason)
         return len(rows)
 
+    def timeline_delivered_replies(self, timeline_id: str) -> int:
+        """该线已经投递出去（外部平台确认收到）的回复条数：回滚抹不掉它们（§7.2）。"""
+        row = self._conn.execute(
+            """SELECT COUNT(*) n FROM message
+               WHERE role='character' AND state IN ('done','sent')
+                 AND session_id IN (SELECT id FROM session WHERE timeline_id=?)
+                 AND seq IN (SELECT msg_seq FROM delivery GROUP BY msg_seq
+                             HAVING SUM(CASE WHEN state='accepted' THEN 0 ELSE 1 END) = 0)""",
+            (timeline_id,),
+        ).fetchone()
+        return int(row["n"] if row is not None else 0)
+
     def timeline_cancel_undelivered(self, timeline_id: str) -> int:
         """该线已固化但还没投递出去的回复一并取消：不继续发送被回滚的内容（§七）。"""
         with self._lock, self._conn:

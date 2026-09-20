@@ -52,6 +52,10 @@ const state = {
   threadId: "main",
   token: "",
   sessionId: "",
+  characterId: "",
+  endpoint: "",
+  credential: null as string | null,
+  bootstrap: null as string | null,
   messages: [] as Message[],
   thinking: false,
 };
@@ -123,6 +127,21 @@ function renderMessages(): void {
 
     const chips = document.createElement("div");
     chips.className = "chips";
+    if (message.role === "character" && message.messageId && state.characterId) {
+      // 披露入口挂在消息上：沿已有对话选片段（DESKTOP_SPEC §6）
+      const disclose = document.createElement("button");
+      disclose.className = "link";
+      disclose.textContent = "披露";
+      disclose.title = "把这条片段披露给另一个角色";
+      disclose.addEventListener("click", () =>
+        selectForDisclosure(
+          String(message.messageId),
+          state.characterId,
+          world.characters.find((item) => item.card_id === state.characterId)?.name ?? state.characterId,
+        ),
+      );
+      chips.appendChild(disclose);
+    }
     if (message.role === "user") {
       chips.appendChild(chip(ACCEPT_LABEL[message.state] ?? message.state, message.state === "failed" ? "bad" : ""));
     }
@@ -157,7 +176,12 @@ function chip(text: string, kind: string): HTMLElement {
   return element;
 }
 
-function renderFacts(target: HTMLElement, facts: Array<[string, string]>): void {
+function renderFacts(target: HTMLElement | null, facts: Array<[string, string]>): void {
+  if (!target) {
+    // 缺节点只记一笔，绝不让渲染把连接 / 聊天主路径拖死
+    console.warn("renderFacts: 目标节点不存在");
+    return;
+  }
   target.innerHTML = "";
   for (const [key, value] of facts) {
     const dt = document.createElement("dt");
@@ -313,6 +337,8 @@ async function connectChat(status: CoreStatus): Promise<void> {
   }
   mgmt = new MgmtClient(status.endpoint, status.mgmt);
   await mgmt.connect();
+  state.endpoint = status.endpoint;
+  state.bootstrap = status.bootstrap ?? null;
 
   const overview = await mgmt.call("status");
   const placeholder = overview.placeholder as Record<string, string>;
@@ -327,6 +353,8 @@ async function connectChat(status: CoreStatus): Promise<void> {
     session = ((await mgmt.call("session.ensure", placeholder)).session ?? {}) as Record<string, string>;
   }
   state.sessionId = String(session.id ?? "");
+  state.characterId = String(session.character_id ?? "");
+  world.characterId = state.characterId || world.characterId;
   renderSessionList(session);
 
   const issued = await mgmt.call("channel.ensure", { name: "builtin", version: "0.1.0" });
@@ -336,6 +364,7 @@ async function connectChat(status: CoreStatus): Promise<void> {
     credential = rotated.credential as string;
   }
   localStorage.setItem("isekai.credential", credential);
+  state.credential = credential;
 
   state.token = "";
   await openChannel(status.endpoint, { credential, bootstrap: status.bootstrap ?? null });
@@ -620,7 +649,15 @@ interface WorldCache {
   containers: Array<{ file: string }>;
   instanceId: string;
   timeline: string;
+  characterId: string;
+  characters: Array<{ card_id: string; name: string; occupation?: string }>;
   clock: ClockView | null;
+}
+
+interface DisclosureSelection {
+  messageId: string;
+  fromCharacter: string;
+  fromName: string;
 }
 
 interface ClockView {
@@ -639,11 +676,18 @@ const world: WorldCache = {
   containers: [],
   instanceId: "",
   timeline: "",
+  characterId: "",
+  characters: [],
   clock: null,
 };
+let disclosureSelection: DisclosureSelection | null = null;
 const GENERATE_TIMEOUT_MS = 600000;
 
-function fillSelect(select: HTMLSelectElement, entries: Array<[string, string]>): void {
+function fillSelect(select: HTMLSelectElement | null, entries: Array<[string, string]>): void {
+  if (!select) {
+    console.warn("fillSelect: 目标节点不存在");
+    return;
+  }
   const previous = select.value;
   select.innerHTML = "";
   for (const [value, label] of entries) {
@@ -716,6 +760,12 @@ async function showInstance(instanceId: string): Promise<void> {
     const timelines = (detail.timelines ?? []) as Array<Record<string, string>>;
     world.instanceId = info.id; // 运行面状态跟着渲染的事实走，避免实例与时间线拼成混合参数
     world.timeline = timelines[0]?.id ?? "";
+    world.characters = (characters as unknown as WorldCache["characters"]) ?? [];
+    if (!world.characters.some((item) => item.card_id === world.characterId)) {
+      world.characterId = world.characters[0]?.card_id ?? "";
+    }
+    renderRoleControls();
+    await renderDisclosures();
     renderFacts($("world-facts"), [
       ["实例", `${info.name}（原始名称：${info.original_name}${info.imported ? "，导入" : ""}）`],
       ["初始世界时刻", `${info.moment} 世界秒`],
@@ -733,6 +783,147 @@ async function showInstance(instanceId: string): Promise<void> {
   } catch (error) {
     worldNote(String(error), true);
   }
+}
+
+function currentCharacterName(cardId: string): string {
+  return world.characters.find((item) => item.card_id === cardId)?.name ?? cardId;
+}
+
+function renderRoleControls(): void {
+  const roleSelect = $("role-select") as HTMLSelectElement;
+  fillSelect(
+    roleSelect,
+    world.characters.map((item) => [
+      item.card_id,
+      `${item.name}${item.occupation ? `｜${item.occupation}` : ""}`,
+    ]),
+  );
+  roleSelect.value = world.characterId;
+  const target = $("disclose-to") as HTMLSelectElement;
+  fillSelect(
+    target,
+    world.characters
+      .filter((item) => item.card_id !== world.characterId)
+      .map((item) => [item.card_id, item.name]),
+  );
+  const note = $("role-note");
+  note.textContent = world.characterId
+    ? `当前会话角色：${currentCharacterName(world.characterId)}`
+    : "先在世界实例里选一个实例";
+}
+
+async function renderDisclosures(): Promise<void> {
+  const facts = $("disclosure-facts");
+  facts.innerHTML = "";
+  if (!mgmt || !world.instanceId || !world.timeline) {
+    renderFacts(facts, [["披露", "未选择实例或时间线"]]);
+    return;
+  }
+  try {
+    const listed = await mgmt.call("disclose.list", {
+      instance_id: world.instanceId,
+      timeline_id: world.timeline,
+    });
+    const rows = (listed.disclosures ?? []) as Array<Record<string, unknown>>;
+    renderFacts(facts, [
+      ["已有披露", String(rows.length)],
+      [
+        "明细",
+        rows.length
+          ? rows
+              .map(
+                (row) =>
+                  `${currentCharacterName(String(row.from_character))} → ${currentCharacterName(
+                    String(row.to_character),
+                  )}（${row.count} 条，世界 ${row.granted_world}）`,
+              )
+              .join("；")
+          : "无",
+      ],
+    ]);
+  } catch (error) {
+    renderFacts(facts, [["披露", String(error)]]);
+  }
+}
+
+async function switchRole(): Promise<void> {
+  const roleSelect = $("role-select") as HTMLSelectElement;
+  const cardId = roleSelect.value;
+  const note = $("role-note");
+  if (!mgmt || !world.instanceId || !world.timeline || !cardId) {
+    note.textContent = "缺实例 / 时间线 / 角色，无法切换";
+    return;
+  }
+  try {
+    world.characterId = cardId;
+    state.characterId = cardId;
+    // 切换角色 = 换一个会话：历史不迁移，各自读自己的
+    const session = ((await mgmt.call("session.ensure", {
+      instance_id: world.instanceId,
+      timeline_id: world.timeline,
+      character_id: cardId,
+    })).session ?? {}) as Record<string, string>;
+    state.sessionId = String(session.id ?? "");
+    const thread = ((await mgmt.call("thread.bind", {
+      channel: "builtin",
+      thread_id: state.threadId,
+      session_id: state.sessionId,
+    })).thread ?? {}) as Record<string, unknown>;
+    state.token = String(thread.binding_token ?? "");
+    await openChannel(state.endpoint ?? "", { credential: state.credential, bootstrap: state.bootstrap });
+    await loadHistory();
+    renderSessionList(session);
+    renderRoleControls();
+    state.phase = "ready";
+    setStatus(`已切到 ${currentCharacterName(cardId)}`, "ok");
+  } catch (error) {
+    note.textContent = String(error);
+  }
+}
+
+async function confirmDisclosure(): Promise<void> {
+  const note = $("disclose-note");
+  const target = $("disclose-to") as HTMLSelectElement;
+  if (!mgmt || !disclosureSelection) {
+    note.textContent = "先在聊天里点角色消息上的「披露」选定片段";
+    return;
+  }
+  if (!target.value) {
+    note.textContent = "没有可披露的接收角色";
+    return;
+  }
+  try {
+    const result = await mgmt.call("disclose.confirm", {
+      instance_id: world.instanceId,
+      timeline_id: world.timeline,
+      from_character: disclosureSelection.fromCharacter,
+      to_character: target.value,
+      refs: [disclosureSelection.messageId],
+      note: "",
+    });
+    note.textContent = `已披露给 ${currentCharacterName(target.value)}（${result.reused ? "同一范围已存在" : "已授权"}）`;
+    disclosureSelection = null;
+    $("disclose-cancel").classList.add("hidden");
+    await renderDisclosures();
+  } catch (error) {
+    note.textContent = String(error);
+  }
+}
+
+function selectForDisclosure(messageId: string, fromCharacter: string, fromName: string): void {
+  disclosureSelection = { messageId, fromCharacter, fromName };
+  $("disclose-note").textContent = `已选定 ${fromName} 的片段（${messageId}）`;
+  $("disclose-cancel").classList.remove("hidden");
+}
+
+function bindDisclosure(): void {
+  ($("role-switch") as HTMLButtonElement).addEventListener("click", () => void switchRole());
+  ($("disclose-confirm") as HTMLButtonElement).addEventListener("click", () => void confirmDisclosure());
+  ($("disclose-cancel") as HTMLButtonElement).addEventListener("click", () => {
+    disclosureSelection = null;
+    $("disclose-note").textContent = "已取消选择";
+    $("disclose-cancel").classList.add("hidden");
+  });
 }
 
 async function refreshClock(instanceId = world.instanceId, timelineId = world.timeline): Promise<void> {
@@ -1026,6 +1217,7 @@ async function boot(): Promise<void> {
   bindComposer();
   bindNav();
   bindWorld();
+  bindDisclosure();
   $("settings-form").addEventListener("submit", (event) => void saveSettings(event));
   $("settings-reload").addEventListener("click", () => void loadSettings());
   $("restart").addEventListener("click", () => void restartCore());

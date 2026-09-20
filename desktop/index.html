@@ -42,6 +42,7 @@
             <button id="world-refresh">刷新</button>
             <span id="world-note" class="muted"></span>
           </div>
+          <dl id="manage-facts" class="facts"></dl>
 
           <h3>世界包</h3>
           <div class="row">
@@ -101,6 +102,21 @@
             <button id="clock-set-rate">设定倍率</button>
             <span id="clock-note" class="muted"></span>
           </div>
+          <h3>多角色与披露（阶段 5）</h3>
+          <div class="row">
+            <select id="role-select"></select>
+            <button id="role-switch">切换会话角色</button>
+            <span id="role-note" class="muted"></span>
+          </div>
+          <div class="row">
+            <select id="disclose-to"></select>
+            <button id="disclose-confirm">披露选中的片段</button>
+            <button id="disclose-cancel" class="hidden">取消选择</button>
+            <span id="disclose-note" class="muted">在聊天里点角色消息上的「披露」选定片段</span>
+          </div>
+          <dl id="disclosure-facts" class="facts"></dl>
+          <p class="muted">披露只开放指定片段；默认互相看不见。撤回只能靠回滚。</p>
+
           <dl id="world-facts" class="facts"></dl>
         </section>
 

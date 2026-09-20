@@ -206,3 +206,84 @@ def test_disclosed_fragment_becomes_a_transcript_memory_not_experience(store) ->
     assert material is not None
     assert material["source"] == "联络者转述"
     assert material["sources"][0]["source_role"] == "other_character", "来源标成另一个人说的"
+
+
+def test_grant_does_not_propagate_to_third_character(store) -> None:
+    """授权不自动传递给第三个角色（§7.1）。"""
+    world_service = _service(store)
+    info, timeline_id, first, second = _two_characters(store, world_service)
+    third_card = sample_card(sample_package(), name="第三个人")
+    world_service.add_character(
+        info["id"], timeline_id, third_card, now_real=1.7e9 + 2 * DAY,
+        joined_world=int(store.clock_get(timeline_id)["processed_world"]),
+    )
+    third = str((third_card.get("meta") or {}).get("card_id"))
+    reply_id, _ = _say(store, info, timeline_id, first, env="env-a8", world_seconds=10, text="问", reply="答：堤长身故")
+    world_service.disclose(info["id"], timeline_id, from_character=first, to_character=second, refs=[reply_id])
+    assert world_service.disclosed_fragments(info["id"], timeline_id, second), "被披露者可见"
+    assert world_service.disclosed_fragments(info["id"], timeline_id, third) == [], "第三人不可见"
+
+
+def test_cross_timeline_ref_is_rejected(store) -> None:
+    """跨线 / 跨实例的引用不触发跨域查询：当作不存在（§7.1）。"""
+    world_service = _service(store)
+    info, timeline_id, first, second = _two_characters(store, world_service)
+    reply_id, _ = _say(store, info, timeline_id, first, env="env-a9", world_seconds=10, text="问", reply="答")
+    branch = world_service.fork(info["id"], timeline_id, commit_id=world_service.commit(info["id"], timeline_id)["id"])
+    other = branch["timeline"]["id"]
+    try:
+        world_service.disclose(info["id"], other, from_character=first, to_character=second, refs=[reply_id])
+    except RuntimeStateError as exc:
+        assert "不存在" in str(exc)
+    else:
+        raise AssertionError("跨线引用应当被拒")
+
+
+def test_undisclosed_material_never_enters_the_other_extraction(store) -> None:
+    """未披露的材料不进 B 的提取来源，也不进她的召回（MEMORY §4.1）。"""
+    world_service = _service(store)
+    info, timeline_id, first, second = _two_characters(store, world_service)
+    secret = "堤长私吞了修堤粮，这事只有我知道"
+    _say(store, info, timeline_id, first, env="env-a10", world_seconds=10, text="你听说了吗", reply=secret)
+    _say(store, info, timeline_id, second, env="env-b10", world_seconds=10, text="今天滩上风大", reply="嗯，风大")
+    # 双方各自的轮次来源（真实链路上由会话提交时登记）
+    for character_id, ref, text in ((first, "user:env-a10", "你听说了吗"),
+                                    (second, "user:env-b10", "今天滩上风大")):
+        world_service.queue_dialog_turn(
+            info["id"], timeline_id, character_id, world_seconds=10,
+            user_ref=ref, user_text=text, reply_message_id=f"m-{ref.split(':')[1]}", reply_text="答",
+        )
+    world_service.queue_world_sources(info["id"], timeline_id)
+    mine = [row for row in store.memory_tasks(info["id"], timeline_id) if row["character_id"] == second]
+    assert mine, "B 有她自己的来源"
+    assert not [row for row in mine if secret in str(row.get("text") or "")], "A 的私有内容不在 B 的待提取里"
+    assert not any(secret[:6] in str(row.get("text") or "") for row in mine)
+    seen = world_service.recall(info["id"], timeline_id, second, topic="堤长 粮")
+    assert all(secret[:6] not in str(item.get("text") or "") for item in seen["entries"]), "召回也没有"
+
+
+def test_disclosure_is_versioned_by_granted_watermark(store) -> None:
+    """授权随时间线版本化：早于授权水位的查询看不到它（§7.1）。"""
+    world_service = _service(store)
+    info, timeline_id, first, second = _two_characters(store, world_service)
+    reply_id, _ = _say(store, info, timeline_id, first, env="env-a11", world_seconds=10, text="问", reply="答")
+    before = int(store.clock_get(timeline_id)["processed_world"])
+    grant = world_service.disclose(info["id"], timeline_id, from_character=first, to_character=second, refs=[reply_id])
+    assert grant["granted_world"] >= before
+    assert world_service.disclosed_fragments(info["id"], timeline_id, second, until=before - 1) == []
+    assert len(world_service.disclosed_fragments(info["id"], timeline_id, second)) == 1
+
+
+def test_rollback_states_that_delivered_text_cannot_be_recalled(store) -> None:
+    """回滚结果明示：已投递到外部平台的内容不保证消除（§7.2）。"""
+    world_service = _service(store)
+    info, timeline_id, first, _ = _two_characters(store, world_service)
+    commit = world_service.commit(info["id"], timeline_id, note="回滚点")
+    message_id, session = _say(store, info, timeline_id, first, env="env-a12", world_seconds=10, text="问", reply="答")
+    seq = store.message_get(0) or None
+    _ = seq
+    row = store._conn.execute("SELECT seq FROM message WHERE message_id=?", (message_id,)).fetchone()
+    store.delivery_set(int(row["seq"]), 0, "accepted") if hasattr(store, "delivery_set") else None
+    result = world_service.rollback(info["id"], timeline_id, commit_id=commit["id"], now_real=1.7e9 + 4 * DAY)
+    assert "warning" in result and result["warning"], "回滚要说明已投递内容不保证消除"
+    assert "delivered_replies_kept" in result

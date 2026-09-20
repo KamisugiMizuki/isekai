@@ -561,6 +561,7 @@ class RuntimeService:
         # 原子切换：先提升运行世代让迟到结果失效，再在同一事务里清空 + 写回
         self.store.clock_put({**before_clock, "generation": int(before_clock["generation"]) + 1})
         # 飞行中的输入作废、未投递的回复取消：旧世代的结果不得写回或继续发送（§七）
+        delivered = self.store.timeline_delivered_replies(timeline_id)
         voided = self.store.timeline_void_inflight(timeline_id)
         cancelled = self.store.timeline_cancel_undelivered(timeline_id)
         self.store.runtime_load(instance_id, timeline_id, dict(snapshot.get("runtime") or {}), clear=True)
@@ -589,6 +590,13 @@ class RuntimeService:
             "generation": int(self.clock_row(timeline_id)["generation"]),
             "voided_inputs": voided,
             "cancelled_replies": cancelled,
+            "delivered_replies_kept": delivered,
+            "warning": (
+                f"有 {delivered} 条回复已经投递到外部平台（用户可能已经读过），回滚不保证消除它们；"
+                "核心历史与此后的生成 / 投递已按回滚点恢复。"
+                if delivered
+                else "回滚覆盖本线核心历史；请确认没有需要保留的进展（必要时先从当前提交分叉或导出）。"
+            ),
         }
 
     # ---------- 角色记忆（MEMORY_SPEC） ----------
