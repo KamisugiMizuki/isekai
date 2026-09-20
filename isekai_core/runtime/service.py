@@ -1738,6 +1738,94 @@ class RuntimeService:
             )
         return out
 
+    async def first_contact(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str,
+        *,
+        channel_id: str,
+        thread_id: str,
+        llm: Any = None,
+        now_real: float | None = None,
+    ) -> dict[str, Any]:
+        """初次联络的独立开场（§5.6）：只投向触发视图的 thread，一次性，不占主动配额。
+
+        没有打开信号就不该走到这里（调用方=通道声明的视图打开）；也不广播、不改长期主动目标。
+        """
+        import time as _time
+
+        now = _time.time() if now_real is not None else float(now_real or 0.0)
+        if now_real is None:
+            now = _time.time()
+        instance = self.store.instance_get(instance_id)
+        if instance is None:
+            raise RuntimeStateError(f"实例不存在：{instance_id}")
+        session = self.store.session_ensure(instance_id, timeline_id, character_id)
+        existing = self.store.first_contact_get(str(session["id"]))
+        if existing is not None:
+            return {"reused": True, "message_id": str(existing["message_id"])}
+
+        world = int(self.clock_row(timeline_id)["processed_world"])
+        card = self.card_of(instance, character_id, timeline_id=timeline_id, world_seconds=world)
+        snapshot = self.character_snapshot(instance_id, timeline_id, character_id, world_seconds=world)
+        text = ""
+        if llm is not None:
+            try:
+                text = await llm.chat(self._first_contact_prompt(card, snapshot), temperature=0.7, timeout=45.0)
+            except Exception:
+                text = ""
+        if not proactive.proactive_text_allowed(text):
+            return {"spoken": False, "reason": "开场没生成出来"}
+
+        target = self.store.thread_get(channel_id, thread_id) or {}
+        message_id = f"m-{__import__('secrets').token_hex(6)}"
+        self.store.outbound_put(
+            session_id=str(session["id"]),
+            message_id=message_id,
+            reply_to=None,
+            covers=[],
+            batches=[[str(text).strip()]],
+            target_channel=channel_id,
+            target_thread=thread_id,
+            binding_version=int(target.get("binding_version") or 0),
+            binding_token=str(target.get("binding_token") or ""),
+        )
+        self.store.first_contact_put(
+            {
+                "session_id": str(session["id"]),
+                "instance_id": instance_id,
+                "timeline_id": timeline_id,
+                "character_id": character_id,
+                "message_id": message_id,
+                "at_world": world,
+                "created_real": now,
+            }
+        )
+        return {"spoken": True, "message_id": message_id, "world": world}
+
+    def _first_contact_prompt(self, card: dict[str, Any], snapshot: dict[str, Any]) -> list[dict[str, str]]:
+        """开场只说她已经历 / 已获知的东西；没有素材就照实说，不编造时间进展。"""
+        name = str((card.get("identity") or {}).get("name") or "她")
+        knowledge = [
+            f"- {str(item.get('text') or '')}"
+            for item in (snapshot.get("knowledge") or [])[:5]
+            if str(item.get("text") or "").strip()
+        ]
+        activity = str(snapshot.get("current_activity") or "")
+        facts = "\n".join(knowledge) or "（她手边没有可讲的近况）"
+        return [
+            {
+                "role": "system",
+                "content": (
+                    f"你是{name}。这是你第一次主动跟联络者开口，写一句自然的话（1-2 句，口语，"
+                    "不要解释、不要加引号、不要列点、不要提设定或来源标签，也不要假装刚做完什么大事）。"
+                    + (f"你此刻在做：{activity}。" if activity else "")
+                ),
+            },
+            {"role": "user", "content": f"你可以提的近况（只用这些，没有就只打个招呼）：\n{facts}"},
+        ]
+
     async def proactive_tick(
         self,
         instance_id: str,

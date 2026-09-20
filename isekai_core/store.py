@@ -263,6 +263,17 @@ CREATE TABLE IF NOT EXISTS custom_state(
   PRIMARY KEY(instance_id, timeline_id, custom_id)
 );
 
+-- 初见（SESSION_CORE_SPEC §5.6）：每个会话只有一次独立开场；不占世界源主动配额
+CREATE TABLE IF NOT EXISTS first_contact(
+  session_id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  message_id TEXT NOT NULL DEFAULT '',
+  at_world INTEGER NOT NULL DEFAULT 0,
+  created_real REAL NOT NULL DEFAULT 0
+);
+
 -- 主动发言账本（SESSION_CORE_SPEC §5.2）：配额按最终消息固化计数；同一素材不重复消费
 CREATE TABLE IF NOT EXISTS proactive_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -647,6 +658,22 @@ class Store:
             (session_id, int(since_world)),
         ).fetchall()
         return [_row_to_dict(item) for item in rows]
+
+    def first_contact_get(self, session_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM first_contact WHERE session_id=?", (session_id,)
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def first_contact_put(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO first_contact(session_id, instance_id, timeline_id,
+                                                        character_id, message_id, at_world, created_real)
+                   VALUES(:session_id, :instance_id, :timeline_id, :character_id, :message_id,
+                          :at_world, :created_real)""",
+                row,
+            )
 
     def proactive_log_add(self, row: dict[str, Any]) -> None:
         with self._lock, self._conn:
@@ -1504,6 +1531,7 @@ class Store:
                 "institution_state",
                 "custom_state",
                 "proactive_log",
+                "first_contact",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute(
@@ -1787,6 +1815,7 @@ class Store:
             "unit", "life_plan", "experience", "claim", "knowledge", "effect_state", "intent",
             "event", "environment_state", "institution_state", "custom_state",
             "proactive_log",   # 回滚撤销还没投出去的主动消息与素材消费（§5.3 末条）
+            "first_contact",   # 回滚撤销开场资格（开场也是已固化消息）
             "memory", "memory_task", "memory_citation",
             "character_join",   # 跨越补卡点的回滚要让补入角色在本线退出（§七）
             "rate_command",     # 历史里的待生效倍率不是现时控制命令（§七）

@@ -89,6 +89,7 @@ ASYNC_OPS = frozenset(
         "event.render",
         "event.expand",
         "runtime.proactive",
+        "runtime.first_contact",
         "runtime.propose",
         "runtime.extract",
         "event.draft",
@@ -837,6 +838,16 @@ async def dispatch_async(
             return await _render_event(cfg, llm, store, args)
         if op == "event.expand":
             return await _expand_claim(cfg, llm, store, args)
+        if op == "runtime.first_contact":
+            service = getattr(runtime, "service", runtime)
+            return await service.first_contact(
+                str(args.get("instance_id") or ""),
+                str(args.get("timeline_id") or ""),
+                str(args.get("character_id") or ""),
+                channel_id=str(args.get("channel_id") or "builtin"),
+                thread_id=str(args.get("thread_id") or "main"),
+                llm=llm,
+            )
         if op == "runtime.proactive":
             return await _proactive_tick(cfg, llm, store, runtime, args)
         if op == "runtime.propose":

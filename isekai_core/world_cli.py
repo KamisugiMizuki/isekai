@@ -53,6 +53,7 @@ OP_BY_COMMAND = {
     ("backup", "restore"): "backup.restore",
     ("backup", "list"): "backup.list",
     ("runtime", "proactive"): "runtime.proactive",
+    ("runtime", "first-contact"): "runtime.first_contact",
     ("proactive", "list"): "proactive.list",
     ("runtime", "clock"): "runtime.clock",
     ("runtime", "activate"): "runtime.activate",
@@ -117,6 +118,9 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             return {**args, "card_path": ns.file, **({"moment": int(ns.moment)} if ns.moment else {})}
         if cmd == "generate":
             return {**args, "brief": ns.brief or ""}
+    if group == "runtime" and cmd == "first-contact":
+        return {"instance_id": ns.id, "timeline_id": ns.timeline, "character_id": ns.card or "",
+                "channel_id": "builtin", "thread_id": getattr(ns, "thread", "main") or "main"}
     if group == "proactive":
         return {"instance_id": ns.id, "timeline_id": ns.timeline}
     if group == "backup":
