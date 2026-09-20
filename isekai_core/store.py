@@ -650,12 +650,28 @@ class Store:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # ponytail: 单连接 + 锁；本地单用户负载，写盘是 WAL 级小事务，必要时再拆写入线程
+        # 写者之间用一把可重入锁串行（SQLite 单写者）；连接按**线程**各持一条：
+        # 共享单连接在并发下会互相踩游标与隐式事务——实测 5 线程并发建实例时
+        # 出现「提交了却读不回来」的丢写与 sqlite3.DatabaseError: no more rows available。
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._local = threading.local()
+        self._connections: list[sqlite3.Connection] = []
+        self._pool_lock = threading.Lock()
         self._conn.execute("PRAGMA synchronous=NORMAL")
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        """当前线程的连接（首次使用即建，WAL + busy_timeout）。"""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.path), check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=8000")
+            self._local.conn = conn
+            with self._pool_lock:
+                self._connections.append(conn)
+        return conn
 
     def thread_for_session(self, session_id: str) -> dict[str, Any] | None:
         """会话的主动投递目标：首次绑定默认使用该 thread（§5.3）。"""
@@ -1089,8 +1105,14 @@ class Store:
 
     def close(self) -> None:
         with self._lock:
-            self._conn.commit()
-            self._conn.close()
+            for conn in list(self._connections):
+                try:
+                    conn.commit()
+                    conn.close()
+                except sqlite3.Error:  # pragma: no cover - 已关掉的连接忽略
+                    pass
+            self._connections.clear()
+            self._local = threading.local()
 
     # ---------- 通道实例 ----------
 
@@ -1578,16 +1600,21 @@ class Store:
     # ---------- 实例（世界设定层） ----------
 
     def instance_names(self) -> list[str]:
-        rows = self._conn.execute("SELECT name FROM instance").fetchall()
-        return [str(row["name"]) for row in rows]
+        # 只读也要走同一把锁 + 显式收尾：裸 SELECT 会在共享连接上留下隐式事务，
+        # 与并发写入混在一起时会把别处的提交卷回（实测：并发建实例时偶发丢写）
+        with self._lock, self._conn:
+            rows = self._conn.execute("SELECT name FROM instance").fetchall()
+            return [str(row["name"]) for row in rows]
 
     def instance_get(self, instance_id: str) -> dict[str, Any] | None:
-        row = self._conn.execute("SELECT * FROM instance WHERE id=?", (instance_id,)).fetchone()
-        return _row_to_dict(row) if row else None
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT * FROM instance WHERE id=?", (instance_id,)).fetchone()
+            return _row_to_dict(row) if row else None
 
     def instance_by_name(self, name: str) -> dict[str, Any] | None:
-        row = self._conn.execute("SELECT * FROM instance WHERE name=?", (name,)).fetchone()
-        return _row_to_dict(row) if row else None
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT * FROM instance WHERE name=?", (name,)).fetchone()
+            return _row_to_dict(row) if row else None
 
     def instance_list(self) -> list[dict[str, Any]]:
         """管理面列表：只有公开元数据，不含世界内部内容（§3.5）。"""
