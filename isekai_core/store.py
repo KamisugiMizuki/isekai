@@ -435,6 +435,26 @@ CREATE TABLE IF NOT EXISTS claim(
 );
 CREATE INDEX IF NOT EXISTS ix_claim_event ON claim(instance_id, timeline_id, event_id);
 
+-- 短期反应（WORLD_RUNTIME_SPEC §11.1）：有来源的素材集合，不是全局情绪数值
+CREATE TABLE IF NOT EXISTS reaction(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  id TEXT NOT NULL,                        -- 由（来源类型, 来源标识）派生：同一来源只建一条
+  source_kind TEXT NOT NULL,               -- event_effect | experience | dialog
+  source_ref TEXT NOT NULL,
+  direction INTEGER NOT NULL DEFAULT 1,
+  intensity TEXT NOT NULL DEFAULT 'mid',   -- low | mid | high（区间表述）
+  stage TEXT NOT NULL DEFAULT 'candidate', -- candidate|adopted|active|fading|paused|expired|long_term
+  tendency TEXT NOT NULL DEFAULT '',
+  basis TEXT NOT NULL DEFAULT '',
+  started_world INTEGER NOT NULL,
+  expiry_condition TEXT NOT NULL DEFAULT '',
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, character_id, id)
+);
+CREATE INDEX IF NOT EXISTS ix_reaction_stage ON reaction(instance_id, timeline_id, stage, started_world);
+
 -- 惰性展开的覆盖状态（EVENT_ENGINE_SPEC §3.4 / 附录B#10）：
 -- 没有行 = 尚未生成；state=absent 只表示「这条记载没写下」，不是「历史被删改」的证据。
 CREATE TABLE IF NOT EXISTS claim_coverage(
@@ -2102,6 +2122,7 @@ class Store:
             "rate_command",     # 历史里的待生效倍率不是现时控制命令（§七）
             "pending_event",    # 回滚撤销待执行状态及其后果（§八 末条）
             "disclosure",       # 回滚同时撤销授权与依赖它的派生（§7.2）
+            "reaction",         # 短期反应随线版本化：回滚撤销派生状态（§11.1 / 附录B#17）
         ):
             self._conn.execute(f"DELETE FROM {table} WHERE timeline_id=?", (timeline_id,))
         # 向量表两种形态都清：按线（新）与按 memory 归属（兼容早期没有 timeline_id 的行）
@@ -2218,6 +2239,7 @@ class Store:
         institution: Iterable[dict[str, Any]] = (),
         customs: Iterable[dict[str, Any]] = (),
         clear_effects: Iterable[Any] = (),
+        reactions: Iterable[dict[str, Any]] = (),
     ) -> bool:
         """把一批事实转移整体提交（§2.7：一批失败即整批回到批前水位）。
 
@@ -2290,6 +2312,59 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, character_id, id) DO NOTHING""",
                     row,
                 )
+            from .runtime import reaction as reaction_mod  # 延迟导入：存储层不反向依赖运行层
+
+            cleared_ids = {
+                str(item.get("id") if isinstance(item, dict) else item) for item in (clear_effects or ())
+            }
+            for raw in reactions:
+                incoming = {"tendency": "", "basis": "", "expiry_condition": "", "updated_world": 0, **raw}
+                existing = self._conn.execute(
+                    """SELECT * FROM reaction WHERE instance_id=? AND timeline_id=? AND character_id=? AND id=?""",
+                    (
+                        incoming["instance_id"],
+                        incoming["timeline_id"],
+                        incoming["character_id"],
+                        incoming["id"],
+                    ),
+                ).fetchone()
+                merged = reaction_mod.merge(
+                    _row_to_dict(existing) if existing else None, incoming
+                )
+                self._conn.execute(
+                    """INSERT INTO reaction(instance_id, timeline_id, character_id, id, source_kind, source_ref,
+                                            direction, intensity, stage, tendency, basis, started_world,
+                                            expiry_condition, updated_world)
+                       VALUES(:instance_id, :timeline_id, :character_id, :id, :source_kind, :source_ref,
+                              :direction, :intensity, :stage, :tendency, :basis, :started_world,
+                              :expiry_condition, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, character_id, id) DO UPDATE SET
+                         direction=:direction, intensity=:intensity, stage=:stage, tendency=:tendency,
+                         basis=:basis, expiry_condition=:expiry_condition, updated_world=:updated_world""",
+                    merged,
+                )
+            # 阶段推进：纯函数，按新水位与解除集合重算该线所有反应（行数少，直接全算）
+            for raw in self._conn.execute(
+                "SELECT * FROM reaction WHERE timeline_id=?", (timeline_id,)
+            ).fetchall():
+                current = _row_to_dict(raw)
+                advanced = reaction_mod.advance(
+                    current, watermark=int(processed_world), cleared=cleared_ids
+                )
+                if advanced != current:
+                    self._conn.execute(
+                        """UPDATE reaction SET stage=?, intensity=?, updated_world=?
+                           WHERE instance_id=? AND timeline_id=? AND character_id=? AND id=?""",
+                        (
+                            advanced["stage"],
+                            advanced["intensity"],
+                            int(advanced.get("updated_world") or advanced.get("started_world") or 0),
+                            current["instance_id"],
+                            current["timeline_id"],
+                            current["character_id"],
+                            current["id"],
+                        ),
+                    )
             for raw in effects:
                 row = {
                     "value": None, "family": "", "recovery": "", "cleared_at": None, "seq": 0, **raw,
@@ -2451,6 +2526,13 @@ class Store:
                 timeline_id,
                 watermark,
             ),
+            "reactions": rows(
+                """SELECT * FROM reaction WHERE instance_id=? AND timeline_id=? AND started_world<=?
+                   ORDER BY started_world, id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
             "effects": rows(
                 """SELECT * FROM effect_state WHERE instance_id=? AND timeline_id=? AND from_world<=?
                    ORDER BY from_world, seq, id""",
@@ -2573,6 +2655,18 @@ class Store:
                               :kind, :target, :source, :stance, :text)
                        ON CONFLICT(instance_id, timeline_id, character_id, id) DO NOTHING""",
                     row,
+                )
+            for row in payload.get("reactions") or []:
+                payload_row = {"tendency": "", "basis": "", "expiry_condition": "", "updated_world": 0, **row}
+                self._conn.execute(
+                    """INSERT INTO reaction(instance_id, timeline_id, character_id, id, source_kind, source_ref,
+                                            direction, intensity, stage, tendency, basis, started_world,
+                                            expiry_condition, updated_world)
+                       VALUES(:instance_id, :timeline_id, :character_id, :id, :source_kind, :source_ref,
+                              :direction, :intensity, :stage, :tendency, :basis, :started_world,
+                              :expiry_condition, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, character_id, id) DO NOTHING""",
+                    payload_row,
                 )
             for row in payload.get("effects") or []:
                 self._conn.execute(
@@ -2803,6 +2897,24 @@ class Store:
             (instance_id, timeline_id, original_id),
         ).fetchone()
         return _row_to_dict(row) if row else None
+
+    def reaction_list(
+        self, instance_id: str, timeline_id: str, *, character_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """该线的短期反应（§11.1）；按角色取时只给该角色。"""
+        if character_id:
+            rows = self._conn.execute(
+                """SELECT * FROM reaction WHERE instance_id=? AND timeline_id=? AND character_id=?
+                   ORDER BY started_world, id""",
+                (instance_id, timeline_id, str(character_id)),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT * FROM reaction WHERE instance_id=? AND timeline_id=?
+                   ORDER BY character_id, started_world, id""",
+                (instance_id, timeline_id),
+            ).fetchall()
+        return [_row_to_dict(row) for row in rows]
 
     def claim_coverage_put(self, row: dict[str, Any]) -> None:
         payload = {"derived_id": "", "note": "", "updated_world": 0, **row}

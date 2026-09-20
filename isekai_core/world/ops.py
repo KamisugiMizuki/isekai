@@ -85,6 +85,8 @@ SYNC_OPS = frozenset(
         "claim.coverage",
         "world.backfill.plan",
         "instance.convert",
+        "reaction.list",
+        "reaction.note",
         "backup.restore",
         "backup.list",
         "proactive.list",
@@ -467,6 +469,35 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 "timelines": store.timeline_list(row["id"]),
                 "commits": store.commit_list(row["id"]),
             }
+        if op == "reaction.list":
+            rows = store.reaction_list(
+                str(args.get("instance_id") or ""),
+                str(args.get("timeline_id") or ""),
+                character_id=str(args.get("character_id") or "") or None,
+            )
+            return {"reactions": rows}
+        if op == "reaction.note":
+            from ..runtime import reaction as reaction_mod
+
+            clock = store.clock_get(str(args.get("timeline_id") or ""))
+            row = reaction_mod.from_dialog(
+                instance_id=str(args.get("instance_id") or ""),
+                timeline_id=str(args.get("timeline_id") or ""),
+                character_id=str(args.get("character_id") or ""),
+                message_id=str(args.get("message_id") or args.get("source_ref") or ""),
+                world_seconds=int(args.get("world_seconds") or (clock["processed_world"] if clock else 0)),
+                direction=int(args.get("direction") or 1),
+                tendency=str(args.get("tendency") or ""),
+                basis=str(args.get("basis") or ""),
+            )
+            ok = store.apply_runtime_batch(
+                timeline_id=str(row["timeline_id"]),
+                generation=int(clock["generation"]),
+                processed_world=int(clock["processed_world"]),
+                catching_up=False,
+                reactions=[row],
+            )
+            return {"noted": bool(ok), "reaction": row["id"]}
         if op == "instance.convert":
             from .instances import convert_instance
 

@@ -16,6 +16,7 @@ from typing import Any
 from ..log import get_logger
 from ..store import Store
 from ..version import DEFAULT_MAX_PARTS, DEFAULT_MAX_TEXT_LEN
+from . import reaction
 from . import budget as budget_mod
 from ..world import instances
 from ..world.cards import region_of
@@ -54,6 +55,32 @@ def from_config(cfg: Any, store: Store) -> "RuntimeService":
     wanted = set(inspect.signature(RuntimeService.__init__).parameters) - {"self", "store"}
     params = {name: getattr(runtime_cfg, name) for name in wanted if hasattr(runtime_cfg, name)}
     return RuntimeService(store, **params)
+
+
+def _reaction_rows(
+    cards: list[dict[str, Any]],
+    *,
+    effects: list[dict[str, Any]],
+    experiences: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """把这一批的后果与经历落成**有来源**的短期反应（§11.1）：素材没来源就不进状态。
+
+    后果按效果的目标（角色标识 / role_id）落到对应角色；经历按角色标识落。
+    """
+    role_to_character = {
+        str(card.get("role_id") or ""): str((card.get("meta") or {}).get("card_id") or "") for card in cards
+    }
+    joined = {str((card.get("meta") or {}).get("card_id") or "") for card in cards}
+    out: list[dict[str, Any]] = []
+    for effect in effects:
+        character_id = role_to_character.get(str(effect.get("target") or ""))
+        if character_id:
+            out.append(reaction.from_effect(effect, character_id=character_id))
+    for experience in experiences:
+        character_id = str(experience.get("character_id") or "")
+        if character_id and character_id in joined:
+            out.append(reaction.from_experience(experience, character_id=character_id))
+    return out
 
 
 def _known_event_ids(
@@ -1031,6 +1058,18 @@ class RuntimeService:
         brief = recalled["brief"]["text"]
         if brief:
             prompt = prompt + chr(10) + chr(10) + "她此刻想得起来的事（按她自己的记性，别当成盘点）：" + chr(10) + brief
+        # 短期反应进语气与取舍（§11.1）：只给还有效的那几条，不展示内部字段与强度数值
+        at = int(world_seconds if world_seconds is not None else 0)
+        if not at:
+            try:
+                at = int(self.clock_row(timeline_id)["processed_world"])
+            except Exception:
+                at = 0
+        tendency = reaction.tendency_block(
+            self.store.reaction_list(instance_id, timeline_id, character_id=character_id), watermark=at
+        )
+        if tendency:
+            prompt = prompt + chr(10) + chr(10) + "她眼下的处境（短期反应，只作语气与取舍的依据，别当成情绪报告）：" + chr(10) + tendency
         return {"prompt": prompt, "memory_ids": recalled["ids"], "brief": brief}
 
     # ---------- 远程向量（§5.2） ----------
@@ -1857,6 +1896,11 @@ class RuntimeService:
                 institution=institution_rows["institution"],
                 customs=institution_rows["customs"],
                 clear_effects=spread['clear_effects'],
+                reactions=_reaction_rows(
+                    cards,
+                    effects=world_rows['effects'] + intent_rows['effects'],
+                    experiences=experiences + intent_rows['experiences'],
+                ),
             )
             if not committed:
                 # 世代已变（冻结 / 重启后迟到）或水位已被别的批次推过：本批整批不落盘
@@ -2790,6 +2834,7 @@ class RuntimeService:
         if note and activity:
             activity = f"{activity}（受影响的后果：{note}）"
         world_package = self.setting(self.store.instance_get(instance_id) or {})["world_package"]
+        reactions = self.store.reaction_list(instance_id, timeline_id, character_id=character_id)
         return {
             "units": personality.visible(units),
             "all_units": units,
@@ -2798,6 +2843,8 @@ class RuntimeService:
             "experiences": experiences,
             "knowledge": knowledge,
             "effects": effects,
+            "reactions": [row for row in reactions if str(row.get("stage")) in reaction.LIVE_STAGES],
+            "reaction_tendency": reaction.tendency_block(reactions, watermark=world_seconds),
             "intents": [
                 row
                 for row in self.store.intent_list(instance_id, timeline_id, character_id)

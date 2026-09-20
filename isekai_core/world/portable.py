@@ -250,6 +250,7 @@ def _restore_runtime_state(
             "events": _remap_rows(payload.get("events"), instance_id, new_id),
             "claims": _remap_rows(payload.get("claims"), instance_id, new_id),
             "knowledge": _remap_rows(payload.get("knowledge"), instance_id, new_id),
+            "reactions": _remap_rows(payload.get("reactions"), instance_id, new_id),
             "effects": _remap_rows(payload.get("effects"), instance_id, new_id),
             "intents": _remap_rows(payload.get("intents"), instance_id, new_id),
             "environment": _remap_rows(payload.get("environment"), instance_id, new_id),
