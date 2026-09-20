@@ -44,8 +44,10 @@ STRUCTURE_HINT = (
 MIN_CONTENT = (
     "内容最小标准（不满足即视为生成失败）：至少两条世界公理；至少一条命名语汇；"
     "实情层与说法层分开存放，每条说法必须有来源与获知条件；至少一个种族并给出寿命覆盖；"
-    "至少一份史料，含贡献者角色与时段、覆盖区间与非空条目；至少一个事件族及其模板与事实效果；"
+    "至少一份史料，含贡献者角色与时段、覆盖区间与非空条目；至少一个事件族及其模板与事实效果"
+    "（效果 target 只能填已存在的标识）；"
     "至少一个生活线模板（显式声明是否睡眠）与一个可装配的角色模板；至少一种与外界联络的机制。"
+    "声明了制度就必须写明职权、适用范围、延续与承接规则；声明了惯例就必须写明适用群体、当前做法、形成依据与允许变化范围。"
 )
 
 
@@ -100,13 +102,35 @@ def _merge_structure(candidate: dict[str, Any], skeleton: dict[str, Any]) -> dic
     return merged
 
 
-async def generate_package(llm: LLMClient, brief: str, *, name: str = "未命名世界") -> tuple[dict[str, Any], list[str]]:
+#: 单次生成请求的默认调用上限（含重试）：三段各两次 / 卡片两次（§2.4 用量预算）
+DEFAULT_PACKAGE_CALLS = len(PACKAGE_SEGMENTS) * 2
+DEFAULT_CARD_CALLS = 2
+
+
+class BudgetExhausted(Exception):
+    """调用预算用尽：暂停并保留已完成的段落，不继续重试扩支。"""
+
+
+def _spend(budget: dict[str, int], label: str) -> None:
+    if budget["calls"] >= budget["limit"]:
+        raise BudgetExhausted(f"{label}：已达确认的调用上限")
+    budget["calls"] += 1
+
+
+def _usage(budget: dict[str, int], *, paused: bool) -> dict[str, Any]:
+    return {"calls": budget["calls"], "limit": budget["limit"], "paused": paused}
+
+
+async def generate_package(
+    llm: LLMClient, brief: str, *, name: str = "未命名世界", max_calls: int = DEFAULT_PACKAGE_CALLS
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
     """对话式：用户描述 → 候选世界包（分段生成，逐段校验）→ 整包校验。
 
-    返回 (候选, 错误列表)；任一必需段落失败即整份不落盘，由调用方交回用户。
+    返回 (候选, 错误列表, 用量)；任一必需段落失败或调用预算用尽即整份不落盘，由调用方交回用户。
     """
     skeleton = template_package(name)
     package = clone_package(skeleton)
+    budget = {"calls": 0, "limit": max(1, int(max_calls))}
     for label, keys in PACKAGE_SEGMENTS:
         sub_skeleton = {key: skeleton[key] for key in keys}
         system = (
@@ -135,31 +159,44 @@ async def generate_package(llm: LLMClient, brief: str, *, name: str = "未命名
             merged = {**current, **{key: candidate.get(key, current[key]) for key in only}}
             return [item for item in validate_package(merged) if item.split(":")[0].split(".")[0].split("[")[0] in only]
 
-        candidate, errors = await _generate_with_retry(
-            llm, system, user, sub_skeleton, check, label=f"世界包·{label}"
-        )
+        try:
+            candidate, errors = await _generate_with_retry(
+                llm, system, user, sub_skeleton, check, label=f"世界包·{label}", budget=budget
+            )
+        except BudgetExhausted as exc:
+            return {**package}, [str(exc)], _usage(budget, paused=True)
         if errors:
-            return {**package, **candidate}, [f"{label}：{item}" for item in errors]
+            return {**package, **candidate}, [f"{label}：{item}" for item in errors], _usage(budget, paused=False)
         for key in keys:
             package[key] = candidate.get(key, package[key])
-    return package, validate_package(package)
+    return package, validate_package(package), _usage(budget, paused=False)
 
 
-async def revise_package(llm: LLMClient, package: dict[str, Any], instruction: str) -> tuple[dict[str, Any], list[str]]:
+async def revise_package(
+    llm: LLMClient, package: dict[str, Any], instruction: str, *, max_calls: int = DEFAULT_CARD_CALLS
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
     """在现有世界包上按指令修订：产出完整新版本，不就地改文件。"""
     system = (
         "你是世界设定层的世界包修订器。按用户指令修改给定世界包，只改与指令相关的部分，其余保持原样。"
         + STRUCTURE_HINT
     )
     user = (
-        f"修订指令：\n{instruction}\n\n当前世界包：\n{json.dumps(package, ensure_ascii=False)}"
+        f"修订指令：\n{instruction}\n\n当前世界包：\n{json.dumps(package, ensure_ascii=False)}\n\n"
+        f"形状参考（字段类型与粒度照此填写；内容按当前世界包替换）：\n{json.dumps(EXAMPLE, ensure_ascii=False)}"
     )
-    return await _generate_with_retry(
-        llm, system, user, package, validate_package, label="世界包修订"
-    )
+    budget = {"calls": 0, "limit": max(1, int(max_calls))}
+    try:
+        candidate, errors = await _generate_with_retry(
+            llm, system, user, package, validate_package, label="世界包修订", budget=budget
+        )
+    except BudgetExhausted as exc:
+        return {**package}, [str(exc)], _usage(budget, paused=True)
+    return candidate, errors, _usage(budget, paused=False)
 
 
-async def fill_section(llm: LLMClient, package: dict[str, Any], section: str) -> tuple[dict[str, Any], list[str]]:
+async def fill_section(
+    llm: LLMClient, package: dict[str, Any], section: str, *, max_calls: int = DEFAULT_CARD_CALLS
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
     """表单式补全：只补指定段落（world / sources / canon / narratives / races / events / life / roles …）。"""
     if section not in package:
         raise PackageError(f"未知段落：{section}")
@@ -169,12 +206,23 @@ async def fill_section(llm: LLMClient, package: dict[str, Any], section: str) ->
     user = (
         f"需要补全的段落：{section}\n"
         f"当前值（可能为空壳）：{json.dumps(package.get(section), ensure_ascii=False)}\n"
-        f"完整世界包（其他段落作为上下文，请原样返回）：{json.dumps(package, ensure_ascii=False)}"
+        f"完整世界包（其他段落作为上下文，请原样返回）：{json.dumps(package, ensure_ascii=False)}\n\n"
+        f"形状参考（字段类型与粒度照此填写；内容按当前世界包替换）：\n"
+        f"{json.dumps({section: EXAMPLE.get(section)}, ensure_ascii=False)}"
     )
-    return await _generate_with_retry(llm, system, user, package, validate_package, label=f"段落 {section}")
+    budget = {"calls": 0, "limit": max(1, int(max_calls))}
+    try:
+        candidate, errors = await _generate_with_retry(
+            llm, system, user, package, validate_package, label=f"段落 {section}", budget=budget
+        )
+    except BudgetExhausted as exc:
+        return {**package}, [str(exc)], _usage(budget, paused=True)
+    return candidate, errors, _usage(budget, paused=False)
 
 
-async def generate_card(llm: LLMClient, package: dict[str, Any], brief: str) -> tuple[dict[str, Any], list[str]]:
+async def generate_card(
+    llm: LLMClient, package: dict[str, Any], brief: str, *, max_calls: int = DEFAULT_CARD_CALLS
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
     """AI 生成角色卡候选：创作校验可用实情层，但候选仍需用户确认后才进入实例。"""
     from .cards import template_card
     from .example import example_card
@@ -189,7 +237,8 @@ async def generate_card(llm: LLMClient, package: dict[str, Any], brief: str) -> 
     system = (
         "你是角色卡生成器。按用户描述生成一张角色卡：身份、职业、背景与世界公理相容，"
         "信息渠道只能用世界包已定义的来源，初始知识必须有合法来源与获知时间（不晚于初始时刻，"
-        "史料不得早于成书），初始性格单元至少一个锚点（置信度 0.75–0.99）、其余按驱动区间取值，"
+        "史料不得早于成书，且引用史料时必须用 scope 写明所掌握的条目，scope 只能取该传本 entries 里的标识），"
+        "初始性格单元至少一个锚点（置信度 0.75–0.99）、其余按驱动区间取值，"
         "生活线模板的活动必须来自世界包对应模板。creator 段是幕后设定，self_knowledge 段是角色自己知道的。" + STRUCTURE_HINT
     )
     user = (
@@ -208,7 +257,14 @@ async def generate_card(llm: LLMClient, package: dict[str, Any], brief: str) -> 
         card = _merge_structure(candidate, skeleton)
         return validate_card(card, package, moment=moment)
 
-    return await _generate_with_retry(llm, system, user, skeleton, check, label="角色卡")
+    budget = {"calls": 0, "limit": max(1, int(max_calls))}
+    try:
+        candidate, errors = await _generate_with_retry(
+            llm, system, user, skeleton, check, label="角色卡", budget=budget
+        )
+    except BudgetExhausted as exc:
+        return {**skeleton}, [str(exc)], _usage(budget, paused=True)
+    return candidate, errors, _usage(budget, paused=False)
 
 
 async def _generate_with_retry(
@@ -219,8 +275,9 @@ async def _generate_with_retry(
     check: Any,
     *,
     label: str,
+    budget: dict[str, int],
 ) -> tuple[dict[str, Any], list[str]]:
-    """两次机会：失败把错误清单回灌；仍失败则原样交回候选与错误（不落盘）。"""
+    """两次机会：失败把错误清单回灌；仍失败则原样交回候选与错误（不落盘）。调用前先记预算。"""
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -228,6 +285,7 @@ async def _generate_with_retry(
     candidate: dict[str, Any] | None = None
     errors: list[str] = []
     for attempt in (0, 1):
+        _spend(budget, label)
         log.info("generator call label=%s attempt=%s budget=%s", label, attempt, GENERATOR_BUDGET)
         try:
             text = await llm.chat(

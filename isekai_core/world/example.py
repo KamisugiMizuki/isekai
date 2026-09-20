@@ -41,8 +41,26 @@ def example_package(name: str = "灰潮纪", *, moment: int = DAY * 1500) -> dic
             "note": "城邦名为两字，人名带堤或潮的偏旁。",
             "terms": [{"term": "堤长", "meaning": "城邦议会的执事者"}],
         },
-        "institutions": [{"id": "inst-1", "name": "堤长议会", "scope": "各城邦"}],
-        "customs": [{"id": "cus-1", "name": "退潮祭", "scope": "沿岸城邦"}],
+        "institutions": [
+            {
+                "id": "inst-1",
+                "name": "堤长议会",
+                "mandate": "议定堤务、征发修补人力与发放退潮通行牌",
+                "scope": "三条沿岸城邦",
+                "succession": "堤长身故或去职时由同城邦议席推举接任，空缺期间日常堤务照旧、通行牌暂停发放",
+                "validity": "自崩塌后第 2 年沿用至今",
+            }
+        ],
+        "customs": [
+            {
+                "id": "cus-1",
+                "name": "退潮祭",
+                "applies_to": "沿岸城邦的堤务吏与盐户",
+                "practice": "大退潮首日在滩口设盐与旧堤砖，读水位尺后散去",
+                "basis": "崩堤后为记住水位而设",
+                "variation": "城邦之间可换用本地盐样，环节顺序不改",
+            }
+        ],
     }
     package["sources"] = [
         {"id": "src-1", "name": "驿站信报", "kind": "official", "reach": "在城邦驿站停留并支付铜钱即可取阅"},
@@ -176,7 +194,7 @@ def example_card(
         "role_id": "rl-1",
         "channels": [{"source_id": "src-1", "conditions": "凭堤务吏身份在驿站取阅信报"}],
         "initial_knowledge": [
-            {"ref_type": "historiography", "ref_id": "hs-1", "obtained_at": DAY * 1200},
+            {"ref_type": "historiography", "ref_id": "hs-1", "scope": ["cf-1", "nv-1"], "obtained_at": DAY * 1200},
             {"ref_type": "canon", "ref_id": "cf-1", "obtained_at": DAY * 1200},
             {"ref_type": "self", "claim": "她记得崩堤那年的盐味和搬家的车。"},
         ],

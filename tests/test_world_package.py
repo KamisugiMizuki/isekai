@@ -222,6 +222,76 @@ def test_race_and_birth_must_be_compatible() -> None:
     assert any("寿命覆盖不相容" in item for item in validate_card(card, package, moment=moment))
 
 
+def test_loading_limits_are_enforced() -> None:
+    """加载限额（§2.3）：超限明确拒绝，不静默裁掉设定。"""
+    package = sample_package()
+    package["world"]["geography"] = "长" * 5000
+    assert any("加载限额" in item for item in validate_package(package))
+
+    package = sample_package()
+    package["world"]["axioms"] = [{"id": f"ax-{index}", "text": "x"} for index in range(600)]
+    assert any("条目数" in item for item in validate_package(package))
+
+    package = sample_package()
+    node: dict = {}
+    cursor = node
+    for _ in range(20):
+        cursor["nested"] = {}
+        cursor = cursor["nested"]
+    package["meta"]["extra"] = node
+    assert any("嵌套深度" in item for item in validate_package(package))
+
+
+def test_unknown_required_capability_is_rejected() -> None:
+    """未知必需能力必须在确认前报错（§2.5）。"""
+    package = sample_package()
+    package["meta"]["requires"] = ["world.package.v1", "future.magic.v9"]
+    errors = validate_package(package)
+    assert any("future.magic.v9" in item for item in errors)
+    package["meta"]["requires"] = ["world.package.v1"]
+    assert validate_package(package) == []
+
+
+def test_effect_target_must_be_registered() -> None:
+    """效果目标指向未登记对象时创建失败（附录 C #10）。"""
+    package = sample_package()
+    package["events"]["families"][0]["templates"][0]["effects"] = [{"kind": "rumor", "target": "某个没登记的人"}]
+    assert any("未登记对象" in item for item in validate_package(package))
+
+    package = sample_package()
+    package["events"]["families"][0]["templates"][0]["effects"] = [{"kind": "rumor", "target": "en-1"}]
+    assert validate_package(package) == []
+
+
+def test_declared_institutions_and_customs_must_be_explicable() -> None:
+    """声明的制度与惯例若无法被一致解释，创建期即失败（附录 C #13）。"""
+    package = sample_package()
+    package["world"]["institutions"][0]["mandate"] = ""
+    package["world"]["customs"][0]["variation"] = ""
+    errors = validate_package(package)
+    assert any("mandate" in item for item in errors)
+    assert any("variation" in item for item in errors)
+
+    package = sample_package()
+    package["world"]["institutions"] = []
+    package["world"]["customs"] = []
+    assert validate_package(package) == [], "未声明即不适用，不因缺少制度拒绝合法题材"
+
+
+def test_historiography_knowledge_needs_explicit_scope() -> None:
+    """初始知识引用史料时必须写明掌握范围，且范围不能越权（附录 C #9）。"""
+    package = sample_package()
+    moment = int(package["calendar"]["initial_moment"])
+
+    card = sample_card(package)
+    card["initial_knowledge"][0].pop("scope", None)
+    assert any("必须写明所掌握的条目" in item for item in validate_card(card, package, moment=moment))
+
+    card = sample_card(package)
+    card["initial_knowledge"][0]["scope"] = ["cf-1", "nv-9"]
+    assert any("超出该传本" in item for item in validate_card(card, package, moment=moment))
+
+
 def test_card_json_is_the_only_artifact() -> None:
     """卡片文件只保存最终版本：确认字段入盘，无生成历史字段。"""
     package = sample_package()

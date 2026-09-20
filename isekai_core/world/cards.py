@@ -176,6 +176,15 @@ def _validate_knowledge(card: dict[str, Any], package: dict[str, Any], *, moment
             compiled = unit.get("compiled_at") or unit.get("written_at")
             if isinstance(compiled, int) and isinstance(obtained, int) and obtained < compiled:
                 errors.append(f"{where}: 史料获知早于成书（{unit.get('title')}）")
+            # 必须明确掌握哪些条目：不能由职业或渠道资格自动获得整部史料（CHARACTER_CARD §5.2）
+            scope = entry.get("scope")
+            entries = unit.get("entries") if isinstance(unit.get("entries"), list) else []
+            if not isinstance(scope, list) or not scope:
+                errors.append(f"{where}.scope: 引用史料必须写明所掌握的条目或范围")
+            else:
+                outside = [item for item in scope if item not in entries]
+                if outside:
+                    errors.append(f"{where}.scope: 超出该传本的条目范围：{'、'.join(str(item) for item in outside)}")
     return errors
 
 

@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -38,6 +40,10 @@ SYNC_OPS = frozenset(
         "world.package.save",
         "world.package.validate",
         "world.package.list",
+        "world.draft.list",
+        "world.draft.save",
+        "world.draft.load",
+        "world.draft.discard",
         "world.card.template",
         "world.card.load",
         "world.card.save",
@@ -112,6 +118,12 @@ def _moment(package: dict[str, Any], args: dict[str, Any]) -> int:
     return int(calendar.get("initial_moment") or 0)
 
 
+def _draft_path(cfg: Config, name: str) -> Path:
+    """草稿落盘位置：`<创作目录>/<名字>.draft.json`；名字做最小脱敏，避免路径穿越。"""
+    safe = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fa5.-]", "_", str(name).strip()) or "draft"
+    return cfg.paths.packages / f"{safe}.draft.json"
+
+
 def _list_files(cfg: Config, kind: str) -> list[dict[str, Any]]:
     """创作目录列表：给管理面下拉用（只返回摘要与校验状态，不返回全文）。"""
     folder = cfg.paths.packages
@@ -123,9 +135,25 @@ def _list_files(cfg: Config, kind: str) -> list[dict[str, Any]]:
         for path in sorted(folder.glob("*.isekai.json")):
             items.append({"file": path.name, "size": path.stat().st_size})
         return items
+    if kind == "draft":
+        # 草稿：允许未通过校验的候选，可显式继续或丢弃（§2.4）
+        for path in sorted(folder.glob("*.draft.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                payload = {}
+            items.append(
+                {
+                    "file": path.name,
+                    "name": payload.get("name"),
+                    "kind": payload.get("kind"),
+                    "updated_at": payload.get("updated_at"),
+                }
+            )
+        return items
     for path in sorted(folder.glob("*.json")):
-        if path.name.endswith(".candidate.json") or path.name.endswith(".isekai.json"):
-            continue  # 未通过校验的候选与实例导出件都不算创作内容
+        if path.name.endswith((".candidate.json", ".draft.json", ".isekai.json")):
+            continue  # 未通过校验的候选、草稿与实例导出件都不算创作内容
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -183,6 +211,38 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any]) -> dict[s
             return {"packages": _list_files(cfg, "package"), "containers": _list_files(cfg, "container")}
         if op == "world.card.list":
             return {"cards": _list_files(cfg, "card")}
+        if op == "world.draft.list":
+            return {"drafts": _list_files(cfg, "draft")}
+        if op == "world.draft.save":
+            name = str(args.get("name") or "").strip()
+            if not name:
+                raise UmpError(Err.INVALID, "草稿需要名称", retryable=False)
+            payload = {
+                "name": name,
+                "kind": str(args.get("kind") or "package"),
+                "payload": args.get("payload") or {},
+                "progress": args.get("progress") or {},
+                "errors": list(args.get("errors") or []),
+                "updated_at": time.time(),
+            }
+            target = _draft_path(cfg, name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return {"file": target.name}
+        if op == "world.draft.load":
+            target = _draft_path(cfg, str(args.get("name") or ""))
+            try:
+                payload = json.loads(target.read_text(encoding="utf-8"))
+            except FileNotFoundError as exc:
+                raise UmpError(Err.NOT_FOUND, f"草稿不存在：{target.name}", retryable=False) from exc
+            except json.JSONDecodeError as exc:
+                raise UmpError(Err.INVALID, f"草稿不是合法 JSON：{exc}", retryable=False) from exc
+            return {"draft": payload, "file": target.name}
+        if op == "world.draft.discard":
+            target = _draft_path(cfg, str(args.get("name") or ""))
+            if target.exists():
+                target.unlink()
+            return {"ok": True, "file": target.name}
         if op == "world.card.template":
             return {"card": template_card(_package_arg(args, cfg), name=str(args.get("name") or "未命名角色"))}
         if op == "world.card.load":
@@ -264,21 +324,26 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any]) -> dict[s
 
 
 async def dispatch_async(cfg: Config, llm: Any, op: str, args: dict[str, Any]) -> dict[str, Any]:
-    """异步操作：涉及模型调用（生成 / 修订 / 补全）。候选一律不落盘。"""
+    """异步操作：涉及模型调用（生成 / 修订 / 补全）。候选一律不落盘，并带回调用用量。"""
+    limit = args.get("max_calls")
+    max_calls = int(limit) if isinstance(limit, int) and limit > 0 else None
+    kwargs = {"max_calls": max_calls} if max_calls else {}
     try:
         if op == "world.package.generate":
-            package, errors = await generate_package(
-                llm, str(args.get("brief") or ""), name=str(args.get("name") or "未命名世界")
+            package, errors, usage = await generate_package(
+                llm, str(args.get("brief") or ""), name=str(args.get("name") or "未命名世界"), **kwargs
             )
         elif op == "world.package.revise":
-            package, errors = await revise_package(llm, _package_arg(args, cfg), str(args.get("instruction") or ""))
+            package, errors, usage = await revise_package(
+                llm, _package_arg(args, cfg), str(args.get("instruction") or ""), **kwargs
+            )
         elif op == "world.package.fill":
-            package, errors = await fill_section(
-                llm, _package_arg(args, cfg), str(args.get("section") or "")
+            package, errors, usage = await fill_section(
+                llm, _package_arg(args, cfg), str(args.get("section") or ""), **kwargs
             )
         elif op == "world.card.generate":
-            package, errors = await generate_card(
-                llm, _package_arg(args, cfg), str(args.get("brief") or "")
+            package, errors, usage = await generate_card(
+                llm, _package_arg(args, cfg), str(args.get("brief") or ""), **kwargs
             )
         else:
             raise UmpError(Err.UNSUPPORTED_TYPE, f"未知管理操作 {op}", retryable=False)
@@ -287,7 +352,7 @@ async def dispatch_async(cfg: Config, llm: Any, op: str, args: dict[str, Any]) -
         raise UmpError(code, f"生成失败：{exc.code}", retryable=exc.retryable) from exc
     except (InstanceError, PackageError) as exc:
         raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
-    return {"candidate": package, "errors": errors, "valid": not errors}
+    return {"candidate": package, "errors": errors, "valid": not errors, "usage": usage}
 
 
 def describe_ops() -> dict[str, Any]:

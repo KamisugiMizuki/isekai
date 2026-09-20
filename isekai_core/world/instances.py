@@ -52,8 +52,13 @@ def create_instance(
     imported: bool = False,
     seed: str | None = None,
     extra_setting: dict[str, Any] | None = None,
+    timelines: list[dict[str, Any]] | None = None,
+    commits: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """从世界包与已确认角色卡创建实例；校验不通过即失败且不留半个实例。"""
+    """从世界包与已确认角色卡创建实例；校验不通过即失败且不留半个实例。
+
+    `timelines` / `commits` 预留给导入路径：导入要在同一次原子写入里恢复时间线与提交行。
+    """
     errors = validate_package(package)
     if errors:
         raise InstanceError(errors)
@@ -70,9 +75,42 @@ def create_instance(
     name = allocate_name(wanted, store.instance_names())
 
     instance_id = new_instance_id()
-    timeline_id = f"tl-{secrets.token_hex(4)}"
-    commit_id = new_commit_id()
     now = time.time()
+    default_timeline = f"tl-{secrets.token_hex(4)}"
+    default_commit = new_commit_id()
+    timeline_rows = [
+        {"instance_id": instance_id, **item}
+        for item in (
+            timelines
+            if timelines is not None
+            else [
+                {
+                    "id": default_timeline,
+                    "name": "初始时间线",
+                    "state": "frozen",  # 创建 / 导入不等于激活（§3.2、§7.3）
+                    "source_commit": default_commit,
+                    "created_at": now,
+                }
+            ]
+        )
+    ]
+    commit_rows = [
+        {"instance_id": instance_id, **item}
+        for item in (
+            commits
+            if commits is not None
+            else [
+                {
+                    "id": default_commit,
+                    "timeline_id": default_timeline,
+                    "kind": "import" if imported else "initial",
+                    "moment": moment,
+                    "note": "导入创建" if imported else "实例创建",
+                    "created_at": now,
+                }
+            ]
+        )
+    ]
     setting: dict[str, Any] = {
         "world_package": clone_package(package),
         "original_name": original,
@@ -94,37 +132,35 @@ def create_instance(
         "imported": 1 if imported else 0,
         "created_at": now,
     }
-    store.instance_create(
-        row,
-        timelines=[
-            {
-                "id": timeline_id,
-                "instance_id": instance_id,
-                "name": "初始时间线",
-                "state": "frozen",  # 创建不等于激活（§4）
-                "source_commit": commit_id,
-                "created_at": now,
-            }
-        ],
-        commits=[
-            {
-                "id": commit_id,
-                "instance_id": instance_id,
-                "timeline_id": timeline_id,
-                "kind": "import" if imported else "initial",
-                "moment": moment,
-                "note": "导入创建" if imported else "实例创建",
-                "created_at": now,
-            }
-        ],
-    )
+    store.instance_create(row, timelines=timeline_rows, commits=commit_rows)
     created = store.instance_get(instance_id)
     assert created is not None
     return public_info(created)
 
 
+def compatibility(row: dict[str, Any]) -> tuple[str, str]:
+    """打开实例的兼容检查（§7.6）：compatible / convertible / blocked。不改变任何状态。
+
+    运行层按此结果决定推进、转换或在兼容性阻断下只读；阶段 1 只暴露结果与提示。
+    """
+    data_major = str(row.get("data_format") or "").split(".")[0]
+    ours_major = DATA_FORMAT_VERSION.split(".")[0]
+    if str(row.get("data_format")) == DATA_FORMAT_VERSION and str(row.get("rules_version")) == RULES_VERSION:
+        return "compatible", ""
+    if data_major == ours_major:
+        return (
+            "convertible",
+            f"数据格式 {row.get('data_format')} → {DATA_FORMAT_VERSION}（规则 {row.get('rules_version')} → {RULES_VERSION}）：需在副本上转换后使用",
+        )
+    return (
+        "blocked",
+        f"数据格式主版本不兼容（导出件 {row.get('data_format')}，本端 {DATA_FORMAT_VERSION}）：停止推进，等待兼容版本或转换",
+    )
+
+
 def public_info(row: dict[str, Any]) -> dict[str, Any]:
     """管理面可见的实例元数据：不暴露世界内部内容（§3.5）。"""
+    status, note = compatibility(row)
     return {
         "id": row["id"],
         "name": row["name"],
@@ -135,6 +171,8 @@ def public_info(row: dict[str, Any]) -> dict[str, Any]:
         "moment": row["moment"],
         "imported": bool(row["imported"]),
         "created_at": row["created_at"],
+        "compatibility": status,
+        "compatibility_note": note,
     }
 
 

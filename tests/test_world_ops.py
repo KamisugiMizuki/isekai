@@ -182,6 +182,99 @@ async def test_mgmt_connection_survives_operation_errors(root) -> None:
 
 
 @pytest.mark.asyncio
+async def test_generate_respects_call_budget(root) -> None:
+    """用量预算（§2.4）：达到确认上限即暂停并保留进度，不靠无限重试扩支。"""
+    async with running_core(root, replies=[json.dumps(sample_package(), ensure_ascii=False)]) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            result = await mgmt.call("world.package.generate", brief="x", max_calls=1, timeout=60)
+            assert result["usage"] == {"calls": 1, "limit": 1, "paused": True}
+            assert result["valid"] is False
+            assert any("已达确认的调用上限" in item for item in result["errors"])
+            assert len(harness.fake.calls) == 1, "达到上限后不再调用模型"
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_draft_roundtrip_and_discard(root) -> None:
+    """草稿态（§2.4）：允许未通过校验的候选暂存、继续与丢弃；不进正式包列表。"""
+    async with running_core(root) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            await mgmt.call(
+                "world.draft.save",
+                name="盐滩纪-package",
+                kind="package",
+                payload={"meta": {"original_name": "草稿世界"}},
+                errors=["world.axioms: 至少一条世界公理（阻断项）"],
+            )
+            leftovers = [
+                item.name for item in (root / "packages").glob("*.json") if not item.name.endswith(".draft.json")
+            ]
+            assert leftovers == [], "草稿不冒充正式包"
+            loaded = await mgmt.call("world.draft.load", name="盐滩纪-package")
+            assert loaded["draft"]["errors"], "草稿保留未通过原因"
+            drafts = (await mgmt.call("world.package.list"))["packages"]
+            assert drafts == [], "草稿不进世界包列表"
+            assert [item["name"] for item in (await mgmt.call("world.draft.list"))["drafts"]] == ["盐滩纪-package"]
+
+            await mgmt.call("world.draft.discard", name="盐滩纪-package")
+            assert (await mgmt.call("world.draft.list"))["drafts"] == []
+            with pytest.raises(Exception):
+                await mgmt.call("world.draft.load", name="盐滩纪-package")
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_export_is_atomic_on_disk(root) -> None:
+    """导出先写临时文件再发布：不留下半截产物（§7.1）。"""
+    package = sample_package()
+    write_json(root / "packages" / "greytide.json", package)
+    write_json(root / "packages" / "tihe.json", sample_card(package))
+    async with running_core(root) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info = (await mgmt.call("instance.create", package_path="greytide.json", card_paths=["tihe.json"]))[
+                "instance"
+            ]
+            await mgmt.call("instance.export", id=info["id"], path="out.isekai.json")
+            files = sorted(item.name for item in (root / "packages").iterdir())
+            assert "out.isekai.json" in files
+            assert not [name for name in files if name.endswith(".tmp")], "不留临时文件"
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_opening_an_instance_reports_compatibility(root) -> None:
+    """打开实例时的兼容检查（§7.6）：不兼容即 blocked，检查本身不改状态。"""
+    import sqlite3
+
+    package = sample_package()
+    write_json(root / "packages" / "greytide.json", package)
+    write_json(root / "packages" / "tihe.json", sample_card(package))
+    async with running_core(root) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info = (await mgmt.call("instance.create", package_path="greytide.json", card_paths=["tihe.json"]))[
+                "instance"
+            ]
+            assert info["compatibility"] == "compatible"
+            # 模拟「旧格式实例」：直接改库中记录的数据格式版本
+            with sqlite3.connect(root / "data" / "isekai.db") as conn:
+                conn.execute("UPDATE instance SET data_format='9.0' WHERE id=?", (info["id"],))
+                conn.commit()
+            detail = await mgmt.call("instance.info", id=info["id"])
+            assert detail["instance"]["compatibility"] == "blocked"
+            assert "主版本不兼容" in detail["instance"]["compatibility_note"]
+            assert detail["timelines"][0]["state"] == "frozen", "检查不改动实例状态"
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
 async def test_instance_setting_exposes_locked_snapshot(root) -> None:
     package = sample_package()
     write_json(root / "packages" / "greytide.json", package)

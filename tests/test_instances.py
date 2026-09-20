@@ -141,7 +141,9 @@ def test_export_is_single_file_without_credentials_or_receipts(store, tmp_path) 
     store.thread_bind("cli-dev", "t1", session["id"])
     target = tmp_path / "export" / "greytide.isekai.json"
     manifest = write_export(store, info["id"], target)
-    assert manifest["counts"] == {"sessions": 1, "messages": 2}
+    assert manifest["counts"]["sessions"] == 1
+    assert manifest["counts"]["messages"] == 2
+    assert manifest["counts"]["timelines"] == 1, "导出携带时间线与提交闭包（§7.1）"
 
     text = target.read_text(encoding="utf-8")
     container = json.loads(text)
@@ -185,7 +187,8 @@ def test_import_creates_new_frozen_instance_and_keeps_original(store, tmp_path) 
     assert imported["id"] != info["id"]
     timelines = store.timeline_list(imported["id"])
     assert timelines[0]["state"] == "frozen", "导入后默认冻结"
-    assert [c["kind"] for c in store.commit_list(imported["id"])] == ["import"]
+    assert timelines[0]["id"] != timeline["id"], "本地标识重新映射，不与原实例相连"
+    assert [c["kind"] for c in store.commit_list(imported["id"])] == ["initial"], "提交闭包随件恢复（保持来源）"
 
     restored_session = store.instance_sessions(imported["id"])[0]
     messages = [m["text"] for m in store.history_page(restored_session["id"])["messages"]]

@@ -88,8 +88,26 @@ def template_package(
             "geography": "",
             "society": "",
             "lexicon": {"note": "", "terms": [{"term": "", "meaning": ""}]},
-            "institutions": [],
-            "customs": [],
+            "institutions": [
+                {
+                    "id": "inst-1",
+                    "name": "",
+                    "mandate": "",
+                    "scope": "",
+                    "succession": "",
+                    "validity": "",
+                }
+            ],
+            "customs": [
+                {
+                    "id": "cus-1",
+                    "name": "",
+                    "applies_to": "",
+                    "practice": "",
+                    "basis": "",
+                    "variation": "",
+                }
+            ],
         },
         "environment": {"types": []},
         "sources": [{"id": "src-1", "name": "", "kind": "personal", "reach": ""}],
@@ -98,7 +116,7 @@ def template_package(
         "entities": [],
         "races": [{"id": "rc-1", "name": "", "lifespan": {"min_years": 60, "max_years": 90}}],
         "historiography": [],
-        "events": {"families": [{"id": "ef-1", "name": "", "templates": [{"id": "et-1", "summary": "", "preconditions": [], "effects": [], "weight": 1}]}]},
+        "events": {"families": [{"id": "ef-1", "name": "", "templates": [{"id": "et-1", "summary": "", "preconditions": [], "effects": [{"kind": "", "target": ""}], "weight": 1}]}]},
         "life": [{"id": "lf-1", "name": "", "sleep": True, "windows": [{"start": 0, "end": day_seconds, "activity": ""}]}],
         "roles": [{"id": "rl-1", "name": "", "description": "", "life_template": "lf-1", "channels": ["src-1"]}],
         "comms": {"mechanisms": [{"id": "cm-1", "name": "", "limits": ""}]},

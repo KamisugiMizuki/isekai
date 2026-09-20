@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import secrets
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -41,6 +44,8 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
     setting = json.loads(row["setting"])
     sessions = store.instance_sessions(instance_id)
     messages = store.instance_messages(instance_id)
+    timelines = store.timeline_list(instance_id)
+    commits = store.commit_list(instance_id)
     payload = {
         "setting": setting,
         "runtime": {
@@ -54,7 +59,29 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
                 for item in sessions
             ],
             "messages": messages,
+            "timelines": [
+                {
+                    "id": item["id"],
+                    "name": item["name"],
+                    "state": item["state"],
+                    "source_commit": item["source_commit"],
+                    "created_at": item["created_at"],
+                }
+                for item in timelines
+            ],
+            "commits": [
+                {
+                    "id": item["id"],
+                    "timeline_id": item["timeline_id"],
+                    "kind": item["kind"],
+                    "moment": item["moment"],
+                    "note": item["note"],
+                    "created_at": item["created_at"],
+                }
+                for item in commits
+            ],
             "seed": row["seed"],
+            "moment": row["moment"],
         },
     }
     return {
@@ -70,7 +97,12 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
             "package_id": row["package_id"],
             "moment": row["moment"],
             "capabilities": list(CAPABILITIES),
-            "counts": {"sessions": len(sessions), "messages": len(messages)},
+            "counts": {
+                "sessions": len(sessions),
+                "messages": len(messages),
+                "timelines": len(timelines),
+                "commits": len(commits),
+            },
         },
         "setting": payload["setting"],
         "runtime": payload["runtime"],
@@ -79,10 +111,22 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
 
 
 def write_export(store: Store, instance_id: str, path: str | Path) -> dict[str, Any]:
+    """先写临时文件、完整校验后再原子发布（§7.1）：中途失败不留下伪装成功的包。"""
     container = build_container(store, instance_id)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(container, ensure_ascii=False, indent=2), encoding="utf-8")
+    text = json.dumps(container, ensure_ascii=False, indent=2)
+    verify_integrity(container)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=str(target.parent), delete=False, suffix=".tmp"
+    )
+    try:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    finally:
+        handle.close()
+    os.replace(handle.name, target)
     return container["container"]
 
 
@@ -146,6 +190,7 @@ def import_instance(store: Store, container: dict[str, Any], *, display_name: st
         raise InstanceError(["导入件的锁定设定未通过校验："] + errors)
 
     runtime = container.get("runtime") or {}
+    timelines, commits, timeline_map = _prepare_graph(runtime, moment)
     row = create_instance(
         store,
         package,
@@ -154,21 +199,75 @@ def import_instance(store: Store, container: dict[str, Any], *, display_name: st
         imported=True,
         seed=str(runtime.get("seed") or "") or None,
         extra_setting={"imported_from": {"exported_at": (container.get("container") or {}).get("exported_at")}},
+        timelines=timelines,
+        commits=commits,
     )
     try:
-        _restore_runtime(store, row["id"], runtime)
+        _restore_sessions(store, row["id"], runtime, timeline_map)
     except Exception:
         store.instance_delete(row["id"])
         raise
     return row
 
 
-def _restore_runtime(store: Store, instance_id: str, runtime: dict[str, Any]) -> None:
-    """阶段 1 只恢复会话与对话原文：时间线 / 提交图在阶段 4 才正式化，目前按初始提交重建。"""
+def _prepare_graph(
+    runtime: dict[str, Any], moment: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
+    """时间线与提交行重新映射本地标识；导入线一律冻结（§7.3）。"""
+    timeline_map: dict[str, str] = {}
+    commit_map: dict[str, str] = {}
+    source_timelines = [item for item in (runtime.get("timelines") or []) if isinstance(item, dict)]
+    source_commits = [item for item in (runtime.get("commits") or []) if isinstance(item, dict)]
+    if not source_timelines:
+        source_timelines = [{"id": "tl-legacy", "name": "初始时间线", "created_at": time.time()}]
+    for item in source_timelines:
+        timeline_map[str(item.get("id"))] = f"tl-{secrets.token_hex(4)}"
+    for item in source_commits:
+        commit_map[str(item.get("id"))] = f"cm-{secrets.token_hex(6)}"
+    timelines = [
+        {
+            "id": timeline_map[str(item.get("id"))],
+            "name": str(item.get("name") or "时间线"),
+            "state": "frozen",
+            "source_commit": commit_map.get(str(item.get("source_commit"))),
+            "created_at": float(item.get("created_at") or time.time()),
+        }
+        for item in source_timelines
+    ]
+    fallback = timelines[0]["id"]
+    commits = [
+        {
+            "id": commit_map[str(item.get("id"))],
+            "timeline_id": timeline_map.get(str(item.get("timeline_id")), fallback),
+            "kind": str(item.get("kind") or "import"),
+            "moment": int(item.get("moment") if isinstance(item.get("moment"), int) else moment),
+            "note": str(item.get("note") or ""),
+            "created_at": float(item.get("created_at") or time.time()),
+        }
+        for item in source_commits
+    ]
+    if not commits:
+        commits = [
+            {
+                "id": f"cm-{secrets.token_hex(6)}",
+                "timeline_id": fallback,
+                "kind": "import",
+                "moment": moment,
+                "note": "导入创建",
+                "created_at": time.time(),
+            }
+        ]
+    return timelines, commits, timeline_map
+
+
+def _restore_sessions(
+    store: Store, instance_id: str, runtime: dict[str, Any], timeline_map: dict[str, str]
+) -> None:
+    """恢复会话与对话原文；时间线标识重新映射，投递与绑定不回传（§7.1）。"""
     timelines = store.timeline_list(instance_id)
     if not timelines:
         raise InstanceError("实例缺少初始时间线")
-    timeline_id = timelines[0]["id"]
+    fallback = timelines[0]["id"]
     sessions = runtime.get("sessions") or []
     messages = runtime.get("messages") or []
     id_map: dict[str, str] = {}
@@ -176,6 +275,7 @@ def _restore_runtime(store: Store, instance_id: str, runtime: dict[str, Any]) ->
         if not isinstance(item, dict):
             continue
         character_id = str(item.get("character_id") or "character")
+        timeline_id = timeline_map.get(str(item.get("timeline_id")), fallback)
         created = store.session_ensure(instance_id, timeline_id, character_id)
         id_map[str(item.get("id"))] = str(created["id"])
     grouped: dict[str, list[dict[str, Any]]] = {}

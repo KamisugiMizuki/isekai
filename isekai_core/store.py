@@ -138,6 +138,8 @@ CREATE TABLE IF NOT EXISTS commit_log(
 CREATE INDEX IF NOT EXISTS ix_timeline_instance ON timeline(instance_id);
 CREATE INDEX IF NOT EXISTS ix_commit_instance ON commit_log(instance_id, timeline_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_session_instance ON session(instance_id);
+-- 名称唯一：规范化比较在应用层（NFKC + 大小写折叠），这里兜底同名直插（§7.4）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_instance_name ON instance(name);
 """
 
 

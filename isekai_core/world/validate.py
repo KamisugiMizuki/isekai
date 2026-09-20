@@ -8,11 +8,18 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..version import CAPABILITIES
 from .package import DENSITIES, PACKAGE_SCHEMA_VERSION
 
 SEGMENT_KEYS = ("id", "name", "start", "end")
 LIFESPAN_MODES = ("long", "unbounded")
 ENTITY_KINDS = ("person", "org", "place", "item")
+
+#: 加载限额（§2.3）：超限明确拒绝，不静默裁掉设定
+MAX_DEPTH = 12
+MAX_NODES = 20000
+MAX_STRING = 4000
+MAX_COLLECTION = 500
 
 
 def _text(value: Any) -> bool:
@@ -50,6 +57,7 @@ def validate_package(package: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if not isinstance(package, dict):
         return ["世界包必须是 JSON 对象"]
+    errors.extend(_check_limits(package))
 
     meta = package.get("meta")
     if not isinstance(meta, dict):
@@ -64,6 +72,14 @@ def validate_package(package: dict[str, Any]) -> list[str]:
         errors.append("meta.original_name: 缺少原始世界包名称")
     if meta.get("density") not in DENSITIES:
         errors.append(f"meta.density: 必须是 {'/'.join(DENSITIES)} 之一")
+    # 未知必需能力必须在确认前报错（§2.5）：包声明它需要的运行能力，本端不认识就拒绝
+    requires = meta.get("requires", [])
+    if not isinstance(requires, list):
+        errors.append("meta.requires: 必须是能力标识列表")
+    else:
+        unknown = [item for item in requires if item not in CAPABILITIES]
+        if unknown:
+            errors.append("meta.requires: 本端尚不支持的能力：" + "、".join(str(item) for item in unknown))
 
     _validate_calendar(package.get("calendar"), errors)
     _validate_world(package.get("world"), errors)
@@ -74,6 +90,32 @@ def validate_package(package: dict[str, Any]) -> list[str]:
     _validate_events(package, known, errors)
     _validate_life_roles(package, errors)
     _validate_initial_state(package, known, errors)
+    return errors
+
+
+def _check_limits(package: dict[str, Any]) -> list[str]:
+    """加载限额：嵌套深度、节点数、单条文本长度、集合长度（§2.3）。"""
+    errors: list[str] = []
+    stack: list[tuple[Any, int, str]] = [(package, 1, "")]
+    nodes = 0
+    while stack:
+        node, depth, path = stack.pop()
+        nodes += 1
+        if nodes > MAX_NODES:
+            return errors + [f"世界包节点数超过上限 {MAX_NODES}（加载限额）"]
+        if depth > MAX_DEPTH:
+            return errors + [f"{path}: 嵌套深度超过上限 {MAX_DEPTH}（加载限额）"]
+        if isinstance(node, dict):
+            for key, value in node.items():
+                here = f"{path}.{key}" if path else str(key)
+                if isinstance(value, str) and len(value) > MAX_STRING:
+                    errors.append(f"{here}: 文本长度 {len(value)} 超过上限 {MAX_STRING}（加载限额）")
+                stack.append((value, depth + 1, here))
+        elif isinstance(node, list):
+            if len(node) > MAX_COLLECTION:
+                errors.append(f"{path}: 条目数 {len(node)} 超过上限 {MAX_COLLECTION}（加载限额）")
+            for index, value in enumerate(node):
+                stack.append((value, depth + 1, f"{path}[{index}]"))
     return errors
 
 
@@ -161,8 +203,26 @@ def _validate_world(world: Any, errors: list[str]) -> None:
             continue
         _check_unique(items, f"world.{key}", errors)
         for index, item in enumerate(items):
-            if isinstance(item, dict) and not _text(item.get("name")):
-                errors.append(f"world.{key}[{index}]: 缺少名称")
+            if not isinstance(item, dict):
+                errors.append(f"world.{key}[{index}]: 条目必须是对象")
+                continue
+            where = f"world.{key}[{index}]"
+            if not _text(item.get("name")):
+                errors.append(f"{where}: 缺少名称")
+            # 制度：职权 / 适用 / 延续与承接；惯例：适用群体 / 做法 / 形成依据 / 允许变化范围
+            if key == "institutions":
+                for field, hint in (("mandate", "职权"), ("scope", "适用范围"), ("succession", "延续与承接规则")):
+                    if not _text(item.get(field)):
+                        errors.append(f"{where}.{field}: 已声明制度必须写明{hint}")
+            else:
+                for field, hint in (
+                    ("applies_to", "适用群体"),
+                    ("practice", "当前做法"),
+                    ("basis", "形成依据"),
+                    ("variation", "允许变化范围"),
+                ):
+                    if not _text(item.get(field)):
+                        errors.append(f"{where}.{field}: 已声明惯例必须写明{hint}")
 
 
 def _validate_environment(environment: Any, errors: list[str]) -> None:
@@ -179,15 +239,24 @@ def _validate_environment(environment: Any, errors: list[str]) -> None:
     for index, item in enumerate(types):
         if not isinstance(item, dict):
             continue
+        where = f"environment.types[{index}]"
         if not _text(item.get("name")):
-            errors.append(f"environment.types[{index}]: 缺少名称")
+            errors.append(f"{where}: 缺少名称")
         if "initial" not in item:
-            errors.append(f"environment.types[{index}]: 缺少初始值")
+            errors.append(f"{where}: 缺少初始值")
+        if not _text(item.get("unit")):
+            errors.append(f"{where}.unit: 已声明的环境类型必须写明单位")
+        if not isinstance(item.get("values"), list) or not item.get("values"):
+            errors.append(f"{where}.values: 已声明的环境类型必须写明取值域")
+        if not _text(item.get("observe")):
+            errors.append(f"{where}.observe: 已声明的环境类型必须写明观察条件")
+        if not isinstance(item.get("expiry"), (str, list)) or not item.get("expiry"):
+            errors.append(f"{where}.expiry: 缺少失效方式")
         if not isinstance(item.get("scope"), (str, list)) or not item.get("scope"):
-            errors.append(f"environment.types[{index}]: 缺少作用范围声明")
+            errors.append(f"{where}: 缺少作用范围声明")
         sources = item.get("sources")
         if not isinstance(sources, list) or not sources:
-            errors.append(f"environment.types[{index}]: 缺少变化来源")
+            errors.append(f"{where}: 缺少变化来源")
 
 
 def _validate_canon_sources(package: dict[str, Any], errors: list[str]) -> set[str]:
@@ -322,7 +391,41 @@ def _validate_historiography(package: dict[str, Any], known: set[str], errors: l
             _check_refs(entries, known, f"{where}.entries", errors)
 
 
+def _all_ids(package: dict[str, Any]) -> set[str]:
+    """包内全部稳定标识：效果目标等结构引用只允许指向这些（附录 C #10）。"""
+    found: set[str] = set()
+    for key in ("sources", "canon", "narratives", "entities", "races", "life", "roles", "historiography"):
+        items = package.get(key)
+        if isinstance(items, list):
+            found |= set(_ids(items))
+    world = package.get("world")
+    if isinstance(world, dict):
+        for key in ("axioms", "institutions", "customs"):
+            items = world.get(key)
+            if isinstance(items, list):
+                found |= set(_ids(items))
+        lexicon = world.get("lexicon")
+        if isinstance(lexicon, dict):
+            found |= set(_ids(lexicon.get("terms")))
+    environment = package.get("environment")
+    if isinstance(environment, dict):
+        found |= set(_ids(environment.get("types")))
+    comms = package.get("comms")
+    if isinstance(comms, dict):
+        found |= set(_ids(comms.get("mechanisms")))
+    events = package.get("events")
+    if isinstance(events, dict):
+        families = events.get("families")
+        if isinstance(families, list):
+            found |= set(_ids(families))
+            for family in families:
+                if isinstance(family, dict):
+                    found |= set(_ids(family.get("templates")))
+    return found
+
+
 def _validate_events(package: dict[str, Any], known: set[str], errors: list[str]) -> None:
+    targets = _all_ids(package)
     events = package.get("events")
     families = events.get("families") if isinstance(events, dict) else None
     if not isinstance(families, list) or not families:
@@ -352,6 +455,11 @@ def _validate_events(package: dict[str, Any], known: set[str], errors: list[str]
             for e_index, effect in enumerate(effects if isinstance(effects, list) else []):
                 if not isinstance(effect, dict) or not _text(effect.get("kind")):
                     errors.append(f"{t_where}.effects[{e_index}]: 效果缺少类型")
+                    continue
+                # 效果目标必须是已登记对象，不能指向未登记的名字（附录 C #10）
+                target = effect.get("target")
+                if target is not None and target not in targets:
+                    errors.append(f"{t_where}.effects[{e_index}].target: 指向未登记对象 {target!r}")
             _check_refs(template.get("preconditions"), known, f"{t_where}.preconditions", errors)
 
 

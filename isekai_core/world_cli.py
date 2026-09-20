@@ -131,6 +131,10 @@ def print_result(result: dict[str, Any], *, out: str | None = None) -> int:
         return 1
     if out and (result.get("candidate") or result.get("package") or result.get("card")):
         print(f"已写入 {out}")
+    usage = result.get("usage")
+    if isinstance(usage, dict):
+        state = "已暂停（未继续重试）" if usage.get("paused") else "完成"
+        print(f"用量：调用 {usage.get('calls')}/{usage.get('limit')} 次，{state}")
     print(json.dumps({key: value for key, value in result.items() if key != "candidate"}, ensure_ascii=False, indent=2))
     return 0
 

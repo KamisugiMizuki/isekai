@@ -703,6 +703,25 @@ async function showInstance(instanceId: string): Promise<void> {
   }
 }
 
+async function saveDraft(
+  name: string,
+  kind: "package" | "card",
+  payload: unknown,
+  errors: string[],
+): Promise<void> {
+  if (!mgmt) return;
+  try {
+    await mgmt.call("world.draft.save", {
+      name: `${name.replace(/\.json$/, "")}-${kind}`,
+      kind,
+      payload,
+      errors,
+    });
+  } catch (error) {
+    worldNote(`草稿保存失败：${error}`, true);
+  }
+}
+
 async function worldAction(action: () => Promise<string | void>): Promise<void> {
   try {
     const message = await action();
@@ -746,6 +765,12 @@ function bindWorld(): void {
       const brief = $<HTMLInputElement>("pkg-brief").value.trim();
       if (!brief) throw new Error("先写一段世界描述");
       const file = $<HTMLInputElement>("pkg-file").value.trim() || "world.json";
+      const settings = (await mgmt!.call("settings.get")) as unknown as SettingsPayload;
+      const ok = window.confirm(
+        `将向 ${settings.llm.model}（${settings.llm.base_url}）发送你填写的世界描述与生成上下文，` +
+          `预计调用 3–6 次（含重试，上限 6 次），用量会在完成后显示。继续？`,
+      );
+      if (!ok) return "已取消，未发送任何内容";
       worldNote("AI 生成中，可能需要一两分钟…");
       const result = await mgmt!.call(
         "world.package.generate",
@@ -753,13 +778,15 @@ function bindWorld(): void {
         GENERATE_TIMEOUT_MS,
       );
       const errors = (result.errors ?? []) as string[];
+      const usage = result.usage as { calls?: number; limit?: number; paused?: boolean } | undefined;
       if (errors.length) {
         showErrors("pkg-errors", errors);
-        return "生成结果未通过校验，未写入";
+        await saveDraft(file, "package", result.candidate, errors);
+        return `生成未通过校验，已存为草稿（调用 ${usage?.calls ?? "?"}/${usage?.limit ?? "?"}）`;
       }
       await mgmt!.call("world.package.save", { path: file, package: result.candidate });
       showErrors("pkg-errors", []);
-      return `已生成并写入 ${file}`;
+      return `已生成并写入 ${file}（调用 ${usage?.calls ?? "?"}/${usage?.limit ?? "?"}）`;
     }),
   );
 
@@ -784,6 +811,12 @@ function bindWorld(): void {
       const file = $<HTMLInputElement>("card-file").value.trim() || "card.json";
       if (!pkg) throw new Error("先选一个世界包");
       if (!brief) throw new Error("先写一段角色描述");
+      const settings = (await mgmt!.call("settings.get")) as unknown as SettingsPayload;
+      const ok = window.confirm(
+        `将向 ${settings.llm.model}（${settings.llm.base_url}）发送角色描述与目标世界包，` +
+          `预计调用 1–2 次（上限 2 次）。继续？`,
+      );
+      if (!ok) return "已取消，未发送任何内容";
       worldNote("AI 生成角色卡中…");
       const result = await mgmt!.call(
         "world.card.generate",
@@ -791,13 +824,15 @@ function bindWorld(): void {
         GENERATE_TIMEOUT_MS,
       );
       const errors = (result.errors ?? []) as string[];
+      const usage = result.usage as { calls?: number; limit?: number } | undefined;
       if (errors.length) {
         showErrors("card-errors", errors);
-        return "生成结果未通过校验，未写入";
+        await saveDraft(file, "card", result.candidate, errors);
+        return `生成未通过校验，已存为草稿（调用 ${usage?.calls ?? "?"}/${usage?.limit ?? "?"}）`;
       }
       await mgmt!.call("world.card.save", { card_path: file, card: result.candidate });
       showErrors("card-errors", []);
-      return `已生成并写入 ${file}（仍需确认）`;
+      return `已生成并写入 ${file}（仍需确认；调用 ${usage?.calls ?? "?"}/${usage?.limit ?? "?"}）`;
     }),
   );
 
