@@ -965,6 +965,7 @@ def _backup_folder(cfg: Any, store: Any) -> Path:
 def backup_once(cfg: Any, store: Any, *, note: str = "") -> dict[str, Any]:
     """落一份一致水位备份并按保留数轮转（backup.create 与退出前补做共用同一路径）。"""
     folder = _backup_folder(cfg, store)
+    folder.mkdir(parents=True, exist_ok=True)  # 首次到期补做时目录还不存在
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     result = store.backup_create(folder / f"isekai-{stamp}.db", note=note)
     if result["ok"]:

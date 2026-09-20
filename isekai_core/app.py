@@ -17,6 +17,7 @@ from .config import Config
 from .llm import FakeLLM, LLMClient
 from .log import get_logger
 from .runtime.service import RuntimeService
+from .world import ops as world_ops
 from .session import SessionService
 from .runtime.service import from_config as runtime_service_from_config
 from .store import Store
