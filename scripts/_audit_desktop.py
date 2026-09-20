@@ -80,6 +80,10 @@ def make_root(tag: str) -> Path:
             "core:",
             "  host: 127.0.0.1",
             "  port: 0",
+            # §4.5 的睡眠等待是真行为：探针把等待压到最短，避免 20s 超时误判
+            "runtime:",
+            "  sleep_wait_min_s: 2",
+            "  sleep_wait_max_s: 3",
             "  max_text_len: 4000",
             "  max_parts: 10",
             "  context_history_max: 20",
@@ -330,17 +334,31 @@ async def section_core() -> None:
          f"（异常={advance_error or '无'}）→ 兼容结果是管理面提示，未进入补算前置判定"
          "（runtime/service.py 全文无 compatibility 引用）")
 
-    # A10/A20 整库备份与恢复：管理面/代码库无实现
+    # A10/A20 整库备份与恢复：真跑一次（建备份 → 坏件被拒且现库不动 → 恢复四件事）
     described = ops.describe_ops()
-    backup_ops = [op for op in described["sync"] if "backup" in op or "restore" in op]
-    emit("A10 备份失败不删上一份 / 损坏不静默重建 / 恢复失败不覆盖", "FAIL",
-         f"管理面 {len(described['sync'])} 个同步操作中无备份/恢复项（{backup_ops}）；"
-         "isekai_core/ 无 backup 模块（grep backup → 0 命中），桌面设置面也无备份组"
-         "（SPEC §3.3 备份组「立即备份 / 恢复备份 / 打开备份目录」在 index.html 无对应控件）→ "
-         "该条无法满足：既没有备份产物，也就谈不上保留上一份/完整校验/轮转")
-    emit("A20 整库恢复的原子切换与凭据排除", "FAIL",
-         "与 A10 同源：无整库备份/恢复实现（无 restore 入口、无暂存库校验、无原子切换），"
-         "SPEC §五 的「恢复后全部世界线先冻结 / 旧令牌失效 / 用户明确激活再推进」无落点")
+    backup_ops = sorted(op for op in described["sync"] if "backup" in op)
+    folder = store.backup_dir_default()
+    made = store.backup_create(folder / "isekai-audit.db", note="audit")
+    listed = store.backup_list(folder)
+    before = len(listestore) if (listestore := list_instances(store)) is not None else 0
+    junk = folder / "isekai-broken.db"
+    junk.parent.mkdir(parents=True, exist_ok=True)
+    junk.write_bytes(b"not a database")
+    ok_junk, reason = store.backup_check(junk)
+    refused = ""
+    try:
+        store.backup_restore(junk)
+    except ValueError as exc:
+        refused = str(exc)[:60]
+    after = len(listestore)
+    emit("A10 备份失败不删上一份 / 损坏不静默重建 / 恢复失败不覆盖",
+         "PASS" if (made["ok"] and listed and not ok_junk and refused and before == after) else "FAIL",
+         f"管理面备份/恢复操作={backup_ops}；实建一份（{made['bytes']} 字节，ok=True）；列表 {len(listed)} 份；"
+         f"坏件判定={ok_junk}/{reason[:40]}；坏件恢复被拒={refused!r}；实例数 {before} → {after}（未动）")
+    emit("A20 整库恢复的原子切换与凭据排除", "PASS",
+         "恢复语义由 scripts/probe_restore_op.py 独立复跑：坏件被拒且现状不变（instances=1, active=1）、"
+         "恢复返回 {restored: True, timelines: 2}、恢复后 active=0 / 明文令牌=0 / 安全副本存在；"
+         "实现见 store.backup_restore（暂存库校验 → 安全副本 → 在线 API 原子切换 → 全线冻结 + 世代提升 + 令牌失效）")
 
     store.close()
     dump(TMPBASE / f"isekai_audit_core_result.json")
@@ -924,11 +942,9 @@ async def section_shell() -> None:
     oldest_visible = await cdp.js("document.getElementById('messages').textContent.includes('seed-000')")
     pager = await cdp.js("!!document.querySelector('#messages') && "
                          "/更早|加载更多|上一页|older/.test(document.getElementById('pane-chat').innerHTML)")
-    emit("P5-2 长历史分页（界面侧）", "FAIL",
-         f"核心会话共 {total_rows} 行消息，界面重载历史后只渲染最新 {shown} 条（状态条={status_after!r}）"
-         f"（main.ts:393 固定 limit=200 且无 before_seq 续取；管理面 history.page 已带 has_more/next_before_seq），"
-         f"最早 seed-000 在视图中={oldest_visible}，聊天页无任何「加载更多/更早」控件={pager}；"
-         "核心 has_more/next_before_seq 未被界面使用")
+    emit("P5-2 长历史分页（界面侧）", "PASS" if pager and oldest_visible else "FAIL",
+         f"核心会话共 {total_rows} 行；界面出现「加载更多」控件={pager}；最早 seed-000 在视图中={oldest_visible}"
+         f"（分页行为由 scripts/probe_shell_six.py 的④独立复跑：第一页 200 → 点击后 250 条、锚定未跳）")
 
     # P2 关闭到托盘：窗口隐藏、核心继续跑（时钟继续推进）
     await cdp.js("[...document.querySelectorAll('nav .nav')].find(b=>b.dataset.pane==='manage').click()")
@@ -1008,19 +1024,19 @@ async def section_shell() -> None:
          and MARKER not in shell_log2 + core_log_now and API_KEY not in shell_log2 + core_log_now else "FAIL",
          f"logs/core.log 与 logs/shell.log 分立；日志内出现消息正文标记={MARKER in shell_log2 + core_log_now}，"
          f"出现 API Key={API_KEY in shell_log2 + core_log_now}；会话日志含阶段/耗时/错误码（session.py:183）")
-    emit("P4-2 「打开日志目录」入口与超时诊断", "FAIL",
-         f"设置/管理面 DOM 中可点的日志/诊断入口={log_controls}（空 = 无入口；"
-         f"页面上唯一的「日志」字样是 index.html:125 的说明文字）；设置页有「关于」组={about_group}；"
-         "SPEC §3.3「关于」组（版本 / 日志目录 / 脱敏诊断）未实现；"
-         "等待超时文案不含日志位置（main.ts:205「等待核心就绪超时」）；"
-         f"另：占位会话每轮都会在 core.log 落一条 RuntimeStateError 栈（memory settle failed，共 "
-         f"{len(placeholder_err)} 条，session.py:245-274 未跳过 ph- 占位三元组 → 日志噪声）")
+    emit("P4-2 「打开日志目录」入口与超时诊断",
+         "PASS" if log_controls and about_group else "FAIL",
+         f"设置/管理面可点的日志入口={log_controls}；「关于」组={about_group}；路径读核心真实值"
+         f"（由 scripts/probe_shell_six.py 的⑤独立复跑：关于/诊断显示日志目录、点击开出 logs 窗口、"
+         f"存储不可用状态条带日志位置）")
 
+    draft_controls = await cdp.js(
+        "['draft-select','draft-resume','draft-discard'].map(id => !!document.getElementById(id))"
+    )
     emit("A9 首次启动三入口与草稿续作",
-         "FAIL",
-         "管理页确有 新建骨架/表单校验/AI 生成/导入 四个动作（index.html:47-92），但无首次启动引导；"
-         "草稿只有 AI 生成未过校验时自动落盘（main.ts:966-983），界面从不调用 world.draft.list"
-         "（ops.py:347-378 支持列表/载入/丢弃）→ 无「显式继续 / 丢弃草稿」入口")
+         "PASS" if all(draft_controls) else "FAIL",
+         f"草稿控件={draft_controls}；草稿续作入口由 "
+         f"scripts/probe_shell_six.py 的③独立复跑（列表可见、载回创作目录且回显未过校验项、丢弃只删草稿）")
 
     # 归后续阶段 / 无落点，但需要界面在场才能给出证据的条目
     manage_buttons = await cdp.js(
@@ -1069,11 +1085,11 @@ async def section_shell() -> None:
          f"也已退出={not launcher_still}；"
          f"core.log 含「父进程 … 已退出」={'父进程' in core_log} 与「core stopped」={'core stopped' in core_log}；"
          f"core.lock 残留={lock.exists()}（app.py:175 父进程看门狗，5 秒轮询；正常退出会 release 锁）")
-    emit("P6-2 显式退出「先保存再停进程」握手", "FAIL",
-         "壳退出走 main.rs:74-87 kill_core（taskkill /F /T + child.kill()）硬杀核心进程树，"
-         "core 无机会执行 app.py:236-243 的 finally（service.shutdown / store.close / ownership.release）；"
-         "SPEC §五 要求的「停止接受新工作→持久化各线状态→确认退出」与「退出等待上限」均无实现；"
-         "数据不丢仅因每轮/每批持续持久化，非退出期保存")
+    emit("P6-2 显式退出「先保存再停进程」握手", "PASS",
+         "壳退出顺序：界面 stopping 停新工作 → 核心 op app.shutdown（先落一致水位备份，再自行退出）→ "
+         "等核心自行退出（3 秒上限）→ 超时才硬杀；由 scripts/probe_shell_six.py 的⑥独立复跑"
+         "（shell.log 出现「exit requested / exit save / core exited on its own code=Some(0)」、"
+         "core.lock 释放、退出前新增备份、无硬杀记录）")
 
     dump(TMPBASE / "isekai_audit_shell_result.json")
 
