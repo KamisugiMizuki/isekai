@@ -52,6 +52,8 @@ OP_BY_COMMAND = {
     ("backup", "create"): "backup.create",
     ("backup", "restore"): "backup.restore",
     ("backup", "list"): "backup.list",
+    ("runtime", "proactive"): "runtime.proactive",
+    ("proactive", "list"): "proactive.list",
     ("runtime", "clock"): "runtime.clock",
     ("runtime", "activate"): "runtime.activate",
     ("runtime", "freeze"): "runtime.freeze",
@@ -115,6 +117,8 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             return {**args, "card_path": ns.file, **({"moment": int(ns.moment)} if ns.moment else {})}
         if cmd == "generate":
             return {**args, "brief": ns.brief or ""}
+    if group == "proactive":
+        return {"instance_id": ns.id, "timeline_id": ns.timeline}
     if group == "backup":
         args = {}
         if cmd == "create":
@@ -268,7 +272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--endpoint", default=None, help="连接已有核心（默认自行拉起）")
     parser.add_argument("--mgmt", default=None, help="已有核心的管理凭据")
     parser.add_argument(
-        "group", choices=["package", "card", "instance", "runtime", "event", "disclose", "backup"]
+        "group", choices=["package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive"]
     )
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
     parser.add_argument("--name", default=None)

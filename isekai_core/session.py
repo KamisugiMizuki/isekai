@@ -94,6 +94,7 @@ class SessionService:
         session_row = self.store.session_get(str(thread_row["session_id"])) or {}
         timeline_id = str(session_row.get("timeline_id") or "")
         line = self.store.timeline_get(timeline_id) if timeline_id else None
+        await self._flush_proactive(str(session_row.get("id") or ""))
         if line is not None:
             # 真实时间线：冻结 / 归档一律不允许对话（§2.2）；占位会话没有时间线行，不在此列
             if str(line.get("state") or "") != "active":
@@ -135,6 +136,15 @@ class SessionService:
             if fixed is not None:
                 await self._send_batches(fixed)
         return {"ref": env_id, "state": row["state"], "message_id": reply_id}
+
+    async def _flush_proactive(self, session_id: str) -> int:
+        """投递仍有效的主动消息（§5.3）：只发最新一条，积压留在历史里，不做洪峰补发。"""
+        pending = self.store.proactive_pending(session_id, since_world=0)
+        if not pending:
+            return 0
+        newest = pending[-1]
+        await self._send_batches(newest)
+        return 1
 
     async def retry(self, *, channel_id: str, thread_id: str, ref: str, kind: str | None = None) -> dict[str, Any]:
         """显式重试：入站生成失败恢复同一轮次；投递失败 / 未知只重发固化结果。"""

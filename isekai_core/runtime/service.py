@@ -28,6 +28,7 @@ from . import (
     events,
     institutions,
     intents,
+    proactive,
     life,
 )
 from . import memory as memory_mod, personality, planning, versioning
@@ -1736,6 +1737,135 @@ class RuntimeService:
                 }
             )
         return out
+
+    async def proactive_tick(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        llm: Any = None,
+        now_real: float | None = None,
+        per_day: int = 2,
+    ) -> dict[str, Any]:
+        """世界源主动发言（§五）：按节律与配额，从她**已获知**的素材里挑一条固化成消息。
+
+        不生成就算了——没有素材、在睡觉、额度用完、角色归档，任何一条都直接跳过；
+        离线补算不补造过去每个发送时机（只按当前时刻评定一次）。
+        """
+        import time as _time
+
+        now = _time.time() if now_real is None else float(now_real)
+        instance = self.store.instance_get(instance_id)
+        timeline = self.store.timeline_get(timeline_id) or {}
+        if instance is None or not timeline:
+            raise RuntimeStateError("实例或时间线不存在")
+        if str(timeline.get("state") or "") != "active":
+            return {"spoken": 0, "skipped": "时间线未激活"}
+
+        clock = self.clock_row(timeline_id)
+        world = int(clock["processed_world"])
+        calendar = self.calendar(instance)
+        day = calendar.day_index(world)
+        spoken: list[dict[str, Any]] = []
+        skipped: dict[str, str] = {}
+        for card in self.cards(instance, timeline_id=timeline_id, world_seconds=world):
+            character_id = str((card.get("meta") or {}).get("card_id") or "")
+            if not character_id:
+                continue
+            if events.is_dead(
+                instance_id,
+                timeline_id,
+                character_id,
+                self.store.event_window(instance_id, timeline_id, until=world, limit=400),
+            ):
+                skipped[character_id] = "已归档"
+                continue
+            session = self.store.session_ensure(instance_id, timeline_id, character_id)
+            target = self.store.thread_for_session(str(session["id"]))
+            plan = self.store.plan_latest(instance_id, timeline_id, character_id)
+            activity = life.activity_label(life.current_window(plan, world))
+            knowledge = self.store.knowledge_window(
+                instance_id, timeline_id, character_id, until=world, limit=40
+            )
+            materials = proactive.candidates(
+                knowledge,
+                world_seconds=world,
+                day_seconds=calendar.day_seconds,
+                consumed=self.store.proactive_consumed(instance_id, timeline_id, character_id),
+            )
+            ok, why = proactive.should_speak(
+                archived=False,
+                activity=activity,
+                quota=proactive.quota_left(
+                    self.store.proactive_day_count(
+                        instance_id, timeline_id, character_id, world_day=day
+                    ),
+                    per_day,
+                ),
+                materials=materials,
+            )
+            if not ok:
+                skipped[character_id] = why
+                continue
+            material = materials[0]
+            text = ""
+            if llm is not None:
+                prompt = self._proactive_prompt(card, material, activity)
+                try:
+                    text = await llm.chat(prompt, temperature=0.6, timeout=45.0)
+                except Exception:
+                    text = ""
+            if not proactive.proactive_text_allowed(text):
+                skipped[character_id] = "素材在但没想好怎么说" if text else "生成失败"
+                continue
+            message_id = f"m-{__import__('secrets').token_hex(6)}"
+            batches = [self._batch_text(str(text).strip())]
+            self.store.outbound_put(
+                session_id=str(session["id"]),
+                message_id=message_id,
+                reply_to=None,
+                covers=[],
+                batches=batches,
+                target_channel=str((target or {}).get("channel_id") or ""),
+                target_thread=str((target or {}).get("thread_id") or ""),
+                binding_version=int((target or {}).get("binding_version") or 0),
+                binding_token=str((target or {}).get("binding_token") or ""),
+            )
+            self.store.proactive_log_add(
+                {
+                    "instance_id": instance_id,
+                    "timeline_id": timeline_id,
+                    "character_id": character_id,
+                    "world_day": int(day),
+                    "material_ref": str(material["ref"]),
+                    "message_id": message_id,
+                    "created_world": world,
+                    "created_real": now,
+                    "state": "fixed",
+                }
+            )
+            spoken.append({"character_id": character_id, "message_id": message_id, "material": material["ref"]})
+        return {"spoken": len(spoken), "messages": spoken, "skipped": skipped, "world": world}
+
+    def _proactive_prompt(self, card: dict[str, Any], material: dict[str, Any], activity: str) -> list[dict[str, str]]:
+        """一句话主动消息：素材来自她已获知的东西，不送秘密原文，也不许喊口号。"""
+        name = str((card.get("identity") or {}).get("name") or "她")
+        where = f"；她此刻在做：{activity}" if activity else ""
+        return [
+            {
+                "role": "system",
+                "content": (
+                    f"你是{name}。用一句口语化的消息把下面这件事告诉联络者，只写这一句，"
+                    "不要解释、不要加引号、不要列点、不要提设定或来源标签。"
+                    f"{where}"
+                ),
+            },
+            {"role": "user", "content": f"你想说的事：{material['text'][:200]}"},
+        ]
+
+    @staticmethod
+    def _batch_text(text: str) -> list[str]:
+        return [text]
 
     def _institution_rows(
         self,

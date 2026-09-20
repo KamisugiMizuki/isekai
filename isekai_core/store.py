@@ -263,6 +263,22 @@ CREATE TABLE IF NOT EXISTS custom_state(
   PRIMARY KEY(instance_id, timeline_id, custom_id)
 );
 
+-- 主动发言账本（SESSION_CORE_SPEC §5.2）：配额按最终消息固化计数；同一素材不重复消费
+CREATE TABLE IF NOT EXISTS proactive_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  world_day INTEGER NOT NULL,
+  material_ref TEXT NOT NULL DEFAULT '',
+  message_id TEXT NOT NULL DEFAULT '',
+  created_world INTEGER NOT NULL DEFAULT 0,
+  created_real REAL NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'fixed'
+);
+CREATE INDEX IF NOT EXISTS ix_proactive_day
+  ON proactive_log(instance_id, timeline_id, character_id, world_day);
+
 -- 外部调用账本（WORLD_RUNTIME_SPEC §2.8）：只记次数与量级，不记正文 / prompt / 密钥
 CREATE TABLE IF NOT EXISTS call_ledger(
   instance_id TEXT NOT NULL,
@@ -613,6 +629,62 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+
+    def thread_for_session(self, session_id: str) -> dict[str, Any] | None:
+        """会话的主动投递目标：首次绑定默认使用该 thread（§5.3）。"""
+        row = self._conn.execute(
+            "SELECT * FROM thread WHERE session_id=? ORDER BY updated_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def proactive_pending(self, session_id: str, *, since_world: int) -> list[dict[str, Any]]:
+        """仍有时效的未投递主动消息（过期的留在历史里，不作为新通知补发）。"""
+        rows = self._conn.execute(
+            """SELECT m.* FROM message m JOIN proactive_log p ON p.message_id = m.message_id
+               WHERE m.session_id=? AND m.reply_to IS NULL AND p.created_world>=?
+               ORDER BY m.seq""",
+            (session_id, int(since_world)),
+        ).fetchall()
+        return [_row_to_dict(item) for item in rows]
+
+    def proactive_log_add(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO proactive_log(instance_id, timeline_id, character_id, world_day,
+                                             material_ref, message_id, created_world, created_real, state)
+                   VALUES(:instance_id, :timeline_id, :character_id, :world_day,
+                          :material_ref, :message_id, :created_world, :created_real, :state)""",
+                row,
+            )
+
+    def proactive_day_count(
+        self, instance_id: str, timeline_id: str, character_id: str, *, world_day: int
+    ) -> int:
+        row = self._conn.execute(
+            """SELECT COUNT(*) FROM proactive_log
+               WHERE instance_id=? AND timeline_id=? AND character_id=? AND world_day=?""",
+            (instance_id, timeline_id, character_id, int(world_day)),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def proactive_consumed(
+        self, instance_id: str, timeline_id: str, character_id: str
+    ) -> set[str]:
+        rows = self._conn.execute(
+            """SELECT material_ref FROM proactive_log
+               WHERE instance_id=? AND timeline_id=? AND character_id=? AND material_ref<>''""",
+            (instance_id, timeline_id, character_id),
+        ).fetchall()
+        return {str(item[0]) for item in rows}
+
+    def proactive_list(self, instance_id: str, timeline_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT * FROM proactive_log WHERE instance_id=? AND timeline_id=?
+               ORDER BY created_world, id""",
+            (instance_id, timeline_id),
+        ).fetchall()
+        return [_row_to_dict(item) for item in rows]
 
     # ---------- 整库备份 / 恢复（DESKTOP_SPEC §3.3） ----------
 
@@ -1431,6 +1503,7 @@ class Store:
                 "environment_state",
                 "institution_state",
                 "custom_state",
+                "proactive_log",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute(
@@ -1713,6 +1786,7 @@ class Store:
         for table in (
             "unit", "life_plan", "experience", "claim", "knowledge", "effect_state", "intent",
             "event", "environment_state", "institution_state", "custom_state",
+            "proactive_log",   # 回滚撤销还没投出去的主动消息与素材消费（§5.3 末条）
             "memory", "memory_task", "memory_citation",
             "character_join",   # 跨越补卡点的回滚要让补入角色在本线退出（§七）
             "rate_command",     # 历史里的待生效倍率不是现时控制命令（§七）
@@ -2390,6 +2464,24 @@ class Store:
                           :audience, :earliest_world, :credibility, :derived_from)
                    ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
                 row,
+            )
+
+    def knowledge_put(self, row: dict[str, Any]) -> None:
+        """单条获知（用于运行层之外的补记与验收）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO knowledge(instance_id, timeline_id, character_id, id, world_seconds,
+                                         kind, target, source, stance, text)
+                   VALUES(:instance_id, :timeline_id, :character_id, :id, :world_seconds,
+                          :kind, :target, :source, :stance, :text)
+                   ON CONFLICT(instance_id, timeline_id, character_id, id) DO NOTHING""",
+                {
+                    "stance": str(row.get("stance") or "recorded"),
+                    "source": str(row.get("source") or ""),
+                    "text": str(row.get("text") or ""),
+                    **{key: row.get(key) for key in
+                       ("instance_id", "timeline_id", "character_id", "id", "world_seconds", "kind", "target")},
+                },
             )
 
     def knowledge_holders(self, instance_id: str, timeline_id: str, target: str) -> list[str]:

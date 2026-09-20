@@ -81,12 +81,14 @@ SYNC_OPS = frozenset(
         "backup.create",
         "backup.restore",
         "backup.list",
+        "proactive.list",
     }
 )
 ASYNC_OPS = frozenset(
     {
         "event.render",
         "event.expand",
+        "runtime.proactive",
         "runtime.propose",
         "runtime.extract",
         "event.draft",
@@ -463,6 +465,9 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
         if op == "backup.list":
             return {"backups": store.backup_list(_backup_folder(cfg, store)),
                     "dir": str(_backup_folder(cfg, store))}
+        if op == "proactive.list":
+            return {"log": store.proactive_list(str(args.get("instance_id") or ""),
+                                                str(args.get("timeline_id") or ""))}
         if op == "instance.setting":
             return {"setting": get_setting(store, str(args.get("id") or ""))}
         if op == "instance.rename":
@@ -832,6 +837,8 @@ async def dispatch_async(
             return await _render_event(cfg, llm, store, args)
         if op == "event.expand":
             return await _expand_claim(cfg, llm, store, args)
+        if op == "runtime.proactive":
+            return await _proactive_tick(cfg, llm, store, runtime, args)
         if op == "runtime.propose":
             return await _propose_intents(cfg, llm, store, args)
         if op == "runtime.extract":
@@ -875,3 +882,16 @@ def _backup_folder(cfg: Any, store: Any) -> Path:
     if not path.is_absolute():
         path = Path(store.path).parent / path
     return path
+
+
+async def _proactive_tick(cfg: Any, llm: Any, store: Any, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """世界源主动发言：管理面 / CLI 触发一次（补算后由调用方决定何时调）。"""
+    _ = cfg
+    service = getattr(runtime, "service", runtime)
+    per_day = int(args.get("per_day") or 2)
+    return await service.proactive_tick(
+        str(args.get("instance_id") or ""),
+        str(args.get("timeline_id") or ""),
+        llm=llm,
+        per_day=per_day,
+    )
