@@ -14,6 +14,7 @@ from typing import Any
 
 from ..log import get_logger
 from ..store import Store
+from . import budget as budget_mod
 from . import cognition, environment, events, intents, life, personality, planning
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
@@ -34,6 +35,10 @@ class RuntimeService:
         catch_up_batches: int = 8,
         catch_up_lag_seconds: int = 0,
         render_calls_per_day: int = 20,
+        instance_tokens_per_day: int = 400_000,
+        timeline_tokens_per_day: int = 150_000,
+        task_tokens_per_day: int = 60_000,
+        priority_reserve_ratio: float = 0.25,
     ) -> None:
         self.store = store
         #: 倍率上限：全局统一、仅开发者可配置（§2.2），默认 2592000 世界秒 / 现实秒
@@ -46,8 +51,96 @@ class RuntimeService:
         self.catch_up_lag_seconds = max(0, int(catch_up_lag_seconds))
         #: 表述 / 展开 / 自主提案的现实日调用上限（§2.8 单任务预算）
         self.render_calls_per_day = max(0, int(render_calls_per_day))
+        #: 三层预算上限（§2.8）：可由管理面按实例覆盖
+        self.budget_limits = {
+            "instance_tokens_per_day": max(0, int(instance_tokens_per_day)),
+            "timeline_tokens_per_day": max(0, int(timeline_tokens_per_day)),
+            "task_tokens_per_day": max(0, int(task_tokens_per_day)),
+        }
+        self.priority_reserve_ratio = max(0.0, min(1.0, float(priority_reserve_ratio)))
 
     # ---------- 基础读取 ----------
+
+    # ---------- 三层预算（§2.8） ----------
+
+    def budget_limits_for(self, instance_id: str) -> dict[str, int]:
+        """实例策略覆盖全局配置（管理面可调上限）。"""
+        limits = dict(self.budget_limits)
+        policy = self.store.budget_policy_get(instance_id)
+        for key in list(limits):
+            value = policy.get(key)
+            if isinstance(value, int) and value > 0:
+                limits[key] = int(value)
+        return limits
+
+    def reserve_call(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        task: str,
+        *,
+        prompt_text: str = "",
+        tokens_est: int | None = None,
+        now_real: float | None = None,
+    ) -> dict[str, Any]:
+        """发起前原子预占；拒绝时返回 ok=False 与三层用量（调用方要如实上报，不得照常调用）。"""
+        import time as _time
+
+        bucket = int((now_real if now_real is not None else _time.time()) // 86400)
+        policy = self.store.budget_policy_get(instance_id)
+        if task in (policy.get("paused_tasks") or []):
+            return {"ok": False, "blocked": ["paused"], "task": task}
+        limits = self.budget_limits_for(instance_id)
+        used = self.store.call_ledger_get(instance_id, timeline_id, task, bucket=bucket)
+        if task in ("event_render", "event_expand") and used >= self.render_calls_per_day:
+            return {"ok": False, "blocked": ["task_calls"], "task": task, "calls": used,
+                    "limit": self.render_calls_per_day}
+        index = budget_mod.task_index(task)
+        reserve = {index: int(limits["instance_tokens_per_day"] * self.priority_reserve_ratio)}
+        est = tokens_est if tokens_est is not None else (budget_mod.estimate_tokens(prompt_text) + 512)
+        return self.store.budget_reserve(
+            instance_id=instance_id,
+            timeline_id=timeline_id,
+            task=task,
+            bucket=bucket,
+            priority=index,
+            tokens_est=est,
+            limits=limits,
+            reserved_for_higher=reserve,
+        )
+
+    def settle_call(
+        self,
+        reservation: dict[str, Any],
+        *,
+        prompt_text: str = "",
+        reply: str = "",
+        outcome: str = "ok",
+        calls: int = 1,
+    ) -> dict[str, Any] | None:
+        """结算真实消耗（成功 / 失败 / 超时都算；没有真实用量时按估算量级记）。"""
+        if not reservation or not reservation.get("ok"):
+            return None
+        tokens = budget_mod.estimate_tokens(prompt_text) + budget_mod.estimate_tokens(reply)
+        return self.store.budget_settle(reservation["id"], tokens_actual=tokens, outcome=outcome, calls=calls)
+
+    def release_call(self, reservation: dict[str, Any]) -> bool:
+        return bool(reservation and reservation.get("ok") and self.store.budget_release(reservation["id"]))
+
+    def budget_view(self, instance_id: str, *, now_real: float | None = None) -> dict[str, Any]:
+        """非内容性的预算状态（§2.8）：用量 / 上限 / 暂停的任务，不含正文与密钥。"""
+        import time as _time
+
+        bucket = int((now_real if now_real is not None else _time.time()) // 86400)
+        policy = self.store.budget_policy_get(instance_id)
+        return {
+            "bucket": bucket,
+            "limits": self.budget_limits_for(instance_id),
+            "paused_tasks": policy.get("paused_tasks") or [],
+            "rows": self.store.budget_rows(instance_id, bucket=bucket),
+            "usage": self.store.budget_usage(instance_id, bucket=bucket),
+            "priority_order": list(budget_mod.PRIORITIES),
+        }
 
     def _rows(self, instance_id: str, timeline_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         instance = self.store.instance_get(instance_id)
@@ -1093,6 +1186,8 @@ class RuntimeService:
         budget_bucket = int(now_real // 86400)
         remaining = int(self.render_calls_per_day)
         proposed: list[dict[str, Any]] = []
+        paused = False
+        blocked: list[str] = []
         for card in self.cards(instance, timeline_id=timeline_id, world_seconds=watermark):
             character_id = str((card.get("meta") or {}).get("card_id") or "")
             if not character_id or events.is_dead(instance_id, timeline_id, character_id, known_events):
@@ -1108,9 +1203,7 @@ class RuntimeService:
             if last and watermark - last < calendar.day_seconds:
                 continue  # 同一世界日内不重复提案
             used = self.store.call_ledger_get(instance_id, timeline_id, "intent_propose", bucket=budget_bucket)
-            if used >= remaining:
-                log.info("intent proposal paused by budget line=%s used=%s", timeline_id, used)
-                break
+            _ = (used, remaining)
             snapshot = self.character_snapshot(
                 instance_id, timeline_id, character_id, world_seconds=watermark
             )
@@ -1137,17 +1230,22 @@ class RuntimeService:
                 observations=snapshot["observations"],
                 allowed=allowed,
             )
+            prompt_text = "\n".join(item["content"] for item in messages)
+            reservation = self.reserve_call(
+                instance_id, timeline_id, "intent_propose", prompt_text=prompt_text, now_real=now_real
+            )
+            if not reservation.get("ok"):
+                log.info("intent proposal paused line=%s blocked=%s", timeline_id, reservation.get("blocked"))
+                paused = True
+                blocked = list(reservation.get("blocked") or [])
+                continue
             try:
                 text = await llm.chat(messages, temperature=0.7, timeout=60.0)
             except Exception:  # 模型不可用不该影响世界推进
                 log.exception("intent proposal failed character=%s", character_id)
-                self.store.call_ledger_add(
-                    instance_id, timeline_id, "intent_propose", bucket=budget_bucket, calls=1
-                )
+                self.settle_call(reservation, prompt_text=prompt_text, outcome="error")
                 continue
-            self.store.call_ledger_add(
-                instance_id, timeline_id, "intent_propose", bucket=budget_bucket, calls=1
-            )
+            self.settle_call(reservation, prompt_text=prompt_text, reply=text)
             decision = planning.parse(text, allowed)
             if decision is None:
                 continue
@@ -1185,7 +1283,16 @@ class RuntimeService:
             proposed.append({"character": character_id, "intent": ident, **decision})
             if len(proposed) >= 8:
                 break
-        return {"proposed": len(proposed), "items": proposed, "budget": {"calls": self.store.call_ledger_get(instance_id, timeline_id, "intent_propose", bucket=budget_bucket), "limit": remaining}}
+        return {
+            "proposed": len(proposed),
+            "items": proposed,
+            "budget": {
+                "paused": paused,
+                "blocked": blocked,
+                "calls": self.store.call_ledger_get(instance_id, timeline_id, "intent_propose", bucket=budget_bucket),
+                "limit": remaining,
+            },
+        }
 
     # ---------- 补卡（角色集合扩充） ----------
 

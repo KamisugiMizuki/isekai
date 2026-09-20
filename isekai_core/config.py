@@ -89,6 +89,10 @@ class RuntimeConfig:
     catch_up_batches: int = 8           # 单次推进批数上限（每批一个世界日）
     catch_up_lag_seconds: int = 172800  # 滞后超过 2 世界日即记为「追赶受限」
     render_calls_per_day: int = 20      # 事件表述 / 展开的现实日调用上限（§2.8 单任务预算）
+    instance_tokens_per_day: int = 400_000   # 实例总预算（所有激活线共享）
+    timeline_tokens_per_day: int = 150_000   # 时间线预算（防一条高倍率线占尽资源）
+    task_tokens_per_day: int = 60_000        # 单任务预算（防重试或坏输入耗尽整条线）
+    priority_reserve_ratio: float = 0.25     # 给更高优先级任务留出的额度比例
 
 
 @dataclass

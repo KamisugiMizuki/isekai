@@ -56,6 +56,8 @@ OP_BY_COMMAND = {
     ("runtime", "advance"): "runtime.advance",
     ("runtime", "card-add"): "runtime.card.add",
     ("runtime", "propose"): "runtime.propose",
+    ("runtime", "budget"): "runtime.budget",
+    ("runtime", "budget-set"): "runtime.budget.set",
     ("runtime", "backfill"): "runtime.backfill",
     ("event", "render"): "event.render",
     ("event", "expand"): "event.expand",
@@ -116,6 +118,14 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args["rate"] = int(ns.rate)
         if cmd == "advance":
             args["max_batches"] = int(ns.max_batches or 16)
+        if cmd == "budget-set":
+            for key in ("instance_tokens_per_day", "timeline_tokens_per_day", "task_tokens_per_day"):
+                value = getattr(ns, key, None)
+                if value is not None:
+                    args[key] = int(value)
+            if ns.task:
+                args["task"] = ns.task
+                args["pause"] = bool(ns.pause) if not ns.pause_resume else False
         if cmd == "card-add":
             args["card_path"] = ns.card
             args["joined_world"] = int(ns.at) if ns.at is not None else None
@@ -224,6 +234,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--at", default=None, help="补卡：锚定补入的世界时刻（缺省=该线已完成水位）")
     parser.add_argument("--note", default=None, help="补卡：备注")
     parser.add_argument("--acquainted", action="store_true", help="补卡：声明与联络者已相识")
+    parser.add_argument("--instance-tokens", dest="instance_tokens_per_day", type=int, default=None,
+                        help="预算：实例总预算（token 量级 / 现实日）")
+    parser.add_argument("--timeline-tokens", dest="timeline_tokens_per_day", type=int, default=None,
+                        help="预算：单条时间线预算")
+    parser.add_argument("--task-tokens", dest="task_tokens_per_day", type=int, default=None,
+                        help="预算：单任务预算")
+    parser.add_argument("--task", default=None, help="预算：要暂停 / 恢复的任务名")
+    parser.add_argument("--pause", action="store_true", help="预算：暂停该任务")
+    parser.add_argument("--resume", dest="pause_resume", action="store_true", help="预算：恢复该任务")
     parser.add_argument("--candidate", default=None, help="把文件内容当作候选对象提交")
     ns = parser.parse_args(argv)
     if (ns.group, ns.command) not in OP_BY_COMMAND:

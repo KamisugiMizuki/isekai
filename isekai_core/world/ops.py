@@ -46,6 +46,8 @@ SYNC_OPS = frozenset(
         "world.draft.load",
         "world.draft.discard",
         "runtime.clock",
+        "runtime.budget",
+        "runtime.budget.set",
         "runtime.activate",
         "runtime.freeze",
         "runtime.rate",
@@ -277,6 +279,12 @@ def _log_runtime_failure(instance_id: str) -> None:
 def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: Any = None) -> dict[str, Any]:
     """同步操作：只读写文件与库，不调用模型。"""
     try:
+        # 预算视图 / 设置：只按实例（不要求时间线），不进 runtime.* 前缀分发
+        if op == "runtime.budget":
+            return _budget_view(cfg, store, args)
+        if op == "runtime.budget.set":
+            return _budget_set(cfg, store, args)
+
         if op.startswith("runtime."):
             return _runtime_op(runtime, op, args, cfg=cfg)
 
@@ -421,6 +429,53 @@ def _day_bucket(now_real: float) -> int:
     return int(now_real // 86400)
 
 
+def _world_service(cfg: Config, store: Store) -> Any:
+    """运行层服务（带上三层预算 / 表述预算等 §2.8 参数）。"""
+    from ..runtime.service import RuntimeService
+
+    return RuntimeService(
+        store,
+        render_calls_per_day=int(cfg.runtime.render_calls_per_day),
+        instance_tokens_per_day=int(cfg.runtime.instance_tokens_per_day),
+        timeline_tokens_per_day=int(cfg.runtime.timeline_tokens_per_day),
+        task_tokens_per_day=int(cfg.runtime.task_tokens_per_day),
+        priority_reserve_ratio=float(cfg.runtime.priority_reserve_ratio),
+    )
+
+
+def _budget_view(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """非内容性的预算状态（§2.8）：用量 / 上限 / 暂停的任务，不含正文与密钥。"""
+    instance_id = str(args.get("instance_id") or "")
+    if not instance_id:
+        raise UmpError(Err.INVALID, "缺少实例", retryable=False)
+    return _world_service(cfg, store).budget_view(instance_id)
+
+
+def _budget_set(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """调整允许的上限或暂停低优先级任务；不能通过调预算改变已固化的世界事实。"""
+    instance_id = str(args.get("instance_id") or "")
+    if not instance_id:
+        raise UmpError(Err.INVALID, "缺少实例", retryable=False)
+    fields: dict[str, Any] = {}
+    for key in ("instance_tokens_per_day", "timeline_tokens_per_day", "task_tokens_per_day"):
+        value = args.get(key)
+        if isinstance(value, int):
+            fields[key] = value if value > 0 else None  # 0 = 清除覆盖，回到全局配置
+    paused = store.budget_policy_get(instance_id).get("paused_tasks") or []
+    task = str(args.get("task") or "")
+    if task and args.get("pause") is not None:
+        paused = sorted(set(paused) - {task}) if not args.get("pause") else sorted(set(paused) | {task})
+        fields["paused_tasks"] = paused
+    if not fields:
+        raise UmpError(Err.INVALID, "没有要改的预算项", retryable=False)
+    policy = store.budget_policy_set(
+        instance_id, **{k: v for k, v in fields.items() if k != "paused_tasks"}
+    )
+    if "paused_tasks" in fields:
+        policy = store.budget_policy_set(instance_id, paused_tasks=fields["paused_tasks"])
+    return {"policy": policy, "view": _world_service(cfg, store).budget_view(instance_id)}
+
+
 async def _propose_intents(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
     """手动触发一次角色自主提案（给 CLI / 调试用；核心 tick 自己也会跑）。"""
     if store is None:
@@ -431,7 +486,7 @@ async def _propose_intents(cfg: Config, llm: Any, store: Store | None, args: dic
         raise UmpError(Err.INVALID, "缺少实例或时间线", retryable=False)
     from ..runtime.service import RuntimeService
 
-    world = RuntimeService(store, render_calls_per_day=int(cfg.runtime.render_calls_per_day))
+    world = _world_service(cfg, store)
     return await world.propose_intents(instance_id, timeline_id, llm=llm, now_real=time.time())
 
 
@@ -451,27 +506,33 @@ async def _render_event(cfg: Config, llm: Any, store: Store | None, args: dict[s
     claims = [item for item in store.claim_list(instance_id, timeline_id, event_id=event_id)
               if item.get("derived_from") is None]
     bucket = _day_bucket(time.time())
-    used = store.call_ledger_get(instance_id, timeline_id, "event_render", bucket=bucket)
     limit = int(cfg.runtime.render_calls_per_day)
-    if used >= limit:
+    messages = render_mod.skeleton_prompt(event, claims)
+    world = _world_service(cfg, store)
+    prompt_text = "\n".join(str(item.get("content") or "") for item in messages)
+    reservation = world.reserve_call(instance_id, timeline_id, "event_render", prompt_text=prompt_text)
+    if not reservation.get("ok"):
+        used = store.call_ledger_get(instance_id, timeline_id, "event_render", bucket=bucket)
         return {
             "event": event_id,
             "detail": str(event.get("detail") or ""),
             "text_source": "template",
             "calls": 0,
-            "budget": {"paused": True, "calls": used, "limit": limit},
+            "budget": {"paused": True, "calls": used, "limit": limit, "blocked": reservation.get("blocked")},
         }
-    messages = render_mod.skeleton_prompt(event, claims)
-    detail, rendered_claims, calls = str(event.get("detail") or ""), {}, 0
+    detail, rendered_claims, calls, replies = str(event.get("detail") or ""), {}, 0, []
     for attempt in range(2):
         calls += 1
         text = await llm.chat(messages, temperature=0.4, timeout=60.0)
+        replies.append(text)
         parsed = render_mod.parse_render(text, claims)
         if parsed and render_mod.facts_preserved(parsed["detail"], str(event.get("summary") or "")):
             detail, rendered_claims = parsed["detail"], parsed["claims"]
             break
     if not rendered_claims:
-        store.call_ledger_add(instance_id, timeline_id, "event_render", bucket=bucket, calls=calls)
+        world.settle_call(
+            reservation, prompt_text=prompt_text, reply="".join(replies), outcome="rejected", calls=calls
+        )
         return {
             "event": event_id,
             "detail": str(event.get("detail") or ""),
@@ -480,7 +541,8 @@ async def _render_event(cfg: Config, llm: Any, store: Store | None, args: dict[s
             "note": "表述未过校验，保留模板（不新增事实）",
         }
     store.event_render_save(instance_id, timeline_id, event_id, detail=detail, claims=rendered_claims)
-    total = store.call_ledger_add(instance_id, timeline_id, "event_render", bucket=bucket, calls=calls)
+    world.settle_call(reservation, prompt_text=prompt_text, reply="".join(replies), calls=calls)
+    total = store.call_ledger_get(instance_id, timeline_id, "event_render", bucket=bucket)
     return {
         "event": event_id,
         "detail": detail,

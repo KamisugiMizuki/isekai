@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -183,6 +184,29 @@ CREATE TABLE IF NOT EXISTS call_ledger(
   calls INTEGER NOT NULL DEFAULT 0,
   tokens INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(instance_id, timeline_id, task, bucket)
+);
+
+CREATE TABLE IF NOT EXISTS budget_reserve(
+  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  task TEXT NOT NULL,
+  bucket INTEGER NOT NULL,               -- 现实日窗口
+  priority INTEGER NOT NULL,
+  tokens_est INTEGER NOT NULL DEFAULT 0,
+  tokens_actual INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'held',    -- held / settled / released
+  outcome_kind TEXT NOT NULL DEFAULT '', -- ok / error / timeout / cancelled
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS budget_policy(
+  instance_id TEXT PRIMARY KEY,
+  paused_tasks TEXT NOT NULL DEFAULT '[]',
+  instance_tokens_per_day INTEGER,
+  timeline_tokens_per_day INTEGER,
+  task_tokens_per_day INTEGER,
+  updated_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS event(
@@ -943,6 +967,8 @@ class Store:
                 "effect_state",
                 "intent",
                 "call_ledger",
+                "budget_reserve",
+                "budget_policy",
                 "environment_state",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
@@ -1438,6 +1464,164 @@ class Store:
             (instance_id, timeline_id, target),
         ).fetchall()
         return [str(row["character_id"]) for row in rows]
+
+    # ---------- 三层预算（§2.8） ----------
+
+    def budget_usage(self, instance_id: str, *, bucket: int, timeline_id: str | None = None) -> dict[str, Any]:
+        """已消耗 + 在途预占（按实例 / 线 / 任务汇总），预占未结算前也算占用。"""
+        cond, args = "instance_id=? AND bucket=?", [instance_id, int(bucket)]
+        if timeline_id:
+            cond += " AND timeline_id=?"
+            args.append(timeline_id)
+        usage: dict[str, Any] = {"instance": 0, "timelines": {}, "tasks": {}}
+        for row in self._conn.execute(
+            f"""SELECT timeline_id, task, SUM(tokens) calls_tokens FROM call_ledger
+                WHERE {cond} GROUP BY timeline_id, task""",
+            args,
+        ):
+            tokens = int(row["calls_tokens"] or 0)
+            usage["instance"] += tokens
+            usage["timelines"][row["timeline_id"]] = usage["timelines"].get(row["timeline_id"], 0) + tokens
+            usage["tasks"][f"{row['timeline_id']}|{row['task']}"] = tokens
+        for row in self._conn.execute(
+            f"""SELECT timeline_id, task, SUM(tokens_est) held FROM budget_reserve
+                WHERE {cond} AND state='held' GROUP BY timeline_id, task""",
+            args,
+        ):
+            held = int(row["held"] or 0)
+            usage["instance"] += held
+            usage["timelines"][row["timeline_id"]] = usage["timelines"].get(row["timeline_id"], 0) + held
+            key = f"{row['timeline_id']}|{row['task']}"
+            usage["tasks"][key] = usage["tasks"].get(key, 0) + held
+        return usage
+
+    def budget_reserve(
+        self,
+        *,
+        instance_id: str,
+        timeline_id: str,
+        task: str,
+        bucket: int,
+        priority: int,
+        tokens_est: int,
+        limits: dict[str, int],
+        reserved_for_higher: dict[int, int] | None = None,
+    ) -> dict[str, Any] | None:
+        """发起前原子预占；三层任何一层不够就拒绝（返回 None）。"""
+        from .runtime.budget import decide
+
+        with self._lock, self._conn:
+            usage = self.budget_usage(instance_id, bucket=bucket)
+            verdict = decide(
+                usage=usage,
+                timeline_id=timeline_id,
+                task=task,
+                priority=priority,
+                tokens_est=max(0, int(tokens_est)),
+                limits=limits,
+                reserved_for_higher=reserved_for_higher or {},
+            )
+            if not verdict["ok"]:
+                return {"ok": False, **verdict}
+            ident = f"rs-{os.urandom(6).hex()}"
+            self._conn.execute(
+                """INSERT INTO budget_reserve(id, instance_id, timeline_id, task, bucket, priority,
+                                             tokens_est, tokens_actual, state, outcome_kind, created_at)
+                   VALUES(?,?,?,?,?,?,?,0,'held','',?)""",
+                (ident, instance_id, timeline_id, task, int(bucket), int(priority), int(tokens_est), time.time()),
+            )
+        return {"ok": True, "id": ident, **verdict}
+
+    def budget_settle(
+        self, reserve_id: str, *, tokens_actual: int = 0, outcome: str = "ok", calls: int = 1
+    ) -> dict[str, Any] | None:
+        """结算：登记真实消耗（成功 / 失败 / 超时都算），释放未使用的预占。"""
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT * FROM budget_reserve WHERE id=?", (reserve_id,)).fetchone()
+            if row is None or row["state"] != "held":
+                return None
+            self._conn.execute(
+                "UPDATE budget_reserve SET state='settled', outcome_kind=?, tokens_actual=? WHERE id=?",
+                (str(outcome), max(0, int(tokens_actual)), reserve_id),
+            )
+            # 同一事务内登记消耗（不调 call_ledger_add，避免嵌套事务）
+            self._conn.execute(
+                """INSERT INTO call_ledger(instance_id, timeline_id, task, bucket, calls, tokens)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(instance_id, timeline_id, task, bucket) DO UPDATE SET
+                     calls = calls + excluded.calls, tokens = tokens + excluded.tokens""",
+                (
+                    row["instance_id"],
+                    row["timeline_id"],
+                    row["task"],
+                    int(row["bucket"]),
+                    max(1, int(calls)),
+                    max(0, int(tokens_actual)),
+                ),
+            )
+        return {
+            "id": reserve_id,
+            "task": row["task"],
+            "calls": max(1, int(calls)),
+            "tokens_actual": int(tokens_actual),
+            "outcome": outcome,
+        }
+
+    def budget_release(self, reserve_id: str) -> bool:
+        """失效任务释放未使用的预占（已发生的外部调用不回滚）。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE budget_reserve SET state='released', outcome_kind='cancelled' WHERE id=? AND state='held'", (reserve_id,)
+            )
+        return bool(cur.rowcount)
+
+    def budget_policy_get(self, instance_id: str) -> dict[str, Any]:
+        row = self._conn.execute("SELECT * FROM budget_policy WHERE instance_id=?", (instance_id,)).fetchone()
+        if row is None:
+            return {
+                "instance_id": instance_id,
+                "paused_tasks": [],
+                "instance_tokens_per_day": None,
+                "timeline_tokens_per_day": None,
+                "task_tokens_per_day": None,
+            }
+        data = _row_to_dict(row)
+        data["paused_tasks"] = json.loads(data.get("paused_tasks") or "[]")
+        return data
+
+    def budget_policy_set(self, instance_id: str, **fields: Any) -> dict[str, Any]:
+        current = self.budget_policy_get(instance_id)
+        current.update(fields)
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO budget_policy(instance_id, paused_tasks, instance_tokens_per_day,
+                                            timeline_tokens_per_day, task_tokens_per_day, updated_at)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(instance_id) DO UPDATE SET
+                     paused_tasks=excluded.paused_tasks,
+                     instance_tokens_per_day=excluded.instance_tokens_per_day,
+                     timeline_tokens_per_day=excluded.timeline_tokens_per_day,
+                     task_tokens_per_day=excluded.task_tokens_per_day,
+                     updated_at=excluded.updated_at""",
+                (
+                    instance_id,
+                    json.dumps(sorted(current.get("paused_tasks") or []), ensure_ascii=False),
+                    current.get("instance_tokens_per_day"),
+                    current.get("timeline_tokens_per_day"),
+                    current.get("task_tokens_per_day"),
+                    time.time(),
+                ),
+            )
+        return self.budget_policy_get(instance_id)
+
+    def budget_rows(self, instance_id: str, *, bucket: int) -> list[dict[str, Any]]:
+        """非内容性的预算账目（来源 / 阶段 / 调用次数 / token 量级 / 结果类别，无正文）。"""
+        rows = self._conn.execute(
+            """SELECT timeline_id, task, bucket, calls, tokens FROM call_ledger
+               WHERE instance_id=? AND bucket=? ORDER BY task""",
+            (instance_id, int(bucket)),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
     def call_ledger_add(
         self, instance_id: str, timeline_id: str, task: str, *, bucket: int, calls: int = 1, tokens: int = 0
