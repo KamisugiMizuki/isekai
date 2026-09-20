@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 from typing import Any, Awaitable, Callable
 
@@ -15,6 +16,7 @@ from . import ump
 from .config import Config
 from .llm import LLMError
 from .log import get_logger
+from .runtime import life, proactive
 from .store import EnvelopeConflict, Store
 from .ump import Envelope, Err, Stage, UmpError
 
@@ -22,6 +24,10 @@ log = get_logger("isekai.session")
 
 #: 单批发送的现实上限：通道端不读数据时不能把轮次拖死（发送结果按未知处理）
 SEND_TIMEOUT_S = 15.0
+
+#: 睡眠期等待到点后的状态表述（§4.5）：只进生成上下文，不展示给用户，也不暴露内部睡眠状态。
+SLEEP_REPLY_HINT = "（她此刻还在睡：只答一句短暂、朦胧的话，不要说她起身、做事或者已经清醒。）"
+WAKE_REPLY_HINT = "（她已经醒了：按清醒状态回答，可以回一句刚才还睡着，但不要用睡意否认这段时间里世界已经推进。）"
 
 #: (channel_id, thread_id, envelope) -> 是否已发出
 Deliver = Callable[[str, str, dict[str, Any]], Awaitable[bool]]
@@ -174,13 +180,15 @@ class SessionService:
             }
 
         state = outbound["state"]
+        # 入站行不持有 message_id：关联列是 reply_message_id；合并批里每条入站都指向同一份固化回复（§4.5）
+        reply_id = outbound["message_id"] or outbound.get("reply_message_id")
         if state in ("queued", "processing"):
-            return {"ref": ref, "state": state, "message_id": outbound["message_id"]}
+            return {"ref": ref, "state": state, "message_id": reply_id}
         if state == "done":
-            fixed = self.store.outbound_by_message_id(outbound["message_id"] or "")
+            fixed = self.store.outbound_by_message_id(str(reply_id or ""))
             if fixed is not None:
                 await self._send_batches(fixed)
-            return {"ref": ref, "state": "done", "message_id": outbound["message_id"]}
+            return {"ref": ref, "state": "done", "message_id": reply_id}
         if state == "cancelled":
             raise UmpError(Err.VOIDED, "该输入已作废", retryable=False, ref=ref, stage=Stage.RECEIVE)
         # failed：恢复同一逻辑轮次的新尝试
@@ -204,40 +212,80 @@ class SessionService:
             row = self.store.message_get(seq)
             if row is None or row["state"] != "queued":
                 return
-            await self._generate(row)
+            batch = await self._wait_and_collect(row)
+            if batch is None:  # 等待期间已失效：不生成、不投递
+                return
+            await self._generate(batch[0], batch=batch)
 
-    async def _generate(self, row: dict[str, Any]) -> None:
-        seq = row["seq"]
+    # ---------- 睡眠期等待与合并（§4.5） ----------
+
+    async def _wait_and_collect(self, row: dict[str, Any]) -> list[dict[str, Any]] | None:
+        """睡眠期等待一拍，再取同一来源的一段连续入站合成一批（多入一回）。
+
+        - 只在该角色此刻处于睡眠块时等待；非睡眠时段不额外等待，同会话仍按接受顺序逐条处理。
+        - 截止点以首次接受该批输入的现实时间为基准，一次确定并持久化：后续输入不重置、
+          不按条数叠加；取快照与排队已耗去的时间计入等待（到点即不再等）。
+        - 等待只让本任务睡，世界推进不被暂停。
+        - 返回 None 表示这一轮在等待期间已失效（冻结 / 回滚 / 归档 / 删除 / 重绑）。
+        """
+        session = self.store.session_get(str(row["session_id"])) or {}
+        if not self._sleeping_now(session):
+            return [row]
+        deadline = self.store.inbound_claim_deadline(int(row["seq"]), delay=self._sleep_delay())
+        row = self.store.message_get(int(row["seq"])) or row  # 取回已持久化截止点的行
+        remaining = deadline - time.time()
+        if remaining > 0:
+            # 睡眠期等待在通道侧显示为正常处理中，不暴露内部睡眠状态（DESKTOP_SPEC §3.1）
+            await self._status(row, "thinking")
+            await asyncio.sleep(remaining)
+        batch = self._collect_batch(row)
+        stale = self._stale_code(row)
+        if stale:
+            # 等待期间被冻结 / 回滚 / 删除 / 重绑：旧任务失效，批内各输入一并结算（§4.5）
+            log.info("waiting turn dropped: %s seq=%s", stale, row["seq"])
+            for item in batch:
+                self.store.inbound_set_state(int(item["seq"]), "cancelled", error_code=stale)
+            await self._status(row, "idle")
+            return None
+        return batch
+
+    async def _generate(self, row: dict[str, Any], *, batch: list[dict[str, Any]] | None = None) -> None:
+        rows = list(batch or [row])
+        seqs = [int(item["seq"]) for item in rows]
         started = time.monotonic()
-        self.store.inbound_set_state(seq, "processing")
+        for seq in seqs:
+            self.store.inbound_set_state(seq, "processing")
         await self._status(row, "thinking")
         try:
-            query_vector = await self._query_vector(row)
-            messages, recalled = self._build_messages(row, query_vector=query_vector)
+            query_vector = await self._query_vector(rows)
+            messages, recalled = self._build_messages(rows, query_vector=query_vector)
             self._recalled = list(recalled)
             text = await self.llm.chat(messages)
         except LLMError as exc:
             log.warning(
                 "generation failed seq=%s stage=%s code=%s elapsed=%.1fs",
-                seq,
+                row["seq"],
                 Stage.GENERATE,
                 exc.code,
                 time.monotonic() - started,
             )
-            self.store.inbound_set_state(seq, "failed", error_code=exc.code)
+            for seq in seqs:
+                self.store.inbound_set_state(seq, "failed", error_code=exc.code)
             await self._status(row, "idle")
             await self._error(row, UmpError(exc.code, exc.message, retryable=exc.retryable, stage=Stage.GENERATE))
             return
         except Exception:  # 兜底：异常不得被当成成功文本
-            log.exception("generation crashed seq=%s", seq)
-            self.store.inbound_set_state(seq, "failed", error_code=Err.INTERNAL)
+            log.exception("generation crashed seq=%s", row["seq"])
+            for seq in seqs:
+                self.store.inbound_set_state(seq, "failed", error_code=Err.INTERNAL)
             await self._status(row, "idle")
             await self._error(row, UmpError(Err.INTERNAL, "生成失败", retryable=True, stage=Stage.GENERATE))
             return
 
         parts = split_parts(text, self._limits(row["channel_id"])[0])
         if not parts:
-            self.store.inbound_set_state(seq, "failed", error_code="empty_completion")
+            for seq in seqs:
+                self.store.inbound_set_state(seq, "failed", error_code="empty_completion")
             await self._status(row, "idle")
             await self._error(
                 row, UmpError(Err.GENERATION_FAILED, "空回复", retryable=True, stage=Stage.GENERATE)
@@ -248,26 +296,29 @@ class SessionService:
             str(row.get("channel_id") or ""), str(row.get("thread_id") or ""), str(row.get("env_id") or "")
         ):
             # 处理期间被回滚 / 重绑作废：不写回、不投递（§七）
-            log.info("turn dropped: input voided seq=%s", seq)
-            self.store.inbound_set_state(seq, "cancelled", error_code=Err.VOIDED)
+            log.info("turn dropped: input voided seq=%s", row["seq"])
+            for seq in seqs:
+                self.store.inbound_set_state(seq, "cancelled", error_code=Err.VOIDED)
             await self._status(row, "idle")
             return
         thread = self.store.thread_get(row["channel_id"], row["thread_id"])
         if thread is None or thread["binding_version"] != row["binding_version"]:
             # 提交前核对绑定版本：重绑后迟到结果不写入、不投递
-            log.info("turn dropped: binding changed seq=%s", seq)
-            self.store.inbound_set_state(seq, "cancelled", error_code=Err.BINDING_EXPIRED)
+            log.info("turn dropped: binding changed seq=%s", row["seq"])
+            for seq in seqs:
+                self.store.inbound_set_state(seq, "cancelled", error_code=Err.BINDING_EXPIRED)
             await self._status(row, "idle")
             return
 
         message_id = ump.new_id("m")
         msg = self.store.commit_turn(
-            inbound_seq=seq,
+            inbound_seq=row["seq"],
+            inbound_seqs=seqs,
             outbound={
                 "session_id": row["session_id"],
                 "message_id": message_id,
-                "reply_to": row["env_id"],
-                "covers": [row["env_id"]],
+                "reply_to": rows[-1]["env_id"],          # 批内最后一条入站（§4.5）
+                "covers": [item["env_id"] for item in rows],
                 "batches": plan_batches(parts, self._limits(row["channel_id"])[1]),
                 "target_channel": row["channel_id"],
                 "target_thread": row["thread_id"],
@@ -275,17 +326,86 @@ class SessionService:
                 "binding_token": thread["binding_token"],
             },
         )
-        self._settle_memory(row, message_id=str(message_id), reply_text=chr(10).join(parts))
+        self._settle_memory(rows, message_id=str(message_id), reply_text=chr(10).join(parts))
         await self._send_batches(msg)
         await self._status(row, "idle")
 
-    def _settle_memory(self, row: dict[str, Any], *, message_id: str, reply_text: str) -> None:
+    def _collect_batch(self, row: dict[str, Any]) -> list[dict[str, Any]]:
+        """封口（§4.5）：到点、达到容量、或遇到其他来源 / 已作废的入站即止，后来输入属下一批。"""
+        capacity = max(1, int(self.cfg.runtime.merge_batch_max))
+        source = (row["channel_id"], row["thread_id"], int(row["binding_version"]))
+        batch = [row]
+        for candidate in self.store.inbound_queued_after(str(row["session_id"]), int(row["seq"])):
+            if len(batch) >= capacity:
+                break
+            if (candidate["channel_id"], candidate["thread_id"], int(candidate["binding_version"])) != source:
+                break  # 不跨通道 / thread / 绑定版本合并
+            if self.store.void_has(
+                str(candidate["channel_id"] or ""),
+                str(candidate["thread_id"] or ""),
+                str(candidate["env_id"] or ""),
+            ):
+                break  # 已作废（回滚 / 重绑过）：让它自己按下一批结算
+            batch.append(candidate)
+        return batch
+
+    def _stale_code(self, row: dict[str, Any]) -> str:
+        """等待中的旧任务是否已失效（§4.5 恢复与作废）；返回空串表示仍然有效。"""
+        channel_id = str(row.get("channel_id") or "")
+        thread_id = str(row.get("thread_id") or "")
+        if self.store.void_has(channel_id, thread_id, str(row.get("env_id") or "")):
+            return Err.VOIDED
+        thread = self.store.thread_get(channel_id, thread_id)
+        if thread is None or int(thread["binding_version"]) != int(row["binding_version"]):
+            return Err.BINDING_EXPIRED
+        session = self.store.session_get(str(row["session_id"])) or {}
+        timeline_id = str(session.get("timeline_id") or "")
+        line = self.store.timeline_get(timeline_id) if timeline_id else None
+        if line is not None and str(line.get("state") or "") != "active":
+            return Err.STATE_BLOCKED  # 冻结 / 归档
+        return ""
+
+    def _sleep_delay(self) -> float:
+        """等待一拍的长度：区间来自配置（§4.5 起点 30–120 秒），一批只取一次。"""
+        low = max(0.0, float(self.cfg.runtime.sleep_wait_min_s))
+        high = max(low, float(self.cfg.runtime.sleep_wait_max_s))
+        return random.uniform(low, high)
+
+    def _sleeping_now(self, session: dict[str, Any]) -> bool:
+        """该角色此刻是否处于睡眠块；生活线 / 时钟不可读按未就绪处理——不等待，也不凭现实钟猜（§4.5）。"""
+        runtime = getattr(self, "runtime", None)
+        instance_id = str(session.get("instance_id") or "")
+        timeline_id = str(session.get("timeline_id") or "")
+        character_id = str(session.get("character_id") or "")
+        if runtime is None or not (instance_id and timeline_id and character_id):
+            return False
+        if instance_id.startswith("ph-"):  # 阶段 0 占位会话：没有生活线
+            return False
+        try:
+            world_seconds = runtime.world_moment(instance_id, timeline_id)
+            plan = self.store.plan_latest(instance_id, timeline_id, character_id)
+            window = life.current_window(plan, world_seconds)
+        except Exception:  # 运行层不可用不得当作「她在睡」
+            log.exception("life line unreadable session=%s", session.get("id"))
+            return False
+        return bool(window) and proactive.sleeping(str(window.get("activity") or ""))
+
+    def _sleep_hint(self, row: dict[str, Any]) -> str:
+        """到期的真实状态表述（§4.5）：仍睡眠 → 短暂朦胧；已醒来 → 按清醒状态，不否认推进。"""
+        if not float(row.get("wait_until") or 0):
+            return ""  # 这一轮没等待过：不加睡眠相关的口吻约束
+        session = self.store.session_get(str(row["session_id"])) or {}
+        return SLEEP_REPLY_HINT if self._sleeping_now(session) else WAKE_REPLY_HINT
+
+    def _settle_memory(self, rows: list[dict[str, Any]], *, message_id: str, reply_text: str) -> None:
         """已固化回复的后续记账（§4.1 / §5.3）：登记来源待提取 + 本轮实际用到的记忆强化。
 
-        失败不影响投递：记忆是派生数据，不能反向拖住已接受的回复。
+        合并批（§4.5）：每条入站按自己的来源各登记一次，回复按本轮唯一标识登记一次
+        （不重复提取同一来源）。失败不影响投递：记忆是派生数据，不能反向拖住已接受的回复。
         """
         runtime = getattr(self, "runtime", None)
-        session = self.store.session_get(row["session_id"])
+        head = rows[0]
+        session = self.store.session_get(head["session_id"])
         if runtime is None or session is None:
             return
         instance_id = str(session.get("instance_id") or "")
@@ -299,14 +419,15 @@ class SessionService:
                 instance_id, timeline_id, character_id,
                 turn_id=str(message_id), memory_ids=list(self._recalled), world_seconds=world_seconds,
             )
-            runtime.queue_dialog_turn(
-                instance_id, timeline_id, character_id,
-                world_seconds=world_seconds,
-                user_ref=str(row.get("env_id") or ""),
-                user_text=str(row.get("text") or ""),
-                reply_message_id=str(message_id),
-                reply_text=str(reply_text or ""),
-            )
+            for row in rows:
+                runtime.queue_dialog_turn(
+                    instance_id, timeline_id, character_id,
+                    world_seconds=world_seconds,
+                    user_ref=str(row.get("env_id") or ""),
+                    user_text=str(row.get("text") or ""),
+                    reply_message_id=str(message_id),
+                    reply_text=str(reply_text or ""),
+                )
         except Exception:
             log.exception("memory settle failed session=%s", session["id"])
 
@@ -338,33 +459,33 @@ class SessionService:
             log.exception("runtime prompt failed session=%s", session["id"])
             return self.cfg.placeholder["system_prompt"]
 
-    async def _query_vector(self, row: dict[str, Any]) -> list[float] | None:
+    async def _query_vector(self, rows: list[dict[str, Any]]) -> list[float] | None:
         """查询向量（§5.2）：未配置或失败即 None，召回退化全文，不阻断对话。"""
         runtime = getattr(self, "runtime", None)
         if runtime is None or not getattr(runtime, "embedding_ready", False):
             return None
         try:
-            session = self.store.session_get(row["session_id"]) or {}
+            session = self.store.session_get(rows[0]["session_id"]) or {}
             return await runtime.embed_query(
-                str(row.get("text") or ""),
+                _batch_text(rows),
                 instance_id=str(session.get("instance_id") or ""),
                 timeline_id=str(session.get("timeline_id") or ""),
             )
         except Exception:
-            log.exception("query embedding failed seq=%s", row.get("seq"))
+            log.exception("query embedding failed seq=%s", rows[0].get("seq"))
             return None
 
     def _system_prompt_with_memory(
-        self, row: dict[str, Any], *, query_vector: list[float] | None = None
+        self, rows: list[dict[str, Any]], *, query_vector: list[float] | None = None
     ) -> tuple[str, list[str]]:
         """真实实例：扮演定义 + 记忆简报；占位会话或无运行层时退回占位提示词。"""
         runtime = getattr(self, "runtime", None)
-        session = self.store.session_get(row["session_id"]) if runtime is not None else None
+        session = self.store.session_get(rows[0]["session_id"]) if runtime is not None else None
         if runtime is None or session is None or str(session["instance_id"]).startswith("ph-"):
             return self.cfg.placeholder["system_prompt"], []
         try:
             context = runtime.turn_context(
-                session, topic=str(row.get("text") or ""), query_vector=query_vector
+                session, topic=_batch_text(rows), query_vector=query_vector
             )
         except Exception:  # 运行层不可用不得阻断对话
             log.exception("runtime context failed session=%s", session["id"])
@@ -372,22 +493,31 @@ class SessionService:
         return str(context.get("prompt") or ""), list(context.get("memory_ids") or [])
 
     def _build_messages(
-        self, row: dict[str, Any], *, query_vector: list[float] | None = None
+        self, rows: list[dict[str, Any]], *, query_vector: list[float] | None = None
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        """返回 (消息序列, 本轮注入的记忆标识)；记忆简报只进上下文（§5.1）。"""
-        history = self.store.context_window(row["session_id"], self.cfg.context_history_max)
-        prompt, recalled = self._system_prompt_with_memory(row, query_vector=query_vector)
+        """返回 (消息序列, 本轮注入的记忆标识)；记忆简报只进上下文（§5.1）。
+
+        合并批（§4.5）：批内各输入按接受顺序保留自己的原文，合成同一轮的用户侧输入；
+        到期的真实状态（仍睡 / 已醒）作为口吻约束随扮演定义一起进上下文。
+        """
+        head = rows[0]
+        history = self.store.context_window(head["session_id"], self.cfg.context_history_max)
+        prompt, recalled = self._system_prompt_with_memory(rows, query_vector=query_vector)
+        hint = self._sleep_hint(head)
+        if hint:
+            prompt = f"{prompt}\n\n{hint}"
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": prompt}
         ]
         for item in history:
-            if item["seq"] >= row["seq"]:
+            if item["seq"] >= head["seq"]:
                 continue
             if item["role"] == "user":
                 messages.append({"role": "user", "content": item["text"] or ""})
             elif item["role"] == "character":
                 messages.append({"role": "assistant", "content": _flatten(item["parts"])})
-        messages.append({"role": "user", "content": row["text"] or ""})
+        for item in rows:
+            messages.append({"role": "user", "content": item["text"] or ""})
         return messages, recalled
 
     # ---------- 投递 ----------
@@ -482,3 +612,8 @@ def _flatten(parts_json: str | None) -> str:
     except json.JSONDecodeError:
         return ""
     return "\n".join(text for batch in batches for text in batch)
+
+
+def _batch_text(rows: list[dict[str, Any]]) -> str:
+    """合并批的按序全文（召回与上下文用的主题文本）。"""
+    return "\n".join(str(row.get("text") or "") for row in rows)

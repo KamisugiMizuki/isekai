@@ -102,6 +102,11 @@ class RuntimeConfig:
     memory_embedding_model: str = ""     # 远程 embedding 模型（空 = 只用全文召回）
     memory_embedding_base_url: str = ""
     memory_embedding_api_key: str = ""
+    #: 睡眠期等待与合并（SESSION_CORE_SPEC §4.5）。等待区间取 §4.5 的起点值 30–120 秒：
+    #: 每批在区间内随机取一拍（默认 45 秒量级），批内只等一拍——后续输入不重置、不叠加。
+    sleep_wait_min_s: float = 30.0
+    sleep_wait_max_s: float = 120.0
+    merge_batch_max: int = 8            # 合并批容量（条数）：达到即封口，后来输入属下一批
     #: 版本管理（阶段 4）：自动提交默认现实 1 小时或新增事件 50 条
     autocommit_enabled: bool = True
     autocommit_minutes: int = 60

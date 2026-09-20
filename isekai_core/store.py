@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS message(
   batch_index INTEGER,
   batch_count INTEGER,
   covers TEXT DEFAULT '[]',
+  wait_until REAL NOT NULL DEFAULT 0, -- 入站：睡眠期合并批的现实截止点（一次确定，不因后续输入重置）
   state TEXT NOT NULL,
   error_code TEXT,
   created_at REAL NOT NULL
@@ -1004,6 +1005,10 @@ class Store:
         if effect_columns and "value" not in effect_columns:
             log.info("effect_state 增列 value")
             self._conn.execute("ALTER TABLE effect_state ADD COLUMN value TEXT")
+        message_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(message)")}
+        if message_columns and "wait_until" not in message_columns:
+            log.info("message 增列 wait_until（睡眠期合并批的截止点，§4.5）")
+            self._conn.execute("ALTER TABLE message ADD COLUMN wait_until REAL NOT NULL DEFAULT 0")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
@@ -1221,6 +1226,34 @@ class Store:
                 (state, error_code, reply_message_id, seq),
             )
 
+    def inbound_claim_deadline(self, seq: int, *, delay: float) -> float:
+        """睡眠期合并批的截止点：以首次接受该输入的现实时间为基准，一次确定并持久化（§4.5）。
+
+        已确定过就返回原值——后续输入不重置、不按条数叠加；取快照与排队耗去的时间
+        由调用方按 `deadline - now` 计入等待。
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT created_at, wait_until FROM message WHERE seq=?", (seq,)
+            ).fetchone()
+            if row is None:
+                return time.time() + float(delay)
+            claimed = float(row["wait_until"] or 0.0)
+            if claimed > 0:
+                return claimed
+            deadline = float(row["created_at"] or 0.0) + float(delay)
+            self._conn.execute("UPDATE message SET wait_until=? WHERE seq=?", (deadline, seq))
+        return deadline
+
+    def inbound_queued_after(self, session_id: str, seq: int) -> list[dict[str, Any]]:
+        """该会话接受顺序上排在这条入站之后、仍未处理的入站（合并批候选，§4.5）。"""
+        rows = self._conn.execute(
+            """SELECT * FROM message WHERE session_id=? AND role='user' AND state='queued' AND seq>?
+               ORDER BY seq""",
+            (session_id, int(seq)),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
     def interrupt_open_turns(self) -> int:
         """启动时收尾上次进程留下的未完成轮次：标记中断，等待显式重试。
 
@@ -1303,13 +1336,21 @@ class Store:
         *,
         inbound_seq: int,
         outbound: dict[str, Any],
+        inbound_seqs: Iterable[int] | None = None,
     ) -> dict[str, Any]:
-        """一次逻辑轮次的固化：回复与输入处理状态共同发布（SESSION_CORE_SPEC §4.2）。"""
+        """一次逻辑轮次的固化：回复与输入处理状态共同发布（SESSION_CORE_SPEC §4.2）。
+
+        合并批（§4.5）：批内每条入站都指向同一份固化回复，查询或重试任一条都得到同一
+        message_id；不逐条补发、不重复提取同一来源。
+        """
+        seqs = [int(item) for item in (list(inbound_seqs) if inbound_seqs is not None else [inbound_seq])]
         with self._lock, self._conn:
             row = self._outbound_put_locked(**outbound)
+            marks = ",".join("?" for _ in seqs)
             self._conn.execute(
-                "UPDATE message SET state='done', error_code=NULL, reply_message_id=? WHERE seq=?",
-                (outbound["message_id"], inbound_seq),
+                f"UPDATE message SET state='done', error_code=NULL, reply_message_id=? "
+                f"WHERE seq IN ({marks})",
+                (outbound["message_id"], *seqs),
             )
             return row
 
