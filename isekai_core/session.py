@@ -89,6 +89,22 @@ class SessionService:
                 Err.VOIDED, "该输入已因回滚 / 重绑作废", retryable=False, ref=env_id, stage=Stage.RECEIVE
             )
 
+        # 冻结线一律不允许对话（§2.2）：必须是已激活的时间线才能接新消息。
+        # 阶段 0 占位会话没有时间线行，不在此列（它不是世界实例）。
+        session_row = self.store.session_get(str(thread_row["session_id"])) or {}
+        timeline_id = str(session_row.get("timeline_id") or "")
+        line = self.store.timeline_get(timeline_id) if timeline_id else None
+        if line is not None:
+            # 真实时间线：冻结 / 归档一律不允许对话（§2.2）；占位会话没有时间线行，不在此列
+            if str(line.get("state") or "") != "active":
+                raise UmpError(
+                    Err.STATE_BLOCKED,
+                    "时间线当前不可对话（未激活或已归档）；先激活再发",
+                    retryable=False,
+                    ref=env_id,
+                    stage=Stage.RECEIVE,
+                )
+
         try:
             row, created = self.store.inbound_put(
                 session_id=thread_row["session_id"],

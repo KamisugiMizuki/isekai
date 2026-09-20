@@ -71,6 +71,8 @@ def make_world(h: Harness, *, cards: list[dict] | None = None, moment: int = DAY
     info = create_instance(h.store, package, cards)
     timeline_id = h.store.timeline_list(info["id"])[0]["id"]
     h.world.ensure_instance(info["id"], now_real=NOW)
+    # 冻结线不允许对话（§2.2）：本探针测的是生成 / 生命周期，先把线激活
+    h.world.activate(info["id"], timeline_id, now_real=NOW)
     return package, info, timeline_id, cards
 
 

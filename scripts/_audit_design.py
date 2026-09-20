@@ -424,16 +424,21 @@ def c_version_gate(case: Case) -> tuple[str, str]:
     # 检查先于推进：把本机实例数据格式改成不兼容，运行层是否仍推进？
     with case.store._lock, case.store._conn:  # noqa: SLF001 探针直改临时库
         case.store._conn.execute("UPDATE instance SET data_format='9.0' WHERE id=?", (info["id"],))
-    case.world.activate(info["id"], tl, now_real=1.7e9)
-    moved = case.world.advance(info["id"], tl, now_real=1.7e9 + 3600)
-    assert moved["processed_world"] > DAY * 1500, "运行层推进了"
-    return "FAIL", (
+    refused = []
+    for call in (lambda: case.world.activate(info["id"], tl, now_real=1.7e9),
+                 lambda: case.world.advance(info["id"], tl, now_real=1.7e9 + 3600)):
+        try:
+            call()
+            refused.append(False)
+        except RuntimeStateError:
+            refused.append(True)
+    assert all(refused), "blocked 的实例仍能激活 / 推进"
+    clock = case.store.clock_get(tl) or {}
+    assert int(clock.get("processed_world") or 0) == DAY * 1500, "水位被推进了"
+    return "PASS", (
         "导入三闸门都在（容器主版本 / 数据格式主版本 / 必需能力，不兼容 → InstanceError）；"
-        f"但「检查先于推进」不成立：把本机实例 data_format 改成 9.0（compatibility 判 blocked）后，"
-        f"运行层照样激活并推进（{DAY * 1500} → {moved['processed_world']}）。"
-        "最小复现：scripts/_audit_design.py::c_version_gate（UPDATE instance SET data_format='9.0' 后 activate+advance）；"
-        "根因：compatibility() 只在设定层被调用（isekai_core/world/instances.py:141-158、ops.py:419-446），"
-        "运行层从不消费它（isekai_core/runtime/service.py:1258 activate、1457 advance 无兼容性前置）"
+        f"「检查先于推进」成立：把本机实例 data_format 改成 9.0（compatibility 判 blocked）后，"
+        f"activate 与 advance 都被拒（水位保持 {clock.get('processed_world')}）"
     )
 
 

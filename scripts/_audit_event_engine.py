@@ -1623,6 +1623,20 @@ def b13d() -> str:
                        repro="card['identity']['died']=moment+2*DAY → advance(5 天)")
         office = {row["office_id"]: dict(row) for row in line.store.institution_list(line.instance_id, line.timeline_id)}
         row = office["off-1"]
+        death_id = str(deaths[0]["id"])
+        if str(row["holder"]) == "" :
+            # 出缺是对的，但必须带来源与发生时刻（不许无声改动）
+            if str(row["source"]) != death_id:
+                raise Fail(f"出缺没有来源：source={row['source']!r}，应为身故事件 {death_id}")
+            if int(row["from_world"]) != int(deaths[0]["world_seconds"]):
+                raise Fail(f"出缺时刻与身故不一致：{row['from_world']} vs {deaths[0]['world_seconds']}")
+            status = institutions.matter_status(row, "通行牌发放")
+            if status != "suspended":
+                raise Fail(f"出缺后事务判定不对：通行牌发放={status!r}")
+            return (
+                f"在任者身故（{death_id} @ {deaths[0]['world_seconds']}）→ off-1 出缺，"
+                f"来源=身故事件、发生时刻一致；空缺期「通行牌发放」判定={status}"
+            )
         if str(row["holder"]) != "cc-堤禾":
             raise Fail(f"职位在任者被无声改动：{row['holder']!r}")
         status = institutions.matter_status(row, "通行牌发放")
