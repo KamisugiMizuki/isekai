@@ -89,6 +89,7 @@ class RuntimeService:
         memory_recall_limit: int = 6,
         memory_brief_tokens: int = 900,
         memory_decay_per_day: float = 0.02,
+        memory_archived_recall_min: float = 0.82,
         memory_embedding_model: str = "",
         memory_embedding_base_url: str = "",
         memory_embedding_api_key: str = "",
@@ -119,6 +120,7 @@ class RuntimeService:
         self.memory_recall_limit = max(1, int(memory_recall_limit))
         self.memory_brief_tokens = max(0, int(memory_brief_tokens))
         self.memory_decay_per_day = max(0.0, min(1.0, float(memory_decay_per_day)))
+        self.memory_archived_recall_min = max(0.0, min(1.0, float(memory_archived_recall_min)))
         #: 远程 embedding（MEMORY_SPEC §5.2）：缺配置即退化全文召回
         self.embedding_model = str(memory_embedding_model or "")
         self.embedding_base_url = str(memory_embedding_base_url or "")
@@ -1045,6 +1047,103 @@ class RuntimeService:
             self.settle_call(reservation, reply=str(text))
         return vectors[0] if vectors else None
 
+    async def organize_memories(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        llm: Any = None,
+        now_real: float | None = None,
+        max_items: int = 3,
+    ) -> dict[str, Any]:
+        """记忆整理（§六）：挂角色作息节律，把过长的旧条目压短——只调表达，不造事实。
+
+        不合并相互矛盾的来源；改写结果按 version+1 固化成新条目并指向旧条目（历史可查当时原文）。
+        同一旧条目只整理一次（来源键去重），补算不会反复改写同一段过去。
+        """
+        import time as _time
+
+        now = _time.time() if now_real is None else float(now_real)
+        instance = self.store.instance_get(instance_id)
+        if instance is None:
+            raise RuntimeStateError(f"实例不存在：{instance_id}")
+        calendar = self.calendar(instance)
+        world = int(self.clock_row(timeline_id)["processed_world"])
+        changed: list[dict[str, Any]] = []
+        for card in self.cards(instance, timeline_id=timeline_id, world_seconds=world):
+            character_id = str((card.get("meta") or {}).get("card_id") or "")
+            if not character_id:
+                continue
+            # 节律：睡眠时段整理；无睡眠角色按世界日界（当日起初四分之一）触发
+            plan = self.store.plan_latest(instance_id, timeline_id, character_id)
+            window = life.current_window(plan, world)
+            sleeping_now = str((window or {}).get("activity") or "").lower() == "sleep"
+            at_day_edge = world % max(1, int(calendar.day_seconds)) < int(calendar.day_seconds) // 4
+            if not (sleeping_now or at_day_edge):
+                continue
+            rows = [
+                row
+                for row in self.store.memory_scope(
+                    instance_id, timeline_id, character_id, until=world
+                )
+                if str(row.get("state")) != "archived"
+                and len(str(row.get("text") or "")) > 60
+                and not str(row.get("source_key") or "").startswith("organize:")
+            ][: max(0, int(max_items))]
+            for row in rows:
+                if llm is None:
+                    break
+                try:
+                    text = await llm.chat(memory_mod.organize_prompt(row), temperature=0.3, timeout=30.0)
+                except Exception:
+                    continue
+                short = memory_mod.parse_organized(str(text), str(row.get("text") or ""))
+                if not short or short == str(row.get("text") or ""):
+                    continue
+                new_row = {
+                    **{key: row.get(key) for key in (
+                        "instance_id", "timeline_id", "character_id", "kind",
+                        "happened_world", "learned_world", "semantic_watermark",
+                    )},
+                    "id": f"mm-org-{row['id'][-10:]}",
+                    "text": short,
+                    "sources": row.get("sources"),
+                    "recorded_world": world,
+                    "strength": row.get("strength"),
+                    "confidence": row.get("confidence"),
+                    "source_key": f"organize:{row['id']}",
+                }
+                created = self.store.memory_add(new_row)
+                if created is not None:
+                    changed.append({"from": str(row["id"]), "to": str(created.get("id") or "")})
+        return {"organized": len(changed), "items": changed}
+
+    def _drop_archived_unless_strong(
+        self,
+        ranked: list[dict[str, Any]],
+        *,
+        topic: str,
+        vector_scores: dict[str, float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """归档条目默认不进召回；**强相关**才唤起（§六），作用域与来源过滤已在前面做过。
+
+        强相关 = 逐字命中（话题与条目文本互相包含）或向量相似度过线；唤起时打上标记，
+        让表述层知道这是「模糊记起」，不是笃定的事实。
+        """
+        query = str(topic or "").strip()
+        vec = dict(vector_scores or {})
+        out: list[dict[str, Any]] = []
+        for item in ranked:
+            if str(item.get("state")) != "archived":
+                out.append(item)
+                continue
+            text = str(item.get("text") or "")
+            literal = bool(query) and (query in text or text in query)
+            score = float(vec.get(str(item.get("id")) or "", 0.0))
+            if literal or score >= float(self.memory_archived_recall_min):
+                out.append({**item, "fuzzy": True})
+        return out
+
     def recall(
         self,
         instance_id: str,
@@ -1089,7 +1188,7 @@ class RuntimeService:
         )
         for item in ranked:
             item["source_label"] = memory_mod.source_label(json.loads(item.get("sources") or "[]"))
-        ranked = [item for item in ranked if str(item.get("state")) != "archived"][:40]
+        ranked = self._drop_archived_unless_strong(ranked, topic=topic, vector_scores=vector_scores)[:40]
         brief = memory_mod.pack_brief(
             ranked, budget_tokens=self.memory_brief_tokens, limit=limit or self.memory_recall_limit
         )

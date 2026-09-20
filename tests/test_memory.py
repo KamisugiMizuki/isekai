@@ -326,3 +326,31 @@ def test_no_memory_browse_api_is_exposed() -> None:
     names = set(ops.SYNC_OPS) | set(ops.ASYNC_OPS)
     assert not any("memory" in name for name in names), f"不该有记忆浏览操作：{names}"
 
+
+
+def test_archived_entry_can_be_recalled_only_when_strongly_related(store, world) -> None:  # noqa: F811
+    """归档条目默认不召回，强相关才唤起（MEMORY_SPEC §六）。"""
+    from isekai_core.runtime.service import RuntimeService as RS
+    from test_runtime import make_instance
+
+    service = RS(store)
+    info, timeline_id, character_id = make_instance(store, world)
+    store.memory_add({
+        "id": "mm-arch", "instance_id": info["id"], "timeline_id": timeline_id,
+        "character_id": character_id, "text": "北堤的通行牌那年秋天停了整整一个月",
+        "kind": "fact", "sources": [{"kind": "claim", "ref": "cl-9"}],
+        "happened_world": 0, "learned_world": 0, "recorded_world": 0,
+        "semantic_watermark": 0, "strength": 0.05, "confidence": 0.5,
+    })
+    # 直接置为归档（低强度归档也走同一条语义）
+    row = store.memory_get("mm-arch")
+    with store._lock, store._conn:  # noqa: SLF001 探针直改临时库
+        store._conn.execute("UPDATE memory SET state='archived' WHERE id='mm-arch'")
+
+    weak = service.recall(info["id"], timeline_id, character_id, topic="盐价怎么算")
+    assert "mm-arch" not in weak["ids"], "弱相关不该唤起归档条目"
+
+    strong = service.recall(info["id"], timeline_id, character_id, topic="那年秋天停了整整一个月")
+    assert "mm-arch" in strong["ids"], "强相关（逐字命中）要能唤起"
+    hit = [item for item in strong["entries"] if item["id"] == "mm-arch"][0]
+    assert hit.get("fuzzy") is True, "唤起时标明是模糊记起"

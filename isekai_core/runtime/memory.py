@@ -296,3 +296,28 @@ def source_label(sources: list[dict[str, Any]]) -> str:
         if item not in seen:
             seen.append(item)
     return "／".join(seen)
+
+
+def organize_prompt(row: dict[str, Any]) -> list[dict[str, str]]:
+    """整理（§六）：把一条旧记忆压短，只调表达——不许加新事实、不许改否定与不确定。"""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "把下面这条记忆改写成更短的一句（不超过 60 字）。"
+                "只能压缩表达，不许增加任何新信息、不许改变否定与不确定性、不许合并别的内容；"
+                "只输出改写后的那句话，不要解释、不要引号。"
+            ),
+        },
+        {"role": "user", "content": str(row.get("text") or "")[:400]},
+    ]
+
+
+def parse_organized(text: str, original: str) -> str:
+    """整理结果：空、过长、或凭空变长的都不要（宁可保持原样）。"""
+    body = str(text or "").strip().strip('"').strip()
+    if not body or chr(10) in body or len(body) > 60:
+        return ""
+    if len(body) >= len(original):
+        return ""
+    return body

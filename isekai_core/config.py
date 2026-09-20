@@ -99,6 +99,8 @@ class RuntimeConfig:
     memory_recall_limit: int = 6         # 单轮简报条数上限
     memory_brief_tokens: int = 900       # 简报预算（字符量级）
     memory_decay_per_day: float = 0.02   # 每世界日强度衰减率
+    #: 归档条目「强相关可唤起」的向量相似度门槛（§六）；逐字命中不受此限
+    memory_archived_recall_min: float = 0.82
     memory_embedding_model: str = ""     # 远程 embedding 模型（空 = 只用全文召回）
     memory_embedding_base_url: str = ""
     memory_embedding_api_key: str = ""
