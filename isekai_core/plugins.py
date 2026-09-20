@@ -318,7 +318,12 @@ class PluginHost:
         """卸载：停用并移除登记 / 绑定；**保留核心会话与角色历史**（§3.2）。"""
         await self.disable(plugin_id, note="卸载")
         self.store.plugin_forget(str(plugin_id))
-        return {"uninstalled": str(plugin_id), "kept": "核心会话与角色历史不动（通道绑定由管理面另行解绑）"}
+        dropped = self.store.channel_forget(str(plugin_id))  # 登记与绑定一起移除（§3.2）
+        return {
+            "uninstalled": str(plugin_id),
+            "dropped": dropped,
+            "kept": "核心会话 / 消息 / 角色历史不动",
+        }
 
     async def stop_all(self) -> int:
         """核心退出：所有插件及所属子进程一并停止，不留后台孤儿（§3.2）。"""

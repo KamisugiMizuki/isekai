@@ -89,3 +89,21 @@ def test_invalid_product_is_not_published(store, world) -> None:
         assert row["data_format"] == OLD_FORMAT
     finally:
         converters.unregister_converter(OLD_FORMAT, "0.1")
+
+
+def test_converter_failure_reason_reaches_the_caller(store, world, tmp_path) -> None:
+    """转换失败要给真实原因（哪一段没过校验），不能落成 internal。"""
+    from isekai_core.config import load_config
+    from isekai_core.ump import UmpError
+    from isekai_core.world import ops as world_ops
+
+    info, _timeline_id, _character = make_instance(store, world)
+    _make_old(store, info)
+    converters.register_converter("9.9", "0.1", lambda payload: {**payload, "world_package": {"meta": {}}})
+    try:
+        cfg = load_config(tmp_path)
+        with pytest.raises(UmpError) as exc:
+            world_ops.dispatch(cfg, store, "instance.convert", {"instance_id": info["id"], "confirmed": True})
+        assert "转换产物未通过完整校验" in str(exc.value), exc.value
+    finally:
+        converters.unregister_converter("9.9", "0.1")

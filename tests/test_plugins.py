@@ -126,3 +126,22 @@ def _instance(harness, world):
     world.ensure_instance(info["id"], now_real=1.7e9)
     timelines = store.timeline_list(info["id"])
     return info, str(timelines[0]["id"]), None
+
+
+async def test_uninstall_also_drops_the_channel_binding(tmp_path) -> None:
+    """§3.2 卸载 = 移除插件登记 **与绑定**；会话 / 消息 / 角色历史一概不动。"""
+    async with running_core(tmp_path) as h:
+        folder = tmp_path / "plugins"
+        _write_plugin(folder, "echo-plugin", _stub("echo.py"))
+        host = plugins.PluginHost(cfg=h.cfg, store=h.runtime.store, server=h.runtime.server, folder=folder)
+        await host.enable("echo-plugin")
+        channel = h.runtime.store.channel_by_name("echo-plugin")
+        assert channel is not None and h.runtime.store.thread_list(channel["id"]) == []
+        h.runtime.store.thread_bind(channel["id"], "dm-1", "ss-keep")
+        sessions_before = h.runtime.store._conn.execute("SELECT COUNT(*) AS n FROM session").fetchone()["n"]  # noqa: SLF001
+        out = await host.uninstall("echo-plugin")
+        assert out["dropped"]["channel"] == 1 and out["dropped"]["threads"] == 1
+        assert h.runtime.store.channel_by_name("echo-plugin") is None
+        assert h.runtime.store.plugin_get("echo-plugin") is None
+        sessions_after = h.runtime.store._conn.execute("SELECT COUNT(*) AS n FROM session").fetchone()["n"]  # noqa: SLF001
+        assert sessions_after == sessions_before, "解绑只动通道与绑定两张表，会话不受影响"

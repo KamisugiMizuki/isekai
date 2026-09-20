@@ -403,19 +403,22 @@ class Ctx:
 
 
 @asynccontextmanager
-async def core(root: Path, *, replies: list[str] | None = None):
+async def core(root: Path, *, replies: list[str] | None = None, with_mgmt: bool = True):
+    """起一个真核心。`with_mgmt=False` 时不占管理凭据（凭据每核心一次性，留给进程内管理通道用）。"""
     cfg = load_config(root)
     cfg.paths.packages.mkdir(parents=True, exist_ok=True)
     llm = FakeLLM(replies or REPLIES)
     runtime = await build_runtime(cfg, llm=llm)
     endpoint = await runtime.server.start()
-    mgmt = MgmtClient(endpoint, runtime.server.mgmt_token)
-    await mgmt.connect()
+    mgmt = MgmtClient(endpoint, runtime.server.mgmt_token) if with_mgmt else None
+    if mgmt is not None:
+        await mgmt.connect()
     ctx = Ctx(root=root, cfg=cfg, runtime=runtime, mgmt=mgmt, llm=llm)
     try:
         yield ctx
     finally:
-        await mgmt.close()
+        if mgmt is not None:
+            await mgmt.close()
         await runtime.service.shutdown()
         await runtime.server.close()
         runtime.store.close()
@@ -643,6 +646,44 @@ async def b1_shared_validation(ctx: Ctx) -> tuple[str, str]:
         f"generator.validate_package is validate.validate_package={shared}；生成正常包 errors={good['errors']}；"
         f"畸形输出回灌错误 {len(garbage['errors'])} 条；非法包落盘被拒（{refused[:28]}…）且原文件逐字节不变={intact}；"
         f"候选落盘文件={candidates or '无'}"
+    )
+
+
+async def b2_two_transports_same_verdict(ctx: Ctx) -> tuple[str, str]:
+    """附录 C2 尾句 / §2.5：同一份固化产物，桌面 WS 与进程内通道给出逐字段一致的结论。"""
+    from isekai_core.local_channel import InProcessChannel
+
+    good = mypkg()
+    broken = mypkg()
+    broken["world"]["axioms"] = []
+    good_path = ctx.write("wp-consistent.json", good)
+    broken_path = ctx.write("wp-broken.json", broken)
+
+    # 桌面端：真 WS 管理通道（壳走的那条）
+    over_ws = await ctx.mgmt.call("world.package.validate", package_path=str(good_path))
+    bad_ws = await ctx.mgmt.call("world.package.validate", package_path=str(broken_path))
+
+    # 安卓端：另一核心实例上的进程内管理通道，读同一份文件（管理凭据每核心一次性，不预先占用）
+    root_b = tmpdir("b2b")
+    async with core(root_b, with_mgmt=False) as other:
+        local = InProcessChannel(other.runtime.server, channel_id="builtin-local", name="安卓内建")
+        auth = await local.connect_mgmt()
+        reply = await local.mgmt("world.package.validate", {"package_path": str(good_path)})
+        broken_reply = await local.mgmt("world.package.validate", {"package_path": str(broken_path)})
+        await local.close()
+    over_local = reply.get("result") or {}
+    bad_local = broken_reply.get("result") or {}
+
+    same_ok = over_local == over_ws and bad_local == bad_ws
+    bad_errors = bad_ws.get("errors") or []
+    ok = bool(auth.get("ok")) and same_ok and over_ws.get("errors") == [] and bool(bad_errors)
+    return ("PASS" if ok else "FAIL"), (
+        f"进程内管理通道握手={auth.get('ok')}；同一份包（{good_path.name}）经两条传输的 result 逐字段一致={same_ok}"
+        f"（WS errors={over_ws.get('errors')}、进程内 errors={over_local.get('errors')}）；"
+        f"坏包（公理段为空）两端结果一致={bad_local == bad_ws}，各报 {len(bad_errors)} 条"
+        f"（首条：{(bad_errors or [''])[0][:60]}）；"
+        f"两条传输共用 CoreServer._handler 同一段握手 / 认证 / 分发代码（local_channel.py:110-149），"
+        f"两端只做表单与展示（world/ops.py:38-103）"
     )
 
 
@@ -1687,6 +1728,253 @@ async def g6_black_box_surface(ctx: Ctx) -> tuple[str, str]:
     )
 
 
+async def h1_backfill_plan(ctx: Ctx) -> tuple[str, str]:
+    """§3.6 条 2/3/4：一档文本的批量编纂——十年一卷、10–20 条一批、各传本选载、产物联合校验。"""
+    from isekai_core.runtime import events as events_mod
+    from isekai_core.runtime.calendar import calendar_from_package
+
+    package = mypkg()
+    calendar = calendar_from_package(package)
+    year = int(calendar.year_seconds)
+    package["sources"].append({"id": "src-2", "kind": "official", "name": "井社旧档", "reach": "井社档案室里"})
+    for index in range(2):  # 两个十年各一条实情（无传本层）
+        ident = f"cf-e{index}"
+        package["canon"].append(
+            {"id": ident, "statement": f"第{index}个十年的井事。", "tags": ["灾害"], "at": index * 10 * year + 1}
+        )
+        package["initial_state"]["events"].append(ident)
+    for index in range(45):  # 同一卷同一传本 45 条：必须切成 10–20 条一批
+        ident = f"nv-r{index}"
+        package["narratives"].append(
+            {
+                "id": ident, "text": f"第{index}条传闻。", "source_id": "src-1", "canon_ref": "cf-1",
+                "obtain": ["在坡口听老人讲"], "confidence": "believed", "at": 1,
+            }
+        )
+        package["initial_state"]["rumors"].append(ident)
+    for index in range(5):  # 下一卷另一传本只有 5 条：不足一批就不凑量
+        ident = f"nv-s{index}"
+        package["narratives"].append(
+            {
+                "id": ident, "text": f"下一卷第{index}条。", "source_id": "src-2", "canon_ref": "cf-1",
+                "obtain": ["抄自旧档"], "confidence": "believed", "at": 10 * year + 1,
+            }
+        )
+        package["initial_state"]["rumors"].append(ident)
+    idents = (
+        ["cf-e0", "cf-e1", "nv-1"]  # nv-1 = mypkg 自带的说法条目（同卷同传本，一起进第一批）
+        + [f"nv-r{index}" for index in range(45)]
+        + [f"nv-s{index}" for index in range(5)]
+    )
+
+    info = (await ctx.mgmt.call("instance.create", package=package, cards=[mycard(package)]))["instance"]
+    timeline = ctx.store.timeline_list(info["id"])[0]["id"]
+    plan = (await ctx.mgmt.call("world.backfill.plan", instance_id=info["id"]))["plan"]
+    again = (await ctx.mgmt.call("world.backfill.plan", instance_id=info["id"]))["plan"]
+
+    spans = [int(item["to_world"]) - int(item["from_world"]) for item in plan["volumes"]]
+    big = [len(item["entries"]) for item in plan["batches"] if item["source_id"] == "src-1"]
+    small = [len(item["entries"]) for item in plan["batches"] if item["source_id"] == "src-2"]
+    by_source = {str(sid): set(items) for sid, items in plan["selection"].items()}
+    in_own_source = all(set(item["entries"]) <= by_source.get(str(item["source_id"]), set()) for item in plan["batches"])
+    selected = sorted(ident for items in plan["selection"].values() for ident in items)
+    # 换种子只改编纂顺序、不改材料集合（同一种子同结果由上面两次 op 调用核）
+    other_seed = events_mod.backfill_plan(package, seed="seed-b", rules_version="0.1", calendar=calendar)
+    same_material = sorted(i for b in other_seed["batches"] for i in b["entries"]) == sorted(
+        i for b in plan["batches"] for i in b["entries"]
+    )
+    sizes = {
+        str(count): events_mod.backfill_batch_sizes(count) for count in (7, 20, 23, 45)
+    }
+    balance_ok = (
+        sizes["7"] == [7] and sizes["20"] == [20] and sizes["23"] == [12, 11] and sizes["45"] == [15, 15, 15]
+    )
+
+    def clear_events() -> None:
+        with ctx.store._lock, ctx.store._conn:
+            ctx.store._conn.execute("DELETE FROM event WHERE instance_id=?", (info["id"],))
+
+    clear_events()
+    written = int(
+        (await ctx.mgmt.call("runtime.backfill", instance_id=info["id"], timeline_id=timeline))["backfill"]["rows"]
+    )
+    events_after = n(ctx.store, "SELECT COUNT(*) FROM event WHERE instance_id=?", (info["id"],))
+    setting = json.loads(ctx.store.instance_get(info["id"])["setting"])
+    for item in setting["world_package"]["narratives"]:
+        if str(item.get("id")) == "nv-r0":
+            item.pop("text", None)  # 退化成没有「一句话」文本
+        if str(item.get("id")) == "nv-r1":
+            item["source_id"] = "src-ghost"  # 挂到未声明的传本上
+    with ctx.store._lock, ctx.store._conn:
+        ctx.store._conn.execute(
+            "UPDATE instance SET setting=? WHERE id=?", (json.dumps(setting, ensure_ascii=False), info["id"])
+        )
+    clear_events()
+    refused = ""
+    try:
+        await ctx.mgmt.call("runtime.backfill", instance_id=info["id"], timeline_id=timeline)
+    except UmpError as exc:
+        refused = exc.message
+
+    ok = (
+        plan["total"] == len(idents) == 53
+        and plan["volume_years"] == events_mod.BACKFILL_VOLUME_YEARS == 10
+        and plan["batch_bounds"] == [events_mod.BACKFILL_BATCH_MIN, events_mod.BACKFILL_BATCH_MAX] == [10, 20]
+        and plan == again
+        and same_material
+        and all(span == 10 * year for span in spans)
+        and selected == sorted(idents)
+        and in_own_source
+        and sum(big) == 46 and len(big) == 3 and all(10 <= size <= 20 for size in big)
+        and small == [5]
+        and plan["with_text"] == plan["total"]
+        and balance_ok
+        and events_after == plan["total"]
+        and "缺少一句话文本" in refused
+        and "未声明的传本" in refused
+    )
+    return ("PASS" if ok else "FAIL"), (
+        f"计划（经管理面 world.backfill.plan 读实例锁定包）：条目 {plan['total']} 条"
+        f"（实情 {sum(1 for i in idents if i.startswith('cf-'))} + 说法 {sum(1 for i in idents if i.startswith('nv-'))}）、"
+        f"十年一卷={plan['volume_years']} 年（各卷跨度实测={sorted(set(spans))} 秒 = 10×{year}）、批界={plan['batch_bounds']}；"
+        f"同一实例两次调用计划逐字段一致={plan == again}、换种子材料集合不变={same_material}；"
+        f"同卷同传本 {sum(big)} 条 → 批大小={big}、下一卷另一传本 5 条 → {small}（不凑量）；"
+        f"各传本选载={ {key: len(value) for key, value in plan['selection'].items()} }、"
+        f"批内条目属于本批传本={in_own_source}、选载集合与条目一一对应={selected == sorted(idents)}；"
+        f"分批规则实测 7→{sizes['7']}、20→{sizes['20']}、23→{sizes['23']}、45→{sizes['45']}；"
+        f"产物固化：合法回填写入 {written} 行（事件 {events_after} 条 = 计划条目数）；"
+        f"把 nv-r0 的「一句话」文本抽掉、nv-r1 挂到未声明传本上后再回填 → 被创建期联合校验拒绝（{refused[:88]}）"
+    )
+
+
+async def h2_load_byte_limit(ctx: Ctx) -> tuple[str, str]:
+    """§2.3 加载限额：按字节数在解析前拦；正常包照常加载；容器件走更宽的那道闸。"""
+    from isekai_core.world.package import MAX_PACKAGE_BYTES, read_json_file
+    from isekai_core.world.portable import MAX_CONTAINER_BYTES
+
+    package = mypkg()
+    card = mycard(package)
+    big = mypkg()
+    big["filler"] = "x" * MAX_PACKAGE_BYTES  # 结构上仍是合法包，只是字节数超限
+    big_path = ctx.write("wp-big.json", big)
+    junk_path = ctx.cfg.paths.packages / "wp-junk.json"
+    junk_path.write_text("x" * (MAX_PACKAGE_BYTES + 4096), encoding="utf-8")  # 根本不是 JSON
+    bloated_card = mycard(package)
+    bloated_card["appearance"] = "x" * MAX_PACKAGE_BYTES
+    card_path = ctx.cfg.paths.packages / "card-big.json"
+    card_path.write_text(json.dumps(bloated_card, ensure_ascii=False), encoding="utf-8")
+
+    oversized = ""
+    try:
+        await ctx.mgmt.call("instance.create", package_path=str(big_path), cards=[card], display_name="超限包")
+    except UmpError as exc:
+        oversized = exc.message
+    not_json = ""
+    try:
+        await ctx.mgmt.call("world.package.validate", package_path=str(junk_path))
+    except UmpError as exc:
+        not_json = exc.message
+    instances_after_package = len(ctx.store.instance_list())
+    card_route = ""
+    try:
+        await ctx.mgmt.call("instance.create", package=package, card_paths=[str(card_path)], display_name="超限卡")
+    except UmpError as exc:
+        card_route = exc.message
+    instances_after_card = len(ctx.store.instance_list())
+
+    created = (await ctx.mgmt.call(
+        "instance.create", package=package, cards=[card], display_name="正常包"
+    ))["instance"]
+    wider = read_json_file(big_path, limit=MAX_CONTAINER_BYTES).get("filler") is not None
+    ok = (
+        "加载限额" in oversized and "加载限额" in not_json and wider
+        and bool(created["id"]) and instances_after_package == 0
+    )
+    return ("PASS" if ok else "FAIL"), (
+        f"加载限额 {MAX_PACKAGE_BYTES} 字节（1 MiB）：结构合法但超限的包经管理面创建 → 被拒"
+        f"（{oversized[:70]}），库中实例数仍 {instances_after_package}；"
+        f"同一超限内容不是 JSON 时 → 仍报同一道闸（{not_json[:60]}）⇒ 拦在解析前；"
+        f"限额内的正常包照常创建={bool(created['id'])}（名称 {created['name']}）；"
+        f"容器件限额 {MAX_CONTAINER_BYTES} 字节更宽，同一超限文件按容器限额读得动={wider}；"
+        f"旁注缺口：角色卡经 instance.create 的 card_paths 走 instances.load_cards 直读"
+        f"（instances.py:381-394，无字节闸），超限卡文件实测结果={card_route[:52] or '未拒绝'}、"
+        f"实例数 {instances_after_package}→{instances_after_card}"
+    )
+
+
+async def h3_trusted_converter(ctx: Ctx) -> tuple[str, str]:
+    """§7.5 / §7.6 可信转换器：没登记不猜；未确认不动数据；副本转换 + 完整校验 + 原子发布。"""
+    from isekai_core import version
+    from isekai_core.world import converters
+
+    package = mypkg()
+    card = mycard(package)
+    old = "9.9"
+
+    def mark_old(instance_id: str) -> None:
+        with ctx.store._lock, ctx.store._conn:
+            ctx.store._conn.execute("UPDATE instance SET data_format=? WHERE id=?", (old, instance_id))
+
+    info = (await ctx.mgmt.call("instance.create", package=package, cards=[card]))["instance"]
+    timeline = ctx.store.timeline_list(info["id"])[0]["id"]
+    ctx.world.activate(info["id"], timeline, now_real=1.7e9)
+    mark_old(info["id"])
+    before = ctx.store.instance_get(info["id"])["setting"]
+
+    unregistered = (await ctx.mgmt.call("instance.convert", instance_id=info["id"], confirmed=True))["convert"]
+    untouched = ctx.store.instance_get(info["id"])["setting"] == before
+    still_old = ctx.store.instance_get(info["id"])["data_format"] == old
+
+    converters.register_converter(
+        old, version.DATA_FORMAT_VERSION, lambda payload: {**payload, "migrated": True}
+    )
+    try:
+        pending = (await ctx.mgmt.call("instance.convert", instance_id=info["id"], confirmed=False))["convert"]
+        unconfirmed_same = ctx.store.instance_get(info["id"])["setting"] == before
+        converted = (await ctx.mgmt.call("instance.convert", instance_id=info["id"], confirmed=True))["convert"]
+        row = ctx.store.instance_get(info["id"])
+        exports = sorted(p.name for p in ctx.cfg.paths.exports.glob("*.isekai.json")) if ctx.cfg.paths.exports.exists() else []
+        frozen = [item["state"] for item in ctx.store.timeline_list(info["id"])]
+        migrated = json.loads(row["setting"]).get("migrated") is True
+
+        bad = (await ctx.mgmt.call("instance.create", package=package, cards=[card], display_name="坏转换"))["instance"]
+        mark_old(bad["id"])
+        bad_before = ctx.store.instance_get(bad["id"])["setting"]
+        converters.register_converter(
+            old, version.DATA_FORMAT_VERSION, lambda payload: {**payload, "world_package": {"meta": {}}}
+        )
+        refused = ""
+        try:
+            await ctx.mgmt.call("instance.convert", instance_id=bad["id"], confirmed=True)
+        except UmpError as exc:
+            refused = f"{exc.code}: {exc.message}"
+        bad_row = ctx.store.instance_get(bad["id"])
+        bad_intact = bad_row["setting"] == bad_before and bad_row["data_format"] == old
+    finally:
+        converters.unregister_converter(old, version.DATA_FORMAT_VERSION)
+
+    ok = (
+        not unregistered["converted"] and unregistered["state"] == "blocked"
+        and "兼容版本" in str(unregistered.get("hint"))
+        and untouched and still_old
+        and pending["needs_confirmation"] and not pending["converted"] and unconfirmed_same
+        and converted["converted"] and converted["from"] == old and bool(converted["safety"])
+        and row["data_format"] == version.DATA_FORMAT_VERSION and row["rules_version"] == version.RULES_VERSION
+        and migrated and all(state == "frozen" for state in frozen)
+        and bool(refused) and bad_intact
+    )
+    return ("PASS" if ok else "FAIL"), (
+        f"数据格式 {old}（未登记）→ 转换请求回 state={unregistered['state']}、converted={unregistered['converted']}、"
+        f"提示={str(unregistered.get('hint'))[:40]}，实例设定一字未动={untouched}、格式仍 {still_old and old}；"
+        f"登记 {old}→{version.DATA_FORMAT_VERSION} 后：confirmed=False → needs_confirmation="
+        f"{pending.get('needs_confirmation')}、converted={pending['converted']}、数据未动={unconfirmed_same}；"
+        f"confirmed=True → converted={converted['converted']}、from={converted.get('from')}、"
+        f"可恢复副本={converted['safety'] and exports}、格式转成 {row['data_format']} / 规则 {row['rules_version']}、"
+        f"设定里带转换器产物={migrated}、本线状态={frozen}（先冻结，等用户明确激活）；"
+        f"转换器产出非法包 → 不发布（{refused[:46]}），实例设定与格式仍原样={bad_intact}"
+    )
+
+
 CHECKS: list[Check] = [
     Check("A1", "附录 C1 / §3.3", "改 / 删源模板与角色卡后既有实例内容不变", a1_source_decoupled, "world/instances.py:114-135, world/package.py:153-168"),
     Check("A2", "附录 C1 / §3.4", "锁定实例不能改历法或既有角色卡（无写入口）", a2_locked_no_writer, "world/ops.py:299-505（无设定写 op）"),
@@ -1695,6 +1983,7 @@ CHECKS: list[Check] = [
     Check("A5", "§3.7 版本与生命周期", "同一补卡请求重试返回原子发布结果", a5_join_idempotent, "world/ops.py:250-264"),
     Check("A6", "§3.7 语义 / 目标线与加入事件", "补卡可自定义加入世界事件并登记", a6_join_event, "runtime/service.py:2835-2944"),
     Check("B1", "附录 C2", "新建与修订共用校验；失败不覆盖确认版本", b1_shared_validation, "world/generator.py, world/ops.py:341-348"),
+    Check("B2", "附录 C2 / §2.5", "两端解释同一固化产物一致（真 WS 与进程内通道同一结论）", b2_two_transports_same_verdict, "world/ops.py:38-103, local_channel.py:89-165"),
     Check("C1", "附录 C3 / §7.4", "创建 / 导入 / 重命名并发下仍全局唯一", c1_naming_unique, "world/package.py:30-48, world/instances.py:203-216"),
     Check("C2", "§7.2", "原始名称记录独立，改名不改它，导入优先读它", c2_original_name, "world/package.py:127-135, world/instances.py:70-75"),
     Check("D1", "附录 C4 / §7.1", "多线导出再导入恢复对话 / 披露 / 记忆 / 引用", d1_roundtrip, "world/portable.py:40-121, store.py:2163-2272"),
@@ -1718,32 +2007,13 @@ CHECKS: list[Check] = [
     Check("G4", "§7.6", "compatible / convertible / blocked 三态；blocked 阻断推进", g4_compat_states, "world/instances.py:141-158, runtime/service.py:1390-1397"),
     Check("G5", "§7.5", "路径穿越 / 绝对路径 / 可执行载荷不生效", g5_hostile_payload, "world/portable.py:144-154, ops.py:106-118"),
     Check("G6", "§3.5", "管理面不暴露性格数值 / 记忆 / 事件正文", g6_black_box_surface, "world/ops.py:427-454, 485-486"),
+    Check("H1", "§3.6 条 2/3/4", "回填十年一卷 × 10–20 条一批；选载范围对应；产物不合法不固化", h1_backfill_plan, "runtime/events.py:450-572, world/ops.py:549-564"),
+    Check("H2", "§2.3", "读取前按字节数拦：超限包被拒、正常包照常加载", h2_load_byte_limit, "world/package.py:138-173, world/ops.py:144-159"),
+    Check("H3", "§7.5 / §7.6", "没登记不猜；未确认不动；副本转换 + 完整校验 + 原子发布", h3_trusted_converter, "world/converters.py, world/instances.py:207-272"),
 ]
 
-DEFERRED_NOTE: dict[str, str] = {
-    "B2": (
-        "附录 C2 尾句「两端解释同一包一致」：仓库内无安卓端实现（DESIGN.md 阶段 7 仍未落地），"
-        "桌面端与 CLI 都走同一 world.ops 面（ops.py:38-103），没有第二套校验器可供实测；"
-        "同一条款在 WORLD_SETTING_SPEC §2.5「共享生成器」处也只能核到「单端一致」。"
-    ),
-    "H1": (
-        "§3.6 创建期历史回填的「一档文本」批量编纂与联合校验步骤："
-        "本仓库的回填只把包内已写定的初始事件 / 传闻落成条目（runtime/events.py:336-400，不施加效果、"
-        "不生成文本、不抽样骨架），没有可实测的「分时代抽样 / 10–20 条一批 / 传本选载范围」行为；"
-        "该段设计属实现级待定项（§十），本次不作为失败计。"
-    ),
-    "H2": (
-        "§2.3「文件规模」限额：结构限额（深度 / 节点 / 文本 / 集合）实测都生效，"
-        "但读取前没有按字节数的文件规模上限（world/package.py:138-150 直接 read_text）；"
-        "超过 1 MiB 的包只要能通过结构限额就会被读进来。属「数值实现时标定」范围，记 DEFERRED。"
-    ),
-    "H3": (
-        "§7.5 / §7.6「可信转换器」：仓库里没有任何转换器实现（无注册表、无执行路径），"
-        "instances.compatibility 只产出 compatible / convertible / blocked 判定，convertible 之后没有"
-        "「在副本上转换 → 重新完整校验 → 原子发布」的行为可实测；§3.7「补卡后再次补入必须使用新的加入版本」"
-        "里的旧成员资格撤销路径也走同一处缺口。属 §十「转换器注册格式」待定项，记 DEFERRED。"
-    ),
-}
+# 暂无留待实现级待定的条款（原 B2 / H1 / H2 / H3 已随实现落地转为行为断言）。
+DEFERRED_NOTE: dict[str, str] = {}
 
 
 async def main() -> int:

@@ -20,7 +20,7 @@ from ..store import Store
 from ..version import APP_VERSION, DATA_FORMAT_VERSION, RULES_VERSION
 from . import converters
 from .cards import validate_assembly
-from .package import PackageError, clone_package, ensure_original_name, normalize_name, unique_name
+from .package import PackageError, clone_package, ensure_original_name, normalize_name, unique_name, PackageError, read_json_file
 from .validate import validate_package
 
 log = get_logger("isekai.world.instances")
@@ -383,11 +383,9 @@ def load_cards(package: dict[str, Any], card_paths: list[str]) -> list[dict[str,
     cards: list[dict[str, Any]] = []
     for path in card_paths:
         try:
-            raw = json.loads(open(path, encoding="utf-8").read())
-        except FileNotFoundError as exc:
-            raise InstanceError(f"角色卡文件不存在：{path}") from exc
-        except json.JSONDecodeError as exc:
-            raise InstanceError(f"角色卡不是合法 JSON（{path}）：{exc}") from exc
+            raw = read_json_file(path, what="角色卡文件")  # 与包 / 导入件共用同一道闸（含读取前字节限额）
+        except PackageError as exc:
+            raise InstanceError(str(exc)) from exc
         if not isinstance(raw, dict):
             raise InstanceError(f"角色卡顶层必须是对象：{path}")
         cards.append(raw)

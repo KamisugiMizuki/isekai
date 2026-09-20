@@ -1299,6 +1299,16 @@ class Store:
             return None
         return row
 
+    def channel_forget(self, ref: str) -> dict[str, int]:
+        """卸载通道：删登记与绑定（会话 / 消息 / 角色历史一概不动）。"""
+        row = self.channel_get(str(ref)) or self.channel_by_name(str(ref))
+        if row is None:
+            return {"channel": 0, "threads": 0}
+        with self._lock, self._conn:
+            threads = self._conn.execute("DELETE FROM thread WHERE channel_id=?", (row["id"],)).rowcount
+            channels = self._conn.execute("DELETE FROM channel_instance WHERE id=?", (row["id"],)).rowcount
+        return {"channel": max(0, int(channels or 0)), "threads": max(0, int(threads or 0))}
+
     def channel_touch(self, channel_id: str) -> None:
         with self._lock, self._conn:
             self._conn.execute(

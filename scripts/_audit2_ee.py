@@ -1277,20 +1277,89 @@ def b9b() -> str:
 
 
 @check("B10", "附录B#10 「尚未生成」与「已确认缺载」必须区分，缺载不得当作删改证据")
-def b10() -> Any:
-    hits: list[str] = []
-    for path in sorted((ROOT / "isekai_core").rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        for word in ("缺载", "尚未生成", "未展开", "lacuna"):
-            if word in text:
-                hits.append(f"{path.relative_to(ROOT)}:{word}")
-    coverage = [f"{p.relative_to(ROOT)}" for p in sorted((ROOT / "isekai_core").rglob("*.py"))
-                if "coverage" in p.read_text(encoding="utf-8")]
-    return ("DEFERRED",
-            f"运行期没有「已确认缺载 / 尚未生成 / 已展开」的状态区分：全仓 isekai_core 命中 "
-            f"{len(hits)} 处（{hits[:3]}）；'coverage' 只出现在 {coverage[:2]} 的静态校验里，"
-            "惰性展开也没有「本来源缺载」的记录形态。SPEC §十一 自列残余"
-            "（「历史回填的候选槽语义与体裁选取规则；惰性展开的触发条件、预算与派生表示的存储方式」）")
+def b10() -> str:
+    """§3.4 惰性展开的三种覆盖状态在库里可区分，且缺载/丢弃都不动原记载。
+
+    断言搬自 tests/test_claim_coverage.py（那里的 FakeRenderLLM 与本脚本的 ScriptedLLM 同为
+    `async chat(messages, *, max_tokens, timeout, temperature) -> str` 的脚本模型；
+    参考测试里先渲染一条说法只为拿到一条记载，这里直接用 `inject` 落同形的说法行）。
+    """
+    case = Case(seed="seed-b10")
+    try:
+        cfg = load_config(case.dir / "cfg")
+        case.activate()
+        # 两条原始记载：A 走「说不可考 → 已确认缺载」，B 走「带新数字 → 被护栏丢弃」。
+        # 同一传本只会展开一次（命中既有派生记录即复用），故两条各自独立。
+        case.inject(
+            summary="退潮延误，驿站停摆 2 日",
+            claims=[
+                {"id": "cl-b10-a", "text": "驿站传：退潮延误，驿站停摆 2 日", "source_id": "src-1"},
+                {"id": "cl-b10-b", "text": "驿路杂记：停摆 2 日，其余不载", "source_id": "src-1"},
+            ],
+        )
+
+        def coverage_of(claim_id: str) -> dict[str, Any]:
+            return world_ops.dispatch(
+                cfg, case.store, "claim.coverage",
+                {"instance_id": case.instance_id, "timeline_id": case.timeline_id, "claim_id": claim_id},
+            )["coverage"]
+
+        def text_of(claim_id: str) -> str:
+            return str(next(r for r in case.claims() if str(r["id"]) == claim_id)["text"])
+
+        def expand(claim_id: str, reply: str) -> dict[str, Any]:
+            return asyncio.run(world_ops.dispatch_async(
+                cfg, ScriptedLLM([reply]), "event.expand",
+                {"instance_id": case.instance_id, "timeline_id": case.timeline_id, "claim_id": claim_id},
+                store=case.store,
+            ))
+
+        before = {cid: text_of(cid) for cid in ("cl-b10-a", "cl-b10-b")}
+        pending = coverage_of("cl-b10-a")
+        if str(pending.get("state")) != "pending" or "尚未生成" not in str(pending.get("note") or ""):
+            raise Violation(f"未展开的记载没有记成「尚未生成」：{_dbg(pending)}",
+                            where="isekai_core/world/ops.py:571 claim.coverage（无覆盖行时按 pending 兜底）")
+        if text_of("cl-b10-a") != before["cl-b10-a"]:
+            raise Violation("读取覆盖状态改动了记载文本")
+
+        absent = expand("cl-b10-a", "此事不可考，没有记下更多。")
+        lacuna = coverage_of("cl-b10-a")
+        if str(absent.get("state")) != "absent" or not absent.get("derived"):
+            raise Violation(f"说「不可考」的展开没有被记成「已确认缺载」：{_dbg(absent)}",
+                            where="isekai_core/world/ops.py:1011 _expand_claim（render.declares_absence → state=absent）")
+        if str(lacuna.get("state")) != "absent" or "缺载≠删改" not in str(lacuna.get("note") or ""):
+            raise Violation(f"覆盖状态没有落成「已确认缺载 / 缺载≠删改」：{_dbg(lacuna)}")
+        if str(lacuna.get("derived_id") or "") != str(absent["derived"]):
+            raise Violation(f"派生记录没有回填到覆盖状态：派生 {absent.get('derived')!r} vs 覆盖 {_dbg(lacuna)}")
+        if text_of("cl-b10-a") != before["cl-b10-a"]:
+            raise Violation("缺载被当成删改：原记载文本被改写",
+                            where="isekai_core/world/ops.py:995 _expand_claim（展开产物另存派生记录，不回写原文）")
+        derived = [str(r["id"]) for r in case.claims() if str(r.get("derived_from") or "") == "cl-b10-a"]
+        if derived != [str(absent["derived"])]:
+            raise Violation(f"展开产物不是新增的派生记录：{derived}")
+
+        rejected = expand("cl-b10-b", "那年死了 777 个人。")
+        note = str(rejected.get("note") or "")
+        if str(rejected.get("state")) != "pending" or "已确认缺载" not in note or "尚未生成" in note:
+            raise Violation(f"被护栏丢弃的展开没有与「尚未生成」区分开：{_dbg(rejected)}",
+                            where="isekai_core/world/ops.py:974 _expand_claim（数字护栏丢弃 → state=pending）")
+        dropped = coverage_of("cl-b10-b")
+        if str(dropped.get("state")) != "pending":
+            raise Violation(f"被丢弃的展开被写成了已确定的覆盖状态：{_dbg(dropped)}")
+        # 覆盖面只在「展开被采纳」时写行：被丢弃的这次读回仍是默认的「尚未生成」，
+        # 三次尝试的区分（尚未生成 / 已确认缺载 / 已展开）落在 expand 的返回 note 与调用账本上 ——
+        # 如实记进 observed，不放宽判据。
+        if case.store.claim_derived(case.instance_id, case.timeline_id, "cl-b10-b") is not None:
+            raise Violation("不合规的展开落了派生记录")
+        if text_of("cl-b10-b") != before["cl-b10-b"]:
+            raise Violation("护栏丢弃展开时改写了原记载")
+        return (f"未展开 → pending（note「{pending['note']}」）；说「不可考」的展开 → absent（派生 "
+                f"{absent['derived']} 回填覆盖状态，note「{lacuna['note']}」，原记载 {before['cl-b10-a'][:14]!r} 一字未动）；"
+                f"带新数字 777 的展开被丢弃 → 仍 pending（note「{note[:26]}…」，未落派生记录，原记载不变；"
+                f"覆盖行仍为默认「{dropped.get('note')}」—— 被丢弃与从未展开在覆盖面上同报 pending，"
+                f"区分只在 expand 的返回与调用账本）")
+    finally:
+        case.close()
 
 
 #==== B11: 未登记对象
@@ -1985,17 +2054,159 @@ def s6env() -> str:
 
 @check("§六 同刻", "正文§六 多事件同刻覆盖采用固定优先规则与稳定标识排序")
 def s6prio() -> str:
-    hits: list[str] = []
-    for path in sorted((ROOT / "isekai_core").rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        for word in ("优先表", "priority", "priority_table", "同刻"):
-            if word in text:
-                hits.append(f"{path.relative_to(ROOT)}:{word}")
-    same = [h for h in hits if not h.endswith("priority")]
-    return ("DEFERRED",
-            f"事件模板与运行层都没有同刻覆盖的优先规则声明：全仓 isekai_core 命中 {len(hits)} 处，"
-            f"其中非预算相关的 {same[:4]}；同刻多效果各自独立施加（service._world_event_rows 逐候选落行），"
-            "SPEC §十一 自列残余「同刻多效果优先规则」")
+    """同刻顺序只由内容定：优先档位（固定表 / 模板声明）+ 标识排序，与喂入顺序无关。
+
+    断言搬自 tests/test_same_instant.py（`effect_window` 读回 (id, priority, seq)）。
+    """
+    case = Case(seed="seed-s6prio")
+    try:
+        case.activate()
+        at = case.watermark()
+
+        def effect(ident: str, kind: str, instant: int, priority: int | None = None) -> dict[str, Any]:
+            row = {
+                "id": ident, "instance_id": case.instance_id, "timeline_id": case.timeline_id,
+                "event_id": f"ev-{ident}", "target": "rl-1", "kind": kind, "family": "",
+                "from_world": instant, "expiry": "until_cleared", "recovery": "",
+                "active": 1, "cleared_at": None,
+            }
+            if priority is not None:
+                row["priority"] = priority
+            return row
+
+        def feed(rows: list[dict[str, Any]], *, processed_world: int,
+                 events_rows: list[dict[str, Any]] | None = None) -> bool:
+            return case.store.apply_runtime_batch(
+                timeline_id=case.timeline_id,
+                generation=int(case.store.clock_get(case.timeline_id)["generation"]),
+                processed_world=processed_world, catching_up=False,
+                events=events_rows or [], effects=rows,
+            )
+
+        def event_row(ident: str, kinds: list[str], instant: int) -> dict[str, Any]:
+            """与 service.py:2503 同形的引擎事件行（档位 = 事件内最强效果）。"""
+            candidate = {"effects": [{"kind": k, "target": "rl-1", "expiry": "until_cleared"} for k in kinds]}
+            return {
+                "id": ident, "instance_id": case.instance_id, "timeline_id": case.timeline_id,
+                "world_seconds": instant, "seq": 11, "kind": "world", "family": "",
+                "template": "audit2.same-instant", "source": "engine", "summary": f"{ident} 骨架",
+                "detail": f"{ident} 骨架", "text_source": "template",
+                "effects": candidate["effects"], "share_value": 0, "importance": 0.5,
+                "created_real": 0.0, "priority": events.event_priority(candidate),
+            }
+
+        def window(instant: int, prefix: str) -> list[tuple[str, int, int]]:
+            return [(str(r["id"]), int(r["priority"]), int(r["seq"]))
+                    for r in case.store.effect_window(case.instance_id, case.timeline_id, until=instant)
+                    if int(r["from_world"]) == instant and str(r["id"]).startswith(prefix)]
+
+        def check_shape(rows: list[tuple[str, int, int]], *, want_ids: list[str], instant: int) -> None:
+            if [item[0] for item in rows] != want_ids:
+                raise Violation(f"同刻 {instant} 的顺序不是「优先档位 → 标识」：{rows}（应为 {want_ids}）",
+                                where="isekai_core/store.py:2395 _same_instant_order（入库前定序）")
+
+        # ① 固定档位：route_blocked 80 > environment_state 60 > rumor_spread 10，标识 a<c<b 会打乱字面序
+        straight = [
+            effect("fx-s6-a", "route_blocked", at),
+            effect("fx-s6-b", "rumor_spread", at),
+            effect("fx-s6-c", "environment_state", at),
+        ]
+        if not feed(list(reversed(straight)), processed_world=at):  # 反着喂
+            raise Violation("同刻效果批次被拒（世代 / 水位校验），检查无法进行")
+        first = window(at, "fx-s6-")
+        check_shape(first, want_ids=["fx-s6-a", "fx-s6-c", "fx-s6-b"], instant=at)
+        if [item[2] for item in first] != [0, 1, 2]:
+            raise Violation(f"同刻顺序没有写进 seq：{first}", where="isekai_core/store.py:684 _same_instant_order")
+        want_prio = [events.EFFECT_PRIORITY[k] for k in ("route_blocked", "environment_state", "rumor_spread")]
+        if [item[1] for item in first] != want_prio:
+            raise Violation(f"读回的档位不是固定表的值 {want_prio}：{first}",
+                            where="isekai_core/store.py:2517 _row_priority（未声明的按 EFFECT_PRIORITY 补）")
+
+        # ② 反着喂第二组（同三个类型、标识顺序也反）→ 读回同一形状，顺序不随调用方迭代顺序
+        other = [
+            effect("fx-s6-d", "route_blocked", at + 1),
+            effect("fx-s6-e", "rumor_spread", at + 1),
+            effect("fx-s6-f", "environment_state", at + 1),
+        ]
+        if not feed(list(reversed(other)), processed_world=at + 1):
+            raise Violation("第二组同刻效果批次被拒")
+        second = window(at + 1, "fx-s6-")
+        check_shape(second, want_ids=["fx-s6-d", "fx-s6-f", "fx-s6-e"], instant=at + 1)
+
+        # ③ 模板 / 调用方声明的 priority 覆盖固定档位
+        if not feed(
+            [effect("fx-s6-low", "route_blocked", at + 2),
+             effect("fx-s6-high", "rumor_spread", at + 2, priority=99)],
+            processed_world=at + 2,
+        ):
+            raise Violation("声明式 priority 的批次被拒")
+        third = window(at + 2, "fx-s6-")
+        check_shape(third, want_ids=["fx-s6-high", "fx-s6-low"], instant=at + 2)
+        if [item[1] for item in third] != [99, events.EFFECT_PRIORITY["route_blocked"]]:
+            raise Violation(f"声明档位没有覆盖固定档位：{third}")
+
+        # ④ 同刻多事件：档位 = 事件内最强效果（service.py:2517 盖章），同刻按档位定序。
+        # 这里构造是因为真实引擎几乎不产同刻多事件（⑤ 实测：10 天里 19 条世界级事件落在 18 个时刻，仅 1 例同刻）。
+        if not feed(
+            [],
+            processed_world=at + 3,
+            events_rows=[event_row("ev-s6-e1", ["rumor_spread"], at + 3),
+                         event_row("ev-s6-e2", ["route_blocked"], at + 3)],
+        ):
+            raise Violation("同刻两事件的批次被拒")
+        ev_order = [(str(r["id"]), int(r["seq"])) for r in case.ev_rows() if str(r["id"]).startswith("ev-s6-")]
+        if [item[0] for item in ev_order] != ["ev-s6-e2", "ev-s6-e1"]:
+            raise Violation(f"同刻两事件没有按优先档位定序（按标识会给出 e1 在前）：{ev_order}",
+                            where="isekai_core/store.py:2394 _same_instant_order(at_key='world_seconds') "
+                                  "+ isekai_core/runtime/service.py:2517 event_priority")
+
+        # ⑤ 真实推进：引擎自己的效果行也走同一处定序，且同刻多效果确实在真实数据里出现
+        case.advance(10)
+        real = [r for r in case.store.effect_window(case.instance_id, case.timeline_id, until=10**15)
+                if not str(r["id"]).startswith("fx-s6-")]
+        groups: dict[int, list[dict[str, Any]]] = {}
+        for row in real:
+            groups.setdefault(int(row["from_world"]), []).append(row)
+        multi = [g for g in groups.values() if len(g) > 1]
+        # 同一时刻由两个批次各写一行时会撞上同一个 seq，读回退化成按标识：那不是顺序失效，跳过并计数
+        skip = [g for g in groups.values() if len({int(x["seq"]) for x in g}) != len(g)]
+        off = [(moment, [str(x["id"]) for x in g]) for moment, g in groups.items()
+               if g not in skip and [str(x["id"]) for x in g] !=
+               [str(x["id"]) for x in sorted(g, key=lambda x: (-int(x["priority"]), str(x["id"])))]]
+        if off:
+            raise Violation(f"真实推进里同刻效果的读回顺序不是「档位 → 标识」：{off[:2]}",
+                            where="isekai_core/store.py:2395 _same_instant_order → effect_window 的 (from_world, seq, id)")
+        if not multi:
+            raise Violation("推进 10 天没有出现任何同刻多效果，检查在真实数据上落空")
+        by_instant: dict[int, int] = {}
+        for row in engine_rows(case):
+            by_instant[int(row["world_seconds"])] = by_instant.get(int(row["world_seconds"]), 0) + 1
+        same_instant_events = sum(1 for n in by_instant.values() if n > 1)
+
+        # ⑥ 事件档位取事件内最强效果；bool 不算显式声明；空效果落到 DEFAULT
+        weakest, strongest = events.EFFECT_PRIORITY["rumor_spread"], events.EFFECT_PRIORITY["route_blocked"]
+        if strongest <= weakest:
+            raise Violation(f"固定表本身不成链：route_blocked={strongest} rumor_spread={weakest}")
+        if events.effect_priority({"kind": "public_notice", "priority": 99}) != 99:
+            raise Violation("显式声明的 priority 不被采纳",
+                            where="isekai_core/runtime/events.py:45 effect_priority")
+        if events.effect_priority({"kind": "public_notice", "priority": True}) != events.EFFECT_PRIORITY["public_notice"]:
+            raise Violation("bool 被当成显式档位")
+        if events.event_priority({"effects": [{"kind": "rumor_spread"}, {"kind": "route_blocked"}]}) != strongest:
+            raise Violation("事件档位没有取最强效果", where="isekai_core/runtime/events.py:55 event_priority")
+        if events.event_priority({"effects": []}) != events.DEFAULT_EFFECT_PRIORITY:
+            raise Violation("无效果事件的档位不是默认值")
+        return (f"同刻三效果固定档位 route_blocked {want_prio[0]} > environment_state {want_prio[1]} > "
+                f"rumor_spread {want_prio[2]}：反着喂 → 读回 {[i[0] for i in first]}（seq {[i[2] for i in first]}）；"
+                f"另三个反序喂 → {[i[0] for i in second]}，形状一致；声明 priority=99 压过固定档位 → "
+                f"{[i[0] for i in third]}（档位 {[i[1] for i in third]}）；同刻两事件按事件内最强效果定序 → "
+                f"{[i[0] for i in ev_order]}；真实推进 10 天 {len(real)} 条效果 / {len(groups)} 个时刻，"
+                f"{len(multi)} 个时刻同刻多效果且读回顺序全为「档位 → 标识」（跳过的撞 seq 组 {len(skip)} 个；"
+                f"引擎 {len(engine_rows(case))} 条世界级事件分布在 {len(by_instant)} 个时刻，"
+                f"同刻多事件实测 {same_instant_events} 例）；event_priority 取最强效果 "
+                f"（{strongest}）、空效果为 {events.DEFAULT_EFFECT_PRIORITY}")
+    finally:
+        case.close()
 
 
 @check("§八3 职位", "正文§八#3 用户「以合法新事件改变某职位的持有者」应有可表达、不静默失效的路径")

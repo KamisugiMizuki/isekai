@@ -37,3 +37,15 @@ def test_container_limit_is_wider_than_package_limit(tmp_path) -> None:
     with pytest.raises(PackageError):
         read_json_file(path)
     assert read_json_file(path, limit=MAX_CONTAINER_BYTES)["x"], "容器件走更宽的那道闸"
+
+
+def test_oversized_card_file_is_rejected_before_reading(tmp_path) -> None:
+    """角色卡走与世界包同一道闸：超限在读取前被拒（不是先读进来再校验）。"""
+    from isekai_core.world.instances import InstanceError, load_cards
+
+    big = tmp_path / "big_card.json"
+    big.write_text(json.dumps({"filler": "x" * (MAX_PACKAGE_BYTES + 1)}, ensure_ascii=False), encoding="utf-8")
+    assert big.stat().st_size > MAX_PACKAGE_BYTES
+    with pytest.raises(InstanceError) as exc:
+        load_cards({}, [str(big)])
+    assert "加载限额" in str(exc.value)

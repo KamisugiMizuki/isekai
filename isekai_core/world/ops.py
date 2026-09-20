@@ -21,6 +21,7 @@ from ..store import Store
 from ..ump import Err, UmpError
 from .cards import template_card, validate_assembly, validate_card
 from .generator import fill_section, generate_card, generate_package, revise_package
+from . import converters
 from .instances import (
     InstanceError,
     create_instance,
@@ -624,7 +625,7 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             info = import_instance(store, container, display_name=args.get("display_name") or None)
             _ensure_runtime(runtime, info["id"])
             return {"instance": info}
-    except (InstanceError, PackageError) as exc:
+    except (InstanceError, PackageError, converters.ConverterError) as exc:
         raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
     except OSError as exc:
         raise UmpError(Err.INTERNAL, f"文件操作失败：{type(exc).__name__}", retryable=False) from exc
@@ -1117,7 +1118,7 @@ async def dispatch_async(
     except LLMError as exc:
         code = Err.LLM_NOT_CONFIGURED if exc.code == "llm_not_configured" else Err.GENERATION_FAILED
         raise UmpError(code, f"生成失败：{exc.code}", retryable=exc.retryable) from exc
-    except (InstanceError, PackageError) as exc:
+    except (InstanceError, PackageError, converters.ConverterError) as exc:
         raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
     return {"candidate": package, "errors": errors, "valid": not errors, "usage": usage}
 

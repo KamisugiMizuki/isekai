@@ -26,11 +26,13 @@ sys.path.insert(0, str(REPO))
 from websockets.asyncio.client import connect as ws_connect  # noqa: E402
 from websockets.exceptions import ConnectionClosed  # noqa: E402
 
+from isekai_core import plugins  # noqa: E402
 from isekai_core import ump  # noqa: E402
 from isekai_core.app import build_runtime  # noqa: E402
 from isekai_core.client import MgmtClient, UmpClient  # noqa: E402
 from isekai_core.config import load_config  # noqa: E402
 from isekai_core.llm import FakeLLM, LLMError  # noqa: E402
+from isekai_core.local_channel import InProcessChannel  # noqa: E402
 from isekai_core.log import setup_logging  # noqa: E402
 from isekai_core.ump import UmpError  # noqa: E402
 from isekai_core.world.example import DAY, example_card, example_package  # noqa: E402
@@ -1455,6 +1457,457 @@ async def k35(ctx: Ctx) -> str:
             f"壳侧重连有界：RECONNECT_DELAYS_MS=[1000,2000,4000,8000,16000] 用尽后停止并提示重启（desktop/src/main.ts:244,301-305，静态复核）")
 
 
+# --------------------------------------------- 插件宿主 / 进程内通道 / 通知 / 能力边界（§3.1–§3.4、§2.5）
+
+#: 探针用最小通道插件（UMP over stdio）：启动留痕、入口参数原样记下、握手后把环境落盘
+PLUGIN_STUB = '''"""探针用最小通道插件（UMP over stdio）。"""
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def send(frame):
+    sys.stdout.write(json.dumps(frame, ensure_ascii=False) + "\\n")
+    sys.stdout.flush()
+
+
+with open(os.path.join(HERE, "booted.txt"), "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(sys.argv, ensure_ascii=False) + "\\n")
+
+send({
+    "ump": "1.0", "type": "hello", "id": "p-1", "ts": 0,
+    "payload": {
+        "channel": {"id": os.environ["ISEKAI_PLUGIN_ID"], "name": "探针插件", "version": "0.1.0"},
+        "capabilities": {"segments": True, "status": True},
+        "auth": {"credential": os.environ["ISEKAI_PLUGIN_CREDENTIAL"]},
+    },
+})
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    frame = json.loads(line)
+    if frame.get("type") == "hello_ack":
+        with open(os.path.join(HERE, "seen.json"), "w", encoding="utf-8") as fh:
+            json.dump({"state": frame["payload"].get("state"), "env": dict(os.environ)}, fh, ensure_ascii=False)
+'''
+
+#: 探针用「立刻崩溃」插件：启动次数留痕，用来看有没有重启风暴
+PLUGIN_CRASH = '''"""探针用「立刻崩溃」插件。"""
+import os
+import sys
+
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "starts.txt"), "a", encoding="utf-8") as fh:
+    fh.write("start\\n")
+sys.stderr.write("boom: 探针插件立刻退出\\n")
+sys.exit(3)
+'''
+
+#: 探针用「活着但永不握手」插件：把「启用 = 握手成功才 running」这条判据逼到底
+PLUGIN_HANG = '''"""探针用「永不握手」插件：只留痕，不发 hello，也不退出。"""
+import os
+import sys
+
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "booted.txt"), "a", encoding="utf-8") as fh:
+    fh.write("start\\n")
+for _line in sys.stdin:
+    pass
+'''
+
+#: 探针用「刷 stderr」插件：握手照做，同时灌 300 行 stderr（其中一行 1200 字符）
+PLUGIN_CHATTY = '''"""探针用「刷 stderr」插件。"""
+import json
+import os
+import sys
+
+for index in range(300):
+    sys.stderr.write("line-%03d%s\\n" % (index, "x" * 1200 if index == 299 else ""))
+sys.stderr.flush()
+
+
+def send(frame):
+    sys.stdout.write(json.dumps(frame, ensure_ascii=False) + "\\n")
+    sys.stdout.flush()
+
+
+send({
+    "ump": "1.0", "type": "hello", "id": "p-1", "ts": 0,
+    "payload": {
+        "channel": {"id": os.environ["ISEKAI_PLUGIN_ID"], "name": "话痨插件", "version": "0.1.0"},
+        "capabilities": {"segments": False, "status": False},
+        "auth": {"credential": os.environ["ISEKAI_PLUGIN_CREDENTIAL"]},
+    },
+})
+
+for _line in sys.stdin:
+    pass
+'''
+
+
+def write_plugin(folder: Path, plugin_id: str, source: str, *, entry: list[str] | None = None,
+                 version: str = "0.1.0") -> Path:
+    """按 §3.1 的目录制写一份插件（manifest + 入口），返回插件目录。"""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "main.py").write_text(source, encoding="utf-8")
+    manifest = {
+        "id": plugin_id, "name": f"{plugin_id} 探针插件", "version": version, "ump": "1.x",
+        "entry": entry or ["python", "main.py"], "description": "审计探针", "author": "audit2",
+    }
+    (folder / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    return folder
+
+
+def plugin_host(h: Harness, tag: str) -> plugins.PluginHost:
+    """一块独立插件目录 + 宿主（同 app.build_runtime 的构造方式）。"""
+    return plugins.PluginHost(
+        cfg=h.cfg, store=h.store, server=h.runtime.server, folder=h.cfg.paths.root / "plugins" / tag
+    )
+
+
+def plugin_env(plugin_dir: Path) -> dict[str, str]:
+    """读探针插件落盘的环境快照（握手成功那一刻的 os.environ）。"""
+    return json.loads((plugin_dir / "seen.json").read_text(encoding="utf-8"))["env"]
+
+
+async def until(predicate: Callable[[], bool], *, timeout: float = 8.0, step: float = 0.1) -> bool:
+    """等一个条件成立（子进程是另一条时间线，落盘 / 退出的可见性有延迟）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(step)
+    return bool(predicate())
+
+
+async def local_frames(channel: InProcessChannel, wanted: set[str], *, pre: list[dict[str, Any]] | None = None,
+                       timeout: float = 10.0) -> list[dict[str, Any]]:
+    """进程内通道没有 drain：凑齐想看的帧类型后返回（帧都在这条通道自己的 sent 缓冲里）。"""
+    seen = list(pre or [])
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not wanted <= {str(frame.get("type")) for frame in seen}:
+        seen.extend(channel.ws.take())
+        await asyncio.sleep(0.05)
+    seen.extend(channel.ws.take())
+    return seen
+
+
+async def d01(ctx: Ctx) -> str:
+    """§3.1：目录制 manifest 扫描 / 登记——只读清单、不跑代码；坏清单与缺入口在启用前就报出来。"""
+    folder = ctx.a.cfg.paths.root / "plugins" / "d01"
+    write_plugin(folder / "boot", "aud2-boot", PLUGIN_STUB)
+    (folder / "flat.json").write_text(
+        json.dumps({"id": "aud2-flat", "name": "平铺清单插件", "version": "0.2.0", "ump": "1.x",
+                    "entry": ["python", "main.py"], "description": "平铺放法", "author": "audit2"},
+                   ensure_ascii=False), encoding="utf-8")
+    (folder / "broken.json").write_text("{ 坏清单", encoding="utf-8")
+    write_plugin(folder / "missing", "aud2-missing", PLUGIN_STUB, entry=["python-nonexistent", "main.py"])
+    scanned = {str(item["id"]): item for item in plugins.scan(folder)}
+    host = plugin_host(ctx.a, "d01")
+    plugins.install(host)  # 挂上宿主：此后 plugin.list / plugin.enable 走同一份登记
+    listed = {str(item["id"]): item for item in host.list_plugins()}
+    via_mgmt = (await ctx.mgmt_a.call("plugin.list"))["plugins"]
+    item = listed.get("aud2-boot") or {}
+    assert item.get("id") == "aud2-boot" and item.get("name") == "aud2-boot 探针插件", listed
+    assert item.get("version") == "0.1.0" and item.get("entry") == ["python", "main.py"], item
+    assert item.get("errors") == [] and item.get("state") == "registered", item
+    assert "aud2-flat" in scanned and "aud2-flat" in listed, f"平铺 <root>/*.json 清单未识别：{sorted(scanned)}"
+    broken = scanned.get("") or {}
+    assert broken.get("errors"), f"坏清单未如实报错：{scanned}"
+    missing = listed.get("aud2-missing") or {}
+    assert any("找不到" in err for err in missing.get("errors") or []), missing
+    assert not (folder / "boot" / "booted.txt").exists(), "扫描阶段运行了插件代码"
+    assert {str(row["id"]) for row in via_mgmt} >= {"aud2-boot", "aud2-flat", "aud2-missing"}, via_mgmt
+    refused = await host.enable("aud2-missing", timeout=3.0)
+    assert refused.get("enabled") is False and refused.get("state") == "invalid", refused
+    assert "aud2-missing" not in host._running and not (folder / "missing" / "booted.txt").exists(), \
+        "启用前检查失败却起来了进程"
+    return (f"目录制 + 平铺 <root>/*.json 两种清单都扫到（{sorted(k for k in listed if k)}），登记行含 "
+            f"id/name/version={item['version']}/entry={item['entry']}；坏清单如实报错「{broken['errors'][0][:20]}…」，"
+            f"缺入口报「找不到」且启用被拒（state=invalid、未起进程）；扫描后 booted.txt 不存在（只读清单、不跑代码）；"
+            f"管理面 plugin.list 同一份登记 {len(via_mgmt)} 条")
+
+
+async def d02(ctx: Ctx) -> str:
+    """§2.5 / §3.2：插件跑在子进程；stdio 上按行 NDJSON 握手；入口参数不经 shell；停用后进程真的没了。"""
+    folder = ctx.a.cfg.paths.root / "plugins" / "d02"
+    arg = "& echo pwned > pwned.txt"  # 若有人把它们拼成 shell 串，这条会被当命令跑
+    entry = ["python", "main.py", arg]
+    plugin_dir = write_plugin(folder / "trans", "aud2-trans", PLUGIN_STUB, entry=entry)
+    host = plugin_host(ctx.a, "d02")
+    plugins.install(host)
+    started = (await ctx.mgmt_a.call("plugin.enable", id="aud2-trans"))["enable"]
+    assert started.get("enabled") is True and started.get("state") == "running", started
+    assert await until(lambda: (plugin_dir / "seen.json").exists(), timeout=10), "启用返回 running 但插件未握手"
+    seen = json.loads((plugin_dir / "seen.json").read_text(encoding="utf-8"))
+    assert seen["state"] == "ready", seen["state"]
+    argv = json.loads((plugin_dir / "booted.txt").read_text(encoding="utf-8").splitlines()[0])
+    assert argv == entry[1:], f"入口参数未按原样成为 argv：{argv}"
+    assert not (plugin_dir / "pwned.txt").exists(), "入口参数被 shell 执行了"
+    proc = host._running["aud2-trans"]["proc"]
+    assert proc.returncode is None, "启用说 running，子进程却已退出"
+    stopped = await host.disable("aud2-trans")
+    assert stopped["state"] == "stopped" and "aud2-trans" not in host._running, stopped
+    assert await until(lambda: proc.returncode is not None, timeout=6), "停用后插件进程还在"
+    assert stopped["how"] == "clean", f"停用未走有界退出：{stopped}"
+    assert str(ctx.a.store.plugin_get("aud2-trans")["state"]) == "stopped", ctx.a.store.plugin_get("aud2-trans")
+    return (f"管理面 plugin.enable 拉起子进程 pid={proc.pid}：stdio 上按行 NDJSON 握手（插件侧 hello_ack.state=ready）；"
+            f"入口 argv={argv} 原样进进程、`{arg}` 未被执行（不经 shell）；停用 → how=clean 有界退出、"
+            f"停用后 returncode={proc.returncode}（进程真的没了）、登记行 state=stopped")
+
+
+async def d03(ctx: Ctx) -> str:
+    """§3.2：启用要握手成功才算 running；崩溃标 failed 不重启风暴；手工更新不换身份；卸载保留核心历史。"""
+    folder = ctx.a.cfg.paths.root / "plugins" / "d03"
+    life = write_plugin(folder / "life", "aud2-life", PLUGIN_STUB)
+    boom = write_plugin(folder / "boom", "aud2-boom", PLUGIN_CRASH)
+    host = plugin_host(ctx.a, "d03")
+    first = await host.enable("aud2-life", timeout=20)
+    assert first.get("enabled") is True and first.get("state") == "running", first
+    row = ctx.a.store.channel_by_name("aud2-life")
+    caps = json.loads(row["capabilities"])
+    assert caps.get("segments") is True and caps.get("status") is True, \
+        f"启用说 running 时通道上还没有插件自报的能力声明：{row}"
+    cred1 = plugin_env(life)["ISEKAI_PLUGIN_CREDENTIAL"]
+    channel_id = str(row["id"])
+    assert (life / "booted.txt").read_text(encoding="utf-8").count("\n") == 1, "一次启用起了多个进程"
+    # 手工更新：先停、换文件、再启用——通道身份不换，凭据换新（旧的立刻失效）
+    assert (await host.disable("aud2-life"))["state"] == "stopped"
+    (life / "seen.json").unlink()
+    write_plugin(life, "aud2-life", PLUGIN_STUB, version="0.2.0")
+    second = await host.enable("aud2-life", timeout=20)
+    assert second.get("enabled") is True and second.get("state") == "running", second
+    assert await until(lambda: (life / "seen.json").exists(), timeout=10), "更新后未重新握手"
+    cred2 = plugin_env(life)["ISEKAI_PLUGIN_CREDENTIAL"]
+    row2 = ctx.a.store.channel_by_name("aud2-life")
+    assert str(row2["id"]) == channel_id, f"手工更新换了通道身份：{channel_id} → {row2['id']}"
+    assert str(row2["version"]) == "0.2.0", row2
+    assert cred2 and cred1 != cred2, "重新启用没有换凭据"
+    ws = await ws_connect(ctx.a.endpoint)
+    stale = await raw_hello(ws, "aud2-life", {"credential": cred1})
+    assert err_code(stale) == ump.Err.AUTH_FAILED, f"上一版凭据仍可用：{stale}"
+    await ws.close()
+    # 崩溃：进程立刻退出 → failed，且只启动过一次（不重启风暴）
+    crashed = await host.enable("aud2-boom", timeout=20)
+    assert crashed.get("enabled") is False and crashed.get("state") == "failed", crashed
+    assert "立刻退出" in str(crashed.get("note")), crashed
+    assert await until(lambda: any("boom" in line for line in host._stderr.get("aud2-boom") or []), timeout=5), \
+        f"崩溃插件的 stderr 摘要没留下：{host._stderr.get('aud2-boom')}"
+    await asyncio.sleep(1.5)
+    starts = (boom / "starts.txt").read_text(encoding="utf-8").split()
+    assert len(starts) == 1, f"崩溃后自动重启了（启动 {len(starts)} 次）"
+    assert "aud2-boom" not in host._running, "崩溃的插件仍被当作在运行"
+    assert str(ctx.a.store.plugin_get("aud2-boom")["state"]) == "failed", ctx.a.store.plugin_get("aud2-boom")
+    # 启用必须以**这一次**的握手为准：上一轮留下的通道能力不能顶替（换成一个永不握手的实现再启用）
+    hang = write_plugin(folder / "hang", "aud2-hang", PLUGIN_STUB)
+    assert (await host.enable("aud2-hang", timeout=20)).get("enabled") is True
+    assert await until(lambda: (hang / "seen.json").exists(), timeout=10), "首次启用未握手"
+    assert (await host.disable("aud2-hang"))["state"] == "stopped"
+    (hang / "seen.json").unlink()
+    write_plugin(hang, "aud2-hang", PLUGIN_HANG)  # 换文件：这次不发 hello，也不退出
+    stuck = await host.enable("aud2-hang", timeout=3.0)
+    handshook = await until(lambda: (hang / "seen.json").exists(), timeout=1.0)
+    assert handshook or not stuck.get("enabled"), \
+        f"启用没以本次握手为准：插件从未发 hello（无 hello_ack），宿主却报了运行中：{stuck}"
+    assert "握手超时" in str(stuck.get("note")), f"启用失败没给明确原因：{stuck}"
+    assert str(ctx.a.store.channel_by_name("aud2-hang")["capabilities"]) == "{}", \
+        "上一轮的能力声明没被清掉：这一轮握手与否无从判断"
+    assert (await host.disable("aud2-hang"))["state"] == "stopped"
+    # 卸载：先在这条通道上真聊一轮，卸载后核心会话 / 消息一行不动
+    session = (await ctx.mgmt_a.call("session.ensure", instance_id="ph-audit2", timeline_id="main",
+                                     character_id="ph-audit2"))["session"]
+    thread = (await ctx.mgmt_a.call("thread.bind", channel="aud2-life", thread_id="dm-life",
+                                    session_id=session["id"]))["thread"]
+    client = UmpClient(endpoint=ctx.a.endpoint, channel_id="aud2-life", name="aud2-life", credential=cred2)
+    await client.connect()
+    try:
+        await client.send_user_message(thread_id="dm-life", binding_token=thread["binding_token"], text="卸载前的一句")
+        reply = (await replies(client, 1))[0]
+    finally:
+        await client.close()
+    history_before = [m["message_id"] for m in ctx.a.store.history_page(session["id"], limit=50)["messages"]]
+    proc = host._running["aud2-life"]["proc"]
+    out = await host.uninstall("aud2-life")
+    assert out["uninstalled"] == "aud2-life", out
+    assert ctx.a.store.plugin_get("aud2-life") is None, "卸载后插件登记行还在"
+    assert await until(lambda: proc.returncode is not None, timeout=6), "卸载后插件进程还在"
+    history_after = [m["message_id"] for m in ctx.a.store.history_page(session["id"], limit=50)["messages"]]
+    assert history_after == history_before and reply.payload["message_id"] in history_after, \
+        f"卸载动了核心历史：{history_before} → {history_after}"
+    assert ctx.a.store.session_get(session["id"]) is not None, "卸载删了核心会话行"
+    return (f"启用 → 握手成功（通道能力声明来自插件自己的 hello）才算 running；手工更新（v0.1.0→0.2.0 换文件重启用）"
+            f"通道身份不变（{channel_id}）、凭据轮换（旧凭据 → auth_failed）；换成一个永不握手的实现再启用 → 不被认作"
+            f"运行中（{stuck.get('state')}：{stuck.get('note')!r}，且启用时已把上一轮能力声明清回 \"{{}}\"）；"
+            f"崩溃插件 → failed（note 含「立刻退出」+ stderr「boom…」）且只启动 1 次、不重启风暴；卸载 → 插件登记行消失、"
+            f"插件进程退出，核心会话 {session['id']} 与 {len(history_after)} 行消息原样保留"
+            f"（注：通道身份行 {channel_id} 与 thread 绑定仍在——plugins.py:321 自述「通道绑定由管理面另行解绑」，"
+            f"SPEC §3.2 表措辞为「移除插件登记 / 绑定」）")
+
+
+async def d05(ctx: Ctx) -> str:
+    """§3.4：子进程环境只给必要变量 + 该插件自己的凭据，不继承 LLM Key / 管理凭据。"""
+    folder = ctx.a.cfg.paths.root / "plugins" / "d05"
+    plugin_dir = write_plugin(folder / "env", "aud2-env", PLUGIN_STUB)
+    host = plugin_host(ctx.a, "d05")
+    result = await host.enable("aud2-env", timeout=20)
+    assert result.get("enabled") is True, result
+    assert await until(lambda: (plugin_dir / "seen.json").exists(), timeout=10), "插件未握手"
+    env = plugin_env(plugin_dir)
+    allowed = set(plugins.ENV_ALLOWLIST) | {"PYTHONUNBUFFERED", "ISEKAI_PLUGIN_ID", "ISEKAI_PLUGIN_CREDENTIAL"}
+    extra = sorted(set(env) - allowed)
+    assert not extra, f"子进程拿到白名单外的变量：{extra}"
+    leaked = sorted(key for key in env if any(token in key.upper() for token in ("KEY", "TOKEN", "SECRET")))
+    assert not leaked, f"子进程环境带核心凭据类变量：{leaked}"
+    values = set(env.values())
+    assert ctx.a.mgmt_token and ctx.a.mgmt_token not in values, "管理凭据进了插件子进程环境"
+    assert ctx.a.bootstrap and ctx.a.bootstrap not in values, "引导凭据进了插件子进程环境"
+    assert env.get("ISEKAI_PLUGIN_ID") == "aud2-env", env.get("ISEKAI_PLUGIN_ID")
+    assert env.get("ISEKAI_PLUGIN_CREDENTIAL") and env["ISEKAI_PLUGIN_CREDENTIAL"] != ctx.a.mgmt_token, \
+        "插件自己那条通道的凭据没给"
+    assert "PATH" in env, "PATH 都没给（子进程起不来）"
+    assert (await host.disable("aud2-env"))["state"] == "stopped"
+    return (f"子进程实收 {len(env)} 个变量，全部落在白名单内（{sorted(env)}）；无任何 KEY/TOKEN/SECRET 类键"
+            f"（{len(leaked)} 个），不含管理令牌与引导凭据（按值比对），含自己的 ISEKAI_PLUGIN_ID 与 "
+            f"ISEKAI_PLUGIN_CREDENTIAL（工作凭据，已用它完成握手）")
+
+
+async def d06(ctx: Ctx) -> str:
+    """§2.5：进程内传输（安卓内建 / 不占回环端口）与桌面 WS 走同一段握手 / 认证 / 校验代码。"""
+    local = InProcessChannel(ctx.b.runtime.server, channel_id="aud2-inproc-boot", name="安卓内建")
+    ack = await local.connect(bootstrap=ctx.b.bootstrap)
+    assert ack.get("type") == "hello_ack", ack
+    assert ack["payload"]["state"] == "ready", ack["payload"]
+    assert int(ack["payload"]["negotiated"]["max_text_len"]) >= 1, ack["payload"]["negotiated"]
+    issued = str(ack["payload"].get("credential") or "")
+    assert issued, "引导换持久凭据的语义应与桌面一致"
+    await local.close()
+    forged = InProcessChannel(ctx.b.runtime.server, channel_id="aud2-inproc-boot", name="安卓内建")
+    bad = await forged.connect(credential="cr-forged")
+    assert bad.get("type") == "error" and bad["payload"]["code"] == ump.Err.AUTH_FAILED, bad
+    await forged.close()
+    client, thread, session, credential, _instance, _timeline, _character = await room(
+        ctx.b, ctx.mgmt_b, moment=AWAKE_AT, channel="aud2-inproc", thread_id="dm-in",
+    )
+    await client.close()  # 收发都改走进程内：只借它的通道与 thread 绑定
+    live = InProcessChannel(ctx.b.runtime.server, channel_id="aud2-inproc", name="安卓内建")
+    ack2 = await live.connect(credential=credential)
+    assert ack2.get("type") == "hello_ack" and ack2["payload"]["state"] == "ready", ack2
+    token = thread["binding_token"]
+    refusal = await live.send(ump.make("user_message", {"text": "带张图", "attachments": [{"kind": "image"}]},
+                                      thread_id="dm-in", binding_token=token, id="e-in-bad"))
+    assert refusal and refusal[0]["type"] == "error", refusal
+    assert refusal[0]["payload"]["code"] == ump.Err.UNSUPPORTED_CAPABILITY, refusal
+    text = await live.send(ump.make("user_message", {"text": "进程内这一句"}, thread_id="dm-in",
+                                    binding_token=token, id="e-in-1"))
+    text += await live.send(ump.make("ping", {}))
+    frames = await local_frames(live, {"pong", "reply"}, pre=text)
+    kinds = [str(frame["type"]) for frame in frames]
+    assert "accepted" in kinds, frames
+    assert "pong" in kinds, frames
+    got_reply = [f for f in frames if f["type"] == "reply"]
+    assert got_reply and got_reply[-1]["payload"]["reply_to"] == "e-in-1", f"进程内传输没走完一轮：{kinds}"
+    await live.close()
+    return (f"进程内通道：引导握手 → hello_ack(state=ready，签发持久凭据 {issued[:6]}…)，错凭据 → auth_failed；"
+            f"同一通道用持久凭据重连后收发照常（accepted + pong + 一轮 reply {got_reply[-1]['payload']['message_id']}"
+            f"（covers={got_reply[-1]['payload']['covers']}））；带 attachments 的消息同样被明确拒绝"
+            f"（unsupported_capability）——认证 / 校验 / 投递是同一段代码，本检查全程没有开回环连接 / 占端口")
+
+
+async def d07(ctx: Ctx) -> str:
+    """§2.5 末条：通知只引用已固化消息；重复登记幂等；失效只报管理错误——不改投、不激活冻结线。"""
+    client, thread, session, _credential, instance_id, timeline_id, _character = await room(
+        ctx.a, ctx.mgmt_a, moment=AWAKE_AT, channel="aud2-notice", thread_id="dm-nt",
+    )
+    await client.send_user_message(thread_id="dm-nt", binding_token=thread["binding_token"], text="通知要引用的这一条")
+    reply = (await replies(client, 1))[0]
+    mid = reply.payload["message_id"]
+    await client.close()
+    args = {"instance_id": instance_id, "timeline_id": timeline_id, "session_id": session["id"],
+            "message_id": mid, "revision": 3}
+    first = (await ctx.mgmt_a.call("notice.create", **args))["notice"]
+    again = (await ctx.mgmt_a.call("notice.create", **args))["notice"]
+    assert first["id"] == again["id"], f"同一条固化消息登记出两条通知：{first} / {again}"
+    rows = (await ctx.mgmt_a.call("notice.list", instance_id=instance_id))["notices"]
+    assert len(rows) == 1 and rows[0]["id"] == first["id"], rows
+    target = (await ctx.mgmt_a.call("notice.resolve", id=first["id"]))["target"]
+    assert target["valid"] is True, target
+    assert target["session_id"] == session["id"] and target["message_id"] == mid, target
+    assert target["revision"] == 3 and target["message_seq"] is not None, target
+    by_message = (await ctx.mgmt_a.call("notice.resolve", message_id=mid))["target"]
+    assert by_message["session_id"] == session["id"], by_message
+    # 时间线冻结 / 归档：只报管理错误，仍指向原会话，不把冻结线激活
+    ctx.a.store.timeline_set_state(timeline_id, "archived")
+    frozen = (await ctx.mgmt_a.call("notice.resolve", id=first["id"]))["target"]
+    assert frozen["valid"] is False and "归档" in frozen["reason"], frozen
+    assert frozen["session_id"] == session["id"], f"失效后改投了：{frozen}"
+    states = [str(t["state"]) for t in ctx.a.store.timeline_list(instance_id) if str(t["id"]) == timeline_id]
+    assert states == ["archived"], f"解析通知把冻结线激活了：{states}"
+    # 消息被删（回滚 / 作废）：同上，只报原因
+    ctx.a.store.timeline_set_state(timeline_id, "active")
+    with ctx.a.store._lock, ctx.a.store._conn:
+        ctx.a.store._conn.execute("DELETE FROM message WHERE session_id=? AND message_id=?", (session["id"], mid))
+    gone = (await ctx.mgmt_a.call("notice.resolve", id=first["id"]))["target"]
+    assert gone["valid"] is False and "消息已不存在" in gone["reason"], gone
+    assert gone["session_id"] == session["id"], gone
+    stored = ctx.a.store.notice_get(first["id"])
+    assert stored["session_id"] == session["id"] and stored["message_id"] == mid, stored
+    return (f"notice.create 两次登记同一固化消息 → 同一通知 {first['id']}（notice 表只 1 行）；resolve 命中 → "
+            f"valid=true、原会话 {session['id']} + message_id={mid} + 固定 revision=3（按 message_id 也能查）；"
+            f"时间线归档后 → valid=false、reason「{frozen['reason']}」；消息被删后 → reason「{gone['reason']}」；"
+            f"两种情况 target.session_id 都仍是原会话（不改投），冻结线状态未被改回（仍 {states[0]}）")
+
+
+async def d09(ctx: Ctx) -> str:
+    """§2.1 / §七 更后置：v1 只文本——附件 / 流式 / content_type 明确拒绝；插件侧受限日志有容量上限。"""
+    caps = ump.parse_hello({"channel": {"id": "aud2-caps"}, "capabilities": {},
+                            "auth": {"bootstrap": "b"}})["capabilities"]
+    assert caps["text"] is True and caps["attachments"] is False and caps["stream"] is False, caps
+    client, thread, _session, _credential = await bind_thread(
+        ctx.a, ctx.mgmt_a, channel="aud2-bounds", thread_id="dm-bd",
+    )
+    token = thread["binding_token"]
+    channel_id = thread["channel_id"]
+    refused: list[str] = []
+    try:
+        for label, extra in (("attachments", {"attachments": [{"kind": "image"}]}),
+                             ("stream", {"stream": True}),
+                             ("content_type", {"content_type": "image/png"})):
+            ref = f"e-{label}"
+            await client.send(ump.make("user_message", {"text": "在吗", **extra}, thread_id="dm-bd",
+                                       binding_token=token, id=ref))
+            frames = await drain(client, 1.0)
+            errors = [e for e in frames if e.type == "error"]
+            assert errors and errors[-1].payload["code"] == ump.Err.UNSUPPORTED_CAPABILITY, \
+                (label, [e.type for e in frames], [e.payload for e in frames if e.type == "error"])
+            assert errors[-1].payload["stage"] == ump.Stage.PROTOCOL, errors[-1].payload
+            assert not [e for e in frames if e.type in ("accepted", "reply")], \
+                f"{label} 没被明确拒绝，还收了：{[e.type for e in frames]}"
+            assert ctx.a.store.inbound_find(channel_id, "dm-bd", ref) is None, f"{label} 被静默收下并落库"
+            refused.append(f"{label}→{errors[-1].payload['code']}")
+    finally:
+        await client.close()
+    folder = ctx.a.cfg.paths.root / "plugins" / "d09"
+    write_plugin(folder / "chatty", "aud2-chatty", PLUGIN_CHATTY)
+    host = plugin_host(ctx.a, "d09")
+    result = await host.enable("aud2-chatty", timeout=20)
+    assert result.get("enabled") is True, result
+    cap = plugins.STDERR_KEEP_LINES
+    assert await until(lambda: len(host._stderr.get("aud2-chatty") or []) >= cap, timeout=12), \
+        f"stderr 日志没读到上限行数：{len(host._stderr.get('aud2-chatty') or [])} / {cap}"
+    kept = host._stderr.get("aud2-chatty") or []
+    assert len(kept) <= cap, f"stderr 日志无上限：{len(kept)} 行"
+    assert max(len(line) for line in kept) <= plugins.STDERR_LINE_CHARS, \
+        f"单行未截断：{max(len(line) for line in kept)} 字符"
+    assert not any(line.startswith("line-000") for line in kept), "最早的行没被丢弃（缓冲区其实无上限）"
+    assert (await host.disable("aud2-chatty"))["state"] == "stopped"
+    return (f"能力声明 text=True / attachments=False / stream=False；带 attachments / stream / content_type 的"
+            f"用户消息逐条明确拒绝（{'、'.join(refused)}，stage=protocol），且没有 accepted / reply、没有落库"
+            f"（不是静默忽略）；刷 300 行 stderr 的插件：宿主只留 {len(kept)} 行（上限 {cap}）、"
+            f"单行最长 {max(len(line) for line in kept)} 字符（上限 {plugins.STDERR_LINE_CHARS}）、最早的行已丢弃")
+
+
 CHECKS: list[tuple[str, str, str, Callable[[Ctx], Awaitable[str]]]] = [
     ("K01", "信封：非 1.x 版本 / 未知 type / 方向越权 / 必填与类型校验", k1),
     ("K02", "认证：无 auth、错凭据、引导凭据一次性", k2),
@@ -1491,29 +1944,23 @@ CHECKS: list[tuple[str, str, str, Callable[[Ctx], Awaitable[str]]]] = [
     ("K33", "独立开场：reply_to=null、一次性、不伪造入站", k33),
     ("K34", "归档说明：system_notice 分类与角色上下文", k34),
     ("K35", "永久错误：不降级、不放行、不重连风暴", k35),
+    ("D01", "插件宿主：目录制 manifest 扫描 / 登记（只读清单、不跑代码、启用前检查）", d01),
+    ("D02", "插件承载：子进程 + stdio 按行 NDJSON + 不经 shell + 停用后进程退出", d02),
+    ("D03", "插件生命周期：握手才 running / 崩溃标 failed / 手工更新 / 卸载保留历史", d03),
+    ("D05", "环境最小化：子进程不带核心凭据，只给白名单与自己的凭据", d05),
+    ("D06", "安卓内建 / 进程内传输：同一段握手、认证与校验", d06),
+    ("D07", "管理面通知：登记幂等、定位解析、失效不改投", d07),
+    ("D09", "能力边界：附件 / 流式 / content_type 明确拒绝 + 受限日志容量上限", d09),
 ]
 
-#: 按 SPEC 自述的分期条款（§七 / §九）暂缓，不计 FAIL
-DEFERRED: list[tuple[str, str, str]] = [
-    ("D01", "插件宿主：目录制 manifest 扫描 / 登记 / 启用前检查（§3.1）",
-     "CHANNEL_PLUGIN_SPEC §七「随外部通道需求后置：目录插件宿主、生命周期…」；isekai_core 无插件模块与 manifest 解析"),
-    ("D02", "插件承载：子进程 + stdin/stdout NDJSON + stderr 受限日志 + 进程树收尾 / 孤儿（§2.5、§3.2）",
-     "同 §七 后置；核心只有回环 WS 承载（channel.py:89-105），无子进程拉起与进程树结束实现"),
-    ("D03", "插件生命周期：启用 → 握手 → 停用有界退出 / 崩溃标记 / 手工更新 / 卸载保留历史（§3.2）",
-     "同 §七 后置「启停与绑定 UI」；管理面无插件启停 / 卸载操作"),
-    ("D04", "第三方交付：协议字段表、生命周期、收发、错误 / 重试、兼容说明与 Python 参考实现（§3.3）",
-     "§七 后置清单含「文档及参考实现」；docs/ 无插件开发文档或参考插件，仅 CHANNEL_PLUGIN_SPEC 规范本身"),
-    ("D05", "插件子进程环境最小化与沙箱（§3.4）",
-     "§3.4 自述「不替代沙箱…安全沙箱留待确有需求时另行设计」；无子进程环境构造代码"),
-    ("D06", "安卓内建通道与进程内传输（§2.5、§七 更后置）",
-     "§2.5「实际路线待评估，不强制复制桌面 WS」+ §七「更后置」；仓库无 Android 通道实现"),
-    ("D07", "管理面通知的创建与定位解析（§2.5 末条）",
-     "§七 阶段 0 清单（UMP v1 / 内建聊天 / 认证 / 去重回执错误 / 持久化重连）不含通知；核心与壳均无通知创建 / 定位实现"),
-    # D08（实现级字段表 / 字符计数方式 / 错误码表 / 帧上限）已成文并留了对拍脚本，不再是缺口：
-    #     docs/CHANNEL_PROTOCOL_APPENDIX.md · scripts/_audit2_proto_doc.py（5 组断言，不一致即 FAIL）
-    ("D09", "附件 / 富媒体 / 流式表达 / 资源配额 / 分发渠道（§七 更后置）",
-     "§2.1「v1 仅文本、非流式」+ §七「更后置」；协议枚举里无相关类型"),
-]
+#: 按 SPEC 自述的分期条款（§七 / §九）暂缓的条目——现已全部落地为上面的行为断言，列表为空。
+#: 真正的残余（第三方交付文档与参考实现）由对拍脚本盯着，不再计 DEFERRED：
+#:     D04 协议字段表 / 生命周期 / 收发 / 错误重试 / 兼容说明 → docs/CHANNEL_PROTOCOL_APPENDIX.md
+#:         参考实现 → examples/channel_plugin_reference.py（tests/test_plugins.py::test_reference_plugin_handshakes 真拉起来握手）
+#:         文档与实现的对拍 → scripts/_audit2_proto_doc.py（5 组断言，不一致即 FAIL）
+#:     D08（实现级字段表 / 字符计数方式 / 错误码表 / 帧上限）同上，已由 docs/CHANNEL_PROTOCOL_APPENDIX.md
+#:         + scripts/_audit2_proto_doc.py 覆盖
+DEFERRED: list[tuple[str, str, str]] = []
 
 
 async def main() -> int:
