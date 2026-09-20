@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import secrets
 import time
 from typing import Any, Awaitable, Callable
 
@@ -100,6 +101,18 @@ class SessionService:
         session_row = self.store.session_get(str(thread_row["session_id"])) or {}
         timeline_id = str(session_row.get("timeline_id") or "")
         line = self.store.timeline_get(timeline_id) if timeline_id else None
+        # 归档（身故）后不再产生新回复：首次说明一次，之后只按协议拒绝（§5.7）
+        instance_id = str(session_row.get("instance_id") or "")
+        character_id = str(session_row.get("character_id") or "")
+        if instance_id and character_id and self.store.death_exists(instance_id, timeline_id, character_id):
+            await self._archive_notice(session_row, character_id)
+            raise UmpError(
+                Err.STATE_BLOCKED,
+                "该角色已归档（身故），不再产生新回复；历史保留可查",
+                retryable=False,
+                ref=env_id,
+                stage=Stage.RECEIVE,
+            )
         await self._flush_proactive(str(session_row.get("id") or ""))
         if line is not None:
             # 真实时间线：冻结 / 归档一律不允许对话（§2.2）；占位会话没有时间线行，不在此列
@@ -142,6 +155,42 @@ class SessionService:
             if fixed is not None:
                 await self._send_batches(fixed)
         return {"ref": env_id, "state": row["state"], "message_id": reply_id}
+
+    async def _archive_notice(self, session_row: dict[str, Any], character_id: str) -> None:
+        """归档说明：一个会话只给一次，且只进历史与待投递（不占配额、不重发）。"""
+        session_id = str(session_row.get("id") or "")
+        if not session_id or self.store.session_notice_get(session_id, "archive") is not None:
+            return
+        target = self.store.thread_for_session(session_id) or {}
+        message_id = f"m-{secrets.token_hex(6)}"
+        text = f"{character_id} 已经不在了。之后的消息不会再转给她，早先的对话都还留着。"
+        self.store.outbound_put(
+            session_id=session_id,
+            message_id=message_id,
+            reply_to=None,
+            covers=[],
+            batches=[[text]],
+            target_channel=str(target.get("channel_id") or ""),
+            target_thread=str(target.get("thread_id") or ""),
+            binding_version=int(target.get("binding_version") or 0),
+            binding_token=str(target.get("binding_token") or ""),
+        )
+        self.store.session_notice_put(
+            {
+                "session_id": session_id,
+                "instance_id": str(session_row.get("instance_id") or ""),
+                "timeline_id": str(session_row.get("timeline_id") or ""),
+                "kind": "archive",
+                "message_id": message_id,
+                "created_real": time.time(),
+            }
+        )
+        try:
+            fixed = self.store.outbound_by_message_id(message_id)
+            if fixed is not None:
+                await self._send_batches(fixed)
+        except Exception:
+            pass  # 投递失败不留半成品：消息已在历史与待投递里
 
     async def _flush_proactive(self, session_id: str) -> int:
         """投递仍有效的主动消息（§5.3）：只发最新一条，积压留在历史里，不做洪峰补发。"""

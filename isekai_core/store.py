@@ -264,6 +264,17 @@ CREATE TABLE IF NOT EXISTS custom_state(
   PRIMARY KEY(instance_id, timeline_id, custom_id)
 );
 
+-- 会话通告（SESSION_CORE_SPEC §5.7）：归档说明 / 最后联络一类，一次性
+CREATE TABLE IF NOT EXISTS session_notice(
+  session_id TEXT NOT NULL,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  message_id TEXT NOT NULL DEFAULT '',
+  created_real REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY(session_id, kind)
+);
+
 -- 初见（SESSION_CORE_SPEC §5.6）：每个会话只有一次独立开场；不占世界源主动配额
 CREATE TABLE IF NOT EXISTS first_contact(
   session_id TEXT PRIMARY KEY,
@@ -659,6 +670,30 @@ class Store:
             (session_id, int(since_world)),
         ).fetchall()
         return [_row_to_dict(item) for item in rows]
+
+    def death_exists(self, instance_id: str, timeline_id: str, character_id: str) -> bool:
+        """该角色是否已有身故记录（归档判定；不另立字段）。"""
+        row = self._conn.execute(
+            """SELECT 1 FROM event WHERE instance_id=? AND timeline_id=? AND template=?
+               AND world_seconds>0 LIMIT 1""",
+            (instance_id, timeline_id, f"death:{character_id}"),
+        ).fetchone()
+        return row is not None
+
+    def session_notice_get(self, session_id: str, kind: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM session_notice WHERE session_id=? AND kind=?", (session_id, kind)
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def session_notice_put(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO session_notice(session_id, instance_id, timeline_id, kind,
+                                                        message_id, created_real)
+                   VALUES(:session_id, :instance_id, :timeline_id, :kind, :message_id, :created_real)""",
+                row,
+            )
 
     def first_contact_get(self, session_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -1573,6 +1608,7 @@ class Store:
                 "custom_state",
                 "proactive_log",
                 "first_contact",
+                "session_notice",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute(
@@ -1857,6 +1893,7 @@ class Store:
             "event", "environment_state", "institution_state", "custom_state",
             "proactive_log",   # 回滚撤销还没投出去的主动消息与素材消费（§5.3 末条）
             "first_contact",   # 回滚撤销开场资格（开场也是已固化消息）
+            "session_notice",  # 回滚撤销通告资格
             "memory", "memory_task", "memory_citation",
             "character_join",   # 跨越补卡点的回滚要让补入角色在本线退出（§七）
             "rate_command",     # 历史里的待生效倍率不是现时控制命令（§七）
