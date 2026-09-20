@@ -411,6 +411,7 @@ class SessionService:
                 "reply_to": rows[-1]["env_id"],          # 批内最后一条入站（§4.5）
                 "covers": [item["env_id"] for item in rows],
                 "batches": plan_batches(parts, self._limits(row["channel_id"])[1]),
+                "model_fingerprint": self._model_fingerprint(),
                 "target_channel": row["channel_id"],
                 "target_thread": row["thread_id"],
                 "binding_version": row["binding_version"],
@@ -420,6 +421,15 @@ class SessionService:
         self._settle_memory(rows, message_id=str(message_id), reply_text=chr(10).join(parts))
         await self._send_batches(msg)
         await self._status(row, "idle")
+
+    def _model_fingerprint(self) -> str:
+        """产出这条回复的模型标识（§十.15）：换模型后旧回复仍看得出边界。"""
+        llm = getattr(self, "llm", None)
+        model = str(getattr(getattr(llm, "cfg", None), "model", "") or "")
+        if not model:
+            cfg = getattr(self, "cfg", None)
+            model = str(getattr(getattr(cfg, "llm", None), "model", "") or "")
+        return model[:80]
 
     async def _catching_up_notice(self, row: dict[str, Any], *, binding_token: str) -> None:
         """追赶期的系统提示：每个追赶档只发一条（session_notice 去重），追平后自动解除。"""

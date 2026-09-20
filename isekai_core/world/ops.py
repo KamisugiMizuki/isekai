@@ -456,12 +456,12 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 "commits": store.commit_list(row["id"]),
             }
         if op == "backup.create":
-            return {"backup": _backup_once(cfg, store, note=str(args.get("note") or ""))}
+            return {"backup": backup_once(cfg, store, note=str(args.get("note") or ""))}
         if op == "app.shutdown":
             # 显式退出握手（DESKTOP_SPEC §五）：「先保存再停进程」的核心半边。
             # 保存 = 补做一次退出前备份（一致水位快照）；停进程 = 请求核心自行退出，
             # 由 app.py 的 finally 收尾（会话收尾 / 关服务 / 释放写库锁），不走 taskkill 硬杀。
-            saved = _backup_once(cfg, store, note="退出前补做")
+            saved = backup_once(cfg, store, note="退出前补做")
             _request_exit()
             return {"saved": saved}
         if op == "backup.restore":
@@ -962,7 +962,7 @@ def _backup_folder(cfg: Any, store: Any) -> Path:
     return path
 
 
-def _backup_once(cfg: Any, store: Any, *, note: str = "") -> dict[str, Any]:
+def backup_once(cfg: Any, store: Any, *, note: str = "") -> dict[str, Any]:
     """落一份一致水位备份并按保留数轮转（backup.create 与退出前补做共用同一路径）。"""
     folder = _backup_folder(cfg, store)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())

@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS message(
   batch_count INTEGER,
   covers TEXT DEFAULT '[]',
   wait_until REAL NOT NULL DEFAULT 0, -- 入站：睡眠期合并批的现实截止点（一次确定，不因后续输入重置）
+  model_fingerprint TEXT NOT NULL DEFAULT '',  -- 产出该回复的模型标识（换模型后旧行仍看得出边界）
   state TEXT NOT NULL,
   error_code TEXT,
   created_at REAL NOT NULL
@@ -1087,6 +1088,9 @@ class Store:
             log.info("effect_state 增列 value")
             self._conn.execute("ALTER TABLE effect_state ADD COLUMN value TEXT")
         message_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(message)")}
+        if message_columns and "model_fingerprint" not in message_columns:
+            log.info("message 增列：model_fingerprint")
+            self._conn.execute("ALTER TABLE message ADD COLUMN model_fingerprint TEXT NOT NULL DEFAULT ''")
         if message_columns and "wait_until" not in message_columns:
             log.info("message 增列 wait_until（睡眠期合并批的截止点，§4.5）")
             self._conn.execute("ALTER TABLE message ADD COLUMN wait_until REAL NOT NULL DEFAULT 0")
@@ -1379,6 +1383,7 @@ class Store:
         binding_version: int,
         binding_token: str,
         role: str = "character",
+        model_fingerprint: str = "",
     ) -> dict[str, Any]:
         """固化回复（一次逻辑轮次的产物）。batches 是分批后的分段计划。
 
@@ -1408,8 +1413,8 @@ class Store:
         cur = self._conn.execute(
             """INSERT INTO message(session_id, role, channel_id, thread_id, binding_version, binding_token,
                                    message_id, reply_to, batch_id, batch_index, batch_count, parts, covers,
-                                   state, created_at)
-               VALUES(?, ?, ?,?,?,?, ?,?, ?, 0, ?, ?, ?, 'fixed', ?)""",
+                                   model_fingerprint, state, created_at)
+               VALUES(?, ?, ?,?,?,?, ?,?, ?, 0, ?, ?, ?, ?, 'fixed', ?)""",
             (
                 session_id,
                 str(kwargs.get("role") or "character"),
@@ -1423,6 +1428,7 @@ class Store:
                 len(batches),
                 json.dumps(batches, ensure_ascii=False),
                 covers_json,
+                str(kwargs.get("model_fingerprint") or ""),
                 now,
             ),
         )

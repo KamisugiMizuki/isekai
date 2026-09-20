@@ -527,11 +527,12 @@ def section_static() -> None:
 
     # SPEC 头部状态行 vs 实现（文档自身一致性）
     header = [ln for ln in spec.splitlines() if ln.startswith("> 状态：")]
+    stale = bool(header) and "阶段 1 起的界面与操作未实现" in header[0]
+    stated = bool(header) and "已大部分实现" in header[0]
     check("S7 SPEC 头部状态行与实现一致",
-          "PASS" if not header else "FAIL",
-          f"文档状态行={header[0][:120] if header else '无'}…；"
-          f"但 desktop/index.html 已实现世界包 AI 生成 / 角色卡审定 / 实例创建·导入·导出 / 披露 / 草稿 / 备份（阶段 1+）"
-          f"→ 头部「阶段 1 起的界面与操作未实现」与实际不符（文档滞后，非代码缺陷）",
+          "PASS" if header and not stale and stated else "FAIL",
+          f"文档状态行={'有' if header else '无'}；陈旧表述「阶段 1 起的界面与操作未实现」={'仍在' if stale else '已删'}；"
+          f"已按实况写明阶段 1+ 已实现={'是' if stated else '否'}（对照 desktop/index.html 的生成 / 审定 / 实例管理 / 披露 / 草稿 / 备份）",
           clause="DESKTOP_SPEC §八 实施分期 / 头部状态行", code="docs/DESKTOP_SPEC.md:5")
 
 

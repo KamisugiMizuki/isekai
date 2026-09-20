@@ -221,6 +221,11 @@ async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | N
 
     try:
         await runtime.server.start()
+        # 启动后补做到期检查（§五）：先把「该备份的」补上，再对外就绪
+        try:
+            _backup_if_due(cfg, runtime.store, note="启动后补做")
+        except Exception:
+            log.exception("startup backup failed")
         blocked_ids = [
             str(row["id"])
             for row in runtime.store.instance_list()
@@ -251,6 +256,24 @@ async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | N
         runtime.store.close()
         ownership.release()
         log.info("core stopped")
+
+
+def _backup_due(cfg: Any, store: Any) -> bool:
+    """备份到期判断（DESKTOP_SPEC §五）：没有备份或距上次成功超过 interval_hours；0 = 只在退出前补做。"""
+    backup_cfg = getattr(cfg, "backup", None)
+    hours = int(getattr(backup_cfg, "interval_hours", 24) or 0)
+    if hours <= 0:
+        return False
+    folder = Path(store.path).parent / str(getattr(backup_cfg, "dir", "backups") or "backups")
+    latest = max((item.stat().st_mtime for item in folder.glob("isekai-*.db")), default=0.0)
+    return (time.time() - latest) >= hours * 3600
+
+
+def _backup_if_due(cfg: Any, store: Any, *, note: str) -> None:
+    if not _backup_due(cfg, store):
+        return
+    result = world_ops.backup_once(cfg, store, note=note)
+    log.info("backup due-check %s: ok=%s", note, result.get("ok"))
 
 
 async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float = 5.0) -> None:
@@ -295,6 +318,11 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
                 await runtime.world.embed_memories(instance_id, timeline_id, now_real=time.time(), limit=8)
         except Exception:
             log.exception("memory extraction pass failed")
+        # 备份到期检查（§五）：运行期间定时检查，失败只记日志，不挡推进
+        try:
+            _backup_if_due(runtime.cfg, runtime.store, note="运行期到期检查")
+        except Exception:
+            log.exception("backup due-check failed")
         # 世界源主动发言（§5.2 / §5.3）：按节律与配额从她已获知的素材里挑一条固化，并当场投给唯一目标
         try:
             for instance_id, timeline_id in active:
