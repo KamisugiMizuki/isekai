@@ -175,6 +175,15 @@ def _validate_knowledge(card: dict[str, Any], package: dict[str, Any], *, moment
             errors.append(f"{where}.obtained_at: 必须是非负世界秒获知时间")
         elif obtained > moment:
             errors.append(f"{where}.obtained_at: 获知时间晚于初始时刻")
+        if kind == "canon":
+            # 实情层条目必须由某一部传本收录，否则等于卡片自己给出一个世界没有的来源
+            covering = [
+                unit.get("title")
+                for unit in known_items.values()
+                if ref in (unit.get("entries") if isinstance(unit.get("entries"), list) else [])
+            ]
+            if not covering:
+                errors.append(f"{where}.ref_id: 没有任何传本收录该实情条目 {ref!r}")
         if kind == "historiography":
             unit = known_items.get(ref) or {}
             compiled = unit.get("compiled_at") or unit.get("written_at")

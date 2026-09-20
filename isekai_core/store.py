@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS commit_auto_state(
 );
 
 CREATE TABLE IF NOT EXISTS disclosure(
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL,
   instance_id TEXT NOT NULL,
   timeline_id TEXT NOT NULL,
   from_character TEXT NOT NULL,
@@ -147,7 +147,8 @@ CREATE TABLE IF NOT EXISTS disclosure(
   granted_world INTEGER NOT NULL,      -- 生效水位：随时间线版本化（§7.1）
   granted_real REAL NOT NULL,
   note TEXT NOT NULL DEFAULT '',
-  state TEXT NOT NULL DEFAULT 'granted'
+  state TEXT NOT NULL DEFAULT 'granted',
+  PRIMARY KEY(instance_id, timeline_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS event_draft(
@@ -547,6 +548,14 @@ def _relabel_payload(payload: dict[str, Any], instance_id: str, timeline_id: str
     return out
 
 
+def _event_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """事件行 → 存储形态：effects 一律 JSON 文本（引擎内部给列表，库内给文本）。"""
+    payload = dict(row)
+    if not isinstance(payload.get("effects"), str):
+        payload["effects"] = json.dumps(payload.get("effects") or [], ensure_ascii=False)
+    return payload
+
+
 def _office_payload(row: dict[str, Any]) -> dict[str, Any]:
     """制度行 → 存储形态（列表字段走 JSON 列）。"""
     payload = dict(row)
@@ -689,6 +698,7 @@ class Store:
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._migrate_memory_tables()
+            self._migrate_disclosure_pk()
             self._migrate_runtime_tables()
             row = self._conn.execute("SELECT value FROM meta WHERE key='data_format'").fetchone()
             if row is None:
@@ -699,6 +709,35 @@ class Store:
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema', ?)", (str(SCHEMA_VERSION),)
             )
             self._conn.commit()
+
+    def _migrate_disclosure_pk(self) -> None:
+        """旧库迁移：披露授权表从 id 单主键改成 (实例, 线, id) 复合主键。
+
+        导入的副本与源实例会持有同一个授权标识，单主键会把副本那一份静默吞掉（§7.3）。
+        """
+        sql = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='disclosure'"
+        ).fetchone()
+        if not sql or "PRIMARY KEY(instance_id, timeline_id, id)" in str(sql[0]):
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                """CREATE TABLE disclosure_new(
+                     id TEXT NOT NULL, instance_id TEXT NOT NULL, timeline_id TEXT NOT NULL,
+                     from_character TEXT NOT NULL, to_character TEXT NOT NULL, scope TEXT NOT NULL,
+                     granted_world INTEGER NOT NULL, granted_real REAL NOT NULL,
+                     note TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'granted',
+                     PRIMARY KEY(instance_id, timeline_id, id))"""
+            )
+            self._conn.execute(
+                """INSERT OR IGNORE INTO disclosure_new
+                     (id, instance_id, timeline_id, from_character, to_character, scope,
+                      granted_world, granted_real, note, state)
+                   SELECT id, instance_id, timeline_id, from_character, to_character, scope,
+                          granted_world, granted_real, note, state FROM disclosure"""
+            )
+            self._conn.execute("DROP TABLE disclosure")
+            self._conn.execute("ALTER TABLE disclosure_new RENAME TO disclosure")
 
     def _migrate_runtime_tables(self) -> None:
         """运行层表的形态迁移（旧库就地升级；派生数据重建是最后手段）。"""
@@ -1284,12 +1323,26 @@ class Store:
     def instance_messages(self, instance_id: str) -> list[dict[str, Any]]:
         """导出用的完整对话：不含投递回执、去重作废记录与通道凭据（§7.1）。"""
         rows = self._conn.execute(
-            """SELECT m.session_id, m.role, m.text, m.state, m.binding_version, m.created_at, m.message_id
-               FROM message m JOIN session s ON s.id = m.session_id
+            """SELECT m.* FROM message m JOIN session s ON s.id = m.session_id
                WHERE s.instance_id=? ORDER BY m.seq""",
             (instance_id,),
         ).fetchall()
-        return [_row_to_dict(r) for r in rows]
+        out: list[dict[str, Any]] = []
+        for raw in rows:
+            row = _row_to_dict(raw)
+            # 出站正文在 parts 里，text 为空——导出必须给正文，否则副本读不到她说过的话
+            out.append(
+                {
+                    "session_id": row["session_id"],
+                    "role": row["role"],
+                    "text": self.message_text(row),
+                    "state": row["state"],
+                    "binding_version": row.get("binding_version"),
+                    "created_at": row.get("created_at"),
+                    "message_id": row.get("message_id"),
+                }
+            )
+        return out
 
     def instance_import_messages(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         """导入的对话行：**重新签发消息标识**（导入=新实例，本地标识一律重映射，§7.3）。"""
@@ -1697,7 +1750,7 @@ class Store:
                               :template, :source, :summary, :detail, :text_source, :effects,
                               :share_value, :importance, :created_real)
                        ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
-                    row,
+                    _event_payload(row),
                 )
             for row in claims:
                 self._conn.execute(
@@ -1874,6 +1927,13 @@ class Store:
                 timeline_id,
                 watermark,
             ),
+            "disclosure": rows(
+                """SELECT * FROM disclosure WHERE instance_id=? AND timeline_id=? AND granted_world<=?
+                   ORDER BY granted_world, id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
             "institution": rows(
                 """SELECT * FROM institution_state WHERE instance_id=? AND timeline_id=? AND updated_world<=?
                    ORDER BY office_id""",
@@ -1947,7 +2007,7 @@ class Store:
                               :template, :source, :summary, :detail, :text_source, :effects,
                               :share_value, :importance, :created_real)
                        ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
-                    row,
+                    _event_payload(row),
                 )
             for row in payload.get("claims") or []:
                 self._conn.execute(
@@ -1985,6 +2045,22 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, type_id) DO NOTHING""",
                     row,
                 )
+            for row in payload.get("dialog") or []:
+                self._conn.execute(
+                    """INSERT INTO message(session_id, role, channel_id, thread_id, env_id, binding_version,
+                                          binding_token, text, state, message_id, created_at)
+                       VALUES(:session_id, :role, NULL, NULL, NULL, 0, NULL, :text, :state,
+                              :message_id, :created_at)
+                       ON CONFLICT DO NOTHING""",
+                    {
+                        "session_id": str(row.get("session_id") or ""),
+                        "role": str(row.get("role") or "character"),
+                        "text": str(row.get("text") or ""),
+                        "state": str(row.get("state") or "fixed"),
+                        "message_id": row.get("message_id"),
+                        "created_at": float(row.get("created_at") or 0.0),
+                    },
+                )
             for row in payload.get("institution") or []:
                 self._conn.execute(
                     """INSERT INTO institution_state(instance_id, timeline_id, office_id, institution_id,
@@ -2003,6 +2079,15 @@ class Store:
                        VALUES(:instance_id, :timeline_id, :custom_id, :name, :applies_to, :form,
                               :forms_json, :basis, :source, :from_world, :updated_world)
                        ON CONFLICT(instance_id, timeline_id, custom_id) DO NOTHING""",
+                    row,
+                )
+            for row in payload.get("disclosure") or []:
+                self._conn.execute(
+                    """INSERT INTO disclosure(instance_id, timeline_id, id, from_character, to_character,
+                                             scope, granted_world, granted_real, note, state)
+                       VALUES(:instance_id, :timeline_id, :id, :from_character, :to_character,
+                              :scope, :granted_world, :granted_real, :note, :state)
+                       ON CONFLICT DO NOTHING""",
                     row,
                 )
             for row in payload.get("memories") or []:
@@ -2225,14 +2310,17 @@ class Store:
             self._conn.execute(
                 """INSERT INTO memory(id, instance_id, timeline_id, character_id, text, kind, sources,
                                       happened_world, learned_world, recorded_world, semantic_watermark,
-                                      strength, confidence, state, version, supersedes, superseded_by, source_key)
+                                      strength, confidence, state, version, supersedes, superseded_by,
+                                      source_key, decay_world)
                    VALUES(:id,:instance_id,:timeline_id,:character_id,:text,:kind,:sources,
                           :happened_world,:learned_world,:recorded_world,:semantic_watermark,
-                          :strength,:confidence,:state,1,:supersedes,NULL,:source_key)""",
+                          :strength,:confidence,:state,1,:supersedes,NULL,:source_key,:decay_world)""",
                 {
                     "sources": json.dumps(row.get("sources") or [], ensure_ascii=False),
                     "state": memory_mod.state_for(float(row.get("strength") or 0.6)),
                     "supersedes": supersedes,
+                    # 衰减从记录水位起算；缺省用记录时刻（不是 0——0 会让条目一推进就归零）
+                    "decay_world": int(row.get("decay_world") or row.get("recorded_world") or 0),
                     **{key: row.get(key) for key in (
                         "id", "instance_id", "timeline_id", "character_id", "text", "kind",
                         "happened_world", "learned_world", "recorded_world", "semantic_watermark",
@@ -2448,16 +2536,16 @@ class Store:
             )
 
     def memory_missing_embeddings(
-        self, instance_id: str, timeline_id: str, *, model: str, limit: int = 64
+        self, instance_id: str, timeline_id: str, *, model: str, dim: int = 0, limit: int = 64
     ) -> list[dict[str, Any]]:
         """缺向量或指纹不符的条目（模型 / 维度变了就重建，旧向量不再参与召回）。"""
         rows = self._conn.execute(
             """SELECT m.id, m.text, m.character_id, e.model AS embed_model, e.source_version
                FROM memory m LEFT JOIN memory_embedding e ON e.memory_id = m.id
                WHERE m.instance_id=? AND m.timeline_id=?
-                 AND (e.memory_id IS NULL OR e.model <> ?)
+                 AND (e.memory_id IS NULL OR e.model <> ? OR (? > 0 AND e.dim <> ?))
                ORDER BY m.learned_world, m.id LIMIT ?""",
-            (instance_id, timeline_id, str(model), int(limit)),
+            (instance_id, timeline_id, str(model), int(dim), int(dim), int(limit)),
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
 

@@ -477,6 +477,10 @@ def _validate_historiography(package: dict[str, Any], known: set[str], errors: l
     if not isinstance(units, list):
         errors.append("historiography: 缺少史料列表")
         return
+    if not units:
+        # 附录 D：至少一部有效传本（阻断项）——空壳计数不算数
+        errors.append("historiography: 至少一部有效传本（阻断项）")
+        return
     _check_unique(units, "historiography", errors)
     for index, unit in enumerate(units):
         if not isinstance(unit, dict):

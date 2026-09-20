@@ -148,6 +148,50 @@ def _known_changes(
     return latest
 
 
+def vacancies_for_deaths(
+    rows: list[dict[str, Any]],
+    deaths: list[dict[str, Any]],
+    package: dict[str, Any],
+    *,
+    world_seconds: int,
+) -> list[dict[str, Any]]:
+    """声明的延续规则：在任者身故 → 该职位出缺。
+
+    依据=身故事件（来源标识与发生时刻都登记在变化行上）；这里只做「出缺」，不替世界
+    决定由谁承接——承接是后续合法事件或角色行动的事。
+    """
+    name_of_entity = {
+        _str(item.get("id")): _str(item.get("name"))
+        for item in package.get("entities") or []
+        if isinstance(item, dict)
+    }
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        holder = str(row.get("holder") or "")
+        if not holder:
+            continue
+        for death in deaths:
+            card_id = str(death.get("card_id") or "")
+            names = {str(name) for name in death.get("names") or []}
+            holder_name = name_of_entity.get(holder, "")
+            if holder == card_id or (holder_name and holder_name in names):
+                out.append(
+                    {
+                        **row,
+                        "holder": "",
+                        "source": str(death.get("event_id") or row.get("source") or ""),
+                        "from_world": int(world_seconds),
+                        "updated_world": int(world_seconds),
+                    }
+                )
+                break
+    return out
+
+
+def _str(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
 def observations(
     rows: list[dict[str, Any]],
     customs: list[dict[str, Any]],

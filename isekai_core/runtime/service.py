@@ -16,6 +16,7 @@ from typing import Any
 from ..log import get_logger
 from ..store import Store
 from . import budget as budget_mod
+from ..world import instances
 from ..world.validate import custom_index as _custom_index, office_index as _office_index
 
 from . import (
@@ -593,7 +594,10 @@ class RuntimeService:
         delivered = self.store.timeline_delivered_replies(timeline_id)
         voided = self.store.timeline_void_inflight(timeline_id)
         cancelled = self.store.timeline_cancel_undelivered(timeline_id)
-        self.store.runtime_load(instance_id, timeline_id, dict(snapshot.get("runtime") or {}), clear=True)
+        load_rows = dict(snapshot.get("runtime") or {})
+        # 正文 §三：回滚同时恢复目标提交点的对话（会话行按会话标识回写）
+        load_rows["dialog"] = list(snapshot.get("dialog") or [])
+        self.store.runtime_load(instance_id, timeline_id, load_rows, clear=True)
         now = float(now_real if now_real is not None else time.time())
         self.store.clock_put({
             **self.clock_row(timeline_id),
@@ -846,8 +850,15 @@ class RuntimeService:
             entries = memory_mod.parse_extraction(text, {str(item["ref"]) for item in materials})
             by_ref = {str(item["ref"]): item for item in materials}
             if not entries:
+                # 分不清「确实没记下什么」与「回答不可解析」：看有没有结构化载荷。
+                # 有载荷而解析为空 = 模型说没有可记内容；没载荷 = 失败，保留待处理可重试。
+                parseable = "[" in text and "]" in text
                 for material in materials:
-                    self.store.memory_task_set(str(material["task"]["id"]), state="done", note="无可记内容")
+                    self.store.memory_task_set(
+                        str(material["task"]["id"]),
+                        state="done" if parseable else "pending",
+                        note="无可记内容" if parseable else "提取结果不可解析",
+                    )
                 continue
             for entry in entries:
                 material = by_ref[entry["ref"]]
@@ -979,7 +990,28 @@ class RuntimeService:
                 vector=vector,
                 content_hash=embedding_mod.content_hash(str(row["text"])),
             )
-        return {"embedded": len(vectors), "model": self.embedding_model}
+        rebuilt = 0
+        # 同名换维度也要重建：库内旧向量维度与本次不同 → 按真实维度再补一轮
+        if vectors:
+            stale = self.store.memory_missing_embeddings(
+                instance_id, timeline_id, model=self.embedding_model, dim=len(vectors[0]), limit=8
+            )
+            if stale:
+                try:
+                    more = await self._embed([str(item["text"]) for item in stale])
+                except Exception:
+                    more = []
+                for row, vector in zip(stale, more):
+                    self.store.memory_embedding_put(
+                        memory_id=str(row["id"]),
+                        instance_id=instance_id,
+                        timeline_id=timeline_id,
+                        model=self.embedding_model,
+                        vector=vector,
+                        source_version=int(row.get("source_version") or 0),
+                    )
+                    rebuilt += 1
+        return {"embedded": len(vectors), "rebuilt": rebuilt, "model": self.embedding_model}
 
     async def embed_query(
         self, text: str, *, instance_id: str = "", timeline_id: str = "", now_real: float | None = None
@@ -1255,6 +1287,15 @@ class RuntimeService:
         self.store.clock_put(row)
         return row
 
+    def _require_compatible(self, instance_id: str) -> None:
+        """兼容检查先于推进：blocked 的实例不能激活 / 推进（只读或先转换）。"""
+        row = self.store.instance_get(instance_id)
+        if row is None:
+            return
+        status, note = instances.compatibility(row)
+        if status == "blocked":
+            raise RuntimeStateError(f"实例兼容性阻断，不能推进：{note or status}")
+
     def activate(
         self, instance_id: str, timeline_id: str, *, now_real: float, rate: int | None = None
     ) -> dict[str, Any]:
@@ -1263,6 +1304,7 @@ class RuntimeService:
         倍率超过当前上限（上限被调低 / 导入端上限更低）时不静默改写：保持冻结，
         要求调用方在激活操作中确认一个合法倍率（§2.4）。
         """
+        self._require_compatible(instance_id)
         instance, timeline = self._rows(instance_id, timeline_id)
         if timeline["state"] == "active":
             return self.view(instance_id, timeline_id, now_real=now_real)
@@ -1454,10 +1496,15 @@ class RuntimeService:
 
     # ---------- 水位推进 ----------
 
+    def _advance_guard(self, instance_id: str) -> None:
+        """推进前的统一前置（兼容性）。放在所有 advance 入口必经处。"""
+        self._require_compatible(instance_id)
+
     def advance(
         self, instance_id: str, timeline_id: str, *, now_real: float, max_batches: int | None = None
     ) -> dict[str, Any]:
         """把水位从已处理时刻推进到目标时刻，按世界日分批、每批原子（§2.6）。"""
+        self._require_compatible(instance_id)
         instance, timeline = self._rows(instance_id, timeline_id)
         if timeline["state"] != "active":
             return {"state": "frozen", "processed_world": int(self.clock_row(timeline_id)["processed_world"])}
@@ -1505,6 +1552,7 @@ class RuntimeService:
                 instance_id,
                 timeline_id,
                 world_rows["effects"] + prelim_intents["effects"],
+                deaths=self._death_cards(death_rows["events"]),
                 from_world=processed,
                 to_world=stop,
             )
@@ -1672,6 +1720,23 @@ class RuntimeService:
             changed[str(row["type_id"])] = row
         return list(changed.values())
 
+    @staticmethod
+    def _death_cards(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """本批身故：取角色标识与姓名（供制度状态判定在任者是否已身故）。"""
+        out: list[dict[str, Any]] = []
+        for event in events or []:
+            template = str(event.get("template") or "")
+            if not template.startswith("death:"):
+                continue
+            out.append(
+                {
+                    "card_id": template.split(":", 1)[1],
+                    "event_id": str(event.get("id") or ""),
+                    "names": [str(event.get("subject_name") or ""), str(event.get("summary") or "")],
+                }
+            )
+        return out
+
     def _institution_rows(
         self,
         instance: dict[str, Any],
@@ -1679,6 +1744,7 @@ class RuntimeService:
         timeline_id: str,
         effects: list[dict[str, Any]],
         *,
+        deaths: list[dict[str, Any]] | None = None,
         from_world: int,
         to_world: int,
     ) -> dict[str, list[dict[str, Any]]]:
@@ -1704,6 +1770,14 @@ class RuntimeService:
         new_rows, new_customs = institutions.apply_effects(
             rows, custom_state, effects, package, world_seconds=to_world
         )
+        if deaths:
+            # 声明的延续规则：在任者身故即出缺（有依据：身故事件 + 包内声明）
+            for vacated in institutions.vacancies_for_deaths(
+                new_rows, deaths, package, world_seconds=to_world
+            ):
+                for index, row in enumerate(new_rows):
+                    if str(row["office_id"]) == str(vacated["office_id"]):
+                        new_rows[index] = vacated
         changed_rows = [row for row in new_rows if int(row["updated_world"]) == int(to_world)]
         changed_customs = [row for row in new_customs if int(row["updated_world"]) == int(to_world)]
         return {"institution": changed_rows, "customs": changed_customs}
@@ -2478,6 +2552,9 @@ class RuntimeService:
             raise RuntimeStateError("角色卡缺少 card_id")
         if int((card.get("identity") or {}).get("born") or 0) > joined_world:
             raise RuntimeStateError("补入时刻早于角色出生时刻")
+        died = (card.get("identity") or {}).get("died")
+        if isinstance(died, int) and died <= joined_world:
+            raise RuntimeStateError("补入时刻该角色已身故，不能补入（个人史与世界既定历史冲突）")
         existing = {
             str((item.get("meta") or {}).get("card_id"))
             for item in self.cards(instance, timeline_id=timeline_id, world_seconds=watermark)

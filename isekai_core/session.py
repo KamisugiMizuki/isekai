@@ -112,11 +112,13 @@ class SessionService:
             return {"ref": env_id, "state": "queued", "message_id": None}
 
         # 重复发送：只查询 / 恢复原处理，不重新生成
-        if row["state"] == "done" and row["message_id"]:
-            fixed = self.store.outbound_by_message_id(row["message_id"])
+        # 入站行不持有 message_id：关联列是 reply_message_id（出站行的稳定标识）
+        reply_id = row["message_id"] or row["reply_message_id"]
+        if row["state"] == "done" and reply_id:
+            fixed = self.store.outbound_by_message_id(str(reply_id))
             if fixed is not None:
                 await self._send_batches(fixed)
-        return {"ref": env_id, "state": row["state"], "message_id": row["message_id"]}
+        return {"ref": env_id, "state": row["state"], "message_id": reply_id}
 
     async def retry(self, *, channel_id: str, thread_id: str, ref: str, kind: str | None = None) -> dict[str, Any]:
         """显式重试：入站生成失败恢复同一轮次；投递失败 / 未知只重发固化结果。"""
@@ -134,7 +136,16 @@ class SessionService:
                 raise UmpError(Err.NOT_FOUND, "该回复不属于当前通道", retryable=False, ref=ref, stage=Stage.RECEIVE)
             await self._send_batches(outbound)
             rollup = self.store.delivery_rollup(outbound["seq"])
-            return {"ref": ref, "state": rollup, "message_id": outbound["message_id"]}
+            # accepted.state 只报接收侧枚举；投递汇总另置字段（否则客户端按协议校验失败、静默丢弃）
+            settled = {"delivered": "done", "accepted": "done", "sent": "done"}.get(
+                str(rollup), "queued"
+            )
+            return {
+                "ref": ref,
+                "state": settled,
+                "delivery": rollup,
+                "message_id": outbound["message_id"],
+            }
 
         state = outbound["state"]
         if state in ("queued", "processing"):

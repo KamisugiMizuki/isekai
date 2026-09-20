@@ -247,6 +247,9 @@ def _restore_runtime_state(
             "effects": _remap_rows(payload.get("effects"), instance_id, new_id),
             "intents": _remap_rows(payload.get("intents"), instance_id, new_id),
             "environment": _remap_rows(payload.get("environment"), instance_id, new_id),
+            "institution": _remap_rows(payload.get("institution"), instance_id, new_id),
+            "customs": _remap_rows(payload.get("customs"), instance_id, new_id),
+            "disclosure": _remap_rows(payload.get("disclosure"), instance_id, new_id),
             "memories": _remap_rows(payload.get("memories"), instance_id, new_id),
             "memory_tasks": _remap_rows(payload.get("memory_tasks"), instance_id, new_id),
         }
