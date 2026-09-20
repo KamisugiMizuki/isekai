@@ -2631,13 +2631,35 @@ class Store:
             for item in self.memory_scope(str(row["instance_id"]), str(row["timeline_id"]), character_id)
             if str(item["kind"]) == str(row["kind"])
         ]
+        # 矛盾链只挂到「不晚于本行」的最近一条：迟到提取不许把后来固化的纠正顶掉
+        incoming_world = int(
+            row.get("semantic_watermark") or row.get("recorded_world") or row.get("learned_world") or 0
+        )
         supersedes = None
+        best_world = -1
+        newest_contradiction = None
         for item in siblings:
-            if memory_mod.contradicts(str(item["text"]), str(row["text"])):
+            # 先判相反：矛盾里也常有相同词，反着判顺序会把纠正当成重复吞掉
+            if not memory_mod.contradicts(str(item["text"]), str(row["text"])):
+                if memory_mod.same_fact(str(item["text"]), str(row["text"])):
+                    return None  # 同事实：合并来源即可，不新增条目
+                continue
+            item_world = int(
+                item.get("semantic_watermark") or item.get("recorded_world") or item.get("learned_world") or 0
+            )
+            if newest_contradiction is None or item_world > int(
+                newest_contradiction.get("semantic_watermark")
+                or newest_contradiction.get("recorded_world") or 0
+            ):
+                newest_contradiction = item
+            if item_world <= incoming_world and (supersedes is None or item_world > best_world):
                 supersedes = str(item["id"])
-                break
-            if memory_mod.same_fact(str(item["text"]), str(row["text"])):
-                return None  # 同事实：合并来源即可，不新增条目
+                best_world = item_world
+        late = False
+        if newest_contradiction is not None and supersedes is None:
+            # 本行比已有的纠正还旧：新条目作为「当时认知」入档，由既有条目取代
+            late = True
+            supersedes = str(newest_contradiction["id"])
         with self._lock, self._conn:
             self._conn.execute(
                 """INSERT INTO memory(id, instance_id, timeline_id, character_id, text, kind, sources,
@@ -2649,8 +2671,8 @@ class Store:
                           :strength,:confidence,:state,1,:supersedes,NULL,:source_key,:decay_world)""",
                 {
                     "sources": json.dumps(row.get("sources") or [], ensure_ascii=False),
-                    "state": memory_mod.state_for(float(row.get("strength") or 0.6)),
-                    "supersedes": supersedes,
+                    "state": "archived" if late else memory_mod.state_for(float(row.get("strength") or 0.6)),
+                    "supersedes": supersedes if not late else None,
                     # 衰减从记录水位起算；缺省用记录时刻（不是 0——0 会让条目一推进就归零）
                     "decay_world": int(row.get("decay_world") or row.get("recorded_world") or 0),
                     **{key: row.get(key) for key in (
@@ -2660,7 +2682,13 @@ class Store:
                     )},
                 },
             )
-            if supersedes:
+            if late:
+                # 迟到提取：把既有纠正标成「取代了它」，本行只作历史
+                self._conn.execute(
+                    "UPDATE memory SET superseded_by=? WHERE instance_id=? AND timeline_id=? AND id=?",
+                    (str(row.get("id")), row.get("instance_id"), row.get("timeline_id"), supersedes),
+                )
+            elif supersedes:
                 # 明确纠正：新条目替代旧的，旧条目保留（历史可查当时认知）
                 self._conn.execute(
                     "UPDATE memory SET superseded_by=?, state='archived' WHERE id=?", (row["id"], supersedes)
