@@ -13,6 +13,11 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# §3.1/A17 桌面提醒：系统通知 + 点击定位会话。不用官方 tauri-plugin-notification：
+# 它在桌面端不实现点击事件（tauri-apps/plugins-workspace#2150）且 show() 丢掉通知句柄、
+# 吞掉显示失败，拿不到「点击 → 定位」也报不出「通知不可用」；这里直接用插件内部同一套
+# notify-rust，保留句柄等激活回调，显示失败照实回报给渲染层。
+notify-rust = "4"
 
 [features]
 # 生产 / 自包含运行：使用内嵌前端资源而不是 devUrl（不带该 feature 的 debug 构建会去找 dev 服务器）

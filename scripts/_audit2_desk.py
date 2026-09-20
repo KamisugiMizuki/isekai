@@ -6,6 +6,7 @@
   .venv/Scripts/python.exe scripts/_audit2_desk.py llmfail    # 真壳 + 死地址 LLM（不联网）→ 生成失败 UI
   .venv/Scripts/python.exe scripts/_audit2_desk.py storage    # 存储不可用根 → UI 存储错误
   .venv/Scripts/python.exe scripts/_audit2_desk.py nointerp   # 缺 .venv 的根 → 启动失败诊断
+  .venv/Scripts/python.exe scripts/_audit2_desk.py notify     # §3.1/A17 桌面提醒：真壳登记 / 通知 / 点击定位
 
 只读策略：仓库内文件（data/isekai.db、config/config.yaml、logs/、desktop/、isekai_core/、tests/）
 一律不改；一切可写数据落在 %LOCALAPPDATA%/Temp/isekai_audit2_*，用 junction 指回仓库的
@@ -471,16 +472,42 @@ def section_static() -> None:
           clause="§二.1 重复启动复用 / 唤起已有应用，不再启动第二个写库进程",
           code="desktop/src-tauri/Cargo.toml · src/main.rs:321-391")
 
-    # §3.1 桌面提醒（阶段 2–3）
+    # §3.1 桌面提醒（阶段 2–3）：壳侧必须真的有「登记 → 通知 → 点击定位」三段代码
+    ts_src = (REPO / "desktop" / "src" / "main.ts").read_text(encoding="utf-8")
+    html_src = (REPO / "desktop" / "index.html").read_text(encoding="utf-8")
+    ts_parts = {
+        "登记（管理面 notice.create）": "notice.create",
+        "解析定位（管理面 notice.resolve）": "notice.resolve",
+        "显示系统通知（壳命令 notify_message）": "notify_message",
+        "待定位提醒轮询（隐藏到托盘时兜底）": "take_pending_notice",
+        "设置开关（默认开）": "set-notify-enabled",
+        "开关闸门（关闭后不登记）": "notifyOn",
+    }
+    ts_missing = [name for name, token in ts_parts.items() if token not in ts_src]
+    rust_parts = {
+        "通知显示（notify_message 命令）": "fn notify_message",
+        "点击落点（open_notice）": "fn open_notice",
+        "系统通知激活回调（wait_for_action）": "wait_for_action",
+        "把窗口带到前台": "set_focus",
+    }
+    rust_missing = [name for name, token in rust_parts.items() if token not in rust]
+    hint_missing = [token for token in ("id=\"notice-open\"", "id=\"notice-note\"", "id=\"set-notify-enabled\"")
+                    if token not in html_src]
+    deps = [ln.strip() for ln in cargo.splitlines() if ln.strip().startswith(("notify-rust", "tauri-plugin-notification"))]
     hits = [str(p.relative_to(REPO)) for p in
             list((REPO / "desktop" / "src").rglob("*.ts"))
             + list((REPO / "desktop" / "src-tauri" / "src").rglob("*.rs"))
             + [REPO / "desktop" / "index.html", REPO / "desktop" / "src-tauri" / "Cargo.toml"]
             if re.search(r"notification|notify|提醒", p.read_text(encoding="utf-8", errors="replace"), re.I)]
-    check("S3 §3.1/A17 桌面提醒入口存在", "FAIL" if not hits else "PASS",
-          f"desktop/ 内含 notification|notify|提醒 的文件={hits or '无'}",
+    check("S3 §3.1/A17 桌面提醒入口（登记 → 系统通知 → 点击定位）实现存在",
+          "PASS" if not (ts_missing or rust_missing or hint_missing) else "FAIL",
+          f"渲染层缺={ts_missing or '无'}（命中={[k for k in ts_parts if k not in ts_missing]}）；"
+          f"壳缺={rust_missing or '无'}（命中={[k for k in rust_parts if k not in rust_missing]}）；"
+          f"界面控件缺={hint_missing or '无'}；通知依赖={deps}；desktop/ 内含 "
+          f"notification|notify|提醒 的文件={hits or '无'}；行为级断言见 notify 模式 S3.1–S3.7",
           clause="§3.1 桌面提醒只作为已固化主动消息的入口 / §十.17",
-          code="desktop/（无通知实现）")
+          code="desktop/src/main.ts（notice.create / notice.resolve / notify_message）· "
+               "desktop/src-tauri/src/main.rs（notify_message / open_notice）")
 
     # §3.3 设置面：界面里是否存在各设置组
     html = (REPO / "desktop" / "index.html").read_text(encoding="utf-8")
@@ -1682,6 +1709,429 @@ async def section_nointerp() -> None:
     dump("nointerp")
 
 
+# ================================================================== notify（§3.1 末条 / §十.17 桌面提醒）
+
+#: 主动消息正文（假 LLM）：通知正文应当是它，不是任何内部标识
+NOTIFY_TEXT = "北堤的通行牌这三天都停发了，先别走那条路。"
+#: 通知观察点：记录 notify_message 的载荷与结果；__notifyFail 非空时让通知命令失败（注入「通知不可用」）
+#: 观察点：WebView2 里 `window.__TAURI_INTERNALS__` 与其 invoke 都是只读属性（w/c 全 false，
+#: Proxy / defineProperty 均失败，实测），页面内截不到 invoke 载荷；所以通知一侧用壳自己的
+#: 诊断日志（notification shown / failed，不含正文）当证据，这里只截 UMP 的 delivery 上报。
+NOTIFY_STUB = (
+    "(()=>{window.__umpSend=window.__umpSend||[];"
+    "if(!window.__origWsSend){window.__origWsSend=WebSocket.prototype.send;"
+    "WebSocket.prototype.send=function(d){try{const m=JSON.parse(String(d));"
+    "if(m&&m.type==='delivery'){window.__umpSend.push(m.payload||{});}}catch(e){}"
+    "return window.__origWsSend.call(this,d);};}"
+    "window.__notifyStubReady=true;return true;})()"
+)
+
+
+async def install_observe(cdp: Cdp, timeout: float = 90.0) -> bool:
+    """装上观察点（Tauri 的 internals 可能在页面 ready 之后才注入 → 轮询到装上为止）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if await cdp.js(NOTIFY_STUB):
+                return True
+        except Exception:  # noqa: BLE001 - 页面还在初始化
+            pass
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def mgmt_call(cdp: Cdp, op: str, **args):
+    """经壳自己已认证的管理面连接调 op。
+
+    核心的管理令牌是一次性的（channel.py `_mgmt_used`），只会交给受信壳；
+    探针要断言管理面契约就只能借壳的通路 —— 页面把 `mgmt.call` 挂在 window.__mgmtCall 上。
+    """
+    return await cdp.js(f"window.__mgmtCall({json.dumps(op)},{json.dumps(args)})",
+                        await_promise=True) or {}
+
+
+def foreground_pid() -> int:
+    """当前前台窗口属于哪个进程（「点击提醒 → 聚焦窗口」的观察点）。"""
+    user32 = ctypes.windll.user32
+    owner = ctypes.c_ulong()
+    user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(owner))
+    return int(owner.value)
+
+
+def db_exec(root: Path, sql: str, params: tuple = ()) -> None:
+    """写一行到临时数据根。探针自己的 DML 必须显式 commit：sqlite3 在 close() 时回滚未提交事务。"""
+    con = sqlite3.connect(root / "data" / "isekai.db", timeout=20)
+    con.execute("PRAGMA busy_timeout=20000")
+    try:
+        con.execute(sql, params)
+        con.commit()
+    finally:
+        con.close()
+
+
+def knowledge_add(root: Path, inst: str, line: str, char: str, *, key: str, text: str) -> None:
+    """补一条「她已获知」的素材：主动发言要有可分享的东西。"""
+    world = int(one(root, "SELECT COALESCE(MAX(processed_world), 0) FROM timeline_clock "
+                          "WHERE timeline_id=?", (line,)) or 0)
+    db_exec(root, "INSERT OR REPLACE INTO knowledge(instance_id,timeline_id,character_id,id,world_seconds,"
+                  "kind,target,source,stance,text) VALUES(?,?,?,?,?,'claim',?,'src-1','recorded',?)",
+            (inst, line, char, f"kn-{key}", world, f"cl-{key}", text))
+
+
+def fixed_messages(root: Path, session_id: str) -> list[tuple]:
+    """该会话里 reply_to 为空的已固化消息（主动消息 / 独立开场）。"""
+    return db(root, "SELECT message_id FROM message WHERE session_id=? AND reply_to IS NULL ORDER BY seq",
+              (session_id,))
+
+
+async def wait_fixed(root: Path, session_id: str, known: set[str], timeout: float = 40.0) -> str:
+    """等一条**新的**已固化主动消息落库。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for (message_id,) in fixed_messages(root, session_id):
+            if str(message_id) not in known:
+                return str(message_id)
+        await asyncio.sleep(1.0)
+    return ""
+
+
+async def click_session(cdp: Cdp, needle: str) -> str:
+    """点侧栏里文字含 needle 的会话（侧栏只列当前查看实例的会话 + 正在用的那条）。"""
+    return str(await cdp.js(
+        "(()=>{const bs=[...document.querySelectorAll('#sessions button.session')];"
+        f"const hit=bs.find(b=>b.textContent.includes({json.dumps(needle)}));"
+        "(hit||bs[0])?.click();return (hit||bs[0])?.textContent||'';})()") or "")
+
+
+async def leave_target(cdp: Cdp, other_instance: str, target_name: str,
+                        timeout: float = 25.0) -> str:
+    """离开提醒目标会话：侧栏只列当前查看实例的会话，所以先切到另一个实例，
+    再点那条不是 active 的会话（= 对照实例的角色会话）；标题里不再有目标实例名才算离开。"""
+    await cdp.pane("manage")
+    await cdp.select("inst-select", other_instance)
+    title = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        await asyncio.sleep(2.0)
+        await cdp.pane("chat")
+        clicked = await cdp.js(
+            "(()=>{const bs=[...document.querySelectorAll('#sessions button.session')];"
+            "const hit=bs.find(b=>!b.classList.contains('active'));"
+            "if(!hit)return '';hit.click();return hit.textContent;})()")
+        if clicked:
+            await asyncio.sleep(4.0)
+            title = str(await cdp.js("document.getElementById('title').textContent") or "")
+            if target_name not in title:
+                return title
+        await cdp.pane("manage")
+    return title
+
+
+async def notify_click(cdp: Cdp, notice_id: str) -> None:
+    """通知点击落点：与系统通知的激活回调进同一段壳侧处理（main.rs open_notice）。"""
+    await cdp.js("window.__TAURI_INTERNALS__.invoke('notice_click',"
+                 f"{{notice_id:{json.dumps(notice_id)}}})", await_promise=True)
+
+
+async def section_notify() -> None:
+    from isekai_core.config import load_config
+    from isekai_core.store import Store
+
+    root = make_root("notify")
+    instances = prepare_world(root)
+    cfg = load_config(root)
+    store = Store(cfg.paths.db)
+    store.ensure_schema()
+    inst = instances[0]["id"]
+    line = store.timeline_list(inst)[0]["id"]
+    char = str(one(root, "SELECT character_id FROM unit WHERE instance_id=? AND timeline_id=? LIMIT 1",
+                   (inst, line)) or "")
+    session = store.session_ensure(inst, line, char)
+    session_id = str(session["id"])
+    # 世界时钟前移 8 小时：示例世界从午夜开局（生活计划第一段是睡眠），主动发言要角色清醒（§5.2 节律）
+    shift = 28800
+    db_exec(root, "UPDATE timeline_clock SET base_world = base_world + ?, processed_world = processed_world + ? "
+                  "WHERE timeline_id = ?", (shift, shift, line))
+    # 素材 m1：主动发言要有她已获知的东西（m2 / m3 留给开关与降级两轮）
+    store.knowledge_put({"instance_id": inst, "timeline_id": line, "character_id": char,
+                         "id": "kn-m1",
+                         "world_seconds": int((store.clock_get(line) or {}).get("processed_world") or 0),
+                         "kind": "claim", "target": "cl-m1", "source": "src-1",
+                         "stance": "recorded", "text": "北堤的通行牌停发三天了"})
+    # 另一个实例也备一条会话：验证「点击提醒 → 切回来」前得先真的离开目标会话
+    inst2 = instances[1]["id"]
+    line2 = store.timeline_list(inst2)[0]["id"]
+    char2 = str(one(root, "SELECT character_id FROM unit WHERE instance_id=? AND timeline_id=? LIMIT 1",
+                    (inst2, line2)) or "")
+    session2 = str(store.session_ensure(inst2, line2, char2)["id"])
+    store.close()
+    print(f"[notify] 数据根={root}；实例={inst}；线={line}；角色={char}；会话={session_id}；"
+          f"对照实例={inst2}；对照会话={session2}", flush=True)
+
+    kill_tree()
+    proc, cdp, _ = await boot_shell(root, PORT + 4, {"ISEKAI_LLM_FAKE": "1",
+                                                     "ISEKAI_LLM_FAKE_REPLY": NOTIFY_TEXT})
+    await cdp.js(STUB)
+    # 尽早装：核心 tick 不等壳就绪，主动消息可能先到；internals 注入晚于页面 ready，所以轮询重试
+    observed = await install_observe(cdp)
+    status = await cdp.wait("document.getElementById('status').textContent", "已就绪", 120)
+
+    # ---- 激活甲世界的线（时钟只对当前查看的激活线有效）+ 把聊天 thread 绑到目标会话
+    await cdp.pane("manage")
+    await cdp.select("inst-select", inst)
+    await cdp.wait("document.getElementById('clock-label').textContent", "冻结", 30)
+    await cdp.js("document.getElementById('clock-activate').click()")
+    await cdp.wait("document.getElementById('clock-label').textContent", "倍率", 30)
+    await cdp.pane("chat")
+    await click_session(cdp, char)
+    await asyncio.sleep(6.0)
+    bound = one(root, "SELECT COUNT(*) FROM thread WHERE session_id=? AND thread_id='main'", (session_id,))
+
+    # ---- 主动消息到达（核心自身 tick 的生活节律路径：素材 + 清醒 + 额度 + 唯一目标）
+    fixed = await wait_fixed(root, session_id, set())
+    shown = await cdp.wait("document.getElementById('messages').textContent", NOTIFY_TEXT[:14], 30)
+    await asyncio.sleep(2.5)
+    notices = list((await mgmt_call(cdp, "notice.list", instance_id=inst)).get("notices") or [])
+    payload = await cdp.js("window.__notify") or []
+    fixed_all = [str(item) for (item,) in fixed_messages(root, session_id)]
+    mapped = [str(row.get("message_id") or "") for row in notices]
+    paired = set(mapped) == set(fixed_all)
+    shown_logs = len([ln for ln in logs(root).splitlines() if "notification shown" in ln])
+    ok = (status == "已就绪" and observed and bound == 1 and bool(fixed) and bool(notices)
+          and fixed in mapped and set(mapped) <= set(fixed_all) and NOTIFY_TEXT[:14] in str(shown)
+          and shown_logs == len(notices))
+    check("S3.1 §3.1/A17 已固化主动消息到达 → 壳登记提醒（notice.list 一条，message_id 与固化消息一致）",
+          "PASS" if ok else "FAIL",
+          f"真壳状态={status!r}；通知观察点已装={observed}；聊天 thread 绑定到目标会话={bool(bound)}；"
+          f"核心 tick 固化的主动消息={fixed_all}（★首条={fixed!r}）；notice.list {len(notices)} 条，"
+          f"message_id 与之{'一致' if paired else '不一致'}：{mapped}；"
+          f"壳日志里「系统通知已显示」={shown_logs} 行（= 提醒条数：{shown_logs == len(notices)}，"
+          f"页面内载荷观察点装不上见 S3.2 说明）；界面已显示该消息={NOTIFY_TEXT[:14] in str(shown)}",
+          clause="§3.1 桌面提醒只作为已固化主动消息的入口；§十.17 桌面提醒点击后打开固化消息所属会话",
+          code="desktop/src/main.ts mergeReply→registerNotice（notice.create）",
+          expected="收到 reply_to 为空的已固化消息后，受信管理面出现一条引用同一 message_id 的提醒")
+
+    # ---- 通知载荷卫生 + 系统通知是否真的发出
+    source = (REPO / "desktop" / "src" / "main.ts").read_text(encoding="utf-8")
+    built = re.search(r"function noticePayload\(text: string\).*?\n\}", source, re.S)
+    payload_line = re.search(r"return \{\s*title:.*?\n\s*\};", built.group(0) if built else "", re.S)
+    payload_src = payload_line.group(0) if payload_line else ""
+    ids_used = bool(re.search(r"\.id\b|messageId|instanceId|timelineId|sessionId", payload_src))
+    notify_ok = await cdp.js("window.__notifyOk")
+    notify_err = await cdp.js("window.__notifyErr")
+    shown_logs = len([ln for ln in logs(root).splitlines() if "notification shown" in ln])
+    ok = bool(built) and not ids_used and shown_logs >= 1
+    check("S3.2 §3.1/A17 系统通知载荷（标题 / 正文）只由显示名 + 固化消息原文构造、不含内部标识",
+          "PASS" if ok else "FAIL",
+          f"noticePayload 的标题 / 正文表达式={payload_src.strip()!r}（含 .id / *Id 字段={ids_used}）；"
+          f"改由壳日志确认通知真的发出：notification shown={shown_logs} 行；"
+          f"页面内载荷观察点不可用（WebView2 的 __TAURI_INTERNALS__ 与 invoke 全为只读属性，"
+          f"Proxy/defineProperty 均失败）→ 载荷内容以构造断言 + 通知已发出为准；"
+          f"注入观察点的成功 / 错误计数={notify_ok}/{notify_err!r}",
+          clause="§3.1 桌面提醒不作为第二份历史；CHANNEL_PLUGIN_SPEC §2.5 通知载荷不承载内部标识",
+          code="desktop/src/main.ts noticePayload · desktop/src-tauri/src/main.rs notify_message",
+          expected="通知只带显示名与消息原文；实例 / 时间线 / 会话 / 消息标识只留在壳与管理面的内部通路")
+
+    # ---- 断线重连补读：把投递记录退回 pending（模拟没收到回执）→ 重连会补发同一条。
+    #      核心只补发**最新一条**主动消息（session.py resend_pending：旧的留在历史里不补发），
+    #      所以这一条要拿最新那条来测。
+    latest = fixed_all[-1] if fixed_all else fixed
+    db_exec(root, "UPDATE delivery SET state='pending' "
+                  "WHERE msg_seq=(SELECT seq FROM message WHERE message_id=?)", (latest,))
+    before = len(notices)
+    chars_before = await cdp.js("document.querySelectorAll('#messages li.character').length")
+    sends_before = len([row for row in (await cdp.js("window.__umpSend") or [])
+                        if str(row.get("message_id")) == latest])
+    await cdp.js("document.getElementById('restart').classList.remove('hidden');"
+                 "document.getElementById('restart').click()")
+    back = await cdp.wait("document.getElementById('status').textContent", "已就绪", 120)
+    await asyncio.sleep(8.0)
+    notices2 = list((await mgmt_call(cdp, "notice.list", instance_id=inst)).get("notices") or [])
+    payload2 = await cdp.js("window.__notify") or []
+    chars_after = await cdp.js("document.querySelectorAll('#messages li.character').length")
+    delivery = one(root, "SELECT state FROM delivery WHERE msg_seq="
+                         "(SELECT seq FROM message WHERE message_id=?)", (latest,))
+    sends_after = len([row for row in (await cdp.js("window.__umpSend") or [])
+                       if str(row.get("message_id")) == latest])
+    off_logs = len([ln for ln in logs(root).splitlines() if "notification shown" in ln])
+    ok = (back == "已就绪" and before == len(notices2) and chars_after == chars_before
+          and sends_after > sends_before and off_logs == len(notices2))
+    check("S3.3 §3.1/A17 断线重连补读不重复登记（同一条固化消息只登记一次）",
+          "PASS" if ok else "FAIL",
+          f"把最新一条主动消息（{latest}，核心只补发最新一条）的投递记录退回 pending 再重启核心："
+          f"重连后状态={back!r}；补读确实重投（壳对同一条消息的回执上报 {sends_before}→{sends_after} 次，"
+          f"核心侧投递状态={delivery!r}）；重连后壳日志里的通知行={off_logs}（= 提醒数）；"
+          f"注：重连时壳会 thread.bind 换绑定令牌，核心对旧令牌回执按「旧回执不能作用于新绑定」拒绝"
+          f"（channel.py _on_delivery），故投递状态可能停在 pending —— 壳侧照常上报，"
+          f"靠 message_id 去重保证不重复登记；"
+          f"notice.list {before}→{len(notices2)} 条；角色消息条数 {chars_before}→{chars_after}"
+          f"（重复投递不重复渲染）；补读后没有新的通知出现（notification shown 行数={off_logs}）",
+          clause="§3.1 历史按当前会话分页加载，重连后补读；§十.17 提醒不因重连重复出现",
+          code="desktop/src/main.ts registerNotice（noticedMessages 去重）",
+          expected="同一 message_id 的重复投递不再创建提醒、不再发通知")
+
+    # ---- 点击提醒（目标有效）：窗口回到前台 + 切到提醒指向的实例 / 时间线 / 会话
+    notice_one = str((notices2 or [{}])[0].get("id") or "")
+    other_title = await leave_target(cdp, inst2, instances[0]["name"])
+    close_window(proc.pid)  # 关窗到托盘：通知点击要能把窗口带回来
+    await asyncio.sleep(2.5)
+    visible_before = window_count(proc.pid)
+    await notify_click(cdp, notice_one)
+    await asyncio.sleep(4.5)
+    visible_after = window_count(proc.pid)
+    focused = foreground_pid() == proc.pid
+    title = await cdp.js("document.getElementById('title').textContent")
+    active = await cdp.js("document.querySelector('#sessions button.session.active')?.textContent||''")
+    ok = (visible_before == 0 and visible_after >= 1 and instances[0]["name"] in str(title)
+          and str(title) != str(other_title) and "·" in str(active))
+    check("S3.4 §十.17 点击提醒 → 窗口回到前台并定位到原实例 / 时间线 / 会话",
+          "PASS" if ok else "FAIL",
+          f"先切到对照实例（{instances[1]['name']}）的会话并关窗到托盘：可见窗口数 {visible_before}；"
+          f"点提醒后 {visible_after}（窗口被带回来）；前台窗口属本壳={focused}；"
+          f"顶栏 {other_title!r} → {title!r}；侧栏活动会话={active!r}",
+          clause="§十.17 桌面提醒点击后打开固化消息所属的当前有效会话",
+          code="desktop/src-tauri/src/main.rs open_notice/notice_click · main.ts openNotice（notice.resolve）",
+          expected="点击后窗口可见并切到 target 指向的会话（先离开原会话再点，切换可验证）")
+
+    # ---- 开关关闭：不再创建提醒，管理面照常
+    await cdp.pane("settings")
+    await cdp.js("(()=>{const b=document.getElementById('set-notify-enabled');b.checked=false;"
+                 "b.dispatchEvent(new Event('change',{bubbles:true}));return b.checked;})()")
+    await asyncio.sleep(1.5)
+    flag = json.loads((root / "config" / "shell.json").read_text(encoding="utf-8")).get("notify_enabled")
+    before_off = list((await mgmt_call(cdp, "notice.list", instance_id=inst)).get("notices") or [])
+    shown_before_off = len([ln for ln in logs(root).splitlines() if "notification shown" in ln])
+    chars_before2 = await cdp.js("document.querySelectorAll('#messages li.character').length")
+    known = {str(item) for (item,) in fixed_messages(root, session_id)}
+    knowledge_add(root, inst, line, char, key="m2", text="盐仓的账本换人了")
+    # 每日额度已被核心自身的节律用掉：这一轮走管理面 runtime.proactive，
+    # 再重启核心 → 重连补发把这条固化消息投给壳（顺带再走一遍补读路径）
+    gen2 = await mgmt_call(cdp, "runtime.proactive", instance_id=inst, timeline_id=line, per_day=5)
+    await cdp.js("document.getElementById('restart').classList.remove('hidden');"
+                 "document.getElementById('restart').click()")
+    back2 = await cdp.wait("document.getElementById('status').textContent", "已就绪", 120)
+    fixed2 = await wait_fixed(root, session_id, known, timeout=45.0)
+    await asyncio.sleep(8.0)  # 等补发投递 + 历史补读
+    chars_after2 = await cdp.js("document.querySelectorAll('#messages li.character').length")
+    shown_off = len([ln for ln in logs(root).splitlines() if "notification shown" in ln])
+    notices3 = list((await mgmt_call(cdp, "notice.list", instance_id=inst)).get("notices") or [])
+    await cdp.pane("manage")
+    await cdp.js("document.getElementById('world-refresh').click()")
+    await asyncio.sleep(2.0)
+    facts = await cdp.js("document.getElementById('manage-facts').textContent")
+    ok = (flag is False and bool(fixed2) and len(notices3) == len(before_off)
+          and int(chars_after2 or 0) >= int(chars_before2 or 0) + 1
+          and shown_off == shown_before_off and bool(str(facts)))
+    check("S3.6 §3.3/§3.1 设置面关闭桌面提醒后不再创建提醒，管理面照常",
+          "PASS" if ok else "FAIL",
+          f"关掉开关后壳设置 notify_enabled={flag!r}；管理面 runtime.proactive 仍能生成 "
+          f"{str(gen2)[:70]}（message_id={fixed2!r}；重启补读后该消息进了历史："
+          f"角色消息 {chars_before2}→{chars_after2} 条）；notice.list {len(before_off)}→{len(notices3)} 条、"
+          f"壳日志 notification shown 行数 {shown_before_off}→{shown_off}"
+          f"（关掉后不再登记、不再通知）；重连状态={back2!r}；管理面刷新后事实区非空={bool(str(facts))}",
+          clause="§3.3 日常用户可调项由 UI 保存到本地配置；§3.1 关闭提醒不影响管理面",
+          code="desktop/src/main.ts registerNotice（notifyOn 闸门）· index.html #set-notify-enabled",
+          expected="关闭后新到的主动消息不登记提醒、不发通知；管理面与历史不受影响")
+
+    # ---- 通知不可用：换一个带 ISEKAI_NOTIFY_FAIL=1 的壳（同一数据根）跑降级路径
+    await cdp.pane("settings")
+    await cdp.js("(()=>{const b=document.getElementById('set-notify-enabled');b.checked=true;"
+                 "b.dispatchEvent(new Event('change',{bubbles:true}));return b.checked;})()")
+    await asyncio.sleep(1.5)
+    kill_tree()
+    # 旧核跟着旧壳一起退：等写库锁释放再起新壳，别让新核撞上「另一个核心在写」
+    for _ in range(40):
+        lock = core_lock_pid(root)
+        if not lock or not pid_alive(lock):
+            break
+        await asyncio.sleep(0.5)
+    proc, cdp, _ = await boot_shell(root, PORT + 5, {"ISEKAI_LLM_FAKE": "1",
+                                                    "ISEKAI_LLM_FAKE_REPLY": NOTIFY_TEXT,
+                                                    "ISEKAI_NOTIFY_FAIL": "1"})
+    await cdp.js(STUB)
+    observed = observed and await install_observe(cdp, timeout=60)
+    status_b = await cdp.wait("document.getElementById('status').textContent", "已就绪", 120)
+    chars_before3 = await cdp.js("document.querySelectorAll('#messages li.character').length")
+    knowledge_add(root, inst, line, char, key="m3", text="渡口的桥板换新了")
+    known3 = {str(item) for (item,) in fixed_messages(root, session_id)}
+    await mgmt_call(cdp, "runtime.proactive", instance_id=inst, timeline_id=line, per_day=5)
+    await cdp.js("document.getElementById('restart').classList.remove('hidden');"
+                 "document.getElementById('restart').click()")
+    await cdp.wait("document.getElementById('status').textContent", "已就绪", 120)
+    fixed3 = await wait_fixed(root, session_id, known3, timeout=45.0)
+    await asyncio.sleep(8.0)
+    chars_after3 = await cdp.js("document.querySelectorAll('#messages li.character').length")
+    notices4 = list((await mgmt_call(cdp, "notice.list", instance_id=inst)).get("notices") or [])
+    degrade = await cdp.js("document.getElementById('notify-note').textContent")
+    await cdp.send_text("你那边现在怎么样？", enter=True)
+    chat_ok = False
+    for _ in range(40):
+        users = int(await cdp.js("document.querySelectorAll('#messages li.user').length") or 0)
+        chars = int(await cdp.js("document.querySelectorAll('#messages li.character').length") or 0)
+        if users >= 1 and chars > int(chars_after3 or 0):
+            chat_ok = True
+            break
+        await asyncio.sleep(1.0)
+    fail_logs = len([ln for ln in logs(root).splitlines() if "notification failed" in ln])
+    mapped4 = {str(row.get("message_id") or "") for row in notices4}
+    ok = (status_b == "已就绪" and bool(fixed3) and len(notices4) > len(notices3)
+          and fixed3 in mapped4 and "不可用" in str(degrade)
+          and int(chars_after3 or 0) >= int(chars_before3 or 0) + 1
+          and fail_logs >= 1 and chat_ok)
+    check("S3.7 §3.1/A17 系统通知不可用时降级：不崩、历史照常可读、界面有可读说明",
+          "PASS" if ok else "FAIL",
+          f"用 ISEKAI_NOTIFY_FAIL=1 的壳（状态={status_b!r}，同一数据根）注入通知失败："
+          f"新消息 message_id={fixed3!r} 仍固化并进历史（角色消息 {chars_before3}→{chars_after3} 条）；"
+          f"提醒仍登记（notice.list {len(notices3)}→{len(notices4)} 条且含该消息"
+          f"={fixed3 in mapped4}，通知失败不吞提醒）；"
+          f"壳日志里 notification failed={fail_logs} 行；界面说明={degrade!r}；"
+          f"此后仍能正常对话（自己的消息 + 新回复进历史={chat_ok}）",
+          clause="§3.1 系统通知不可用时用户仍可从历史读取；§3.3 配置检查失败保留原值，错误提示可读",
+          code="desktop/src/main.ts registerNotice（catch → notifyUnavailable）· #notify-note",
+          expected="通知失败只降级为界面说明：提醒记录、聊天与历史全部照常")
+
+    # ---- 目标失效（归档）：只显示管理错误，不改投、不切换、不激活冻结线
+    notice_three = str((notices4 or [{}])[-1].get("id") or "")
+    other = await leave_target(cdp, inst2, instances[0]["name"])
+    await mgmt_call(cdp, "runtime.timeline.archive", instance_id=inst, timeline_id=line)
+    resolved = await mgmt_call(cdp, "notice.resolve", id=notice_three)
+    target = resolved.get("target") or {}
+    lines_before = db(root, "SELECT id, state FROM timeline ORDER BY id")
+    await notify_click(cdp, notice_three)
+    await asyncio.sleep(4.5)
+    note = await cdp.js("document.getElementById('notice-note').textContent")
+    title2 = await cdp.js("document.getElementById('title').textContent")
+    lines_after = db(root, "SELECT id, state FROM timeline ORDER BY id")
+    leak_in_note = {name: value for name, value in (("instance", inst), ("timeline", line),
+                                                    ("session", session_id)) if value in str(note)}
+    ok = (target.get("valid") is False and str(target.get("reason") or "") != ""
+          and "系统错误" in str(note) and str(title2) == str(other)
+          and lines_before == lines_after and not leak_in_note
+          and all(state != "active" for _, state in lines_after))
+    check("S3.5 §十.17 目标归档后点击提醒：报管理错误、不改投其他会话、不激活冻结线",
+          "PASS" if ok else "FAIL",
+          f"先切到对照实例会话，再归档目标线；notice.resolve={resolved}（valid=false 且带原因）；"
+          f"点提醒后界面提示={note!r}（含内部标识={leak_in_note or '无'}）；"
+          f"顶栏未变（{other!r} → {title2!r}）；时间线状态 点击前{lines_before} 点击后{lines_after}"
+          f"（没有线被激活：{[s for _, s in lines_after]}）",
+          clause="§十.17 目标被删除 / 归档 / 回滚 / 重绑时不改投其他会话、不激活冻结线，并显示管理错误",
+          code="desktop/src/main.ts openNotice（valid=false 分支）· main.rs open_notice",
+          expected="失效目标只报管理错误：不改投角色、不改变激活集合、历史仍可读")
+    kill_tree()
+    stamp = str(root.name).rsplit("_", 1)[-1]
+    outdir = TMPBASE / f"isekai_notify_{stamp}"
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "result.json").write_text(json.dumps(RESULTS, ensure_ascii=False, indent=2), encoding="utf-8")
+    (outdir / "shell-core.log").write_text(logs(root), encoding="utf-8")
+    (outdir / "README.txt").write_text(
+        "§3.1/A17 桌面提醒验收（notify 模式）\n"
+        f"数据根={root}\n"
+        "复现：cd /d/Hermes_workspace/isekai && .venv/Scripts/python.exe scripts/_audit2_desk.py notify\n",
+        encoding="utf-8")
+    print(f"[notify] 日志目录={outdir}", flush=True)
+    dump("notify")
+
+
 # ================================================================== 入口
 
 async def amain() -> None:
@@ -1704,6 +2154,8 @@ async def amain() -> None:
             await section_llmfail()
         if which in ("storage", "all"):
             await section_storage()
+        if which in ("notify", "all"):
+            await section_notify()
         if which in ("nointerp", "all"):
             await section_nointerp()
     finally:

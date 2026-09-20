@@ -47,6 +47,8 @@ struct AppState {
     quitting: AtomicBool,
     //: 退出请求已发出：界面靠轮询取走（隐藏到托盘时壳叫不动页面）
     exit_requested: AtomicBool,
+    //: 提醒点击后待定位的提醒标识：同样由界面轮询取走（§3.1/A17）
+    pending_notice: Mutex<Option<String>>,
 }
 
 fn log_line(root: &Path, message: &str) {
@@ -201,6 +203,92 @@ fn core_status(state: State<AppState>) -> CoreStatus {
 #[tauri::command]
 fn exit_pending(state: State<AppState>) -> bool {
     state.exit_requested.load(Ordering::SeqCst)
+}
+
+/// 桌面提醒（DESKTOP_SPEC §3.1 / §十.17）：只作「已固化主动消息」的入口。
+/// 显示系统通知；点击落点走 `open_notice`（系统回调与无人值守验收共用同一段处理）。
+/// 标题 / 正文由渲染层给（不含实例 / 时间线 / 会话标识），壳只负责显示。
+#[tauri::command(rename_all = "snake_case")]
+fn notify_message(
+    app: tauri::AppHandle,
+    notice_id: String,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    // 开发 / 验收开关：让通知直接失败，用于验证「系统通知不可用」的降级路径（§3.1 末条）。
+    // 与核心的 ISEKAI_LLM_FAKE 同类；不写正文、错误码不带凭据。
+    if std::env::var("ISEKAI_NOTIFY_FAIL").is_ok() {
+        let message = "系统通知不可用：注入的失败（ISEKAI_NOTIFY_FAIL）".to_string();
+        let state = app.state::<AppState>();
+        log_line(&state.root, &format!("notification failed: {message}"));
+        return Err(message);
+    }
+    let mut notification = notify_rust::Notification::new();
+    notification.summary(&title).body(&body);
+    // 安装版才有注册的 AppUserModelID；dev（target/debug|release）走系统默认，
+    // 否则自定义 AUMID 没有对应快捷方式时通知根本不显示（与官方插件同一口径）。
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|item| item.display().to_string()))
+        .unwrap_or_default();
+    if !(exe_dir.ends_with("\\target\\debug") || exe_dir.ends_with("\\target\
+elease")) {
+        notification.app_id(&app.config().identifier);
+    }
+    let handle = match notification.show() {
+        Ok(handle) => handle,
+        Err(error) => {
+            let message = format!("系统通知不可用：{error}");
+            let state = app.state::<AppState>();
+            log_line(&state.root, &format!("notification failed: {message}"));
+            return Err(message);
+        }
+    };
+    {
+        let state = app.state::<AppState>();
+        log_line(&state.root, &format!("notification shown notice={notice_id}"));
+    }
+    let click_app = app.clone();
+    std::thread::spawn(move || {
+        // 只有真的点开通知（Default / 动作按钮）才定位会话；通知自己过期或被划掉（Closed）不动窗口。
+        let _ = handle.wait_for_response(move |response: &notify_rust::NotificationResponse| {
+            if matches!(
+                response,
+                notify_rust::NotificationResponse::Default | notify_rust::NotificationResponse::Action(_)
+            ) {
+                open_notice(&click_app, &notice_id);
+            }
+        });
+    });
+    Ok(())
+}
+
+/// 通知点击落点：把窗口带到前台，再把提醒交给渲染层定位（§3.1 末条）。
+/// 窗口操作要用 run_on_main_thread：系统通知的激活回调跑在壳自己的线程上，不在主线程。
+fn open_notice(app: &tauri::AppHandle, notice_id: &str) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = handle.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    });
+    let state = app.state::<AppState>();
+    *state.pending_notice.lock().unwrap() = Some(notice_id.to_string());
+    // 隐藏到托盘时 emit 送不到页面（见 begin_quit 注释）：标志位留一份，页面轮询取走
+    let _ = app.emit("notice-open", notice_id);
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn notice_click(app: tauri::AppHandle, notice_id: String) {
+    open_notice(&app, &notice_id);
+}
+
+/// 页面轮询取走待定位的提醒（取走即清，避免重复定位）
+#[tauri::command]
+fn take_pending_notice(state: State<AppState>) -> Option<String> {
+    state.pending_notice.lock().unwrap().take()
 }
 
 /// 壳自己的设置文件（不动核心的 config.yaml）：目前只有「内建聊天开关」这类壳侧偏好。
@@ -442,6 +530,7 @@ fn main() {
         exit_ready: Mutex::new(None),
         quitting: AtomicBool::new(false),
         exit_requested: AtomicBool::new(false),
+        pending_notice: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -458,6 +547,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             core_status,
             exit_pending,
+            notify_message,
+            notice_click,
+            take_pending_notice,
             shell_settings,
             shell_setting_set,
             core_restart,

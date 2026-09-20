@@ -36,6 +36,10 @@
             <button id="history-more" class="link hidden">加载更多（更早的消息）</button>
             <span id="history-note" class="muted"></span>
           </div>
+          <div class="row">
+            <button id="notice-open" class="link hidden">提醒：打开最新一条主动消息</button>
+            <span id="notice-note" class="muted"></span>
+          </div>
           <ol id="messages" aria-live="polite"></ol>
           <div id="composer-note" class="muted"></div>
           <form id="composer">
@@ -185,6 +189,13 @@
             <span id="chat-note" class="muted"></span>
           </div>
           <p class="muted">停用内建聊天后，壳不再登记 / 连接 builtin 聊天通道（不连 UMP、不提交对话），管理面、备份与设置照常可用；开关状态保存在本机。</p>
+
+          <h3>桌面提醒</h3>
+          <div class="row">
+            <label><input id="set-notify-enabled" type="checkbox" checked /> 主动消息到达时发系统通知</label>
+            <span id="notify-note" class="muted"></span>
+          </div>
+          <p class="muted">提醒只作已固化主动消息的入口，不是第二份历史；通知与提醒入口都由受信管理面解析定位原实例 / 时间线 / 角色会话。目标被删除 / 归档 / 回滚或重绑时显示管理错误，不改投其他角色、不激活冻结线；系统通知不可用时历史仍可读取。关闭开关只停止登记提醒，管理面照常。</p>
 
           <h3>备份</h3>
           <dl id="backup-facts" class="facts"></dl>

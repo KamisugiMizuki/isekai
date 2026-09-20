@@ -452,9 +452,11 @@ async function loadShellSettings(): Promise<void> {
   try {
     const settings = await invoke<Record<string, unknown>>("shell_settings");
     chatOn = settings[CHAT_FLAG] !== false;
+    notifyOn = settings[NOTIFY_FLAG] !== false;
   } catch (error) {
     console.warn(`壳设置读取失败：${error}`);
     chatOn = true;
+    notifyOn = true;
   }
 }
 
@@ -894,6 +896,142 @@ function mergeReply(payload: Record<string, unknown>): void {
   if (ump && state.token) {
     ump.reportDelivery(state.threadId, state.token, messageId, batchIndex, "accepted");
   }
+  if (!payload.reply_to) {
+    // 主动消息（没有对应入站）到达：登记提醒 + 系统通知；同一 message_id 的重复投递由去重挡住
+    void registerNotice(messageId, parts.join(""));
+  }
+}
+
+/* ---------- 桌面提醒（§3.1 末条 / §十.17）：只作已固化主动消息的入口，不做第二份历史 ---------- */
+
+/// 桌面提醒开关（默认开）：关掉后不再登记提醒，也不发系统通知；管理面照常。
+const NOTIFY_FLAG = "notify_enabled";
+let notifyOn = true;
+/// 系统通知不可用时留一句可读说明（不挡聊天与历史）
+let notifyUnavailable = "";
+/// 登记到的提醒：noticeId → message_id（不存正文，不是第二份历史）
+const notices = new Map<string, string>();
+/// 幂等：同一条固化消息只登记一次（重连补读 / 重复投递不再登记）
+const noticedMessages = new Set<string>();
+let noticeNote = "";
+let noticeNoteBad = false;
+
+function notifyEnabled(): boolean {
+  return notifyOn;
+}
+
+async function setNotifyEnabled(enabled: boolean): Promise<void> {
+  notifyOn = enabled;
+  try {
+    await invoke("shell_setting_set", { key: NOTIFY_FLAG, value: enabled });
+  } catch (error) {
+    $("notify-note").textContent = `壳设置写入失败：${error}`;
+    return;
+  }
+  renderNotices();
+}
+
+/// 提醒入口与说明：开关状态、系统通知是否可用、以及不切换时的管理错误都写在这里
+function renderNotices(): void {
+  const count = notices.size;
+  const button = $("notice-open");
+  button.classList.toggle("hidden", count === 0);
+  if (count > 0) {
+    button.textContent = count > 1 ? `提醒：打开最新一条（另有 ${count - 1} 条）` : "提醒：打开最新一条主动消息";
+  }
+  $("notice-note").textContent = noticeNote;
+  $("notice-note").classList.toggle("bad", noticeNoteBad);
+  $("notify-note").textContent = !notifyOn
+    ? "已停用：不登记提醒、不发系统通知；管理面照常"
+    : notifyUnavailable || "已启用：主动消息到达时发系统通知";
+}
+
+/// 通知标题 / 正文只用显示名与消息原文：实例 / 时间线 / 会话标识不进载荷（§3.1 / A17）
+function noticePayload(text: string): { title: string; body: string } {
+  const place = world.instances.find((item) => item.id === state.instanceId)?.name ?? "";
+  const who = world.characters.find((item) => item.card_id === state.characterId)?.name ?? "";
+  return {
+    title: [place, who].filter(Boolean).join(" · ") || "isekai",
+    body: text.replace(/\s+/g, " ").trim().slice(0, 80) || "有一条新的主动消息",
+  };
+}
+
+/// 主动消息固化 / 到达：先登记提醒（管理面 notice.create），再发系统通知。
+/// 通知不可用只降级说明；登记失败不吞消息——下次投递还能补（§十.17：提醒不可用时历史仍可读）。
+async function registerNotice(messageId: string, text: string): Promise<void> {
+  if (!messageId || !notifyOn || noticedMessages.has(messageId)) return;
+  noticedMessages.add(messageId);
+  if (!mgmt || !state.sessionId) return;
+  let noticeId = "";
+  try {
+    // 会话版本：提醒固定引用固化消息 + 原会话版本；回滚让版本倒退，提醒随之后失效
+    const page = await mgmt.call("history.page", { session_id: state.sessionId, limit: 1 });
+    const created = await mgmt.call("notice.create", {
+      instance_id: state.instanceId,
+      timeline_id: state.timelineId,
+      session_id: state.sessionId,
+      message_id: messageId,
+      revision: Number(page.revision ?? 0),
+    });
+    noticeId = String(((created.notice ?? {}) as Record<string, unknown>).id ?? "");
+  } catch (error) {
+    noticedMessages.delete(messageId);
+    noticeNote = `提醒登记失败（${error}）：历史照常可读。`;
+    noticeNoteBad = true;
+    renderNotices();
+    return;
+  }
+  if (noticeId) notices.set(noticeId, messageId);
+  noticeNote = "";
+  noticeNoteBad = false;
+  renderNotices();
+  try {
+    const payload = noticePayload(text);
+    await invoke("notify_message", { notice_id: noticeId, title: payload.title, body: payload.body });
+  } catch (error) {
+    notifyUnavailable = `系统通知不可用（${error}）`;
+    renderNotices();
+  }
+}
+
+/// 点击提醒（系统通知 / 提醒入口）→ 管理面解析定位：目标仍有效才切到原会话；
+/// 目标被删除 / 归档 / 回滚 / 重绑时只显示管理错误，不改投其他会话、不激活冻结线（§3.1 / A17）。
+async function openNotice(noticeId: string): Promise<void> {
+  if (!mgmt || !noticeId) return;
+  let target: Record<string, unknown> | null = null;
+  try {
+    const resolved = await mgmt.call("notice.resolve", { id: noticeId });
+    target = (resolved.target ?? null) as Record<string, unknown> | null;
+  } catch (error) {
+    noticeNote = `提醒定位失败（${error}）：未切换会话。`;
+    noticeNoteBad = true;
+    renderNotices();
+    return;
+  }
+  const sessionId = String(target?.session_id ?? "");
+  if (!target || !target.valid || !sessionId) {
+    noticeNote = "系统错误：这条提醒指向的消息已不在有效会话上（目标被删除 / 归档 / 回滚或重绑），"
+      + "不会改投其他角色；历史仍可从会话列表读取。";
+    noticeNoteBad = true;
+    renderNotices();
+    return;
+  }
+  let row = state.sessions.find((item) => item.id === sessionId) ?? null;
+  if (!row) {
+    await loadSessions();
+    row = state.sessions.find((item) => item.id === sessionId) ?? null;
+  }
+  if (!row) {
+    noticeNote = "系统错误：提醒指向的会话不在会话列表里（可能已删除），未切换。";
+    noticeNoteBad = true;
+    renderNotices();
+    return;
+  }
+  await switchSession(row);
+  notices.delete(noticeId);
+  noticeNote = `已定位到原会话：${sessionLabel(row)}`;
+  noticeNoteBad = false;
+  renderNotices();
 }
 
 /* ---------- 交互 ---------- */
@@ -2096,6 +2234,25 @@ async function boot(): Promise<void> {
     ? "已启用：对话走内建通道（builtin）"
     : "已停用：不登记 / 不连接聊天通道，管理面保留";
   $("restart").addEventListener("click", () => void restartCore());
+  // 无人值守验收：把本窗口自己的管理面连接交给探针断言（不新增权限——页面本来就能调这些 op）
+  (window as unknown as { __mgmtCall?: unknown }).__mgmtCall =
+    (op: string, args: Record<string, unknown> = {}) => mgmt?.call(op, args);
+  // 桌面提醒：开关（默认开）+ 入口按钮（系统通知的兜底入口，点它走同一条定位逻辑）
+  const notifyBox = $<HTMLInputElement>("set-notify-enabled");
+  notifyBox.checked = notifyEnabled();
+  notifyBox.addEventListener("change", () => void setNotifyEnabled(notifyBox.checked));
+  $("notice-open").addEventListener("click", () => {
+    const next = notices.keys().next();
+    if (!next.done) void openNotice(String(next.value));
+  });
+  renderNotices();
+  // 通知被点击：壳把窗口带到前台后把提醒交给这里定位（隐藏到托盘时事件送不到，另有标志位轮询兜底）
+  await listen<string>("notice-open", (event) => void openNotice(String(event.payload)));
+  setInterval(() => {
+    void invoke<string | null>("take_pending_notice")
+      .then((pending) => (pending ? openNotice(pending) : undefined))
+      .catch(() => undefined);
+  }, 1000);
   renderComposeGate();
   await loadLocalFacts(); // 顶栏的语义召回降级标识来自本地配置事实（§六）
   // 壳的退出请求：先保存再让它停核心（有上限，超时由壳硬杀）。
