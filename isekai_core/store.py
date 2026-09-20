@@ -435,6 +435,19 @@ CREATE TABLE IF NOT EXISTS claim(
 );
 CREATE INDEX IF NOT EXISTS ix_claim_event ON claim(instance_id, timeline_id, event_id);
 
+-- 管理面通知（CHANNEL_PLUGIN_SPEC §2.5 末条）：只作**已固化主动消息**的入口，不存第二份历史。
+-- 固定引用 (message_id, 原会话版本)；回滚 / 删除 / 归档 / 重绑后解析只返回管理错误，不改投、不激活冻结线。
+CREATE TABLE IF NOT EXISTS notice(
+  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  UNIQUE(instance_id, timeline_id, session_id, message_id)
+);
+
 -- 短期反应（WORLD_RUNTIME_SPEC §11.1）：有来源的素材集合，不是全局情绪数值
 CREATE TABLE IF NOT EXISTS reaction(
   instance_id TEXT NOT NULL,
@@ -2897,6 +2910,78 @@ class Store:
             (instance_id, timeline_id, original_id),
         ).fetchone()
         return _row_to_dict(row) if row else None
+
+    def notice_put(self, row: dict[str, Any]) -> dict[str, Any]:
+        """登记一条通知引用（同一条固化消息只登记一次：唯一键 + 幂等返回既有行）。"""
+        payload = {"revision": 0, "created_at": time.time(), **row}
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO notice(id, instance_id, timeline_id, session_id, message_id, revision, created_at)
+                   VALUES(:id, :instance_id, :timeline_id, :session_id, :message_id, :revision, :created_at)
+                   ON CONFLICT(instance_id, timeline_id, session_id, message_id) DO NOTHING""",
+                payload,
+            )
+        existing = self.notice_get(str(payload["message_id"]))
+        return existing or payload
+
+    def notice_get(self, ident: str) -> dict[str, Any] | None:
+        """按通知 id 或 message_id 取一条。"""
+        row = self._conn.execute("SELECT * FROM notice WHERE id=?", (str(ident),)).fetchone()
+        if row is None:
+            row = self._conn.execute(
+                "SELECT * FROM notice WHERE message_id=? ORDER BY created_at LIMIT 1", (str(ident),)
+            ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def notice_list(self, instance_id: str | None = None) -> list[dict[str, Any]]:
+        if instance_id:
+            rows = self._conn.execute(
+                "SELECT * FROM notice WHERE instance_id=? ORDER BY created_at, id", (instance_id,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM notice ORDER BY created_at, id").fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def notice_target(self, row: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+        """定位通知指向的会话（§2.5 末条）：只解析、不改投、不激活；失效时给出管理错误原因。"""
+        issues: list[str] = []
+        instance = self.instance_get(str(row.get("instance_id") or ""))
+        if instance is None:
+            issues.append("实例已删除")
+        timeline = next(
+            (item for item in self.timeline_list(str(row.get("instance_id") or "")) if str(item["id"]) == str(row.get("timeline_id"))),
+            None,
+        )
+        if timeline is None:
+            issues.append("时间线已删除")
+        elif str(timeline.get("state")) == "archived":
+            issues.append("时间线已归档")
+        session = self.session_get(str(row.get("session_id") or ""))
+        if session is None:
+            issues.append("会话已删除（回滚或重建）")
+        elif str(session.get("instance_id")) != str(row.get("instance_id")) or str(
+            session.get("timeline_id")
+        ) != str(row.get("timeline_id")):
+            issues.append("会话已重绑到别的时间线")
+        message = self._conn.execute(
+            "SELECT seq, state, role FROM message WHERE session_id=? AND message_id=? ORDER BY seq LIMIT 1",
+            (str(row.get("session_id") or ""), str(row.get("message_id") or "")),
+        ).fetchone()
+        if message is None:
+            issues.append("消息已不存在（回滚或作废）")
+        target = {
+            "instance_id": str(row.get("instance_id") or ""),
+            "timeline_id": str(row.get("timeline_id") or ""),
+            "session_id": str(row.get("session_id") or ""),
+            "message_id": str(row.get("message_id") or ""),
+            "revision": int(row.get("revision") or 0),
+            "timeline_state": None if timeline is None else str(timeline.get("state") or ""),
+            "message_seq": None if message is None else int(message["seq"]),
+            "message_state": None if message is None else str(message["state"]),
+            "valid": not issues,
+            "reason": "；".join(issues),
+        }
+        return target, issues
 
     def reaction_list(
         self, instance_id: str, timeline_id: str, *, character_id: str | None = None

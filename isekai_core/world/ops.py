@@ -87,6 +87,9 @@ SYNC_OPS = frozenset(
         "instance.convert",
         "reaction.list",
         "reaction.note",
+        "notice.create",
+        "notice.list",
+        "notice.resolve",
         "backup.restore",
         "backup.list",
         "proactive.list",
@@ -469,6 +472,28 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 "timelines": store.timeline_list(row["id"]),
                 "commits": store.commit_list(row["id"]),
             }
+        if op == "notice.create":
+            row = {
+                "id": f"nt-{__import__('secrets').token_hex(6)}",
+                "instance_id": str(args.get("instance_id") or ""),
+                "timeline_id": str(args.get("timeline_id") or ""),
+                "session_id": str(args.get("session_id") or ""),
+                "message_id": str(args.get("message_id") or ""),
+                "revision": int(args.get("revision") or 0),
+                "created_at": time.time(),
+            }
+            if not (row["instance_id"] and row["timeline_id"] and row["session_id"] and row["message_id"]):
+                raise UmpError(Err.INVALID, "通知要固定引用实例 / 时间线 / 会话 / 已固化消息", retryable=False)
+            return {"notice": store.notice_put(row)}
+        if op == "notice.list":
+            return {"notices": store.notice_list(str(args.get("instance_id") or "") or None)}
+        if op == "notice.resolve":
+            ident = str(args.get("id") or args.get("message_id") or "")
+            row = store.notice_get(ident)
+            if row is None:
+                raise UmpError(Err.NOT_FOUND, f"没有该通知：{ident}", retryable=False)
+            target, _issues = store.notice_target(row)
+            return {"target": target}
         if op == "reaction.list":
             rows = store.reaction_list(
                 str(args.get("instance_id") or ""),
