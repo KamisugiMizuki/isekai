@@ -167,6 +167,11 @@ def parse_hello(payload: dict[str, Any]) -> dict[str, Any]:
         "capabilities": {
             "segments": bool(caps.get("segments", False)),
             "status": bool(caps.get("status", False)),
+            # v1 基线：只文本、非流式（CHANNEL_PLUGIN_SPEC §2.1）。附件 / 富媒体 / 流式是**更后置**的
+            # 扩展点：这里显式声明不支持，收到相关字段一律明确拒绝，不静默忽略。
+            "text": True,
+            "attachments": False,
+            "stream": False,
             **limits,
         },
         "bootstrap": bootstrap if isinstance(bootstrap, str) else None,
@@ -174,10 +179,33 @@ def parse_hello(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+#: v1 只承担文本；这些字段出现即明确拒绝（扩展这些能力时再在此开闸，不提前铺设）
+_EXTENSION_FIELDS = ("attachments", "attachment", "media", "stream", "stream_id")
+
+
+def _reject_unsupported_extensions(payload: dict[str, Any]) -> None:
+    for field in _EXTENSION_FIELDS:
+        if payload.get(field) not in (None, [], {}, ""):
+            raise UmpError(
+                Err.UNSUPPORTED_CAPABILITY,
+                f"v1 只承担文本：{field} 属更后置的附件 / 流式扩展（不静默忽略）",
+                retryable=False,
+            )
+    content_type = payload.get("content_type")
+    if isinstance(content_type, str) and content_type and content_type != "text":
+        raise UmpError(
+            Err.UNSUPPORTED_CAPABILITY,
+            f"v1 只承担 text：content_type={content_type!r} 未支持",
+            retryable=False,
+        )
+
+
 def _validate_payload(env_type: str, payload: dict[str, Any], max_text_len: int) -> None:
     if env_type == "hello":
         parse_hello(payload)
-    elif env_type == "user_message":
+        return
+    _reject_unsupported_extensions(payload)
+    if env_type == "user_message":
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip():
             raise UmpError(Err.PROTOCOL, "user_message.text must be a non-empty string")

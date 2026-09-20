@@ -89,7 +89,15 @@ def test_hello_normalises_capabilities():
             "auth": {"bootstrap": "bs-1"},
         }
     )
-    assert hello["capabilities"] == {"segments": True, "status": True, "max_text_len": 1000, "max_parts": 3}
+    assert hello["capabilities"] == {
+        "segments": True,
+        "status": True,
+        "text": True,
+        "attachments": False,  # v1 只文本：能力声明里说清边界（§2.1）
+        "stream": False,
+        "max_text_len": 1000,
+        "max_parts": 3,
+    }
     assert hello["bootstrap"] == "bs-1" and hello["credential"] is None
 
 
