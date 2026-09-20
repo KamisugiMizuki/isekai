@@ -58,6 +58,8 @@ OP_BY_COMMAND = {
     ("runtime", "propose"): "runtime.propose",
     ("runtime", "extract"): "runtime.extract",
     ("runtime", "budget"): "runtime.budget",
+    ("disclose", "confirm"): "disclose.confirm",
+    ("disclose", "list"): "disclose.list",
     ("event", "draft"): "event.draft",
     ("event", "confirm"): "event.confirm",
     ("runtime", "timeline-rename"): "runtime.timeline.rename",
@@ -110,6 +112,16 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             return {**args, "card_path": ns.file, **({"moment": int(ns.moment)} if ns.moment else {})}
         if cmd == "generate":
             return {**args, "brief": ns.brief or ""}
+    if group == "disclose":
+        args = {"instance_id": ns.id, "timeline_id": ns.timeline}
+        if cmd == "confirm":
+            args["from_character"] = ns.card or ""
+            args["to_character"] = ns.at or ""
+            args["refs"] = ns.ref or ""
+            args["note"] = ns.note or ""
+        if cmd == "list":
+            args["to_character"] = ns.at or ""
+        return args
     if group == "event":
         args = {"instance_id": ns.id, "timeline_id": ns.timeline}
         if cmd == "draft":
@@ -245,7 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--root", default=None, help="数据根目录")
     parser.add_argument("--endpoint", default=None, help="连接已有核心（默认自行拉起）")
     parser.add_argument("--mgmt", default=None, help="已有核心的管理凭据")
-    parser.add_argument("group", choices=["package", "card", "instance", "runtime", "event"])
+    parser.add_argument("group", choices=["package", "card", "instance", "runtime", "event", "disclose"])
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
     parser.add_argument("--name", default=None)
     parser.add_argument("--density", default=None)

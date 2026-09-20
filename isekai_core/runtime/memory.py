@@ -281,7 +281,12 @@ def source_label(sources: list[dict[str, Any]]) -> str:
         elif kind == "claim":
             labels.append("听说" if via else "读到的")
         elif kind == "dialog":
-            labels.append("联络者所述" if role == "user" else "对话")
+            if role == "user":
+                labels.append("联络者所述")
+            elif role == "other_character":
+                labels.append("联络者转述")
+            else:
+                labels.append("对话")
         elif kind == "intent":
             labels.append("她自己的打算")
         else:

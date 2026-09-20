@@ -16,7 +16,7 @@ from typing import Any
 from ..log import get_logger
 from ..store import Store
 from . import budget as budget_mod
-from . import cognition, drafts, embedding as embedding_mod, environment, events, intents, life
+from . import cognition, disclosure, drafts, embedding as embedding_mod, environment, events, intents, life
 from . import memory as memory_mod, personality, planning, versioning
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
@@ -103,6 +103,103 @@ class RuntimeService:
         """世界时刻的人话标签（历法视图，§2.1）。"""
         instance = self.store.instance_get(instance_id) or {}
         return self.calendar(instance).describe(int(world_seconds))
+
+    # ---------- 多角色披露（§七，阶段 5） ----------
+
+    def disclose(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        from_character: str,
+        to_character: str,
+        refs: list[str],
+        note: str = "",
+        now_real: float | None = None,
+    ) -> dict[str, Any]:
+        """用户明确向指定角色披露指定片段（§7.1）：独立确认事务，授权先落库再允许读取。
+
+        范围必须明确到具体消息；含糊转述不产生授权。授权不改变世界真值，也不把来源角色的
+        经历变成接收角色的亲历。
+        """
+        import time as _time
+
+        now = _time.time() if now_real is None else float(now_real)
+        scope = disclosure.normalize_scope({
+            "from_character": from_character, "to_character": to_character, "refs": refs, "note": note,
+        })
+        cards = {str((card.get("meta") or {}).get("card_id")): card for card in self.cards(
+            self.store.instance_get(instance_id) or {}, timeline_id=timeline_id
+        )}
+        if scope["from_character"] not in cards:
+            raise RuntimeStateError("来源角色不在本线")
+        if scope["to_character"] not in cards:
+            raise RuntimeStateError("接收角色不在本线")
+        resolved: list[dict[str, Any]] = []
+        for ref in scope["refs"]:
+            row = self.store.message_by_ref(instance_id, timeline_id, ref)
+            if row is None:
+                raise RuntimeStateError(f"披露范围里的片段不存在：{ref}")
+            session = self.store.session_get(str(row["session_id"])) or {}
+            if str(session.get("character_id")) != scope["from_character"]:
+                raise RuntimeStateError(f"片段不属于来源角色：{ref}")
+            resolved.append({
+                "ref": ref, "role": str(row["role"]), "text": self.store.message_text(row),
+                "world_seconds": self.world_moment(instance_id, timeline_id),
+            })
+        watermark = self.world_moment(instance_id, timeline_id)
+        refs_key = ",".join(sorted(item["ref"] for item in resolved))
+        ident = "dc-" + events.stable_key(
+            instance_id, timeline_id, scope["from_character"], scope["to_character"], refs_key
+        )[:12]
+        if self.store.disclosure_get(ident) is not None:
+            return {"id": ident, "reused": True, "scope": resolved}
+        self.store.disclosure_add({
+            "id": ident, "instance_id": instance_id, "timeline_id": timeline_id,
+            "from_character": scope["from_character"], "to_character": scope["to_character"],
+            "scope": json.dumps({"refs": resolved, "note": scope["note"]}, ensure_ascii=False),
+            "granted_world": watermark, "granted_real": now, "note": scope["note"], "state": "granted",
+        })
+        # 授权落库之后才允许接收角色下一轮读到（§7.1 独立确认事务）
+        return {"id": ident, "reused": False, "granted_world": watermark, "scope": resolved}
+
+    def disclosures(
+        self, instance_id: str, timeline_id: str, *, to_character: str | None = None, until: int | None = None
+    ) -> list[dict[str, Any]]:
+        """披露清单只回管理元数据，不额外提供别的角色记忆或世界实情（DESKTOP_SPEC §6）。"""
+        rows = self.store.disclosure_list(instance_id, timeline_id, to_character=to_character, until=until)
+        return [
+            {
+                "id": str(row["id"]),
+                "from_character": str(row["from_character"]),
+                "to_character": str(row["to_character"]),
+                "granted_world": int(row["granted_world"]),
+                "note": str(row.get("note") or ""),
+                "count": len((json.loads(row["scope"] or "{}").get("refs") or [])),
+            }
+            for row in rows
+        ]
+
+    def disclosed_fragments(
+        self, instance_id: str, timeline_id: str, to_character: str, *, until: int | None = None
+    ) -> list[dict[str, Any]]:
+        """接收角色可读的转述片段（作用域视图，不复制来源角色的其他内容）。"""
+        out: list[dict[str, Any]] = []
+        for row in self.store.disclosure_list(instance_id, timeline_id, to_character=to_character, until=until):
+            scope = json.loads(row["scope"] or "{}")
+            speaker = self._display_name(instance_id, timeline_id, str(row["from_character"]))
+            for item in scope.get("refs") or []:
+                if not str(item.get("text") or "").strip():
+                    continue
+                out.append({
+                    "disclosure_id": str(row["id"]),
+                    "from_character": str(row["from_character"]),
+                    "source_name": speaker,
+                    "ref": str(item.get("ref") or ""),
+                    "text": str(item["text"]),
+                    "granted_world": int(row["granted_world"]),
+                })
+        return out
 
     # ---------- 用户引入事件（§八，阶段 4） ----------
 
@@ -531,6 +628,20 @@ class RuntimeService:
             }))
         return added
 
+    def queue_disclosed_sources(self, instance_id: str, timeline_id: str, character_id: str) -> int:
+        """把接收角色看到的转述登记进提取来源（§4.1 / §7.1）：记成转述，不当亲历。"""
+        added = 0
+        for item in self.disclosed_fragments(instance_id, timeline_id, character_id):
+            entry = disclosure.transcribe_entry(item)
+            added += int(self.store.memory_task_add({
+                "id": f"mt-dsc-{events.stable_key(instance_id, timeline_id, character_id, item['disclosure_id'], item['ref'])[:12]}",
+                "instance_id": instance_id, "timeline_id": timeline_id, "character_id": character_id,
+                "source_kind": "disclosed", "source_ref": f"{item['disclosure_id']}:{item['ref']}",
+                "source_world": int(item["granted_world"]), "created_world": int(item["granted_world"]),
+                "text": entry["text"],
+            }))
+        return added
+
     def queue_world_sources(self, instance_id: str, timeline_id: str, *, since_world: int = 0) -> int:
         """世界侧来源（§4.1）：她的经历、她已获知的说法、她自己的打算——不传未过滤实情。"""
         added = 0
@@ -549,6 +660,7 @@ class RuntimeService:
                 rows.append(("claim", str(row["id"]), int(row["world_seconds"])))
             for row in self.store.intent_list(instance_id, timeline_id, character_id):
                 rows.append(("intent", str(row["id"]), int(row["source_world"])))
+            self.queue_disclosed_sources(instance_id, timeline_id, character_id)
             for kind, ref, world in rows:
                 if int(world) <= int(since_world):
                     continue
@@ -565,6 +677,14 @@ class RuntimeService:
         instance_id, timeline_id = str(task["instance_id"]), str(task["timeline_id"])
         ref, kind = str(task["source_ref"]), str(task["source_kind"])
         when = self.describe_world(instance_id, int(task["source_world"]))
+        if kind == "disclosed":
+            return {
+                "text": str(task.get("text") or ""),
+                "source": "联络者转述",
+                "when": when,
+                "sources": [{"kind": "dialog", "ref": ref, "source_role": "other_character", "via": ref.split(":")[0]}],
+                "world": int(task["source_world"]),
+            }
         if kind == "dialog":
             role = "user" if ref.startswith("user:") else "character"
             text = str(task.get("text") or "")
@@ -746,6 +866,11 @@ class RuntimeService:
             )
         except Exception:  # 召回失败不得阻断对话
             return {"prompt": prompt, "memory_ids": [], "brief": ""}
+        block = disclosure.brief_block(
+            self.disclosed_fragments(instance_id, timeline_id, character_id)
+        )
+        if block:
+            prompt = prompt + chr(10) + chr(10) + chr(10).join(block)
         brief = recalled["brief"]["text"]
         if brief:
             prompt = prompt + chr(10) + chr(10) + "她此刻想得起来的事（按她自己的记性，别当成盘点）：" + chr(10) + brief
@@ -865,6 +990,19 @@ class RuntimeService:
         if world_seconds is None:
             world_seconds = int(self.clock_row(timeline_id)["processed_world"])
         entries = self.store.memory_scope(instance_id, timeline_id, character_id, until=int(world_seconds))
+        # 已授权的转述：作为**视图**参与召回，不复制来源角色的其他内容（§7.1）
+        for item in self.disclosed_fragments(instance_id, timeline_id, character_id, until=int(world_seconds)):
+            entry = disclosure.transcribe_entry(item)
+            entries = entries + [{
+                "id": f"mm-disc-{item['disclosure_id'][-6:]}-{abs(hash(item['ref'])) % 10000}",
+                "text": entry["text"],
+                "kind": entry["kind"],
+                "sources": json.dumps(entry["sources"], ensure_ascii=False),
+                "learned_world": int(item["granted_world"]),
+                "strength": 0.6,
+                "confidence": 0.8,
+                "state": "active",
+            }]
         if not entries:
             return {"entries": [], "ids": [], "brief": {"lines": [], "ids": [], "text": ""}}
         day_seconds = self.calendar(self.store.instance_get(instance_id)).day_seconds
@@ -1028,8 +1166,12 @@ class RuntimeService:
     ) -> list[dict[str, Any]]:
         """实例锁定的角色卡；给了线与水位时并入已补入的角色（§九 / 附录 B #18）。"""
         cards = list(self.setting(instance).get("cards") or [])
-        if timeline_id is None or world_seconds is None:
+        if timeline_id is None:
             return cards
+        if world_seconds is None:
+            # 没给水位就按该线当前水位：补入的角色默认算「已在本线」，别让她隐形
+            clock = self.store.clock_get(timeline_id)
+            world_seconds = int(clock["processed_world"]) if clock else 0
         joined = self.store.character_join_list(instance["id"], timeline_id, until=int(world_seconds))
         for row in joined:
             try:

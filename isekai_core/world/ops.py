@@ -48,6 +48,8 @@ SYNC_OPS = frozenset(
         "runtime.clock",
         "runtime.budget",
         "runtime.budget.set",
+        "disclose.confirm",
+        "disclose.list",
         "event.confirm",
         "runtime.timeline.rename",
         "runtime.timeline.archive",
@@ -290,6 +292,10 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
     """同步操作：只读写文件与库，不调用模型。"""
     try:
         # 预算视图 / 设置：只按实例（不要求时间线），不进 runtime.* 前缀分发
+        if op == "disclose.confirm":
+            return _disclose_confirm(cfg, store, args)
+        if op == "disclose.list":
+            return _disclose_list(cfg, store, args)
         if op == "event.confirm":
             return _confirm_user_event(cfg, store, args)
         if op == "runtime.timeline.rename":
@@ -468,6 +474,34 @@ def _version_ids(args: dict[str, Any]) -> tuple[str, str]:
     if not instance_id or not timeline_id:
         raise UmpError(Err.INVALID, "缺少实例或时间线", retryable=False)
     return instance_id, timeline_id
+
+
+def _disclose_confirm(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """用户明确向指定角色披露指定片段（§7.1）：独立确认事务，不提供模糊放行。"""
+    instance_id, timeline_id = _version_ids(args)
+    refs = args.get("refs")
+    if isinstance(refs, str):
+        refs = [item.strip() for item in refs.split(",") if item.strip()]
+    if not refs:
+        raise UmpError(Err.INVALID, "披露需要明确的片段引用（refs）", retryable=False)
+    to_character = str(args.get("to_character") or args.get("card") or "")
+    if not to_character:
+        raise UmpError(Err.INVALID, "披露需要接收角色", retryable=False)
+    return _world_service(cfg, store).disclose(
+        instance_id, timeline_id,
+        from_character=str(args.get("from_character") or ""),
+        to_character=to_character, refs=list(refs), note=str(args.get("note") or ""),
+    )
+
+
+def _disclose_list(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """披露清单：只回管理元数据，不提供其他角色记忆或世界实情（DESKTOP_SPEC）。"""
+    instance_id, timeline_id = _version_ids(args)
+    return {
+        "disclosures": _world_service(cfg, store).disclosures(
+            instance_id, timeline_id, to_character=str(args.get("to_character") or "") or None
+        )
+    }
 
 
 def _confirm_user_event(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:

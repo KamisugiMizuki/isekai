@@ -137,6 +137,19 @@ CREATE TABLE IF NOT EXISTS commit_auto_state(
   last_commit_moment INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS disclosure(
+  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  from_character TEXT NOT NULL,
+  to_character TEXT NOT NULL,
+  scope TEXT NOT NULL,                 -- 明确的消息 / 片段引用（JSON）
+  granted_world INTEGER NOT NULL,      -- 生效水位：随时间线版本化（§7.1）
+  granted_real REAL NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'granted'
+);
+
 CREATE TABLE IF NOT EXISTS event_draft(
   id TEXT PRIMARY KEY,
   instance_id TEXT NOT NULL,
@@ -1170,6 +1183,7 @@ class Store:
                 "intent",
                 "call_ledger",
                 "commit_snapshot",
+                "disclosure",
                 "event_draft",
                 "pending_event",
                 "commit_auto_state",
@@ -1300,6 +1314,55 @@ class Store:
                 )
         return row
 
+    # ---------- 多角色披露（§七） ----------
+
+    def message_text(self, row: dict[str, Any]) -> str:
+        """消息正文：入站看 text，出站的正文在 parts（分批 JSON）里。"""
+        text = str(row.get("text") or "").strip()
+        if text:
+            return text
+        from .session import _flatten  # 同一套展开逻辑，避免两处各写一遍
+
+        return _flatten(row.get("parts"))
+
+    def message_by_ref(self, instance_id: str, timeline_id: str, ref: str) -> dict[str, Any] | None:
+        """按 message_id 或 env_id 取一条已固化消息（披露范围选择用）。"""
+        row = self._conn.execute(
+            """SELECT * FROM message WHERE (message_id=? OR env_id=?)
+               AND session_id IN (SELECT id FROM session WHERE instance_id=? AND timeline_id=?)
+               ORDER BY seq LIMIT 1""",
+            (ref, ref, instance_id, timeline_id),
+        ).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def disclosure_add(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO disclosure(id, instance_id, timeline_id, from_character, to_character,
+                                          scope, granted_world, granted_real, note, state)
+                   VALUES(:id, :instance_id, :timeline_id, :from_character, :to_character,
+                          :scope, :granted_world, :granted_real, :note, :state)""",
+                row,
+            )
+
+    def disclosure_list(
+        self, instance_id: str, timeline_id: str, *, to_character: str | None = None, until: int | None = None
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM disclosure WHERE instance_id=? AND timeline_id=? AND state='granted'"
+        args: list[Any] = [instance_id, timeline_id]
+        if to_character:
+            sql += " AND to_character=?"
+            args.append(to_character)
+        if until is not None:
+            sql += " AND granted_world<=?"
+            args.append(int(until))
+        rows = self._conn.execute(sql + " ORDER BY granted_world, id", args).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def disclosure_get(self, disclosure_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM disclosure WHERE id=?", (disclosure_id,)).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
     # ---------- 用户引入事件（§八） ----------
 
     def draft_put(self, row: dict[str, Any]) -> None:
@@ -1401,6 +1464,7 @@ class Store:
             "character_join",   # 跨越补卡点的回滚要让补入角色在本线退出（§七）
             "rate_command",     # 历史里的待生效倍率不是现时控制命令（§七）
             "pending_event",    # 回滚撤销待执行状态及其后果（§八 末条）
+            "disclosure",       # 回滚同时撤销授权与依赖它的派生（§7.2）
         ):
             self._conn.execute(f"DELETE FROM {table} WHERE timeline_id=?", (timeline_id,))
         # 向量表两种形态都清：按线（新）与按 memory 归属（兼容早期没有 timeline_id 的行）
