@@ -28,7 +28,7 @@ from ..version import (
 )
 from .cards import validate_assembly
 from .instances import InstanceError, create_instance
-from .package import PackageError, clone_package
+from .package import PackageError, clone_package, read_json_file
 from .validate import validate_package
 
 
@@ -144,14 +144,16 @@ def write_export(store: Store, instance_id: str, path: str | Path) -> dict[str, 
     return container["container"]
 
 
+# 容器件上限：整库导出（含全量快照）比世界包大得多，单独给一道更宽但仍有界的闸（§7.3 / §7.5）
+MAX_CONTAINER_BYTES = 256 << 20  # 256 MiB
+
+
 def read_container(path: str | Path) -> dict[str, Any]:
     file = Path(path)
     try:
-        raw = json.loads(file.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise InstanceError(f"导入文件不存在：{file}") from exc
-    except json.JSONDecodeError as exc:
-        raise InstanceError(f"导入文件不是合法 JSON（{file}）：{exc}") from exc
+        raw = read_json_file(file, what="导入文件", limit=MAX_CONTAINER_BYTES)
+    except PackageError as exc:
+        raise InstanceError(str(exc)) from exc
     if not isinstance(raw, dict) or not isinstance(raw.get("container"), dict):
         raise InstanceError("导入文件缺少 container 段")
     return raw

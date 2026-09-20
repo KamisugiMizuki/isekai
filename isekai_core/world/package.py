@@ -135,14 +135,37 @@ def ensure_original_name(package: dict[str, Any]) -> str:
     return fallback
 
 
+# 加载限额（WORLD_SETTING_SPEC §2.3「文件规模…加载限额」，数值实现时标定）：读取前先看字节数，
+# 超限直接拒绝，不把整份内容读进内存。
+MAX_PACKAGE_BYTES = 1 << 20  # 1 MiB：手编的 JSON 世界包远小于它，超了基本就是误选文件或恶意构造
+
+
+def read_json_file(
+    path: str | os.PathLike[str], *, what: str = "世界包文件", limit: int | None = None
+) -> Any:
+    """按加载限额读一份用户给的 JSON（世界包 / 角色卡 / 导入件共用同一道闸）。
+
+    容器件（整库导出）自带更大的上限，其余默认走 `MAX_PACKAGE_BYTES`。
+    """
+    file = Path(path)
+    cap = MAX_PACKAGE_BYTES if limit is None else int(limit)
+    try:
+        size = file.stat().st_size
+    except FileNotFoundError as exc:
+        raise PackageError(f"{what}不存在：{file}") from exc
+    except OSError as exc:
+        raise PackageError(f"{what}不可读：{file}（{exc}）") from exc
+    if size > cap:
+        raise PackageError(f"{what}超过加载限额：{size} 字节 > {cap} 字节（{file}）")
+    try:
+        return json.loads(file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PackageError(f"{what}不是合法 JSON（{file}）：{exc}") from exc
+
+
 def load_package(path: str | os.PathLike[str]) -> dict[str, Any]:
     file = Path(path)
-    try:
-        raw = json.loads(file.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise PackageError(f"世界包文件不存在：{file}") from exc
-    except json.JSONDecodeError as exc:
-        raise PackageError(f"世界包不是合法 JSON（{file}）：{exc}") from exc
+    raw = read_json_file(file, what="世界包文件")
     if not isinstance(raw, dict):
         raise PackageError("世界包顶层必须是对象")
     if not isinstance(raw.get("meta"), dict):

@@ -32,7 +32,7 @@ from .instances import (
     save_card,
     public_setting,
 )
-from .package import PackageError, load_package, save_package, template_package
+from .package import MAX_PACKAGE_BYTES, PackageError, load_package, save_package, template_package
 from .portable import import_instance, read_container, write_export
 from .validate import validate_package
 
@@ -128,18 +128,31 @@ def _package_arg(args: dict[str, Any], cfg: Config) -> dict[str, Any]:
     return load_package(resolve_path(cfg, source))
 
 
+def _read_user_json(path: Path, *, what: str) -> Any:
+    """用户给的 JSON 文件（角色卡 / 草稿 / 导入件）：读之前先按字节限额拦（§2.3 加载限额）。"""
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError as exc:
+        raise UmpError(Err.NOT_FOUND, f"{what}不存在：{path}", retryable=False) from exc
+    except OSError as exc:
+        raise UmpError(Err.INTERNAL, f"{what}不可读：{path}（{exc}）", retryable=False) from exc
+    if size > MAX_PACKAGE_BYTES:
+        raise UmpError(
+            Err.INVALID, f"{what}超过加载限额：{size} 字节 > {MAX_PACKAGE_BYTES} 字节", retryable=False
+        )
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise UmpError(Err.INVALID, f"{what}不是合法 JSON：{exc}", retryable=False) from exc
+
+
 def _card_arg(args: dict[str, Any], cfg: Config) -> dict[str, Any]:
     """角色卡来源：内联 `card` 优先，否则读 `card_path`。"""
     inline = args.get("card")
     if isinstance(inline, dict):
         return inline
     path = resolve_path(cfg, args.get("card_path"))
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise UmpError(Err.NOT_FOUND, f"角色卡文件不存在：{path}", retryable=False) from exc
-    except json.JSONDecodeError as exc:
-        raise UmpError(Err.INVALID, f"角色卡不是合法 JSON：{exc}", retryable=False) from exc
+    raw = _read_user_json(path, what="角色卡文件")
     if not isinstance(raw, dict):
         raise UmpError(Err.INVALID, "角色卡顶层必须是对象", retryable=False)
     return raw
@@ -251,7 +264,7 @@ def _runtime_op(
         if op == "runtime.card.add":
             card = args.get("card")
             if not isinstance(card, dict):
-                card = json.loads(Path(resolve_path(cfg, args.get("card_path"))).read_text(encoding="utf-8"))
+                card = _read_user_json(Path(resolve_path(cfg, args.get("card_path"))), what="角色卡文件")
             event = args.get("event")
             return {
                 "join": runtime.add_character(
@@ -376,12 +389,7 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return {"file": target.name}
         if op == "world.draft.load":
             target = _draft_path(cfg, str(args.get("name") or ""))
-            try:
-                payload = json.loads(target.read_text(encoding="utf-8"))
-            except FileNotFoundError as exc:
-                raise UmpError(Err.NOT_FOUND, f"草稿不存在：{target.name}", retryable=False) from exc
-            except json.JSONDecodeError as exc:
-                raise UmpError(Err.INVALID, f"草稿不是合法 JSON：{exc}", retryable=False) from exc
+            payload = _read_user_json(target, what="草稿")
             return {"draft": payload, "file": target.name}
         if op == "world.draft.discard":
             target = _draft_path(cfg, str(args.get("name") or ""))
