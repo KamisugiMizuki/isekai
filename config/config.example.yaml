@@ -18,6 +18,14 @@ core:
   max_parts: 10          # 单批最大段数，与通道协商取小
   context_history_max: 20 # 生成上下文里带多少条历史往来
 
+# 世界运行层参数：全局统一、仅开发者可配置（WORLD_RUNTIME_SPEC §2.2 / §2.6 / §4）
+# 刻意不提供 UI 入口：这些是世界运行预算，不是日常可调项
+runtime:
+  rate_max: 2592000          # 倍率上限（世界秒 / 现实秒），默认 30 天每秒
+  max_active_timelines: 4    # 同时激活的时间线数量上限
+  catch_up_batches: 8        # 单次推进批数上限（每批推进一个世界日）
+  catch_up_lag_seconds: 172800  # 滞后超过 2 世界日即记为「追赶受限」并如实上报
+
 # 阶段 0 占位会话：世界与角色尚未接入，阶段 1 起被真实实例 / 角色卡取代
 placeholder:
   instance_id: ph-instance

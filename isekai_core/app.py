@@ -138,7 +138,13 @@ async def build_runtime(
         return bool(server and await server.deliver(channel_id, thread_id, envelope))
 
     service = SessionService(store=store, cfg=cfg, llm=llm, deliver=deliver)
-    world = RuntimeService(store)
+    world = RuntimeService(
+        store,
+        rate_max=cfg.runtime.rate_max,
+        max_active_timelines=cfg.runtime.max_active_timelines,
+        catch_up_batches=cfg.runtime.catch_up_batches,
+        catch_up_lag_seconds=cfg.runtime.catch_up_lag_seconds,
+    )
     service.runtime = world  # 会话层经运行层构造扮演定义
     for row in store.instance_list():
         world.ensure_instance(row["id"], now_real=time.time())

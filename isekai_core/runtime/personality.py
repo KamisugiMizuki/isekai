@@ -93,6 +93,11 @@ def apply_time(rows: list[dict[str, Any]], *, from_world: int, to_world: int, da
     return archive_pass(updated)
 
 
+def has_consumed(row: dict[str, Any], source_key: str) -> bool:
+    """该来源是否已被这一行消费过（幂等判定用）。"""
+    return source_key in _consumed(row)
+
+
 def apply_drive(
     rows: list[dict[str, Any]],
     *,
@@ -102,6 +107,8 @@ def apply_drive(
     strength: float,
     positive: bool,
     world_seconds: int,
+    basis: str | None = None,
+    identity: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """一次驱动：强化已有的同义单元，或（事件 / 对话驱动）新建候选单元。
 
@@ -137,12 +144,14 @@ def apply_drive(
         updated.append(
             {
                 "id": f"u-{abs(hash((source_key, semantic))) % (10**10):010d}",
-                "instance_id": rows[0]["instance_id"] if rows else "",
-                "timeline_id": rows[0]["timeline_id"] if rows else "",
-                "character_id": rows[0]["character_id"] if rows else "",
+                "instance_id": (identity or {}).get("instance_id")
+                or (rows[0]["instance_id"] if rows else ""),
+                "timeline_id": (identity or {}).get("timeline_id") or (rows[0]["timeline_id"] if rows else ""),
+                "character_id": (identity or {}).get("character_id")
+                or (rows[0]["character_id"] if rows else ""),
                 "mode": mode,
                 "semantic": semantic,
-                "basis": f"来自 {source_key}",
+                "basis": basis or f"来自 {source_key}",
                 "confidence": seeded,
                 "stability": 1.0 if positive else 0.0,
                 "archived": 0,

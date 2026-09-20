@@ -251,7 +251,7 @@ class SessionService:
         if session is None or str(session["instance_id"]).startswith("ph-"):
             return self.cfg.placeholder["system_prompt"]
         try:
-            return runtime.system_prompt(session)
+            return runtime.system_prompt(session, topic=str(row.get("text") or ""))
         except Exception:  # 运行层不可用不得阻断对话
             log.exception("runtime prompt failed session=%s", session["id"])
             return self.cfg.placeholder["system_prompt"]

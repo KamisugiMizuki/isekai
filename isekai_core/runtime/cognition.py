@@ -38,9 +38,14 @@ def knowledge_slice(
     *,
     world_seconds: int,
     experiences: list[dict[str, Any]] | None = None,
+    topic: str | None = None,
     limit: int = 24,
 ) -> list[dict[str, Any]]:
-    """该角色截至 world_seconds 可引用的知识条目（不含任何实情层条目原文）。"""
+    """该角色截至 world_seconds 可引用的知识条目（不含任何实情层条目原文）。
+
+    `topic` 是查询主题（§13.1 的必填输入）：命中的条目排前面，但**不隐藏**未命中的部分——
+    过滤的对象始终是「可接触性」，不是「相关性」，角色不该因为提问角度而失忆。
+    """
     cognition = card.get("cognition") or {}
     hard = str(cognition.get("mode") or "soft") == "hard"
     allowed = {str(item) for item in (cognition.get("sources") or [])}
@@ -133,6 +138,9 @@ def knowledge_slice(
                 "stance": STANCE_LABEL["experienced"],
             }
         )
+    if topic:
+        needle = topic.strip().lower()
+        out.sort(key=lambda item: 0 if needle and needle in str(item.get("text", "")).lower() else 1)
     return out[-limit:]
 
 
@@ -193,6 +201,7 @@ def play_context(
     *,
     world_seconds: int,
     calendar_label: str,
+    topic: str | None = None,
     current_activity: str = "",
     units: list[dict[str, Any]] | None = None,
     experiences: list[dict[str, Any]] | None = None,
@@ -234,7 +243,8 @@ def play_context(
         "first_contact": dict(card.get("first_contact") or {}),
         "voice": voice,
         "comms": comms,
+        "topic": topic or "",
         "knowledge": knowledge_slice(
-            package, card, world_seconds=world_seconds, experiences=experiences
+            package, card, world_seconds=world_seconds, experiences=experiences, topic=topic
         ),
     }

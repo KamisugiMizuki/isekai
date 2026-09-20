@@ -50,6 +50,7 @@ SYNC_OPS = frozenset(
         "runtime.freeze",
         "runtime.rate",
         "runtime.advance",
+        "runtime.card.add",
         "world.card.template",
         "world.card.load",
         "world.card.save",
@@ -190,7 +191,9 @@ def _list_files(cfg: Config, kind: str) -> list[dict[str, Any]]:
     return items
 
 
-def _runtime_op(runtime: Any, op: str, args: dict[str, Any], *, now_real: float | None = None) -> dict[str, Any]:
+def _runtime_op(
+    runtime: Any, op: str, args: dict[str, Any], *, cfg: Config, now_real: float | None = None
+) -> dict[str, Any]:
     """运行层操作：时钟视图 / 激活 / 冻结 / 倍率 / 推进（§2、§3）。"""
     if runtime is None:
         raise UmpError(Err.STATE_BLOCKED, "运行层不可用", retryable=False)
@@ -205,17 +208,38 @@ def _runtime_op(runtime: Any, op: str, args: dict[str, Any], *, now_real: float 
         if op == "runtime.clock":
             return {"clock": runtime.view(instance_id, timeline_id, now_real=now)}
         if op == "runtime.activate":
-            view = runtime.activate(instance_id, timeline_id, now_real=now)
+            # 用 activate 返回的视图（含是否确认了倍率），别再造一个把确认信息盖掉
+            view = runtime.activate(
+                instance_id, timeline_id, now_real=now, rate=args.get("rate") if args.get("rate") else None
+            )
             advanced = runtime.advance(instance_id, timeline_id, now_real=now)
-            return {"clock": runtime.view(instance_id, timeline_id, now_real=now), "advance": advanced}
+            return {"clock": view, "advance": advanced}
         if op == "runtime.freeze":
             return {"clock": runtime.freeze(instance_id, timeline_id, now_real=now)}
         if op == "runtime.rate":
             result = runtime.set_rate(instance_id, timeline_id, rate=int(args.get("rate") or 0), now_real=now)
             return {"rate": result, "clock": runtime.view(instance_id, timeline_id, now_real=now)}
+        if op == "runtime.card.add":
+            card = args.get("card")
+            if not isinstance(card, dict):
+                card = json.loads(Path(resolve_path(cfg, args.get("card_path"))).read_text(encoding="utf-8"))
+            return {
+                "join": runtime.add_character(
+                    instance_id,
+                    timeline_id,
+                    card,
+                    now_real=now,
+                    joined_world=int(args["joined_world"]) if args.get("joined_world") is not None else None,
+                    note=str(args.get("note") or ""),
+                    acquainted=bool(args.get("acquainted")),
+                )
+            }
         if op == "runtime.advance":
             advanced = runtime.advance(
-                instance_id, timeline_id, now_real=now, max_batches=int(args.get("max_batches") or 16)
+                instance_id,
+                timeline_id,
+                now_real=now,
+                max_batches=int(args["max_batches"]) if args.get("max_batches") else None,
             )
             return {"advance": advanced, "clock": runtime.view(instance_id, timeline_id, now_real=now)}
     except RuntimeStateError as exc:
@@ -248,7 +272,7 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
     """同步操作：只读写文件与库，不调用模型。"""
     try:
         if op.startswith("runtime."):
-            return _runtime_op(runtime, op, args)
+            return _runtime_op(runtime, op, args, cfg=cfg)
 
         if op == "world.package.template":
             return {

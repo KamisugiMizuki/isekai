@@ -46,6 +46,15 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
     messages = store.instance_messages(instance_id)
     timelines = store.timeline_list(instance_id)
     commits = store.commit_list(instance_id)
+    runtime_state: dict[str, dict[str, Any]] = {}
+    for item in timelines:
+        clock = store.clock_get(item["id"])
+        watermark = int(clock["processed_world"]) if clock else int(row["moment"])
+        runtime_state[item["id"]] = {
+            "watermark": watermark,
+            "rate": int(clock["rate"]) if clock else 1,
+            **store.runtime_dump(instance_id, item["id"], watermark=watermark),
+        }
     payload = {
         "setting": setting,
         "runtime": {
@@ -82,6 +91,8 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
             ],
             "seed": row["seed"],
             "moment": row["moment"],
+            # 角色状态按已完成水位导出；不导出待生效倍率命令、投递回执与通道绑定（§2.6 / §2.3.6）
+            "state": runtime_state,
         },
     }
     return {
@@ -204,10 +215,66 @@ def import_instance(store: Store, container: dict[str, Any], *, display_name: st
     )
     try:
         _restore_sessions(store, row["id"], runtime, timeline_map)
+        _restore_runtime_state(store, row["id"], runtime, timeline_map)
     except Exception:
         store.instance_delete(row["id"])
         raise
     return row
+
+
+def _restore_runtime_state(
+    store: Store, instance_id: str, runtime: dict[str, Any], timeline_map: dict[str, str]
+) -> int:
+    """按导出水位恢复角色状态；时钟冻结在该水位上，不恢复待生效倍率命令（§2.6）。"""
+    state = runtime.get("state") or {}
+    if not isinstance(state, dict):
+        return 0
+    loaded = 0
+    for old_id, payload in state.items():
+        new_id = timeline_map.get(str(old_id))
+        if not new_id or not isinstance(payload, dict):
+            continue
+        watermark = int(payload.get("watermark") or 0)
+        rows = {
+            "watermark": watermark,
+            "characters": _remap_rows(payload.get("characters"), instance_id, new_id),
+            "units": _remap_rows(payload.get("units"), instance_id, new_id),
+            "plans": _remap_rows(payload.get("plans"), instance_id, new_id),
+            "experiences": _remap_rows(payload.get("experiences"), instance_id, new_id),
+        }
+        loaded += store.runtime_load(instance_id, new_id, rows)
+        store.clock_put(
+            {
+                "timeline_id": new_id,
+                "base_real": time.time(),
+                "base_world": watermark,
+                "rate": max(1, int(payload.get("rate") or 1)),  # 不静默改写；超上限由激活时确认（§2.4）
+                "high_water_real": time.time(),
+                "anchor_real": time.time(),
+                "processed_world": watermark,
+                "generation": 1,
+                "catching_up": 0,
+                "limited": 0,
+            }
+        )
+    return loaded
+
+
+def _remap_rows(rows: Any, instance_id: str, timeline_id: str) -> list[dict[str, Any]]:
+    """把快照行里的本地标识换成新实例 / 新时间线（角色标识来自卡片，保持不变）。"""
+    out: list[dict[str, Any]] = []
+    for item in rows or []:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            {
+                **item,
+                "instance_id": instance_id,
+                "timeline_id": timeline_id,
+                "id": f"{str(item.get('id') or 'row').split('-')[0]}-{secrets.token_hex(6)}",
+            }
+        )
+    return out
 
 
 def _prepare_graph(

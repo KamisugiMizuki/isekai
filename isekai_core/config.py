@@ -77,6 +77,19 @@ class LLMConfig:
     temperature: float = 0.8
 
 
+@dataclass(frozen=True)
+class RuntimeConfig:
+    """世界运行层参数：全局统一、仅开发者可配置（WORLD_RUNTIME_SPEC §2.2 / §2.6 / §4）。
+
+    刻意不进设置 UI：倍率上限与世界运行预算不是日常可调项（§8.1「倍率上限被误改」）。
+    """
+
+    rate_max: int = 2592000             # 世界秒 / 现实秒
+    max_active_timelines: int = 4       # 同时激活的时间线数量上限
+    catch_up_batches: int = 8           # 单次推进批数上限（每批一个世界日）
+    catch_up_lag_seconds: int = 172800  # 滞后超过 2 世界日即记为「追赶受限」
+
+
 @dataclass
 class Config:
     paths: Paths
@@ -86,6 +99,7 @@ class Config:
     max_text_len: int = DEFAULT_MAX_TEXT_LEN
     max_parts: int = DEFAULT_MAX_PARTS
     context_history_max: int = 20
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     #: 阶段 0 占位会话三元组与提示词；阶段 1 起被真实实例 / 角色卡取代
     placeholder: dict[str, str] = field(
         default_factory=lambda: {
@@ -94,6 +108,22 @@ class Config:
             "character_id": "ph-character",
             "system_prompt": DEFAULT_PLACEHOLDER_PROMPT,
         }
+    )
+
+
+def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
+    """运行层参数：只读 config.yaml 的 runtime 段（无 UI 写入路径）。"""
+    section = _section(raw, "runtime")
+    base = RuntimeConfig()
+    return RuntimeConfig(
+        rate_max=int(section.get("rate_max") or base.rate_max),
+        max_active_timelines=int(section.get("max_active_timelines") or base.max_active_timelines),
+        catch_up_batches=int(section.get("catch_up_batches") or base.catch_up_batches),
+        catch_up_lag_seconds=(
+            int(section["catch_up_lag_seconds"])
+            if "catch_up_lag_seconds" in section
+            else base.catch_up_lag_seconds
+        ),
     )
 
 
@@ -185,6 +215,7 @@ def load_config(root: str | os.PathLike[str] | None = None) -> Config:
         max_text_len=int(core_raw.get("max_text_len") or DEFAULT_MAX_TEXT_LEN),
         max_parts=int(core_raw.get("max_parts") or DEFAULT_MAX_PARTS),
         context_history_max=int(core_raw.get("context_history_max") or 20),
+        runtime=_runtime_config(raw),
     )
 
     placeholder = _section(raw, "placeholder")

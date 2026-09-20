@@ -153,7 +153,22 @@ CREATE TABLE IF NOT EXISTS timeline_clock(
   high_water_real REAL NOT NULL DEFAULT 0,
   anchor_real REAL NOT NULL,             -- 激活时的现实锚点
   processed_world INTEGER NOT NULL,      -- 已处理世界时刻（共同水位）
-  generation INTEGER NOT NULL DEFAULT 1  -- 运行世代：回滚 / 删除使旧任务失效
+  generation INTEGER NOT NULL DEFAULT 1, -- 运行世代：回滚 / 删除使旧任务失效
+  catching_up INTEGER NOT NULL DEFAULT 0,-- 目标时刻领先于处理水位（§2.6）
+  limited INTEGER NOT NULL DEFAULT 0     -- 追赶受限：滞后超过预算，停止扩大目标（§2.6）
+);
+
+-- 补卡：角色在某个世界时刻加入该线（实例设定锁死，加入记录只进运行层，§九 / 附录 B #18）
+CREATE TABLE IF NOT EXISTS character_join(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  joined_world INTEGER NOT NULL,
+  card TEXT NOT NULL,                    -- 卡片快照（复核后固化）
+  note TEXT NOT NULL DEFAULT '',
+  acquainted INTEGER NOT NULL DEFAULT 0, -- 「已相识」声明：补一条对话单元
+  created_real REAL NOT NULL,
+  PRIMARY KEY(instance_id, timeline_id, character_id)
 );
 
 CREATE TABLE IF NOT EXISTS rate_command(
@@ -185,7 +200,6 @@ CREATE TABLE IF NOT EXISTS unit(
 CREATE INDEX IF NOT EXISTS ix_unit_character ON unit(instance_id, timeline_id, character_id);
 
 CREATE TABLE IF NOT EXISTS life_plan(
-  id TEXT PRIMARY KEY,
   instance_id TEXT NOT NULL,
   timeline_id TEXT NOT NULL,
   character_id TEXT NOT NULL,
@@ -194,7 +208,9 @@ CREATE TABLE IF NOT EXISTS life_plan(
   state TEXT NOT NULL DEFAULT 'fixed',
   created_world INTEGER NOT NULL,
   note TEXT NOT NULL DEFAULT '',
-  UNIQUE(instance_id, timeline_id, character_id, day_index)
+  id TEXT NOT NULL,
+  PRIMARY KEY(instance_id, timeline_id, character_id, day_index),
+  UNIQUE(instance_id, timeline_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS experience(
@@ -265,9 +281,12 @@ class Store:
             self._conn.commit()
 
     def _migrate_runtime_tables(self) -> None:
-        """运行层表的主键形态迁移：旧的单列主键会让不同实例互相覆盖，按派生数据重建。"""
-        expected = {"unit": ("instance_id", "timeline_id", "character_id", "id"),
-                    "experience": ("instance_id", "timeline_id", "character_id", "id")}
+        """运行层表的形态迁移（旧库就地升级；派生数据重建是最后手段）。"""
+        expected = {
+            "unit": ("instance_id", "timeline_id", "character_id", "id"),
+            "experience": ("instance_id", "timeline_id", "character_id", "id"),
+            "life_plan": ("instance_id", "timeline_id", "character_id", "day_index"),
+        }
         for table, columns in expected.items():
             rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
             if not rows:
@@ -277,6 +296,12 @@ class Store:
                 continue
             log.warning("重建运行层表 %s（主键形态升级：%s → %s）", table, primary, columns)
             self._conn.executescript(f"DROP TABLE {table};")
+        # 加列：不重建，直接补（§2.6 追赶状态与补卡表随阶段 2 审计加入）
+        clock_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(timeline_clock)")}
+        for name, ddl in (("catching_up", "INTEGER NOT NULL DEFAULT 0"), ("limited", "INTEGER NOT NULL DEFAULT 0")):
+            if clock_columns and name not in clock_columns:
+                log.info("timeline_clock 增列 %s", name)
+                self._conn.execute(f"ALTER TABLE timeline_clock ADD COLUMN {name} {ddl}")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
@@ -771,6 +796,16 @@ class Store:
                 self._conn.execute("DELETE FROM message WHERE session_id=?", (session_id,))
                 self._conn.execute("DELETE FROM thread WHERE session_id=?", (session_id,))
                 self._conn.execute("DELETE FROM session WHERE id=?", (session_id,))
+            # 运行层也要清：否则删掉实例会留下孤儿状态（阶段 2 审计发现）
+            self._conn.execute(
+                "DELETE FROM timeline_clock WHERE timeline_id IN (SELECT id FROM timeline WHERE instance_id=?)",
+                (instance_id,),
+            )
+            self._conn.execute(
+                "DELETE FROM rate_command WHERE timeline_id NOT IN (SELECT id FROM timeline)"
+            )
+            for table in ("unit", "life_plan", "experience", "character_join"):
+                self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute("DELETE FROM commit_log WHERE instance_id=?", (instance_id,))
             self._conn.execute("DELETE FROM timeline WHERE instance_id=?", (instance_id,))
             self._conn.execute("DELETE FROM instance WHERE id=?", (instance_id,))
@@ -798,6 +833,7 @@ class Store:
         return [_row_to_dict(r) for r in rows]
 
     def instance_import_messages(self, session_id: str, messages: list[dict[str, Any]]) -> None:
+        """导入的对话行：**重新签发消息标识**（导入=新实例，本地标识一律重映射，§7.3）。"""
         with self._lock, self._conn:
             for item in messages:
                 self._conn.execute(
@@ -814,7 +850,7 @@ class Store:
                         None,
                         str(item.get("text") or ""),
                         str(item.get("state") or "fixed"),
-                        item.get("message_id"),
+                        f"m-{secrets.token_hex(6)}",
                         float(item.get("created_at") or 0.0),
                     ),
                 )
@@ -842,18 +878,181 @@ class Store:
         return _row_to_dict(row) if row else None
 
     def clock_put(self, row: dict[str, Any]) -> None:
+        payload = {"catching_up": 0, "limited": 0, **row}
         with self._lock, self._conn:
             self._conn.execute(
                 """INSERT INTO timeline_clock(timeline_id, base_real, base_world, rate, high_water_real,
-                                              anchor_real, processed_world, generation)
+                                              anchor_real, processed_world, generation, catching_up, limited)
                    VALUES(:timeline_id, :base_real, :base_world, :rate, :high_water_real,
-                          :anchor_real, :processed_world, :generation)
+                          :anchor_real, :processed_world, :generation, :catching_up, :limited)
                    ON CONFLICT(timeline_id) DO UPDATE SET
                      base_real=:base_real, base_world=:base_world, rate=:rate,
                      high_water_real=:high_water_real, anchor_real=:anchor_real,
-                     processed_world=:processed_world, generation=:generation""",
+                     processed_world=:processed_world, generation=:generation,
+                     catching_up=:catching_up, limited=:limited""",
+                payload,
+            )
+
+    def apply_runtime_batch(
+        self,
+        *,
+        timeline_id: str,
+        generation: int,
+        processed_world: int,
+        catching_up: bool,
+        limited: bool = False,
+        plans: Iterable[dict[str, Any]] = (),
+        units: Iterable[dict[str, Any]] = (),
+        experiences: Iterable[dict[str, Any]] = (),
+    ) -> bool:
+        """把一批事实转移整体提交（§2.7：一批失败即整批回到批前水位）。
+
+        返回 False 表示世代已变（冻结 / 回滚后的迟到任务），整批不落盘。
+        """
+        with self._lock, self._conn:  # 单次 with → 一次提交，中途异常整批回滚
+            row = self._conn.execute(
+                "SELECT generation, processed_world FROM timeline_clock WHERE timeline_id=?", (timeline_id,)
+            ).fetchone()
+            if row is None or int(row["generation"]) != int(generation):
+                return False
+            if int(row["processed_world"]) > int(processed_world):
+                return False  # 水位只前进：并发的另一批已经先写过
+            for plan in plans:
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO life_plan(id, instance_id, timeline_id, character_id, day_index,
+                                                       windows, state, created_world, note)
+                       VALUES(:id, :instance_id, :timeline_id, :character_id, :day_index,
+                              :windows, :state, :created_world, :note)""",
+                    plan,
+                )
+            for unit in units:
+                self._conn.execute(
+                    """INSERT INTO unit(instance_id, timeline_id, character_id, id, mode, semantic, basis,
+                                        confidence, stability, archived, consumed, updated_world)
+                       VALUES(:instance_id, :timeline_id, :character_id, :id, :mode, :semantic, :basis,
+                              :confidence, :stability, :archived, :consumed, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, character_id, id) DO UPDATE SET
+                         confidence=:confidence, stability=:stability, archived=:archived,
+                         consumed=:consumed, updated_world=:updated_world""",
+                    unit,
+                )
+            for item in experiences:
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO experience(id, instance_id, timeline_id, character_id, world_seconds,
+                                                        kind, summary, source_ref, confidence)
+                       VALUES(:id, :instance_id, :timeline_id, :character_id, :world_seconds,
+                              :kind, :summary, :source_ref, :confidence)""",
+                    item,
+                )
+            self._conn.execute(
+                """UPDATE timeline_clock SET processed_world=?, catching_up=?, limited=?
+                   WHERE timeline_id=? AND generation=?""",
+                (processed_world, 1 if catching_up else 0, 1 if limited else 0, timeline_id, generation),
+            )
+            return True
+
+    # ---------- 运行层快照（导出 / 导入：按已完成水位） ----------
+
+    def runtime_dump(self, instance_id: str, timeline_id: str, *, watermark: int) -> dict[str, Any]:
+        def rows(sql: str, *args: Any) -> list[dict[str, Any]]:
+            return [_row_to_dict(r) for r in self._conn.execute(sql, args).fetchall()]
+
+        return {
+            "watermark": int(watermark),
+            "characters": rows(
+                "SELECT * FROM character_join WHERE instance_id=? AND timeline_id=? ORDER BY joined_world",
+                instance_id,
+                timeline_id,
+            ),
+            "units": rows(
+                """SELECT * FROM unit WHERE instance_id=? AND timeline_id=? AND updated_world<=?
+                   ORDER BY character_id, id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "plans": rows(
+                """SELECT * FROM life_plan WHERE instance_id=? AND timeline_id=? AND created_world<=?
+                   ORDER BY character_id, day_index""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "experiences": rows(
+                """SELECT * FROM experience WHERE instance_id=? AND timeline_id=? AND world_seconds<=?
+                   ORDER BY character_id, world_seconds""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+        }
+
+    def runtime_load(self, instance_id: str, timeline_id: str, payload: dict[str, Any]) -> int:
+        """导入运行层快照：整体一次提交，返回写入的行数。"""
+        plans = [
+            {**row, "created_world": int(row.get("created_world", payload.get("watermark", 0)))}
+            for row in payload.get("plans") or []
+        ]
+        with self._lock, self._conn:
+            for row in payload.get("characters") or []:
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO character_join(instance_id, timeline_id, character_id, joined_world,
+                                                             card, note, acquainted, created_real)
+                       VALUES(:instance_id, :timeline_id, :character_id, :joined_world, :card, :note,
+                              :acquainted, :created_real)""",
+                    row,
+                )
+            for row in payload.get("units") or []:
+                self._conn.execute(
+                    """INSERT INTO unit(instance_id, timeline_id, character_id, id, mode, semantic, basis,
+                                        confidence, stability, archived, consumed, updated_world)
+                       VALUES(:instance_id, :timeline_id, :character_id, :id, :mode, :semantic, :basis,
+                              :confidence, :stability, :archived, :consumed, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, character_id, id) DO NOTHING""",
+                    row,
+                )
+            for plan in plans:
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO life_plan(id, instance_id, timeline_id, character_id, day_index,
+                                                       windows, state, created_world, note)
+                       VALUES(:id, :instance_id, :timeline_id, :character_id, :day_index,
+                              :windows, :state, :created_world, :note)""",
+                    plan,
+                )
+            for item in payload.get("experiences") or []:
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO experience(id, instance_id, timeline_id, character_id, world_seconds,
+                                                        kind, summary, source_ref, confidence)
+                       VALUES(:id, :instance_id, :timeline_id, :character_id, :world_seconds,
+                              :kind, :summary, :source_ref, :confidence)""",
+                    item,
+                )
+        return sum(len(payload.get(key) or []) for key in ("characters", "units", "plans", "experiences"))
+
+    # ---------- 补卡 ----------
+
+    def character_join_add(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO character_join(instance_id, timeline_id, character_id, joined_world,
+                                              card, note, acquainted, created_real)
+                   VALUES(:instance_id, :timeline_id, :character_id, :joined_world, :card, :note,
+                          :acquainted, :created_real)
+                   ON CONFLICT(instance_id, timeline_id, character_id) DO UPDATE SET
+                     joined_world=:joined_world, card=:card, note=:note, acquainted=:acquainted""",
                 row,
             )
+
+    def character_join_list(
+        self, instance_id: str, timeline_id: str, *, until: int | None = None
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM character_join WHERE instance_id=? AND timeline_id=?"
+        args: list[Any] = [instance_id, timeline_id]
+        if until is not None:
+            sql += " AND joined_world<=?"
+            args.append(int(until))
+        rows = self._conn.execute(sql + " ORDER BY joined_world, character_id", args).fetchall()
+        return [_row_to_dict(r) for r in rows]
 
     def clock_set_processed(self, timeline_id: str, processed_world: int, *, generation: int | None = None) -> bool:
         """推进水位：世代不符即拒（迟到任务不得写回旧水位，§2.6/§7.1）。"""

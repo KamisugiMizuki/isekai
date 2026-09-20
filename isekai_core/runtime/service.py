@@ -25,10 +25,24 @@ class RuntimeStateError(ValueError):
 
 
 class RuntimeService:
-    def __init__(self, store: Store, *, rate_max: int | None = None) -> None:
+    def __init__(
+        self,
+        store: Store,
+        *,
+        rate_max: int | None = None,
+        max_active_timelines: int = 4,
+        catch_up_batches: int = 8,
+        catch_up_lag_seconds: int = 0,
+    ) -> None:
         self.store = store
-        #: 倍率上限：全局统一、仅开发者可配置（§2.2）
+        #: 倍率上限：全局统一、仅开发者可配置（§2.2），默认 2592000 世界秒 / 现实秒
         self.rate_max = int(rate_max or DEFAULT_RATE_MAX)
+        #: 同时激活的时间线上限（§4）
+        self.max_active_timelines = max(1, int(max_active_timelines))
+        #: 单次推进的批数上限（§2.6 预算）
+        self.catch_up_batches = max(1, int(catch_up_batches))
+        #: 滞后超过该世界秒数即进入「追赶受限」（§2.6）；0 = 与目标同步才退出受限
+        self.catch_up_lag_seconds = max(0, int(catch_up_lag_seconds))
 
     # ---------- 基础读取 ----------
 
@@ -49,8 +63,20 @@ class RuntimeService:
     def calendar(self, instance: dict[str, Any]) -> Calendar:
         return calendar_from_package(self.setting(instance)["world_package"])
 
-    def cards(self, instance: dict[str, Any]) -> list[dict[str, Any]]:
-        return list(self.setting(instance).get("cards") or [])
+    def cards(
+        self, instance: dict[str, Any], *, timeline_id: str | None = None, world_seconds: int | None = None
+    ) -> list[dict[str, Any]]:
+        """实例锁定的角色卡；给了线与水位时并入已补入的角色（§九 / 附录 B #18）。"""
+        cards = list(self.setting(instance).get("cards") or [])
+        if timeline_id is None or world_seconds is None:
+            return cards
+        joined = self.store.character_join_list(instance["id"], timeline_id, until=int(world_seconds))
+        for row in joined:
+            try:
+                cards.append(json.loads(str(row["card"])))
+            except json.JSONDecodeError:
+                log.warning("补入角色卡损坏 card=%s", row.get("character_id"))
+        return cards
 
     def clock_row(self, timeline_id: str) -> dict[str, Any]:
         row = self.store.clock_get(timeline_id)
@@ -83,25 +109,50 @@ class RuntimeService:
         self.store.clock_put(row)
         return row
 
-    def activate(self, instance_id: str, timeline_id: str, *, now_real: float) -> dict[str, Any]:
-        """激活：以当前现实时间重新锚定，不补算冻结期间的间隔（§2.4、§2.6）。"""
-        _, timeline = self._rows(instance_id, timeline_id)
+    def activate(
+        self, instance_id: str, timeline_id: str, *, now_real: float, rate: int | None = None
+    ) -> dict[str, Any]:
+        """激活：以当前现实时间重新锚定，不补算冻结期间的间隔（§2.4、§2.6）。
+
+        倍率超过当前上限（上限被调低 / 导入端上限更低）时不静默改写：保持冻结，
+        要求调用方在激活操作中确认一个合法倍率（§2.4）。
+        """
+        instance, timeline = self._rows(instance_id, timeline_id)
         if timeline["state"] == "active":
             return self.view(instance_id, timeline_id, now_real=now_real)
+        active = self.active_timelines()
+        if len(active) >= self.max_active_timelines:
+            raise RuntimeStateError(f"同时激活的时间线已达上限 {self.max_active_timelines} 条")
         row = self.clock_row(timeline_id)
+        stored_rate = int(row["rate"])
+        effective_rate = stored_rate
+        if rate is not None:
+            effective_rate = self._check_rate(rate)
+        elif stored_rate > self.rate_max:
+            raise RuntimeStateError(
+                f"该线倍率 {stored_rate} 超过当前上限 {self.rate_max}，需要在激活时确认一个合法倍率"
+            )
         world_at_freeze = target_world(self.state_of(row), float(row["anchor_real"]))
+        self.store.rate_cancel_pending(timeline_id)  # 冻结期间的待生效请求不跨重启恢复（§2.3.6）
         self.store.clock_put(
             {
                 **row,
                 "base_real": float(now_real),
                 "base_world": int(world_at_freeze),
+                "rate": effective_rate,
                 "high_water_real": float(now_real),
                 "anchor_real": float(now_real),
                 "processed_world": max(int(row["processed_world"]), int(world_at_freeze)),
+                "generation": int(row["generation"]) + 1,  # 旧世代任务一律失效（§4）
+                "catching_up": 0,
+                "limited": 0,
             }
         )
         self.store.timeline_set_state(timeline_id, "active")
-        return self.view(instance_id, timeline_id, now_real=now_real)
+        result = self.view(instance_id, timeline_id, now_real=now_real)
+        result["confirmed_rate"] = effective_rate if rate is not None else None
+        _ = instance
+        return result
 
     def freeze(self, instance_id: str, timeline_id: str, *, now_real: float) -> dict[str, Any]:
         """冻结：结算已生效倍率段、取消未生效请求；冻结线不推进也不接受倍率调整。"""
@@ -118,6 +169,9 @@ class RuntimeService:
                 "high_water_real": max(float(row["high_water_real"]), float(now_real)),
                 "anchor_real": float(now_real),
                 "processed_world": max(int(row["processed_world"]), int(world)),
+                "generation": int(row["generation"]) + 1,  # 冻结使旧世代任务失效（§4）
+                "catching_up": 0,
+                "limited": 0,
             }
         )
         self.store.timeline_set_state(timeline_id, "frozen")
@@ -132,6 +186,12 @@ class RuntimeService:
             "processed_world": int(max(int(row["processed_world"]), int(world))),
             "cancelled_commands": cancelled,
         }
+
+    def _check_rate(self, rate: int) -> int:
+        """倍率范围校验：正整数、受全局上限约束（§2.2）。"""
+        if not isinstance(rate, int) or isinstance(rate, bool) or not 1 <= rate <= self.rate_max:
+            raise RuntimeStateError(f"倍率必须是 1..{self.rate_max} 的整数")
+        return int(rate)
 
     def _settle_due(
         self, timeline_id: str, row: dict[str, Any], now_real: float
@@ -169,8 +229,7 @@ class RuntimeService:
         _, timeline = self._rows(instance_id, timeline_id)
         if timeline["state"] != "active":
             raise RuntimeStateError("冻结线不接受倍率调整（需先激活）")
-        if not isinstance(rate, int) or isinstance(rate, bool) or not 1 <= rate <= self.rate_max:
-            raise RuntimeStateError(f"倍率必须是 1..{self.rate_max} 的整数")
+        rate = self._check_rate(rate)
         row = self.clock_row(timeline_id)
         state, consumed = self._settle_due(timeline_id, row, now_real)
         self.store.rate_apply(consumed)
@@ -250,7 +309,7 @@ class RuntimeService:
     # ---------- 水位推进 ----------
 
     def advance(
-        self, instance_id: str, timeline_id: str, *, now_real: float, max_batches: int = 16
+        self, instance_id: str, timeline_id: str, *, now_real: float, max_batches: int | None = None
     ) -> dict[str, Any]:
         """把水位从已处理时刻推进到目标时刻，按世界日分批、每批原子（§2.6）。"""
         instance, timeline = self._rows(instance_id, timeline_id)
@@ -262,32 +321,61 @@ class RuntimeService:
         row = self.clock_row(timeline_id)
         target = target_world(state, now_real)
         processed = int(row["processed_world"])
+        if processed > target:
+            # 附录 B #20：处理水位超过合法目标另记为一致性错误，不静默回退、不假装追平
+            log.error(
+                "watermark ahead of target timeline=%s processed=%s target=%s", timeline_id, processed, target
+            )
+            return {"state": "inconsistent", "processed_world": processed, "target": target, "batches": 0}
         if target <= processed:
+            if int(row.get("catching_up") or 0) or int(row.get("limited") or 0):
+                self.store.clock_put({**row, "catching_up": 0, "limited": 0})
             return {"state": "current", "processed_world": processed, "target": target, "batches": 0}
         calendar = self.calendar(instance)
-        cards = self.cards(instance)
+        cards = self.cards(instance, timeline_id=timeline_id, world_seconds=processed)
         generation = int(row["generation"])
+        # 追赶受限（§2.6）：滞后超过预算即进入，停止扩大目标、只按已完成水位回答，不跳过事实效果
+        limited = (target - processed) > self.catch_up_lag_seconds
+        budget = self.catch_up_batches if max_batches is None else max(1, int(max_batches))
         produced = 0
         batches = 0
-        while processed < target and batches < max_batches:
+        while processed < target and batches < budget:
             day = calendar.day_index(processed)
             stop = min(target, (day + 1) * calendar.day_seconds)
-            produced += self._step_batch(
-                instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop, generation=generation
+            plans, units, experiences = self._collect_batch(
+                instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
             )
-            if not self.store.clock_set_processed(timeline_id, stop, generation=generation):
-                break  # 世代不符：本批失效，交给下一轮
+            committed = self.store.apply_runtime_batch(
+                timeline_id=timeline_id,
+                generation=generation,
+                processed_world=stop,
+                catching_up=stop < target,
+                limited=limited,
+                plans=plans,
+                units=units,
+                experiences=experiences,
+            )
+            if not committed:
+                # 世代已变（冻结 / 重启后迟到）或水位已被别的批次推过：本批整批不落盘
+                return {
+                    "state": "stale",
+                    "processed_world": int(self.clock_row(timeline_id)["processed_world"]),
+                    "target": target,
+                    "batches": batches,
+                }
             processed = stop
             batches += 1
+            produced += len(experiences)
         return {
             "state": "current" if processed >= target else "catching_up",
             "processed_world": processed,
             "target": target,
             "batches": batches,
             "experiences": produced,
+            "limited": limited and processed < target,
         }
 
-    def _step_batch(
+    def _collect_batch(
         self,
         instance_id: str,
         timeline_id: str,
@@ -296,10 +384,11 @@ class RuntimeService:
         *,
         from_world: int,
         to_world: int,
-        generation: int,
-    ) -> int:
-        """一批：准备次日计划、按世界时长衰减、把已完成的窗口记为经历。全部先写库再报进度。"""
-        produced = 0
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """收集一批事实转移（不落盘）：次日计划、按世界时长衰减的单元、已完成窗口的经历。"""
+        plans: list[dict[str, Any]] = []
+        units: list[dict[str, Any]] = []
+        experiences: list[dict[str, Any]] = []
         day_seconds = calendar.day_seconds
         for card in cards:
             character_id = str((card.get("meta") or {}).get("card_id") or "")
@@ -308,7 +397,7 @@ class RuntimeService:
             # 当前日与下一日的计划（世界日界由历法决定，不由入睡重新定义）
             for day_index in {calendar.day_index(from_world), calendar.day_index(to_world)}:
                 if self.store.plan_get(instance_id, timeline_id, character_id, day_index) is None:
-                    self.store.plan_put(
+                    plans.append(
                         life.expand_plan(
                             card,
                             calendar,
@@ -318,36 +407,57 @@ class RuntimeService:
                             created_world=from_world,
                         )
                     )
-            units = self.store.unit_list(instance_id, timeline_id, character_id)
-            if units:
-                for row in personality.apply_time(
-                    units, from_world=from_world, to_world=to_world, day_seconds=day_seconds
-                ):
-                    self.store.unit_put(row)
-            plan = self.store.plan_get(instance_id, timeline_id, character_id, calendar.day_index(from_world))
-            if plan is not None:
+            rows = self.store.unit_list(instance_id, timeline_id, character_id)
+            if rows:
+                units.extend(
+                    personality.apply_time(
+                        rows, from_world=from_world, to_world=to_world, day_seconds=day_seconds
+                    )
+                )
+            # 收割昨日与今日的计划：跨日窗口属于昨日，其尾部落在今日（§11 附录 B #7）
+            day_here = calendar.day_index(from_world)
+            for day_index in (day_here - 1, day_here):
+                plan = self.store.plan_get(instance_id, timeline_id, character_id, day_index)
+                if plan is None:
+                    continue
                 try:
                     windows = json.loads(str(plan["windows"])).get("windows", [])
                 except json.JSONDecodeError:
-                    windows = []
-                for window in windows:
-                    if not (from_world < int(window["end"]) <= to_world):
-                        continue
-                    self.store.experience_add(
-                        {
-                            "id": f"xp-{character_id}-{int(window['start'])}",
-                            "instance_id": instance_id,
-                            "timeline_id": timeline_id,
-                            "character_id": character_id,
-                            "world_seconds": int(window["end"]),
-                            "kind": "life",
-                            "summary": f"{window.get('activity') or 'activity'}（{calendar.describe(int(window['start']))}）",
-                            "source_ref": None,
-                            "confidence": "experienced",
-                        }
-                    )
-                    produced += 1
-        return produced
+                    continue
+                experiences.extend(
+                    self._harvest(instance_id, timeline_id, character_id, calendar, windows, from_world, to_world)
+                )
+        return plans, units, experiences
+
+    def _harvest(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str,
+        calendar: Calendar,
+        windows: list[dict[str, Any]],
+        from_world: int,
+        to_world: int,
+    ) -> list[dict[str, Any]]:
+        """把本批内已结束的活动窗记为经历（幂等：同一窗口的 id 固定）。"""
+        out: list[dict[str, Any]] = []
+        for window in windows:
+            if not (from_world < int(window["end"]) <= to_world):
+                continue
+            out.append(
+                {
+                    "id": f"xp-{character_id}-{int(window['start'])}",
+                    "instance_id": instance_id,
+                    "timeline_id": timeline_id,
+                    "character_id": character_id,
+                    "world_seconds": int(window["end"]),
+                    "kind": "life",
+                    "summary": f"{window.get('activity') or 'activity'}（{calendar.describe(int(window['start']))}）",
+                    "source_ref": None,
+                    "confidence": "experienced",
+                }
+            )
+        return out
 
     # ---------- 角色状态 ----------
 
@@ -356,7 +466,7 @@ class RuntimeService:
         instance, _ = self._rows(instance_id, timeline_id)
         calendar = self.calendar(instance)
         units = plans = 0
-        for card in self.cards(instance):
+        for card in self.cards(instance, timeline_id=timeline_id, world_seconds=world_seconds):
             character_id = str((card.get("meta") or {}).get("card_id") or "")
             if not character_id:
                 continue
@@ -439,19 +549,200 @@ class RuntimeService:
                 log.exception("advance failed timeline=%s", timeline_id)
         return advanced
 
+    # ---------- 性格驱动入口 ----------
+
+    def drive_unit(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str,
+        *,
+        driver: str,
+        semantic: str,
+        basis: str,
+        strength: float,
+        direction: int,
+        source_key: str,
+        world_seconds: int | None = None,
+    ) -> dict[str, Any] | None:
+        """把一次驱动落到单元上（§10.1）：来源键去重、变化连续、迁移隐式。
+
+        - 同一来源只消费一次：重试、补算、重新载入都返回 None，不重复强化（§10.3）；
+        - 已有同义单元按其累积稳定度调整，后来的弱驱动不会把它裁到本次驱动的生成上限；
+        - 驱动水位不得超过已完成水位（不能拿尚未发生的影响改角色）。
+
+        阶段 2 的调用方：对话驱动由会话层整理后调用（§10.1 的「AI 命名 + 确定性数值」分界），
+        事件驱动由阶段 3 的事件引擎调用；本方法只做落库与规则，不反问模型。
+        """
+        if driver not in personality.MODES:
+            raise RuntimeStateError(f"未知驱动：{driver}")
+        watermark = int(self.clock_row(timeline_id)["processed_world"])
+        at = watermark if world_seconds is None else int(world_seconds)
+        if at > watermark:
+            raise RuntimeStateError("驱动水位不能超过已完成水位")
+        rows = self.store.unit_list(instance_id, timeline_id, character_id)
+        if any(personality.has_consumed(row, source_key) for row in rows):
+            return None
+        updated = personality.apply_drive(
+            rows,
+            mode=driver,
+            source_key=source_key,
+            semantic=semantic or None,
+            strength=float(strength),
+            positive=direction >= 0,
+            world_seconds=at,
+            basis=basis,
+            identity={
+                "instance_id": instance_id,
+                "timeline_id": timeline_id,
+                "character_id": character_id,
+            },
+        )
+        touched = next(
+            (
+                row
+                for row in updated
+                if str(row.get("semantic")) == semantic and personality.has_consumed(row, source_key)
+            ),
+            None,
+        )
+        for row in updated:
+            if personality.has_consumed(row, source_key):
+                self.store.unit_put(row)
+        return touched
+
+    # ---------- 补卡（角色集合扩充） ----------
+
+    def add_character(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        card: dict[str, Any],
+        *,
+        now_real: float,
+        joined_world: int | None = None,
+        note: str = "",
+        acquainted: bool = False,
+    ) -> dict[str, Any]:
+        """把角色锚定补入该线（§九 / 附录 B #18）。
+
+        - 新角色一直存在：卡片自带个人史，补入只决定她自哪一刻起出现在本线；
+        - 个人史与初始知识按同一认知契约投影（卡片先在设定层过校验，此处只做锚定）；
+        - 补入不激活该线：冻结线锚定冻结时刻（调用方随后自行决定是否激活）；
+        - 加入点之前的经历与水位不变，回滚跨越加入点即一致退出（回滚属阶段 4）。
+        """
+        instance, timeline = self._rows(instance_id, timeline_id)
+        row = self.clock_row(timeline_id)
+        watermark = int(row["processed_world"])
+        if joined_world is None:
+            joined_world = (
+                watermark
+                if timeline["state"] == "active"
+                else target_world(self.state_of(row), float(row["anchor_real"]))
+            )
+        joined_world = int(joined_world)
+        if joined_world > watermark:
+            raise RuntimeStateError("补入时刻不能晚于已完成水位（不能从尚未发生的时刻开始）")
+        if joined_world < int(instance["moment"]):
+            raise RuntimeStateError("补入时刻不能早于实例初始时刻")
+        character_id = str((card.get("meta") or {}).get("card_id") or "")
+        if not character_id:
+            raise RuntimeStateError("角色卡缺少 card_id")
+        if int((card.get("identity") or {}).get("born") or 0) > joined_world:
+            raise RuntimeStateError("补入时刻早于角色出生时刻")
+        existing = {
+            str((item.get("meta") or {}).get("card_id"))
+            for item in self.cards(instance, timeline_id=timeline_id, world_seconds=watermark)
+        }
+        if character_id in existing:
+            raise RuntimeStateError(f"该角色已在本线：{character_id}")
+        from ..world.cards import validate_card  # 局部导入：设定层与运行层不互相依赖
+
+        errors = validate_card(card, self.setting(instance)["world_package"], moment=joined_world)
+        if not bool((card.get("meta") or {}).get("confirmed")):
+            errors.append("meta: 角色卡未确认，不能补入")
+        if errors:
+            raise RuntimeStateError("补入校验未通过：" + "；".join(str(item) for item in errors[:6]))
+        calendar = self.calendar(instance)
+        self.store.character_join_add(
+            {
+                "instance_id": instance_id,
+                "timeline_id": timeline_id,
+                "character_id": character_id,
+                "joined_world": joined_world,
+                "card": json.dumps(card, ensure_ascii=False, sort_keys=True),
+                "note": note,
+                "acquainted": 1 if acquainted else 0,
+                "created_real": float(now_real),
+            }
+        )
+        units = personality.initial_rows(
+            card, instance_id=instance_id, timeline_id=timeline_id, world_seconds=joined_world
+        )
+        if acquainted:  # 「已相识」声明：只补一条对话单元，不改任何既有角色状态
+            units.append(
+                {
+                    "id": "join-acquainted",
+                    "instance_id": instance_id,
+                    "timeline_id": timeline_id,
+                    "character_id": character_id,
+                    "mode": "dialog",
+                    "semantic": "与联络者已相识",
+                    "basis": "补卡时的已相识声明",
+                    "confidence": 0.6,
+                    "stability": 0.0,
+                    "archived": 0,
+                    "consumed": "[]",
+                    "updated_world": joined_world,
+                }
+            )
+        for unit in units:
+            self.store.unit_put(unit)
+        self.store.plan_put(
+            life.expand_plan(
+                card,
+                calendar,
+                day_index=calendar.day_index(joined_world),
+                instance_id=instance_id,
+                timeline_id=timeline_id,
+                created_world=joined_world,
+            )
+        )
+        return {
+            "instance": instance_id,
+            "timeline": timeline_id,
+            "character": character_id,
+            "name": str((card.get("identity") or {}).get("name") or ""),
+            "joined_world": joined_world,
+            "joined_label": calendar.describe(joined_world),
+            "units": len(units),
+            "acquainted": bool(acquainted),
+            "timeline_state": timeline["state"],
+            "note": note,
+        }
+
     # ---------- 会话接入 ----------
 
     def world_moment(self, instance_id: str, timeline_id: str, *, now_real: float | None = None) -> int:
         """可对话的世界时刻 = 已处理水位（不把未推进的目标当既有状态，§2.6）。"""
         return int(self.clock_row(timeline_id)["processed_world"])
 
-    def card_of(self, instance: dict[str, Any], character_id: str) -> dict[str, Any]:
-        for card in self.cards(instance):
+    def card_of(
+        self,
+        instance: dict[str, Any],
+        character_id: str,
+        *,
+        timeline_id: str | None = None,
+        world_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        for card in self.cards(instance, timeline_id=timeline_id, world_seconds=world_seconds):
             if str((card.get("meta") or {}).get("card_id")) == character_id:
                 return card
         raise RuntimeStateError(f"实例内没有该角色：{character_id}")
 
-    def system_prompt(self, session: dict[str, Any], *, now_real: float | None = None) -> str:
+    def system_prompt(
+        self, session: dict[str, Any], *, topic: str | None = None, now_real: float | None = None
+    ) -> str:
         """会话层用的扮演定义：锁定设定 + 该角色截至当前水位的认知切片（无实情层注入）。"""
         import time as _time
 
@@ -460,7 +751,12 @@ class RuntimeService:
         instance, _ = self._rows(session["instance_id"], session["timeline_id"])
         calendar = self.calendar(instance)
         world = self.world_moment(session["instance_id"], session["timeline_id"], now_real=now_real or _time.time())
-        card = self.card_of(instance, str(session["character_id"]))
+        card = self.card_of(
+            instance,
+            str(session["character_id"]),
+            timeline_id=session["timeline_id"],
+            world_seconds=world,
+        )
         snapshot = self.character_snapshot(
             session["instance_id"], session["timeline_id"], str(session["character_id"]), world_seconds=world
         )
@@ -469,6 +765,7 @@ class RuntimeService:
             card,
             world_seconds=world,
             calendar_label=calendar.describe(world),
+            topic=topic,
             current_activity=str(snapshot["current_activity"] or ""),
             units=snapshot["units"],
             experiences=snapshot["experiences"],

@@ -810,9 +810,14 @@ function bindWorld(): void {
     const pair = { instance_id: world.instanceId, timeline_id: world.timeline };
     void clockAction(async () => {
       if (!pair.instance_id || !pair.timeline_id) throw new Error("先选一个实例");
-      const result = await mgmt!.call("runtime.activate", pair);
+      const rateText = $<HTMLInputElement>("clock-rate").value.trim();
+      const rate = rateText ? Number(rateText) : undefined;
+      if (rate !== undefined && (!Number.isInteger(rate) || rate < 1)) throw new Error("倍率必须是正整数");
+      // 上限被调低或导入端上限更低时，激活需要在此确认一个合法倍率（§2.4）
+      const result = await mgmt!.call("runtime.activate", rate === undefined ? pair : { ...pair, rate });
       const clock = result.clock as unknown as ClockView;
-      return `已激活：${clock.label ?? ""}`;
+      const confirmed = (result.clock as unknown as { confirmed_rate?: number }).confirmed_rate;
+      return `已激活：${clock.label ?? ""}${confirmed ? `（确认倍率 ${confirmed}）` : ""}`;
     }, pair);
   });
   $("clock-freeze").addEventListener("click", () => {

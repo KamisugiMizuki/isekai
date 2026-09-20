@@ -54,6 +54,7 @@ OP_BY_COMMAND = {
     ("runtime", "freeze"): "runtime.freeze",
     ("runtime", "rate"): "runtime.rate",
     ("runtime", "advance"): "runtime.advance",
+    ("runtime", "card-add"): "runtime.card.add",
 }
 
 
@@ -97,8 +98,15 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
         args: dict[str, Any] = {"instance_id": ns.id, "timeline_id": ns.timeline}
         if cmd == "rate":
             args["rate"] = int(ns.rate or 0)
+        if cmd == "activate" and ns.rate:
+            args["rate"] = int(ns.rate)
         if cmd == "advance":
             args["max_batches"] = int(ns.max_batches or 16)
+        if cmd == "card-add":
+            args["card_path"] = ns.card
+            args["joined_world"] = int(ns.at) if ns.at is not None else None
+            args["note"] = ns.note or ""
+            args["acquainted"] = bool(ns.acquainted)
         return args
     if group == "instance":
         if cmd == "list":
@@ -199,6 +207,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--rate", default=None, help="倍率（世界秒 / 现实秒）")
     parser.add_argument("--max-batches", dest="max_batches", default=None, help="单次推进的最大批数")
     parser.add_argument("--moment", default=None, help="校验基准时刻（世界秒）")
+    parser.add_argument("--at", default=None, help="补卡：锚定补入的世界时刻（缺省=该线已完成水位）")
+    parser.add_argument("--note", default=None, help="补卡：备注")
+    parser.add_argument("--acquainted", action="store_true", help="补卡：声明与联络者已相识")
     parser.add_argument("--candidate", default=None, help="把文件内容当作候选对象提交")
     ns = parser.parse_args(argv)
     if (ns.group, ns.command) not in OP_BY_COMMAND:
