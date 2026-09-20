@@ -416,29 +416,47 @@ fn config_facts(state: State<AppState>) -> ConfigFacts {
     facts
 }
 
-/// 原生文件对话框（恢复备份选文件）：用系统自带 PowerShell 的 OpenFileDialog。
-/// 对话框会一直阻塞到用户选择（或挂起不选）：跑在阻塞线程池上，壳主线程保持可用，
-/// 托盘退出 / 关窗不会被它挂住（DESKTOP_SPEC §3.2）。
+/// 原生文件对话框（恢复备份选文件 / 导入世界包 / 导入角色卡共用）：用系统自带 PowerShell 的
+/// OpenFileDialog，标题与过滤器由调用方给（不引新依赖）。对话框会一直阻塞到用户选择（或挂起不选）：
+/// 跑在阻塞线程池上，壳主线程保持可用，托盘退出 / 关窗不会被它挂住（DESKTOP_SPEC §3.2）。
 #[tauri::command]
-async fn pick_backup_file(dir: Option<String>) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || pick_backup_file_blocking(dir))
+async fn pick_backup_file(
+    dir: Option<String>,
+    title: Option<String>,
+    filter: Option<String>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || pick_backup_file_blocking(dir, title, filter))
         .await
         .map_err(|error| format!("文件对话框任务失败：{error}"))?
 }
 
-fn pick_backup_file_blocking(dir: Option<String>) -> Result<Option<String>, String> {
+fn pick_backup_file_blocking(
+    dir: Option<String>,
+    title: Option<String>,
+    filter: Option<String>,
+) -> Result<Option<String>, String> {
     let script = concat!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
         "Add-Type -AssemblyName System.Windows.Forms;",
         "$d=New-Object System.Windows.Forms.OpenFileDialog;",
-        "$d.Title='选择要恢复的备份';",
-        "$d.Filter='备份文件 (*.db)|*.db|所有文件 (*.*)|*.*';",
+        "if($env:ISEKAI_PICK_TITLE){$d.Title=$env:ISEKAI_PICK_TITLE};",
+        "if(-not $d.Title){$d.Title='选择文件'};",
+        "if($env:ISEKAI_PICK_FILTER){$d.Filter=$env:ISEKAI_PICK_FILTER};",
+        "if(-not $d.Filter){$d.Filter='所有文件 (*.*)|*.*'};",
         "if($env:ISEKAI_BACKUP_DIR -and (Test-Path $env:ISEKAI_BACKUP_DIR)){$d.InitialDirectory=$env:ISEKAI_BACKUP_DIR};",
         "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($d.FileName)}"
     );
     let output = Command::new("powershell")
         .args(["-NoProfile", "-STA", "-Command", script])
         .env("ISEKAI_BACKUP_DIR", dir.unwrap_or_default())
+        .env(
+            "ISEKAI_PICK_TITLE",
+            title.unwrap_or_else(|| "选择要恢复的备份".to_string()),
+        )
+        .env(
+            "ISEKAI_PICK_FILTER",
+            filter.unwrap_or_else(|| "备份文件 (*.db)|*.db|所有文件 (*.*)|*.*".to_string()),
+        )
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("打开文件对话框失败：{error}"))?;

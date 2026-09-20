@@ -299,20 +299,26 @@ def public_info(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def list_instances(store: Store) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": row["id"],
-            "name": row["name"],
-            "original_name": row["original_name"],
-            "package_id": row["package_id"],
-            "moment": row["moment"],
-            "imported": bool(row["imported"]),
-            "created_at": row["created_at"],
-            "timelines": row["timelines"],
-            "sessions": row["sessions"],
-        }
-        for row in store.instance_list()
-    ]
+    """实例列表：带**兼容性结论**——列表层就能看出哪条开不了，不用先选中（§7.6）。"""
+    items: list[dict[str, Any]] = []
+    for row in store.instance_list():
+        state, reason = compatibility(row)
+        items.append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "original_name": row["original_name"],
+                "package_id": row["package_id"],
+                "moment": row["moment"],
+                "imported": bool(row["imported"]),
+                "created_at": row["created_at"],
+                "timelines": row["timelines"],
+                "sessions": row["sessions"],
+                "compatibility": state,
+                "compatibility_reason": reason,
+            }
+        )
+    return items
 
 
 def get_setting(store: Store, instance_id: str) -> dict[str, Any]:

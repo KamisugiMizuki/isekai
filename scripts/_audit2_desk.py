@@ -312,6 +312,51 @@ def type_keys(*vk_codes: int) -> None:
         user32.keybd_event(vk, 0, 2, 0)
 
 
+def dialog_pid(hwnd: int) -> int:
+    pid = ctypes.c_ulong()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value)
+
+
+def drive_open_dialog(path: str, title_needle: str, timeout: float = 30.0) -> tuple[int, str]:
+    """真驱动原生「打开」文件对话框，返回 (hwnd, 观察文本)。
+
+    壳的 pick_backup_file 是原生对话框，装不了 stub（`__TAURI_INTERNALS__.invoke` 是
+    writable:false，赋值静默失败；2026-09 实测），所以只能真驱动：
+    等对话框出现 → 给文件名框 WM_SETTEXT 绝对路径 → 真鼠标点「打开」按钮。
+    Shell 风格对话框不认 PostMessage(WM_COMMAND/IDOK)，必须真点按钮。
+    """
+    hwnd = 0
+    deadline = time.time() + timeout
+    while time.time() < deadline and not hwnd:
+        hwnd = dialog_hwnd(title_needle)
+        time.sleep(0.4)
+    if not hwnd:
+        return 0, f"原生对话框（标题含「{title_needle}」）未出现"
+    bring_front(hwnd)
+    time.sleep(0.8)
+    children = child_windows(hwnd)
+    edits = sorted({(h, r) for h, cls, _t, r in children if cls.lower() in ("edit", "richedit50w")},
+                   key=lambda item: item[1][1])            # y 最大的是文件名框（最小的是搜索框）
+    buttons = [item for item in sorted({(h, t, r) for h, cls, t, r in children
+                                        if cls.lower() == "button"})
+               if "Open" in item[1] or "打开" in item[1]]
+    if not edits or not buttons:
+        return hwnd, (f"对话框 hwnd={hwnd} 里没找到文件名框 / 「打开」按钮"
+                      f"（edit={len(edits)} button={len(buttons)}）")
+    set_text(edits[-1][0], str(path))
+    time.sleep(0.5)
+    rect = buttons[0][2]
+    click_at((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
+    for _ in range(12):
+        time.sleep(0.5)
+        if not ctypes.windll.user32.IsWindow(hwnd):
+            return hwnd, f"原生对话框 hwnd={hwnd}：文件名框写入 {path}，点「{buttons[0][1]}」后被接受"
+    pid = dialog_pid(hwnd)
+    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)  # 别把模态框留在桌面上
+    return hwnd, f"原生对话框 hwnd={hwnd}（pid={pid}）没有关闭：写入 {path} 后点「{buttons[0][1]}」未被接受"
+
+
 # ------------------------------------------------------------------ CDP
 
 class Cdp:
@@ -1113,6 +1158,144 @@ async def section_main() -> None:
           clause="§六 明确区分核心未就绪、某线追赶、模型失败、向量服务降级；§十.7 embedding 失败时显示可用的降级",
           code="desktop/src/main.ts（无向量状态渲染）· isekai_core/runtime/service.py:1005-1010")
 
+    # ---- 导入入口（§3.2 世界包 / 角色卡）与不兼容实例转换（§7.6）：真壳 + CDP，测试件只落 Temp
+    from isekai_core.world.example import example_package
+
+    fp = str(int(time.time()))
+    pkg_file = f"audit2-import-world-{fp}.json"
+    card_file = f"audit2-import-card-{fp}.json"
+    sample = example_package(name="审计导入世界")
+    bad_pkg, good_pkg = TMPBASE / f"audit2-bad-world-{fp}.json", TMPBASE / pkg_file
+    huge_card, good_card = TMPBASE / f"audit2-huge-card-{fp}.json", TMPBASE / card_file
+    bad_pkg.write_text(json.dumps({"meta": {}, "races": []}, ensure_ascii=False), encoding="utf-8")
+    good_pkg.write_text(json.dumps(sample, ensure_ascii=False), encoding="utf-8")
+    good_card.write_text(json.dumps(example_card(sample, name="审计导入卡"), ensure_ascii=False),
+                         encoding="utf-8")
+    huge_card.write_text('{"identity": {}, "pad": "' + "x" * (1 << 20) + '"}', encoding="utf-8")
+    packages_dir = root / "packages"
+    files_before = sorted(p.name for p in packages_dir.glob("*"))
+    await cdp.pane("manage")
+    await cdp.js("document.getElementById('world-note').textContent='';"
+                 "document.getElementById('pkg-errors').textContent='';"
+                 "document.getElementById('card-errors').textContent='';")
+
+    # ① 坏包：核心的原因原样上界面，不过校验就不落盘
+    drive1 = await pick_import_file(cdp, "pkg-import", bad_pkg, "选择要导入的世界包")
+    bad_pkg_note = await cdp.wait("document.getElementById('pkg-errors').textContent", "未落盘", 45)
+    files_after_bad = sorted(p.name for p in packages_dir.glob("*"))
+    ok_i1 = ("未落盘" in str(bad_pkg_note) and files_before == files_after_bad
+             and "被接受" in drive1)
+    check("I1 §3.2/§7.5 导入坏的世界包：界面原样显示核心的拒绝原因，且不落盘",
+          "PASS" if ok_i1 else "FAIL",
+          f"点「导入世界包…」→ {drive1} → #pkg-errors={bad_pkg_note!r}；"
+          f"创作目录文件 {files_before} → {files_after_bad}"
+          f"（无新增={files_before == files_after_bad}）",
+          clause="§3.2 管理面导入外部世界包；§7.5 导入前结构校验，不过校验不落盘",
+          code="desktop/src/main.ts importInto / importPackage · isekai_core/world/ops.py:394-422",
+          expected="拒绝原因带「未落盘」字样并原样进界面；创作目录不新增文件")
+
+    # ② 好包：导入成功 → 包列表出现并选中；再导一次 → 问一句覆盖 → 带 force 覆盖
+    await cdp.js("document.getElementById('world-note').textContent=''")
+    drive2 = await pick_import_file(cdp, "pkg-import", good_pkg, "选择要导入的世界包")
+    pkg_note = await cdp.wait("document.getElementById('world-note').textContent", "已导入", 45)
+    pkg_view = await cdp.js("({opts:[...document.getElementById('pkg-select').options].map(o=>o.value),"
+                            " sel: document.getElementById('pkg-select').value})")
+    core_pkgs = [str(item.get("file")) for item
+                 in ((await mgmt_call(cdp, "world.package.list")).get("packages") or [])]
+    conf_before = await cdp.js("window.__confirmArgs.length")
+    await cdp.js("document.getElementById('world-note').textContent=''")
+    drive2b = await pick_import_file(cdp, "pkg-import", good_pkg, "选择要导入的世界包")
+    forced_note = await cdp.wait("document.getElementById('world-note').textContent", "覆盖了同名文件", 45)
+    conf_after = await cdp.js("window.__confirmArgs.length")
+    conf_last = await cdp.js("window.__confirmArgs.slice(-1)[0] || ''")
+    ok_i2 = (pkg_file in pkg_view["opts"] and pkg_view["sel"] == pkg_file and pkg_file in core_pkgs
+             and "被接受" in drive2 and "被接受" in drive2b
+             and int(conf_after or 0) == int(conf_before or 0) + 1
+             and "已存在" in str(conf_last) and "覆盖" in str(conf_last)
+             and "覆盖了同名文件" in str(forced_note))
+    check("I2 §3.2 导入好的世界包：列表出现并选中；同名要用户确认覆盖才写",
+          "PASS" if ok_i2 else "FAIL",
+          f"导入 {good_pkg.name} → 世界提示={pkg_note!r}；#pkg-select 选项含该件={pkg_file in pkg_view['opts']}"
+          f"、选中={pkg_view['sel']!r}；核心 world.package.list 含该件={pkg_file in core_pkgs}；"
+          f"同名再导一次（{drive2b}）→ 确认框第 {conf_after} 条={str(conf_last)[:80]!r}（比上次多 "
+          f"{int(conf_after or 0) - int(conf_before or 0)} 条），覆盖后提示={forced_note!r}",
+          clause="§3.2 导入成功后刷新创作目录并选中；同名文件不静默覆盖，需显式确认",
+          code="desktop/src/main.ts importPackage（force 重试）· isekai_core/world/ops.py:405-414",
+          expected="新包进下拉并被选中；同名冲突先问覆盖，确认后才 replaced 落盘")
+
+    # ③ 归属包闸门 + 超限卡：没选包不给导入；超限文件在读之前被拒，目录仍无新增
+    await cdp.select("card-package-select", "")
+    gate = await cdp.js("({disabled: document.getElementById('card-import').disabled,"
+                        " note: document.getElementById('card-import-note').textContent})")
+    await cdp.select("card-package-select", pkg_file)
+    gate_on = await cdp.js("!document.getElementById('card-import').disabled")
+    await cdp.js("document.getElementById('card-errors').textContent=''")
+    files_before_card = sorted(p.name for p in packages_dir.glob("*"))  # 上面这次成功导入之后再看
+    drive3 = await pick_import_file(cdp, "card-import", huge_card, "选择要导入的角色卡")
+    huge_note = await cdp.wait("document.getElementById('card-errors').textContent", "加载限额", 45)
+    files_after_huge = sorted(p.name for p in packages_dir.glob("*"))
+    ok_i3 = (gate["disabled"] is True and "先选归属世界包" in str(gate["note"]) and gate_on is True
+             and "加载限额" in str(huge_note) and "被接受" in drive3
+             and files_before_card == files_after_huge)
+    check("I3 §3.2/§2.3 未选归属包不给导入；超限角色卡被读前拒绝且不落盘",
+          "PASS" if ok_i3 else "FAIL",
+          f"归属包下拉=占位项 → 按钮 disabled={gate['disabled']}、提示={gate['note']!r}；"
+          f"选 {pkg_file} 后按钮可点={gate_on}；选 {huge_card.name}（1 MiB+）导入（{drive3}）→ "
+          f"#card-errors={huge_note!r}；创作目录文件 {files_before_card} → {files_after_huge}"
+          f"（无新增={files_before_card == files_after_huge}）",
+          clause="§3.2 角色卡导入要对着包做联合校验（渠道 / 史料引用）；§2.3 加载限额在读之前拦",
+          code="desktop/src/main.ts renderCardImportGate / importInto · isekai_core/world/ops.py:423-436",
+          expected="没选包时入口不可点且写明要先选包；超限文件带「加载限额」原因被拒，不落盘")
+
+    # ④ 好卡：对着已导入的包做联合校验 → 卡列表出现并选中
+    await cdp.js("document.getElementById('world-note').textContent=''")
+    drive4 = await pick_import_file(cdp, "card-import", good_card, "选择要导入的角色卡")
+    card_note = await cdp.wait("document.getElementById('world-note').textContent", "已导入", 45)
+    card_view = await cdp.js("({opts:[...document.getElementById('card-select').options].map(o=>o.value),"
+                             " sel: document.getElementById('card-select').value})")
+    core_cards = [str(item.get("file")) for item
+                  in ((await mgmt_call(cdp, "world.card.list")).get("cards") or [])]
+    ok_i4 = (card_file in card_view["opts"] and card_view["sel"] == card_file
+             and card_file in core_cards and pkg_file in str(card_note) and "被接受" in drive4)
+    check("I4 §3.2 导入好的角色卡（带归属包联合校验）：卡列表出现并选中",
+          "PASS" if ok_i4 else "FAIL",
+          f"归属包={pkg_file} 时导入 {good_card.name}（{drive4}）→ 世界提示={card_note!r}；"
+          f"#card-select 选项含该件={card_file in card_view['opts']}、选中={card_view['sel']!r}；"
+          f"核心 world.card.list 含该件={card_file in core_cards}",
+          clause="§3.2 角色卡导入对着归属世界包联合校验；导入成功后刷新卡列表并选中",
+          code="desktop/src/main.ts importCard · isekai_core/world/ops.py:423-456",
+          expected="卡进列表并被选中，提示里写明对照哪个包校验")
+
+    # ⑤ 不兼容实例的转换入口（§7.6）：compatible 不显示；不兼容时显示 + 点它给核心的原因
+    inst0 = instances[0]["id"]
+    orig_fmt = str(one(root, "SELECT data_format FROM instance WHERE id=?", (inst0,)) or "")
+    await cdp.select("inst-select", inst0)
+    await asyncio.sleep(2.0)
+    compat_hidden = await cdp.js("document.getElementById('inst-convert-row').classList.contains('hidden')")
+    db_exec(root, "UPDATE instance SET data_format='9.9' WHERE id=?", (inst0,))
+    await cdp.select("inst-select", inst0)
+    await asyncio.sleep(2.0)
+    bad_row = await cdp.js("({hidden: document.getElementById('inst-convert-row').classList.contains('hidden'),"
+                           " note: document.getElementById('inst-convert-note').textContent})")
+    ref = (await mgmt_call(cdp, "instance.convert", instance_id=inst0, confirmed=False)).get("convert") or {}
+    await cdp.js("document.getElementById('inst-convert').click()")
+    conv_note = await cdp.wait("document.getElementById('inst-convert-note').textContent", "转换器", 40)
+    db_exec(root, "UPDATE instance SET data_format=? WHERE id=?", (orig_fmt, inst0))
+    await cdp.select("inst-select", inst0)
+    ok_i5 = (compat_hidden is True and bad_row["hidden"] is False and "9.9" in str(bad_row["note"])
+             and ref.get("state") == "blocked"
+             and str(ref.get("hint") or "") in str(conv_note)
+             and str(ref.get("reason") or "") in str(conv_note) and "用兼容版本" in str(conv_note))
+    check("I5 §7.6 不兼容实例才显示转换入口；点开照实显示核心的原因（无转换器 → 用兼容版本）",
+          "PASS" if ok_i5 else "FAIL",
+          f"data_format={orig_fmt}（compatible）时转换行隐藏={compat_hidden}；"
+          f"改成 9.9 再开管理页 → 行隐藏={bad_row['hidden']}、行内提示={bad_row['note']!r}；"
+          f"核心 instance.convert(confirmed=false)={ref}；点「转换…」后行内提示={conv_note!r}"
+          f"（含核心 hint={ref.get('hint')!r} 与 reason）",
+          clause="§7.6 打开实例做兼容检查：convertible / blocked 才提示转换与原因；没有可信转换器就停在提示上",
+          code="desktop/src/main.ts convertSelectedInstance · isekai_core/world/instances.py:215-243",
+          expected="compatible 不显示入口；不兼容显示入口，点开显示核心给的 reason 与「用兼容版本」提示，不改数据")
+
     # ---- §五 关闭窗口到托盘：核心继续推进
     await cdp.pane("manage")
     await cdp.select("inst-select", instances[1]["id"])
@@ -1738,6 +1921,13 @@ async def install_observe(cdp: Cdp, timeout: float = 90.0) -> bool:
             pass
         await asyncio.sleep(0.5)
     return False
+
+
+async def pick_import_file(cdp: Cdp, button_id: str, path: Path, title_needle: str) -> str:
+    """点导入按钮 → 真驱动随之弹出的原生文件对话框 → 返回可引用的观察文本（文件对话框只能真驱）。"""
+    await cdp.js(f"document.getElementById({json.dumps(button_id)}).click()")
+    _hwnd, note = await asyncio.to_thread(drive_open_dialog, str(path), title_needle)
+    return note
 
 
 async def mgmt_call(cdp: Cdp, op: str, **args):

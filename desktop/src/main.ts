@@ -1473,6 +1473,17 @@ interface InstanceEntry {
   compatibility_note?: string;
 }
 
+interface ConvertResult {
+  converted: boolean;
+  state?: string;
+  reason?: string;
+  hint?: string;
+  needs_confirmation?: boolean;
+  from?: string;
+  to?: string;
+  safety?: string;
+}
+
 interface WorldCache {
   packages: PackageEntry[];
   cards: CardEntry[];
@@ -1576,6 +1587,12 @@ async function loadWorld(): Promise<void> {
   fillSelect($<HTMLSelectElement>("inst-select"), instanceOptions as Array<[string, string]>);
   fillSelect($<HTMLSelectElement>("inst-package-select"), packageOptions as Array<[string, string]>);
   fillSelect($<HTMLSelectElement>("inst-cards-select"), cardOptions as Array<[string, string]>);
+  // 导入角色卡要先指定归属包（联合校验用），所以这个下拉带一个「未选」占位项
+  fillSelect(
+    $<HTMLSelectElement>("card-package-select"),
+    [["", "（未选：导入角色卡先选归属世界包）"], ...packageOptions] as Array<[string, string]>,
+  );
+  renderCardImportGate();
   const importOptions = world.containers.map((item) => [item.file, item.file] as [string, string]);
   fillSelect($<HTMLSelectElement>("import-select"), importOptions);
   const selected = $<HTMLSelectElement>("inst-select").value;
@@ -1612,6 +1629,12 @@ async function showInstance(instanceId: string): Promise<void> {
     const { info, timelines } = loaded;
     renderRoleControls();
     await renderDisclosures();
+    // 不兼容实例（convertible / blocked）才给转换入口；compatible 时整行隐藏（§7.6）
+    const incompatible = info.compatibility === "convertible" || info.compatibility === "blocked";
+    $("inst-convert-row").classList.toggle("hidden", !incompatible);
+    $("inst-convert-note").textContent = incompatible
+      ? `${info.compatibility}：${info.compatibility_note ?? ""}`
+      : "";
     // 补卡的目标时间线：跟当前查看的实例走（§3.2 角色行「选择目标时间线」）
     fillSelect(
       $<HTMLSelectElement>("card-add-timeline"),
@@ -1895,6 +1918,121 @@ async function addCharacter(): Promise<string> {
   return `已补入 ${join.name ?? card}：加入于 ${join.joined_label ?? ""}`;
 }
 
+/* ---------- 导入（世界包 / 角色卡）与不兼容实例转换：入口在壳，校验与落盘在核心 ---------- */
+
+/// 原生文件对话框：复用壳的 pick_backup_file（Tauri 命令，跑在阻塞线程池上），只换标题与过滤器。
+/// 核心只认绝对路径，所以路径授权交给系统对话框，壳不自己拼路径（§3.2）。
+async function pickImportFile(title: string, filter: string): Promise<string | null> {
+  return await invoke<string | null>("pick_backup_file", { dir: "", title, filter });
+}
+
+/// 一次导入：核心拒绝同名覆盖，除非用户显式确认（force）。
+/// 失败时把核心给的原因原样写进本组提示（未落盘 / 超过加载限额 / …），不自己改写成 internal。
+async function importInto(
+  op: string,
+  args: Record<string, unknown>,
+  what: string,
+  here: string,
+): Promise<Record<string, unknown> | null> {
+  if (!mgmt) throw new Error("管理面未连接");
+  try {
+    return await mgmt.call(op, args);
+  } catch (error) {
+    const text = String(error);
+    if (!text.includes("如需覆盖请显式确认")) {
+      $(here).textContent = text;
+      return null;
+    }
+    if (!window.confirm(`${text}\n\n用导入件覆盖同名${what}？原有文件会被替换。`)) {
+      $(here).textContent = `已取消，未覆盖：${text}`;
+      return null;
+    }
+    return await mgmt.call(op, { ...args, force: true });
+  }
+}
+
+/// 导入世界包（§3.2 / §7.5）：外部文件 → 结构校验通过才落创作目录，不过不落盘。
+async function importPackage(): Promise<string> {
+  const picked = await pickImportFile(
+    "选择要导入的世界包（*.json）",
+    "世界包 (*.json)|*.json|所有文件 (*.*)|*.*",
+  );
+  if (!picked) return "已取消选择";
+  $("pkg-errors").textContent = "";
+  const result = await importInto("world.package.import", { source_path: picked }, "世界包", "pkg-errors");
+  if (!result) return "导入未完成：原因见下方错误栏";
+  await loadWorld();
+  $<HTMLSelectElement>("pkg-select").value = String(result.imported ?? "");
+  return `已导入 ${result.imported}（${result.name || "未命名"}）${result.replaced ? "，覆盖了同名文件" : ""}`;
+}
+
+/// 导入角色卡：渠道 / 史料引用要对着归属包做联合校验，所以没有归属包就不给导入（§3.2 / CHARACTER_CARD §5）。
+async function importCard(): Promise<string> {
+  const pkg = $<HTMLSelectElement>("card-package-select").value;
+  if (!pkg) throw new Error("先选归属世界包：联合校验要用它");
+  const picked = await pickImportFile(
+    "选择要导入的角色卡（*.json）",
+    "角色卡 (*.json)|*.json|所有文件 (*.*)|*.*",
+  );
+  if (!picked) return "已取消选择";
+  $("card-errors").textContent = "";
+  const result = await importInto(
+    "world.card.import",
+    { source_path: picked, package_path: pkg },
+    "角色卡",
+    "card-errors",
+  );
+  if (!result) return "导入未完成：原因见下方错误栏";
+  await loadWorld();
+  $<HTMLSelectElement>("card-select").value = String(result.imported ?? "");
+  return `已导入 ${result.imported}（${result.name || "未命名"}，对照 ${
+    result.validated_against || pkg
+  } 联合校验）${result.replaced ? "，覆盖了同名文件" : ""}`;
+}
+
+/// 归属包没选时「导入角色卡…」不给点：联合校验必须要有包。
+function renderCardImportGate(): void {
+  const pkg = $<HTMLSelectElement>("card-package-select").value;
+  $<HTMLButtonElement>("card-import").disabled = !pkg;
+  $("card-import-note").textContent = pkg
+    ? ""
+    : "先选归属世界包：导入角色卡要对着包做联合校验（渠道 / 史料引用）";
+}
+
+/// 不兼容实例的转换入口（§7.6）：先问核心要「需确认 + 原因」，用户确认后才转换；
+/// 没有可信转换器就停在核心给的原因上（不「尽量加载」）。可恢复副本由核心留、路径照回。
+async function convertSelectedInstance(): Promise<string> {
+  if (!mgmt) throw new Error("管理面未连接");
+  const id = $<HTMLSelectElement>("inst-select").value;
+  if (!id) throw new Error("先选实例");
+  const first = (await mgmt.call("instance.convert", { instance_id: id, confirmed: false })).convert as
+    | ConvertResult
+    | undefined;
+  if (!first) throw new Error("核心未回转换结果");
+  if (!first.needs_confirmation) {
+    $("inst-convert-note").textContent = [first.reason, first.hint].filter(Boolean).join("；");
+    return first.hint ?? first.reason ?? "";
+  }
+  $("inst-convert-note").textContent = String(first.reason ?? "");
+  const ok = window.confirm(
+    `${first.reason}\n\n` +
+      "· 转换只在副本上做：通过完整校验才发布，原实例在失败时一字不动\n" +
+      "· 转换前先留一份可恢复副本，成功后线先冻结、由你明确激活\n" +
+      "继续？",
+  );
+  if (!ok) return "已取消，未转换";
+  const done = (await mgmt.call("instance.convert", { instance_id: id, confirmed: true })).convert as
+    | ConvertResult
+    | undefined;
+  if (!done?.converted) {
+    $("inst-convert-note").textContent =
+      [done?.reason, done?.hint].filter(Boolean).join("；") || "转换未完成，原实例保留";
+    return "";
+  }
+  $("inst-convert-note").textContent = "";
+  return `已转换 ${done.from} → ${done.to}；可恢复副本：${done.safety || "（核心未回路径）"}`;
+}
+
 /// 草稿：候选世界包 / 角色卡单独保存，可显式继续，只有「丢弃草稿」才删除（§3.2）
 async function loadDrafts(): Promise<void> {
   if (!mgmt) return;
@@ -1950,6 +2088,12 @@ async function discardDraft(): Promise<string> {
 
 function bindWorld(): void {
   $("world-refresh").addEventListener("click", () => void loadWorld());
+  $("pkg-import").addEventListener("click", () => void worldAction(importPackage));
+  $("card-import").addEventListener("click", () => void worldAction(importCard));
+  $<HTMLSelectElement>("card-package-select").addEventListener("change", () =>
+    renderCardImportGate(),
+  );
+  $("inst-convert").addEventListener("click", () => void worldAction(convertSelectedInstance));
   $("card-add").addEventListener("click", () => void worldAction(addCharacter));
   $("draft-continue").addEventListener("click", () => void worldAction(continueDraft));
   $("draft-discard").addEventListener("click", () => void worldAction(discardDraft));

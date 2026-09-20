@@ -62,6 +62,7 @@
             <button id="pkg-check">校验</button>
             <input id="pkg-file" placeholder="文件名，如 greytide.json" />
             <button id="pkg-template">新建骨架</button>
+            <button id="pkg-import">导入世界包…</button>
           </div>
           <div class="row">
             <input id="pkg-brief" placeholder="用一段话描述这个世界，交给 AI 生成" />
@@ -76,6 +77,11 @@
             <button id="card-confirm">确认卡片</button>
             <input id="card-file" placeholder="文件名，如 tihe.card.json" />
             <button id="card-template">新建骨架</button>
+          </div>
+          <div class="row">
+            <select id="card-package-select" aria-label="归属世界包（导入角色卡用）"></select>
+            <button id="card-import">导入角色卡…</button>
+            <span id="card-import-note" class="muted"></span>
           </div>
           <div class="row">
             <input id="card-brief" placeholder="角色描述，如：盐滩上记水位尺的年轻堤务吏" />
@@ -116,6 +122,10 @@
           <div class="row">
             <select id="import-select" aria-label="导出件（导入为实例）"></select>
             <button id="inst-import">导入为实例</button>
+          </div>
+          <div class="row hidden" id="inst-convert-row">
+            <button id="inst-convert">转换…</button>
+            <span id="inst-convert-note" class="muted"></span>
           </div>
 
           <h3>运行（当前查看的实例）</h3>
