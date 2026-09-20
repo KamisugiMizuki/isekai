@@ -48,6 +48,10 @@ SYNC_OPS = frozenset(
         "runtime.clock",
         "runtime.budget",
         "runtime.budget.set",
+        "event.confirm",
+        "runtime.timeline.rename",
+        "runtime.timeline.archive",
+        "runtime.timeline.delete",
         "runtime.commit",
         "runtime.commits",
         "runtime.fork",
@@ -80,6 +84,7 @@ ASYNC_OPS = frozenset(
         "event.expand",
         "runtime.propose",
         "runtime.extract",
+        "event.draft",
         "world.package.generate",
         "world.package.revise",
         "world.package.fill",
@@ -285,6 +290,14 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
     """同步操作：只读写文件与库，不调用模型。"""
     try:
         # 预算视图 / 设置：只按实例（不要求时间线），不进 runtime.* 前缀分发
+        if op == "event.confirm":
+            return _confirm_user_event(cfg, store, args)
+        if op == "runtime.timeline.rename":
+            return _timeline_rename(cfg, store, args)
+        if op == "runtime.timeline.archive":
+            return _timeline_archive(cfg, store, args)
+        if op == "runtime.timeline.delete":
+            return _timeline_delete(cfg, store, args)
         if op == "runtime.commit":
             return _version_commit(cfg, store, args)
         if op == "runtime.commits":
@@ -457,6 +470,43 @@ def _version_ids(args: dict[str, Any]) -> tuple[str, str]:
     return instance_id, timeline_id
 
 
+def _confirm_user_event(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """确认草案：原子创建新线并注入（§八 第 6–8 条）。"""
+    instance_id = str(args.get("instance_id") or "")
+    draft_id = str(args.get("draft_id") or "")
+    if not instance_id or not draft_id:
+        raise UmpError(Err.INVALID, "缺少实例或草案标识", retryable=False)
+    return _world_service(cfg, store).confirm_user_event(
+        instance_id, draft_id, name=str(args.get("name") or "")
+    )
+
+
+def _timeline_rename(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """命名 / 描述（§四）。"""
+    instance_id, timeline_id = _version_ids(args)
+    return {
+        "timeline": _world_service(cfg, store).rename_timeline(
+            instance_id, timeline_id,
+            name=str(args.get("name") or ""),
+            description=str(args["description"]) if args.get("description") is not None else None,
+        )
+    }
+
+
+def _timeline_archive(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """归档先冻结、不删除数据（§四）。"""
+    instance_id, timeline_id = _version_ids(args)
+    return {"timeline": _world_service(cfg, store).archive_timeline(instance_id, timeline_id)}
+
+
+def _timeline_delete(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """删除需确认；停止该线任务、解绑通道，其他线引用的提交保留（§四）。"""
+    instance_id, timeline_id = _version_ids(args)
+    if not bool(args.get("confirm")):
+        raise UmpError(Err.INVALID, "删除时间线不可恢复，需要 --confirm 确认", retryable=False)
+    return _world_service(cfg, store).delete_timeline(instance_id, timeline_id)
+
+
 def _version_commit(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
     """手动提交：不受自动提交开关限制（§5.1）。"""
     instance_id, timeline_id = _version_ids(args)
@@ -526,6 +576,28 @@ def _budget_set(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, An
     if "paused_tasks" in fields:
         policy = store.budget_policy_set(instance_id, paused_tasks=fields["paused_tasks"])
     return {"policy": policy, "view": _world_service(cfg, store).budget_view(instance_id)}
+
+
+async def _draft_user_event(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
+    """用户引入事件的草案（§八 第 1–5 条）：只翻译与校验，不施加任何效果。"""
+    if store is None:
+        raise UmpError(Err.STATE_BLOCKED, "缺少存储上下文", retryable=False)
+    instance_id = str(args.get("instance_id") or "")
+    timeline_id = str(args.get("timeline_id") or "")
+    if not instance_id or not timeline_id:
+        raise UmpError(Err.INVALID, "缺少实例或时间线", retryable=False)
+    payload = args.get("payload")
+    if isinstance(payload, str) and payload.strip():
+        payload = json.loads(payload)
+    world = _world_service(cfg, store)
+    use_llm = None if (isinstance(payload, dict) and payload.get("effects")) else llm
+    return await world.draft_user_event(
+        instance_id, timeline_id,
+        intent=str(args.get("intent") or ""),
+        payload=payload if isinstance(payload, dict) else None,
+        source_commit=str(args.get("commit_id") or "") or None,
+        llm=use_llm,
+    )
 
 
 async def _extract_memories(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
@@ -702,6 +774,8 @@ async def dispatch_async(
             return await _propose_intents(cfg, llm, store, args)
         if op == "runtime.extract":
             return await _extract_memories(cfg, llm, store, args)
+        if op == "event.draft":
+            return await _draft_user_event(cfg, llm, store, args)
         if op == "world.package.generate":
             package, errors, usage = await generate_package(
                 llm, str(args.get("brief") or ""), name=str(args.get("name") or "未命名世界"), **kwargs

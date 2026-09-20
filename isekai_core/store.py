@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS timeline(
   id TEXT PRIMARY KEY,
   instance_id TEXT NOT NULL,
   name TEXT NOT NULL,
-  state TEXT NOT NULL DEFAULT 'frozen',   -- frozen|active
+  description TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'frozen',   -- frozen|active|archived
   source_commit TEXT,
   created_at REAL NOT NULL
 );
@@ -134,6 +135,30 @@ CREATE TABLE IF NOT EXISTS commit_auto_state(
   instance_id TEXT NOT NULL,
   last_commit_at REAL NOT NULL DEFAULT 0,
   last_commit_moment INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS event_draft(
+  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  source_timeline TEXT NOT NULL,
+  source_commit TEXT,
+  payload TEXT NOT NULL,               -- 规范化后的草案（用户意图 + 已确认部分）
+  state TEXT NOT NULL DEFAULT 'draft', -- draft|confirmed|rejected
+  timeline_id TEXT NOT NULL DEFAULT '',-- 确认后落成的新线
+  created_world INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pending_event(
+  id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  at_world INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',  -- pending|applied|cancelled|skipped
+  note TEXT NOT NULL DEFAULT '',
+  created_world INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS commit_snapshot(
@@ -512,6 +537,11 @@ class Store:
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
             ).fetchone()
             return str(row["sql"] or "") if row is not None else ""
+
+        timeline_sql = sql_of("timeline")
+        if timeline_sql and "description" not in timeline_sql:
+            with self._lock, self._conn:
+                self._conn.execute("ALTER TABLE timeline ADD COLUMN description TEXT NOT NULL DEFAULT ''")
 
         memory_sql = sql_of("memory")
         if memory_sql and "PRIMARY KEY(instance_id, timeline_id, id)" not in memory_sql:
@@ -1140,6 +1170,8 @@ class Store:
                 "intent",
                 "call_ledger",
                 "commit_snapshot",
+                "event_draft",
+                "pending_event",
                 "commit_auto_state",
                 "memory",
                 "memory_task",
@@ -1202,6 +1234,51 @@ class Store:
                     ),
                 )
 
+    def timeline_update(self, timeline_id: str, *, name: str | None = None, description: str | None = None) -> None:
+        """可命名、可描述（§四 列表只含管理元数据）。"""
+        fields: list[str] = []
+        args: list[Any] = []
+        if name is not None:
+            fields.append("name=?")
+            args.append(str(name))
+        if description is not None:
+            fields.append("description=?")
+            args.append(str(description))
+        if not fields:
+            return
+        args.append(timeline_id)
+        with self._lock, self._conn:
+            self._conn.execute(f"UPDATE timeline SET {', '.join(fields)} WHERE id=?", args)
+
+    def timeline_delete(self, instance_id: str, timeline_id: str) -> dict[str, int]:
+        """删除一条线：清运行状态、对话与任务；其他线引用的提交数据保留（§四）。"""
+        protected = {
+            str(row["source_commit"])
+            for row in self.timeline_list(instance_id)
+            if row["id"] != timeline_id and row.get("source_commit")
+        }
+        doomed = [row["id"] for row in self.commit_list(instance_id, timeline_id) if row["id"] not in protected]
+        counts: dict[str, int] = {}
+        with self._lock, self._conn:
+            self.timeline_clear_state(timeline_id)
+            self.timeline_clear_dialog(timeline_id)
+            for table in ("session", "character_join", "rate_command", "budget_reserve",
+                          "commit_auto_state", "timeline_clock"):
+                cur = self._conn.execute(f"DELETE FROM {table} WHERE timeline_id=?", (timeline_id,))
+                counts[table] = int(cur.rowcount or 0)
+            if doomed:
+                marks = ",".join("?" for _ in doomed)
+                cur = self._conn.execute(
+                    f"DELETE FROM commit_snapshot WHERE commit_id IN ({marks})", tuple(doomed)
+                )
+                counts["commit_snapshot"] = int(cur.rowcount or 0)
+                cur = self._conn.execute(f"DELETE FROM commit_log WHERE id IN ({marks})", tuple(doomed))
+                counts["commit_log"] = int(cur.rowcount or 0)
+            counts["commit_kept"] = len(protected & {row["id"] for row in self.commit_list(instance_id)})
+            cur = self._conn.execute("DELETE FROM timeline WHERE id=?", (timeline_id,))
+            counts["timeline"] = int(cur.rowcount or 0)
+        return counts
+
     def timeline_set_state(self, timeline_id: str, state: str) -> None:
         with self._lock, self._conn:
             self._conn.execute("UPDATE timeline SET state=? WHERE id=?", (state, timeline_id))
@@ -1222,6 +1299,51 @@ class Store:
                     (row["id"], row["instance_id"], payload, len(payload), time.time()),
                 )
         return row
+
+    # ---------- 用户引入事件（§八） ----------
+
+    def draft_put(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO event_draft(id, instance_id, source_timeline, source_commit, payload,
+                                           state, timeline_id, created_world, created_at)
+                   VALUES(:id, :instance_id, :source_timeline, :source_commit, :payload,
+                          :state, :timeline_id, :created_world, :created_at)
+                   ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, state=excluded.state,
+                     timeline_id=excluded.timeline_id""",
+                row,
+            )
+
+    def draft_get(self, draft_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM event_draft WHERE id=?", (draft_id,)).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def pending_event_add(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO pending_event(id, instance_id, timeline_id, at_world, payload, state,
+                                             note, created_world, created_at)
+                   VALUES(:id, :instance_id, :timeline_id, :at_world, :payload, :state,
+                          :note, :created_world, :created_at)
+                   ON CONFLICT(id) DO NOTHING""",
+                row,
+            )
+
+    def pending_events_due(self, instance_id: str, timeline_id: str, *, until: int) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT * FROM pending_event WHERE instance_id=? AND timeline_id=? AND state='pending'
+               AND at_world<=? ORDER BY at_world, id""",
+            (instance_id, timeline_id, int(until)),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def pending_event_set(self, event_id: str, *, state: str, note: str = "") -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE pending_event SET state=?, note=? WHERE id=? AND state='pending'",
+                (state, note, event_id),
+            )
+        return bool(cur.rowcount)
 
     def commit_state_get(self, timeline_id: str) -> dict[str, Any]:
         row = self._conn.execute(
@@ -1276,6 +1398,9 @@ class Store:
         for table in (
             "unit", "life_plan", "experience", "claim", "knowledge", "effect_state", "intent",
             "event", "environment_state", "memory", "memory_task", "memory_citation",
+            "character_join",   # 跨越补卡点的回滚要让补入角色在本线退出（§七）
+            "rate_command",     # 历史里的待生效倍率不是现时控制命令（§七）
+            "pending_event",    # 回滚撤销待执行状态及其后果（§八 末条）
         ):
             self._conn.execute(f"DELETE FROM {table} WHERE timeline_id=?", (timeline_id,))
         # 向量表两种形态都清：按线（新）与按 memory 归属（兼容早期没有 timeline_id 的行）
@@ -1285,6 +1410,39 @@ class Store:
                (SELECT id FROM memory WHERE timeline_id=?)""",
             (timeline_id,),
         )
+
+    def timeline_void_inflight(self, timeline_id: str, *, reason: str = "rollback") -> int:
+        """把该线还在处理中的输入登记作废：迟到的生成结果不得写回（§七）。
+
+        走既有的 voided 表——重绑与回滚共用同一套「这条输入已经不算数」的判定。
+        """
+        rows = self._conn.execute(
+            """SELECT channel_id, thread_id, env_id FROM message
+               WHERE role='user' AND env_id IS NOT NULL AND state IN ('queued','processing')
+                 AND session_id IN (SELECT id FROM session WHERE timeline_id=?)""",
+            (timeline_id,),
+        ).fetchall()
+        for row in rows:
+            self.void_put(str(row["channel_id"] or ""), str(row["thread_id"] or ""), str(row["env_id"]), reason)
+        return len(rows)
+
+    def timeline_cancel_undelivered(self, timeline_id: str) -> int:
+        """该线已固化但还没投递出去的回复一并取消：不继续发送被回滚的内容（§七）。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """UPDATE message SET state='cancelled'
+                   WHERE role='character' AND state='fixed'  -- 已固化但还没投递完成
+                     AND session_id IN (SELECT id FROM session WHERE timeline_id=?)""",
+                (timeline_id,),
+            )
+            cancelled = int(cur.rowcount or 0)
+            self._conn.execute(
+                """UPDATE delivery SET state='cancelled'
+                   WHERE msg_seq IN (SELECT seq FROM message WHERE session_id IN
+                                     (SELECT id FROM session WHERE timeline_id=?))""",
+                (timeline_id,),
+            )
+        return cancelled
 
     def timeline_clear_dialog(self, timeline_id: str) -> None:
         """该线会话的对话原文（回滚要把被截去的未来对话一并撤掉，§七）。"""

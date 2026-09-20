@@ -58,6 +58,11 @@ OP_BY_COMMAND = {
     ("runtime", "propose"): "runtime.propose",
     ("runtime", "extract"): "runtime.extract",
     ("runtime", "budget"): "runtime.budget",
+    ("event", "draft"): "event.draft",
+    ("event", "confirm"): "event.confirm",
+    ("runtime", "timeline-rename"): "runtime.timeline.rename",
+    ("runtime", "timeline-archive"): "runtime.timeline.archive",
+    ("runtime", "timeline-delete"): "runtime.timeline.delete",
     ("runtime", "commit"): "runtime.commit",
     ("runtime", "commits"): "runtime.commits",
     ("runtime", "fork"): "runtime.fork",
@@ -107,6 +112,13 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             return {**args, "brief": ns.brief or ""}
     if group == "event":
         args = {"instance_id": ns.id, "timeline_id": ns.timeline}
+        if cmd == "draft":
+            args["intent"] = ns.instruction or ""
+            args["payload"] = ns.candidate or ""
+            args["commit_id"] = ns.commit or ""
+        if cmd == "confirm":
+            args["draft_id"] = ns.ref or ns.file or ""
+            args["name"] = ns.display_name or ""
         if cmd == "render":
             args["event_id"] = ns.file
         if cmd == "expand":
@@ -123,6 +135,11 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args["rate"] = int(ns.rate)
         if cmd == "advance":
             args["max_batches"] = int(ns.max_batches or 16)
+        if cmd == "timeline-rename":
+            args["name"] = ns.display_name or ""
+            args["description"] = ns.note
+        if cmd == "timeline-delete":
+            args["confirm"] = bool(ns.confirm)
         if cmd in ("commit", "rollback"):
             args["note"] = ns.note or ""
         if cmd in ("fork", "rollback"):
@@ -257,6 +274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--task", default=None, help="预算：要暂停 / 恢复的任务名")
     parser.add_argument("--pause", action="store_true", help="预算：暂停该任务")
     parser.add_argument("--commit", default=None, help="版本：提交标识")
+    parser.add_argument("--ref", default=None, help="草案标识等引用")
     parser.add_argument("--confirm", action="store_true", help="版本：确认破坏性操作（回滚）")
     parser.add_argument("--activate", action="store_true", help="版本：分叉后立即激活")
     parser.add_argument("--resume", dest="pause_resume", action="store_true", help="预算：恢复该任务")

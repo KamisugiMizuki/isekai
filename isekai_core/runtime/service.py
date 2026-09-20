@@ -16,7 +16,7 @@ from typing import Any
 from ..log import get_logger
 from ..store import Store
 from . import budget as budget_mod
-from . import cognition, embedding as embedding_mod, environment, events, intents, life
+from . import cognition, drafts, embedding as embedding_mod, environment, events, intents, life
 from . import memory as memory_mod, personality, planning, versioning
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
@@ -104,6 +104,233 @@ class RuntimeService:
         instance = self.store.instance_get(instance_id) or {}
         return self.calendar(instance).describe(int(world_seconds))
 
+    # ---------- 用户引入事件（§八，阶段 4） ----------
+
+    def _known_targets(self, instance: dict[str, Any], timeline_id: str, *, world_seconds: int) -> tuple[set[str], list[str]]:
+        """来源点已登记的对象与渠道：效果只能指向它们（不泄露任何未登记内容）。"""
+        package = self.setting(instance)["world_package"]
+        targets: set[str] = set()
+        for card in self.cards(instance, timeline_id=timeline_id, world_seconds=world_seconds):
+            targets.add(str((card.get("meta") or {}).get("card_id") or ""))
+            targets.add(str(card.get("role_id") or ""))
+            for channel in card.get("channels") or []:
+                if channel.get("source_id"):
+                    targets.add(str(channel["source_id"]))
+        for entity in package.get("entities") or []:
+            if isinstance(entity, dict) and entity.get("id"):
+                targets.add(str(entity["id"]))
+        for item in (package.get("environment") or {}).get("types") or []:
+            if isinstance(item, dict) and item.get("id"):
+                targets.add(str(item["id"]))
+        channels = sorted(
+            str(item["id"]) for item in package.get("comms", {}).get("sources", []) if isinstance(item, dict) and item.get("id")
+        ) if isinstance(package.get("comms"), dict) else []
+        targets.discard("")
+        return targets, channels
+
+    async def draft_user_event(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        intent: str = "",
+        payload: dict[str, Any] | None = None,
+        source_commit: str | None = None,
+        llm: Any = None,
+        now_real: float | None = None,
+    ) -> dict[str, Any]:
+        """生成草案（§八 第 1–5 条）：只翻译与校验，不施加任何效果。"""
+        import time as _time
+
+        now = _time.time() if now_real is None else float(now_real)
+        instance = self.store.instance_get(instance_id)
+        if instance is None:
+            raise RuntimeStateError(f"实例不存在：{instance_id}")
+        if source_commit:
+            source = self.store.commit_get(source_commit)
+            if source is None or str(source["instance_id"]) != instance_id:
+                raise RuntimeStateError(f"没有该提交：{source_commit}")
+            if str(source["timeline_id"]) != timeline_id:
+                raise RuntimeStateError("来源提交不属于这条线")
+            watermark = int(source["moment"])
+        else:
+            watermark = self.world_moment(instance_id, timeline_id)
+        targets, channels = self._known_targets(instance, timeline_id, world_seconds=watermark)
+
+        candidate = dict(payload or {})
+        candidate.setdefault("intent", intent)
+        if llm is not None and str(intent or "").strip() and not candidate.get("effects"):
+            package = self.setting(instance)["world_package"]
+            allowed = planning.allowed_targets(package, {"meta": {"card_id": ""}, "role_id": "", "channels": []}, knowledge=[], observations=[])
+            allowed = {kind: sorted(targets) for kind in allowed}  # 管理面：目标集合是来源点已登记对象
+            prompt = drafts.proposal_prompt(
+                intent=str(intent), world_label=self.describe_world(instance_id, watermark),
+                allowed=allowed, channels=channels,
+            )
+            prompt_text = "\n".join(str(item.get("content") or "") for item in prompt)
+            reservation = self.reserve_call(
+                instance_id, timeline_id, "user_event_draft", prompt_text=prompt_text, now_real=now
+            )
+            if reservation.get("ok"):
+                try:
+                    text = await llm.chat(prompt, temperature=0.3, timeout=60.0)
+                    self.settle_call(reservation, prompt_text=prompt_text, reply=text)
+                    proposed = drafts.parse_proposal(text, targets)
+                    candidate = {**candidate, **{k: v for k, v in proposed.items() if v}}
+                except Exception:
+                    self.settle_call(reservation, prompt_text=prompt_text, outcome="error")
+
+        try:
+            normalized = drafts.normalize_draft(
+                self.setting(instance)["world_package"], candidate,
+                known_targets=targets, world_seconds=watermark, default_channels=channels,
+            )
+        except ValueError as exc:
+            # 无法表达成受支持事件就明确拒绝（不把自由文本当已执行），提示只说用户自己的输入
+            return {"accepted": False, "reason": str(exc)}
+
+        draft_id = drafts.draft_id_for(instance_id, timeline_id, normalized["intent"], normalized["at_world"])
+        row = {
+            "id": draft_id, "instance_id": instance_id, "source_timeline": timeline_id,
+            "source_commit": source_commit or "", "payload": json.dumps(normalized, ensure_ascii=False),
+            "state": "draft", "timeline_id": "", "created_world": watermark, "created_at": now,
+        }
+        existing = self.store.draft_get(draft_id)
+        if existing is not None and str(existing["state"]) == "confirmed":
+            return {"accepted": True, "draft": drafts.public_draft({**normalized, "id": draft_id, "confirmed": True,
+                                                                  "timeline_id": existing["timeline_id"]}),
+                    "reused": True}
+        self.store.draft_put(row)
+        return {"accepted": True, "draft": drafts.public_draft({**normalized, "id": draft_id, "source": {
+            "timeline_id": timeline_id, "commit_id": source_commit or "", "world": watermark}}),
+            "targets_seen": len(targets)}
+
+    def confirm_user_event(
+        self, instance_id: str, draft_id: str, *, name: str = "", now_real: float | None = None
+    ) -> dict[str, Any]:
+        """确认后原子建线并注入（§八 第 6–8 条）：即时事件立即生效，预约只写待执行状态。"""
+        import time as _time
+
+        now = _time.time() if now_real is None else float(now_real)
+        draft = self.store.draft_get(draft_id)
+        if draft is None:
+            raise RuntimeStateError(f"没有该草案：{draft_id}")
+        if str(draft["state"]) == "confirmed":
+            return {"timeline_id": str(draft["timeline_id"]), "reused": True}
+        source_timeline = str(draft["source_timeline"])
+        source_commit = str(draft["source_commit"] or "")
+        payload = json.loads(draft["payload"])
+        # 来源点重新校验（§八 第 7 条）：用当前提交 / 当前水位，不静默换基础
+        base_commit = source_commit or self.commit(instance_id, source_timeline, kind="auto", note="用户引入事件的来源点")["id"]
+        branch = self.fork(
+            instance_id, source_timeline, commit_id=base_commit,
+            name=name or f"引入事件：{str(payload.get('intent') or '')[:12]}", now_real=now,
+        )
+        new_line = str(branch["timeline"]["id"])
+        try:
+            result = self._inject_user_event(instance_id, new_line, payload, draft_id=draft_id, now_real=now)
+        except Exception:
+            # 失败不留下半条线
+            try:
+                self.store.timeline_delete(instance_id, new_line)
+            except Exception:
+                pass
+            raise
+        self.store.draft_put({**draft, "state": "confirmed", "timeline_id": new_line, "payload": draft["payload"]})
+        return {"timeline_id": new_line, "commit": branch["commit"], **result}
+
+    def _inject_user_event(
+        self, instance_id: str, timeline_id: str, payload: dict[str, Any], *, draft_id: str, now_real: float
+    ) -> dict[str, Any]:
+        """注入：即时 → 与水位同批落效果 / 说法 / 获知；预约 → 只写待执行状态。"""
+        clock = self.clock_row(timeline_id)
+        world = int(clock["processed_world"])
+        ident = f"ev-user-{events.stable_key(instance_id, timeline_id, draft_id)[:12]}"
+        if payload["when"] == "scheduled":
+            self.store.pending_event_add({
+                "id": f"pe-{ident[3:]}", "instance_id": instance_id, "timeline_id": timeline_id,
+                "at_world": int(payload["at_world"]), "payload": json.dumps(payload, ensure_ascii=False),
+                "state": "pending", "note": "", "created_world": world, "created_at": now_real,
+            })
+            return {"scheduled": True, "at_world": int(payload["at_world"]), "event": ident}
+        rows = self._user_event_rows(instance_id, timeline_id, payload, ident=ident, world=world)
+        applied = self.store.apply_runtime_batch(
+            timeline_id=timeline_id, generation=int(clock["generation"]), processed_world=world,
+            catching_up=False, events=[rows["event"]], claims=rows["claims"], knowledge=rows["knowledge"],
+            effects=rows["effects"],
+        )
+        if not applied:
+            raise RuntimeStateError("注入被拒（世代已变）")
+        return {"scheduled": False, "event": ident, "effects": len(rows["effects"]), "claims": len(rows["claims"])}
+
+    def _user_event_rows(
+        self, instance_id: str, timeline_id: str, payload: dict[str, Any], *, ident: str, world: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        """用户事件的登记行：与引擎事件同形（效果 + 说法），获知交给常规传播链（§五）。"""
+        event_row = {
+            "instance_id": instance_id, "timeline_id": timeline_id, "id": ident, "world_seconds": world,
+            "seq": 0, "kind": "world", "family": "政治", "template": "user.introduced",
+            "source": "user", "summary": str(payload["intent"])[:200], "detail": str(payload["intent"]),
+            "text_source": "template", "effects": json.dumps(payload["effects"], ensure_ascii=False),
+            "share_value": 0.7, "importance": 0.8, "created_real": time.time(),
+        }
+        effects: list[dict[str, Any]] = []
+        for index, item in enumerate(payload["effects"]):
+            effects.append({
+                "id": f"ef-{ident[3:]}-{index}", "instance_id": instance_id, "timeline_id": timeline_id,
+                "event_id": ident, "target": str(item["target"]), "kind": str(item["kind"]),
+                "family": "政治", "value": item.get("value"), "from_world": world,
+                "expiry": str(item.get("expiry") or "with_cause"), "recovery": str(item.get("recovery") or ""),
+                "active": 1, "cleared_at": None,
+            })
+        claims: list[dict[str, Any]] = []
+        knowledge: list[dict[str, Any]] = []
+        cards = self.cards(
+            self.store.instance_get(instance_id) or {}, timeline_id=timeline_id, world_seconds=world
+        )
+        for index, item in enumerate(payload.get("claims") or []):
+            claim_id = f"cl-{ident[3:]}-{index}"
+            claim = {
+                "id": claim_id, "instance_id": instance_id, "timeline_id": timeline_id, "event_id": ident,
+                "source_id": str(item.get("source_id") or ""), "text": str(item["text"]),
+                "audience": str(item.get("audience") or "public"), "earliest_world": world,
+                "credibility": float(item.get("credibility") or 0.6), "derived_from": None,
+            }
+            claims.append(claim)
+            # 事件就发生在当前水位：按常规规则直接结算到达（与后续批次的传播同一套判定）
+            for card in cards:
+                grant = events.claim_grant(claim, card, world_seconds=world)
+                if grant is not None:
+                    knowledge.append(grant)
+        return {"event": event_row, "effects": effects, "claims": claims, "knowledge": knowledge}
+
+    def apply_due_pending_events(self, instance_id: str, timeline_id: str, *, to_world: int) -> dict[str, int]:
+        """预约事件到点复核后施加或记为未执行（§八 末条，验收 17）：条件失效不强行执行。"""
+        due = self.store.pending_events_due(instance_id, timeline_id, until=to_world)
+        applied = skipped = cancelled = 0
+        for row in due:
+            payload = json.loads(row["payload"])
+            instance = self.store.instance_get(instance_id) or {}
+            targets, _ = self._known_targets(instance, timeline_id, world_seconds=int(row["at_world"]))
+            stale = [item for item in payload["effects"] if str(item["target"]) not in targets]
+            if stale:
+                self.store.pending_event_set(str(row["id"]), state="cancelled", note="条件失效：目标不再是本线参与者")
+                cancelled += 1
+                continue
+            clock = self.clock_row(timeline_id)
+            ident = f"ev-user-{events.stable_key(instance_id, timeline_id, row['id'])[:12]}"
+            rows = self._user_event_rows(instance_id, timeline_id, payload, ident=ident, world=int(row["at_world"]))
+            ok = self.store.apply_runtime_batch(
+                timeline_id=timeline_id, generation=int(clock["generation"]),
+                processed_world=int(clock["processed_world"]), catching_up=False,
+                events=[rows["event"]], claims=rows["claims"], knowledge=rows["knowledge"], effects=rows["effects"],
+            )
+            if ok and self.store.pending_event_set(str(row["id"]), state="applied", note="已施加"):
+                applied += 1
+            else:
+                skipped += 1
+        return {"applied": applied, "cancelled": cancelled, "skipped": skipped}
+
     # ---------- 版本管理（阶段 4，§5 / §6 / §7） ----------
 
     def commit(
@@ -128,6 +355,29 @@ class RuntimeService:
             versioning.public_commit(row)
             for row in self.store.commit_list(instance_id, timeline_id)
         ]
+
+    def rename_timeline(self, instance_id: str, timeline_id: str, *, name: str, description: str | None = None) -> dict[str, Any]:
+        """命名 / 描述（§四）：列表只露管理元数据。"""
+        if not str(name or "").strip():
+            raise RuntimeStateError("名称不能为空")
+        self.store.timeline_update(timeline_id, name=str(name).strip(), description=description)
+        return self.store.timeline_get(timeline_id) or {}
+
+    def archive_timeline(self, instance_id: str, timeline_id: str, *, now_real: float | None = None) -> dict[str, Any]:
+        """归档先冻结、不删除数据（§四）。"""
+        state = str((self.store.timeline_get(timeline_id) or {}).get("state") or "")
+        if state == "active":
+            self.freeze(instance_id, timeline_id, now_real=now_real)
+        self.store.timeline_set_state(timeline_id, "archived")
+        return self.store.timeline_get(timeline_id) or {}
+
+    def delete_timeline(self, instance_id: str, timeline_id: str) -> dict[str, Any]:
+        """删除一条线：停止该线任务、解绑通道、清理数据；其他线引用的提交保留（§四）。"""
+        lines = self.store.timeline_list(instance_id)
+        if len(lines) <= 1:
+            raise RuntimeStateError("实例至少要保留一条时间线")
+        counts = self.store.timeline_delete(instance_id, timeline_id)
+        return {"deleted": timeline_id, "counts": counts}
 
     def maybe_auto_commit(self, instance_id: str, timeline_id: str, *, now_real: float) -> dict[str, Any] | None:
         """自动提交：现实时间到达间隔，或新增事件数到阈值（§5.1，可配置、可关）。"""
@@ -213,6 +463,9 @@ class RuntimeService:
         before_clock = self.clock_row(timeline_id)
         # 原子切换：先提升运行世代让迟到结果失效，再在同一事务里清空 + 写回
         self.store.clock_put({**before_clock, "generation": int(before_clock["generation"]) + 1})
+        # 飞行中的输入作废、未投递的回复取消：旧世代的结果不得写回或继续发送（§七）
+        voided = self.store.timeline_void_inflight(timeline_id)
+        cancelled = self.store.timeline_cancel_undelivered(timeline_id)
         self.store.runtime_load(instance_id, timeline_id, dict(snapshot.get("runtime") or {}), clear=True)
         now = float(now_real if now_real is not None else time.time())
         self.store.clock_put({
@@ -237,6 +490,8 @@ class RuntimeService:
             "state": before_state,
             "world": int(snapshot.get("world") or 0),
             "generation": int(self.clock_row(timeline_id)["generation"]),
+            "voided_inputs": voided,
+            "cancelled_replies": cancelled,
         }
 
     # ---------- 角色记忆（MEMORY_SPEC） ----------
@@ -1108,6 +1363,7 @@ class RuntimeService:
             produced += len(experiences)
             # 记忆按世界时长衰减（§六）：冻结期间不推进即不衰减，幂等
             self.decay_memories(timeline_id, to_world=stop)
+            self.apply_due_pending_events(instance_id, timeline_id, to_world=stop)
         return {
             "state": "current" if processed >= target else "catching_up",
             "processed_world": processed,

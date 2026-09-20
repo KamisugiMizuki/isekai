@@ -207,6 +207,14 @@ class SessionService:
             )
             return
 
+        if self.store.void_has(
+            str(row.get("channel_id") or ""), str(row.get("thread_id") or ""), str(row.get("env_id") or "")
+        ):
+            # 处理期间被回滚 / 重绑作废：不写回、不投递（§七）
+            log.info("turn dropped: input voided seq=%s", seq)
+            self.store.inbound_set_state(seq, "cancelled", error_code=Err.VOIDED)
+            await self._status(row, "idle")
+            return
         thread = self.store.thread_get(row["channel_id"], row["thread_id"])
         if thread is None or thread["binding_version"] != row["binding_version"]:
             # 提交前核对绑定版本：重绑后迟到结果不写入、不投递

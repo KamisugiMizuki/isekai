@@ -30,10 +30,23 @@ def snapshot_of(store: Any, instance_id: str, timeline_id: str, *, note: str = "
         page = store.history_page(str(session["id"]), limit=10000)
         for row in page.get("messages") or []:
             dialog.append({**row, "session_id": str(session["id"])})
+    from ..version import DATA_FORMAT_VERSION, RULES_VERSION
+
+    world_seed = ""
+    try:
+        from .service import RuntimeService  # 局部导入避免循环
+
+        world_seed = RuntimeService(store).seed_of(store.instance_get(instance_id) or {})
+    except Exception:  # 种子取不到不影响快照（空串如实记录）
+        world_seed = ""
     return {
         "note": str(note or ""),
         "world": int(clock.get("processed_world") or 0),
         "rate": int(clock.get("rate") or 1),
+        # 语义元数据（§5.1）：确定性复算要用的规则版本、数据格式与锁定种子，与抽样同源
+        "rules_version": str(RULES_VERSION),
+        "data_format": str(DATA_FORMAT_VERSION),
+        "seed": str(world_seed),
         "sessions": [
             {key: value for key, value in item.items() if key in (
                 "id", "instance_id", "timeline_id", "character_id", "channel_id", "thread_id", "created_at"

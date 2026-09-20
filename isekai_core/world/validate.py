@@ -573,6 +573,23 @@ def _validate_event_calendar(package: dict[str, Any], errors: list[str]) -> None
         if str(item.get("family")) not in families:
             errors.append(f"{where}.family: 未登记的事件族 {item.get('family')!r}")
 
+    # 固定事件不因随机预算被丢弃：包内同日固定事件超过密度档上限时必须在创建前报错（附录 B #3）
+    bounds = DENSITY_TARGETS.get(str(events.get("density") or ""))
+    if bounds:
+        per_day: dict[tuple[int, int], int] = {}
+        for item in fixed:
+            if not isinstance(item, dict):
+                continue
+            key = (int(item.get("month") or 0), int(item.get("day") or 0))
+            per_day[key] = per_day.get(key, 0) + 1
+        for (month, day), count in sorted(per_day.items()):
+            if count > bounds[1]:
+                errors.append(
+                    f"events.calendar: 第 {month} 月第 {day} 日的固定事件有 {count} 件，超过密度档"
+                    f"『{events.get('density')}』的每日上限 {bounds[1]}——固定事件不因预算被丢弃，"
+                    "请减少同日固定事件或调整密度档"
+                )
+
 
 def _validate_life_roles(package: dict[str, Any], errors: list[str]) -> None:
     life = package.get("life")
