@@ -443,24 +443,10 @@ def _day_bucket(now_real: float) -> int:
 
 
 def _world_service(cfg: Config, store: Store) -> Any:
-    """运行层服务（带上三层预算 / 表述预算等 §2.8 参数）。"""
-    from ..runtime.service import RuntimeService
+    """运行层服务：唯一构造入口在 runtime.service.from_config（配置字段自动对齐）。"""
+    from ..runtime.service import from_config
 
-    return RuntimeService(
-        store,
-        render_calls_per_day=int(cfg.runtime.render_calls_per_day),
-        memory_extract_per_day=int(cfg.runtime.memory_extract_per_day),
-        memory_recall_limit=int(cfg.runtime.memory_recall_limit),
-        memory_brief_tokens=int(cfg.runtime.memory_brief_tokens),
-        memory_decay_per_day=float(cfg.runtime.memory_decay_per_day),
-        embedding_model=str(cfg.runtime.memory_embedding_model or ""),
-        embedding_base_url=str(cfg.runtime.memory_embedding_base_url or ""),
-        embedding_api_key=str(cfg.runtime.memory_embedding_api_key or ""),
-        instance_tokens_per_day=int(cfg.runtime.instance_tokens_per_day),
-        timeline_tokens_per_day=int(cfg.runtime.timeline_tokens_per_day),
-        task_tokens_per_day=int(cfg.runtime.task_tokens_per_day),
-        priority_reserve_ratio=float(cfg.runtime.priority_reserve_ratio),
-    )
+    return from_config(cfg, store)
 
 
 def _version_ids(args: dict[str, Any]) -> tuple[str, str]:
@@ -556,7 +542,11 @@ async def _extract_memories(cfg: Config, llm: Any, store: Store | None, args: di
         instance_id, timeline_id, llm=llm, now_real=time.time(),
         limit=int(cfg.runtime.memory_extract_per_day),
     )
-    return {**result, "queued": queued}
+    # 顺带把缺向量的补齐（有配置才动；失败保留待嵌入状态，§5.2）
+    embedded = await world.embed_memories(
+        instance_id, timeline_id, now_real=time.time(), limit=32
+    )
+    return {**result, "queued": queued, "embedded": embedded}
 
 
 async def _propose_intents(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:

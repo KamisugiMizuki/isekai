@@ -18,6 +18,7 @@ from .llm import FakeLLM, LLMClient
 from .log import get_logger
 from .runtime.service import RuntimeService
 from .session import SessionService
+from .runtime.service import from_config as runtime_service_from_config
 from .store import Store
 from .version import APP_VERSION, DATA_FORMAT_VERSION, RULES_VERSION
 
@@ -138,14 +139,7 @@ async def build_runtime(
         return bool(server and await server.deliver(channel_id, thread_id, envelope))
 
     service = SessionService(store=store, cfg=cfg, llm=llm, deliver=deliver)
-    world = RuntimeService(
-        store,
-        rate_max=cfg.runtime.rate_max,
-        max_active_timelines=cfg.runtime.max_active_timelines,
-        catch_up_batches=cfg.runtime.catch_up_batches,
-        catch_up_lag_seconds=cfg.runtime.catch_up_lag_seconds,
-        render_calls_per_day=cfg.runtime.render_calls_per_day,
-    )
+    world = runtime_service_from_config(cfg, store)
     service.runtime = world  # 会话层经运行层构造扮演定义
     for row in store.instance_list():
         world.ensure_instance(row["id"], now_real=time.time())

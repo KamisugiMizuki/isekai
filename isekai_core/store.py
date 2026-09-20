@@ -1278,8 +1278,13 @@ class Store:
             "event", "environment_state", "memory", "memory_task", "memory_citation",
         ):
             self._conn.execute(f"DELETE FROM {table} WHERE timeline_id=?", (timeline_id,))
-        # 向量表按 memory 归属删（自身没有 timeline_id）
+        # 向量表两种形态都清：按线（新）与按 memory 归属（兼容早期没有 timeline_id 的行）
         self._conn.execute("DELETE FROM memory_embedding WHERE timeline_id=?", (timeline_id,))
+        self._conn.execute(
+            """DELETE FROM memory_embedding WHERE memory_id IN
+               (SELECT id FROM memory WHERE timeline_id=?)""",
+            (timeline_id,),
+        )
 
     def timeline_clear_dialog(self, timeline_id: str) -> None:
         """该线会话的对话原文（回滚要把被截去的未来对话一并撤掉，§七）。"""

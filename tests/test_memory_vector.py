@@ -125,7 +125,7 @@ def test_embedding_failure_leaves_items_pending(store) -> None:
     stub = _Stub()
     try:
         world_service = _service(
-            store, embedding_model="stub-embed", embedding_base_url=stub.base_url, embedding_api_key="k"
+            store, memory_embedding_model="stub-embed", memory_embedding_base_url=stub.base_url, memory_embedding_api_key="k"
         )
         info, timeline_id, character_id = _ready(store, world_service)
         _memory(store, info, timeline_id, character_id, "mm-b", "船到了")
@@ -146,7 +146,7 @@ def test_vectors_participate_in_recall_and_respect_model_fingerprint(store) -> N
     stub = _Stub()
     try:
         world_service = _service(
-            store, embedding_model="stub-embed", embedding_base_url=stub.base_url, embedding_api_key="k"
+            store, memory_embedding_model="stub-embed", memory_embedding_base_url=stub.base_url, memory_embedding_api_key="k"
         )
         info, timeline_id, character_id = _ready(store, world_service)
         _memory(store, info, timeline_id, character_id, "mm-tide", "潮位到了刻线")   # 向量 [1,0,0]
@@ -165,7 +165,7 @@ def test_vectors_participate_in_recall_and_respect_model_fingerprint(store) -> N
 
         # 换模型：旧向量不得参与
         other = _service(
-            store, embedding_model="别的模型", embedding_base_url=stub.base_url, embedding_api_key="k"
+            store, memory_embedding_model="别的模型", memory_embedding_base_url=stub.base_url, memory_embedding_api_key="k"
         )
         stale = other.store.memory_vector_scores(
             info["id"], timeline_id, character_id, "船", query_vector=[0.9, 0.1, 0.0], model="别的模型"
@@ -182,8 +182,8 @@ def test_budget_blocks_embedding_but_keeps_text_recall(store) -> None:
     stub = _Stub()
     try:
         world_service = _service(
-            store, embedding_model="stub-embed", embedding_base_url=stub.base_url,
-            embedding_api_key="k", task_tokens_per_day=1,
+            store, memory_embedding_model="stub-embed", memory_embedding_base_url=stub.base_url,
+            memory_embedding_api_key="k", task_tokens_per_day=1,
         )
         info, timeline_id, character_id = _ready(store, world_service)
         _memory(store, info, timeline_id, character_id, "mm-c", "潮位到了刻线")

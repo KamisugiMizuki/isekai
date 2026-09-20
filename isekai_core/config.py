@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,10 @@ class RuntimeConfig:
     memory_embedding_model: str = ""     # 远程 embedding 模型（空 = 只用全文召回）
     memory_embedding_base_url: str = ""
     memory_embedding_api_key: str = ""
+    #: 版本管理（阶段 4）：自动提交默认现实 1 小时或新增事件 50 条
+    autocommit_enabled: bool = True
+    autocommit_minutes: int = 60
+    autocommit_events: int = 50
 
 
 @dataclass
@@ -125,26 +130,32 @@ class Config:
 
 
 def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
-    """运行层参数：只读 config.yaml 的 runtime 段（无 UI 写入路径）。"""
+    """运行层参数：只读 config.yaml 的 `runtime` 段。
+
+    按 dataclass 字段通用映射——新增运行层参数只要加字段就会生效，不用在这里再抄一遍
+    （逐字段手抄漏过头：memory_* / embedding_* / autocommit_* 曾被静默滤掉）。
+    """
     section = _section(raw, "runtime")
     base = RuntimeConfig()
-    return RuntimeConfig(
-        rate_max=int(section.get("rate_max") or base.rate_max),
-        max_active_timelines=int(section.get("max_active_timelines") or base.max_active_timelines),
-        catch_up_batches=int(section.get("catch_up_batches") or base.catch_up_batches),
-        catch_up_lag_seconds=(
-            int(section["catch_up_lag_seconds"])
-            if "catch_up_lag_seconds" in section
-            else base.catch_up_lag_seconds
-        ),
-        render_calls_per_day=(
-            int(section["render_calls_per_day"])
-            if "render_calls_per_day" in section
-            else base.render_calls_per_day
-        ),
-    )
-
-
+    values: dict[str, Any] = {}
+    for field_info in dataclasses.fields(RuntimeConfig):
+        name = field_info.name
+        if name not in section:
+            continue
+        raw_value = section[name]
+        default = getattr(base, name)
+        try:
+            if isinstance(default, bool):
+                values[name] = bool(raw_value)
+            elif isinstance(default, int):
+                values[name] = int(raw_value)
+            elif isinstance(default, float):
+                values[name] = float(raw_value)
+            else:
+                values[name] = str(raw_value or "")
+        except (TypeError, ValueError):
+            continue  # 坏值退回默认，不让配置挡住启动
+    return RuntimeConfig(**values)
 def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
     value = raw.get(key)
     return value if isinstance(value, dict) else {}

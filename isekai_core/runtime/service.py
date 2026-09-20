@@ -27,6 +27,19 @@ class RuntimeStateError(ValueError):
     """运行层拒绝该操作：状态不允许或参数非法。"""
 
 
+def from_config(cfg: Any, store: Store) -> "RuntimeService":
+    """运行层的**唯一构造入口**：按 RuntimeConfig 字段名对齐传参，不再各处手抄一份。
+
+    名字对不上的参数自动跳过——新增运行层配置只要两处同名就生效。
+    """
+    import inspect
+
+    runtime_cfg = cfg.runtime
+    wanted = set(inspect.signature(RuntimeService.__init__).parameters) - {"self", "store"}
+    params = {name: getattr(runtime_cfg, name) for name in wanted if hasattr(runtime_cfg, name)}
+    return RuntimeService(store, **params)
+
+
 class RuntimeService:
     def __init__(
         self,
@@ -45,9 +58,9 @@ class RuntimeService:
         memory_recall_limit: int = 6,
         memory_brief_tokens: int = 900,
         memory_decay_per_day: float = 0.02,
-        embedding_model: str = "",
-        embedding_base_url: str = "",
-        embedding_api_key: str = "",
+        memory_embedding_model: str = "",
+        memory_embedding_base_url: str = "",
+        memory_embedding_api_key: str = "",
         autocommit_enabled: bool = True,
         autocommit_minutes: int = 60,
         autocommit_events: int = 50,
@@ -76,9 +89,9 @@ class RuntimeService:
         self.memory_brief_tokens = max(0, int(memory_brief_tokens))
         self.memory_decay_per_day = max(0.0, min(1.0, float(memory_decay_per_day)))
         #: 远程 embedding（MEMORY_SPEC §5.2）：缺配置即退化全文召回
-        self.embedding_model = str(embedding_model or "")
-        self.embedding_base_url = str(embedding_base_url or "")
-        self.embedding_api_key = str(embedding_api_key or "")
+        self.embedding_model = str(memory_embedding_model or "")
+        self.embedding_base_url = str(memory_embedding_base_url or "")
+        self.embedding_api_key = str(memory_embedding_api_key or "")
         #: 自动提交（§5.1）：默认现实 1 小时或新增事件 50 条，可配置可关；手动提交不受开关限制
         self.autocommit_enabled = bool(autocommit_enabled)
         self.autocommit_minutes = max(1, int(autocommit_minutes))
@@ -537,6 +550,7 @@ class RuntimeService:
             self.store.memory_embedding_put(
                 str(row["id"]),
                 instance_id=instance_id,
+                timeline_id=timeline_id,
                 model=self.embedding_model,
                 vector=vector,
                 content_hash=embedding_mod.content_hash(str(row["text"])),

@@ -26,6 +26,19 @@ runtime:
   catch_up_batches: 8        # 单次推进批数上限（每批推进一个世界日）
   catch_up_lag_seconds: 172800  # 滞后超过 2 世界日即记为「追赶受限」并如实上报
   render_calls_per_day: 20   # 事件表述 / 史料展开的现实日调用上限（超出即退回模板，不重复调用）
+  # 角色记忆（MEMORY_SPEC）：提取 / 简报 / 衰减配额
+  memory_extract_per_day: 40      # 每日提取调用上限（单次最多 8 条材料）
+  memory_recall_limit: 6          # 单轮简报条数上限
+  memory_brief_tokens: 900        # 单轮简报预算（字符量级）
+  memory_decay_per_day: 0.02      # 每世界日强度衰减率
+  # 远程 embedding（§5.2）：三项留空即只用全文召回；地址需 OpenAI 兼容 /v1/embeddings
+  memory_embedding_model: ""       # 例：text-embedding-v4 / bge-m3 / nomic-embed-text
+  memory_embedding_base_url: ""     # 例：https://dashscope.aliyuncs.com/compatible-mode/v1 或 http://127.0.0.1:1234/v1
+  memory_embedding_api_key: ""      # 本地服务随便填；远程填对应平台的 key
+  # 版本管理（阶段 4）：自动提交默认现实 1 小时或新增事件 50 条，可关；手动提交不受开关限制
+  autocommit_enabled: true
+  autocommit_minutes: 60
+  autocommit_events: 50
 
 # 阶段 0 占位会话：世界与角色尚未接入，阶段 1 起被真实实例 / 角色卡取代
 placeholder:
@@ -35,16 +48,3 @@ placeholder:
   system_prompt: |
     你是 isekai 核心进程的占位对话端（阶段 0：世界与角色尚未接入）。
     只做简短、平实的回应，不要虚构世界设定、经历或身份。
-  # 角色记忆（MEMORY_SPEC）：提取 / 简报 / 衰减配额
-  memory_extract_per_day: 40      # 每日提取调用上限（单次最多 8 条材料）
-  memory_recall_limit: 6          # 单轮简报条数上限
-  memory_brief_tokens: 900        # 单轮简报预算（字符量级）
-  memory_decay_per_day: 0.02      # 每世界日强度衰减率
-  # 远程 embedding（§5.2）：留空即只用全文召回；地址需 OpenAI 兼容 /v1/embeddings
-  memory_embedding_model: ""
-  memory_embedding_base_url: ""
-  memory_embedding_api_key: ""
-  # 版本管理（阶段 4）：自动提交默认现实 1 小时或新增事件 50 条，可关；手动提交不受开关限制
-  autocommit_enabled: true
-  autocommit_minutes: 60
-  autocommit_events: 50
