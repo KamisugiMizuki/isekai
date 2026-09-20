@@ -1731,6 +1731,23 @@ class Store:
                         commit,
                     )
 
+    def instance_convert(
+        self, instance_id: str, *, setting: str, data_format: str, rules_version: str
+    ) -> None:
+        """转换后的原子发布（§7.6）：设定快照与版本标记一起写；线先冻结，由用户明确激活再推进。
+
+        写在同一事务里：中途失败保持原实例（旧设定与旧版本标记都还在）。
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE instance SET setting=?, data_format=?, rules_version=? WHERE id=?",
+                (setting, str(data_format), str(rules_version), instance_id),
+            )
+            self._conn.execute(
+                "UPDATE timeline SET state='frozen' WHERE instance_id=? AND state<>'archived'",
+                (instance_id,),
+            )
+
     def instance_rename(self, instance_id: str, name: str) -> None:
         with self._lock, self._conn:
             self._conn.execute("UPDATE instance SET name=? WHERE id=?", (name, instance_id))

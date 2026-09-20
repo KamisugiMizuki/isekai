@@ -84,6 +84,7 @@ SYNC_OPS = frozenset(
         "backup.create",
         "claim.coverage",
         "world.backfill.plan",
+        "instance.convert",
         "backup.restore",
         "backup.list",
         "proactive.list",
@@ -465,6 +466,17 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 ],
                 "timelines": store.timeline_list(row["id"]),
                 "commits": store.commit_list(row["id"]),
+            }
+        if op == "instance.convert":
+            from .instances import convert_instance
+
+            return {
+                "convert": convert_instance(
+                    store,
+                    str(args.get("instance_id") or ""),
+                    confirmed=bool(args.get("confirmed")),
+                    exports_dir=cfg.paths.exports,
+                )
             }
         if op == "world.backfill.plan":
             row = store.instance_get(str(args.get("instance_id") or ""))

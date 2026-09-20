@@ -18,6 +18,7 @@ from typing import Any
 from ..log import get_logger
 from ..store import Store
 from ..version import APP_VERSION, DATA_FORMAT_VERSION, RULES_VERSION
+from . import converters
 from .cards import validate_assembly
 from .package import PackageError, clone_package, ensure_original_name, normalize_name, unique_name
 from .validate import validate_package
@@ -192,7 +193,7 @@ def compatibility(row: dict[str, Any]) -> tuple[str, str]:
     ours_major = DATA_FORMAT_VERSION.split(".")[0]
     if str(row.get("data_format")) == DATA_FORMAT_VERSION and str(row.get("rules_version")) == RULES_VERSION:
         return "compatible", ""
-    if data_major == ours_major:
+    if data_major == ours_major or converters.can_convert(str(row.get("data_format") or ""), DATA_FORMAT_VERSION):
         return (
             "convertible",
             f"数据格式 {row.get('data_format')} → {DATA_FORMAT_VERSION}（规则 {row.get('rules_version')} → {RULES_VERSION}）：需在副本上转换后使用",
@@ -201,6 +202,74 @@ def compatibility(row: dict[str, Any]) -> tuple[str, str]:
         "blocked",
         f"数据格式主版本不兼容（导出件 {row.get('data_format')}，本端 {DATA_FORMAT_VERSION}）：停止推进，等待兼容版本或转换",
     )
+
+
+def convert_instance(
+    store: Any, instance_id: str, *, confirmed: bool, exports_dir: Any = None
+) -> dict[str, Any]:
+    """可信转换的执行路径（§7.6）：自动发现 → 用户确认 → 副本转换 → 完整校验 → 原子发布。
+
+    - 没有登记转换器就停在提示上（用兼容版本），不「尽量加载」；
+    - 未确认只回状态，不动数据（执行转换需用户确认，§7.5）；
+    - 转换前先留一份可恢复副本（原实例整体导出），校验失败时原实例一字不动；
+    - 发布是**一个事务**：设定快照 + 新的数据 / 规则版本标记一起写，线先冻结由用户明确激活。
+    """
+    from . import converters, portable
+    from .validate import validate_package
+
+    row = store.instance_get(instance_id)
+    if row is None:
+        raise InstanceError(f"实例不存在：{instance_id}")
+    state, reason = compatibility(row)
+    source, target = str(row.get("data_format") or ""), DATA_FORMAT_VERSION
+    if state == "compatible":
+        return {"converted": False, "state": "compatible", "reason": reason}
+    if not converters.can_convert(source, target):
+        return {
+            "converted": False,
+            "state": "blocked",
+            "reason": reason,
+            "hint": "没有可信转换器：请用兼容版本打开，或等提供转换器后再试",
+        }
+    if not confirmed:
+        return {"converted": False, "state": "convertible", "reason": reason, "needs_confirmation": True}
+
+    safety = ""
+    if exports_dir is not None:
+        from pathlib import Path
+
+        folder = Path(exports_dir)
+        folder.mkdir(parents=True, exist_ok=True)
+        safety_path = folder / f"{row['name']}-before-convert-{int(time.time())}.isekai.json"
+        portable.write_export(store, instance_id, safety_path)
+        safety = str(safety_path)
+
+    setting = json.loads(row["setting"])
+    converted = converters.convert_payload(setting, source=source, target=target)  # 副本上转换
+    package = converted.get("world_package") if isinstance(converted.get("world_package"), dict) else {}
+    errors = [str(item) for item in validate_package(package)]
+    from .cards import validate_card
+
+    for card in converted.get("cards") or []:
+        if isinstance(card, dict):
+            errors.extend(str(item) for item in validate_card(card, package, moment=int(row["moment"] or 0)))
+    if errors:
+        raise converters.ConverterError("转换产物未通过完整校验：" + "；".join(errors[:5]))
+
+    store.instance_convert(
+        instance_id,
+        setting=json.dumps(converted, ensure_ascii=False),
+        data_format=str(target),
+        rules_version=RULES_VERSION,
+    )
+    return {
+        "converted": True,
+        "state": "compatible",
+        "from": source,
+        "to": str(target),
+        "rules_version": RULES_VERSION,
+        "safety": safety,
+    }
 
 
 def public_info(row: dict[str, Any]) -> dict[str, Any]:
