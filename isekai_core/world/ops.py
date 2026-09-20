@@ -48,6 +48,10 @@ SYNC_OPS = frozenset(
         "runtime.clock",
         "runtime.budget",
         "runtime.budget.set",
+        "runtime.commit",
+        "runtime.commits",
+        "runtime.fork",
+        "runtime.rollback",
         "runtime.activate",
         "runtime.freeze",
         "runtime.rate",
@@ -281,6 +285,14 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
     """同步操作：只读写文件与库，不调用模型。"""
     try:
         # 预算视图 / 设置：只按实例（不要求时间线），不进 runtime.* 前缀分发
+        if op == "runtime.commit":
+            return _version_commit(cfg, store, args)
+        if op == "runtime.commits":
+            return _version_list(cfg, store, args)
+        if op == "runtime.fork":
+            return _version_fork(cfg, store, args)
+        if op == "runtime.rollback":
+            return _version_rollback(cfg, store, args)
         if op == "runtime.budget":
             return _budget_view(cfg, store, args)
         if op == "runtime.budget.set":
@@ -449,6 +461,52 @@ def _world_service(cfg: Config, store: Store) -> Any:
         task_tokens_per_day=int(cfg.runtime.task_tokens_per_day),
         priority_reserve_ratio=float(cfg.runtime.priority_reserve_ratio),
     )
+
+
+def _version_ids(args: dict[str, Any]) -> tuple[str, str]:
+    instance_id = str(args.get("instance_id") or "")
+    timeline_id = str(args.get("timeline_id") or "")
+    if not instance_id or not timeline_id:
+        raise UmpError(Err.INVALID, "缺少实例或时间线", retryable=False)
+    return instance_id, timeline_id
+
+
+def _version_commit(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """手动提交：不受自动提交开关限制（§5.1）。"""
+    instance_id, timeline_id = _version_ids(args)
+    world = _world_service(cfg, store)
+    return {"commit": world.commit(instance_id, timeline_id, kind="manual", note=str(args.get("note") or ""))}
+
+
+def _version_list(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """提交列表只回管理元数据，不带剧情（§5.1）。"""
+    instance_id, timeline_id = _version_ids(args)
+    return {"commits": _world_service(cfg, store).commits(instance_id, timeline_id)}
+
+
+def _version_fork(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """从提交分叉：创建不等于激活（§四）。"""
+    instance_id, timeline_id = _version_ids(args)
+    commit_id = str(args.get("commit_id") or "")
+    if not commit_id:
+        raise UmpError(Err.INVALID, "缺少 commit_id", retryable=False)
+    world = _world_service(cfg, store)
+    result = world.fork(
+        instance_id, timeline_id, commit_id=commit_id,
+        name=str(args.get("name") or ""), activate=bool(args.get("activate")),
+    )
+    return result
+
+
+def _version_rollback(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """回滚是破坏性操作：必须显式确认；建议先分叉或导出（§七）。"""
+    instance_id, timeline_id = _version_ids(args)
+    commit_id = str(args.get("commit_id") or "")
+    if not commit_id:
+        raise UmpError(Err.INVALID, "缺少 commit_id", retryable=False)
+    if not bool(args.get("confirm")):
+        raise UmpError(Err.INVALID, "回滚会覆盖该线有效历史，需要 --confirm 确认", retryable=False)
+    return _world_service(cfg, store).rollback(instance_id, timeline_id, commit_id=commit_id)
 
 
 def _budget_view(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:

@@ -271,6 +271,12 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
                 )
         except Exception:
             log.exception("intent proposal pass failed")
+        # 自动提交（§5.1）：现实间隔或新增事件数到阈值，可配置可关
+        try:
+            for instance_id, timeline_id in runtime.world.active_timelines():
+                runtime.world.maybe_auto_commit(instance_id, timeline_id, now_real=time.time())
+        except Exception:
+            log.exception("auto commit pass failed")
         # 证据充分后提取记忆：有界、按现实日预算、失败留待处理（§4.1）
         try:
             for instance_id, timeline_id in runtime.world.active_timelines():

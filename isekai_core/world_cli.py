@@ -58,6 +58,10 @@ OP_BY_COMMAND = {
     ("runtime", "propose"): "runtime.propose",
     ("runtime", "extract"): "runtime.extract",
     ("runtime", "budget"): "runtime.budget",
+    ("runtime", "commit"): "runtime.commit",
+    ("runtime", "commits"): "runtime.commits",
+    ("runtime", "fork"): "runtime.fork",
+    ("runtime", "rollback"): "runtime.rollback",
     ("runtime", "budget-set"): "runtime.budget.set",
     ("runtime", "backfill"): "runtime.backfill",
     ("event", "render"): "event.render",
@@ -119,6 +123,15 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args["rate"] = int(ns.rate)
         if cmd == "advance":
             args["max_batches"] = int(ns.max_batches or 16)
+        if cmd in ("commit", "rollback"):
+            args["note"] = ns.note or ""
+        if cmd in ("fork", "rollback"):
+            args["commit_id"] = ns.file or ns.commit or ""
+        if cmd == "fork":
+            args["name"] = ns.display_name or ""
+            args["activate"] = bool(ns.activate)
+        if cmd == "rollback":
+            args["confirm"] = bool(ns.confirm)
         if cmd == "budget-set":
             for key in ("instance_tokens_per_day", "timeline_tokens_per_day", "task_tokens_per_day"):
                 value = getattr(ns, key, None)
@@ -243,6 +256,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="预算：单任务预算")
     parser.add_argument("--task", default=None, help="预算：要暂停 / 恢复的任务名")
     parser.add_argument("--pause", action="store_true", help="预算：暂停该任务")
+    parser.add_argument("--commit", default=None, help="版本：提交标识")
+    parser.add_argument("--confirm", action="store_true", help="版本：确认破坏性操作（回滚）")
+    parser.add_argument("--activate", action="store_true", help="版本：分叉后立即激活")
     parser.add_argument("--resume", dest="pause_resume", action="store_true", help="预算：恢复该任务")
     parser.add_argument("--candidate", default=None, help="把文件内容当作候选对象提交")
     ns = parser.parse_args(argv)

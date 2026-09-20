@@ -129,6 +129,21 @@ CREATE TABLE IF NOT EXISTS timeline(
   created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS commit_auto_state(
+  timeline_id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  last_commit_at REAL NOT NULL DEFAULT 0,
+  last_commit_moment INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS commit_snapshot(
+  commit_id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  size INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS commit_log(
   id TEXT PRIMARY KEY,
   instance_id TEXT NOT NULL,
@@ -188,7 +203,7 @@ CREATE TABLE IF NOT EXISTS call_ledger(
 );
 
 CREATE TABLE IF NOT EXISTS memory(
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL,
   instance_id TEXT NOT NULL,
   timeline_id TEXT NOT NULL,
   character_id TEXT NOT NULL,
@@ -206,11 +221,12 @@ CREATE TABLE IF NOT EXISTS memory(
   supersedes TEXT,
   superseded_by TEXT,
   source_key TEXT,
-  decay_world INTEGER NOT NULL DEFAULT 0
+  decay_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS memory_task(
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL,
   instance_id TEXT NOT NULL,
   timeline_id TEXT NOT NULL,
   character_id TEXT NOT NULL,
@@ -222,7 +238,8 @@ CREATE TABLE IF NOT EXISTS memory_task(
   state TEXT NOT NULL DEFAULT 'pending',
   attempts INTEGER NOT NULL DEFAULT 0,
   note TEXT NOT NULL DEFAULT '',
-  UNIQUE(character_id, source_kind, source_ref)
+  UNIQUE(instance_id, timeline_id, character_id, source_kind, source_ref),
+  PRIMARY KEY(instance_id, timeline_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS memory_citation(
@@ -236,13 +253,15 @@ CREATE TABLE IF NOT EXISTS memory_citation(
 );
 
 CREATE TABLE IF NOT EXISTS memory_embedding(
-  memory_id TEXT PRIMARY KEY,
+  memory_id TEXT NOT NULL,
   instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL DEFAULT '',
   model TEXT NOT NULL,
   dim INTEGER NOT NULL,
   vector BLOB NOT NULL,
   source_version INTEGER NOT NULL,
-  created_at REAL NOT NULL
+  created_at REAL NOT NULL,
+  PRIMARY KEY(instance_id, timeline_id, memory_id)
 );
 
 CREATE TABLE IF NOT EXISTS budget_reserve(
@@ -437,6 +456,26 @@ class EnvelopeConflict(Exception):
         self.existing = existing
 
 
+def _relabel_payload(payload: dict[str, Any], instance_id: str, timeline_id: str) -> dict[str, Any]:
+    """把快照里每行都归到目标实例 / 线：分叉与回滚复用同一条装载路径（导入路径早已重映射过）。"""
+    out: dict[str, Any] = dict(payload)
+    for key, value in payload.items():
+        if not isinstance(value, list):
+            continue
+        rows: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            if "instance_id" in row:
+                row["instance_id"] = instance_id
+            if "timeline_id" in row:
+                row["timeline_id"] = timeline_id
+            rows.append(row)
+        out[key] = rows
+    return out
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
@@ -466,9 +505,83 @@ class Store:
 
     # ---------- 生命周期 ----------
 
+    def _migrate_memory_tables(self) -> None:
+        """旧库迁移：memory / memory_task / memory_embedding 改成按线隔离的主键。"""
+        def sql_of(table: str) -> str:
+            row = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            return str(row["sql"] or "") if row is not None else ""
+
+        memory_sql = sql_of("memory")
+        if memory_sql and "PRIMARY KEY(instance_id, timeline_id, id)" not in memory_sql:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    """CREATE TABLE memory_new(
+                         id TEXT NOT NULL, instance_id TEXT NOT NULL, timeline_id TEXT NOT NULL,
+                         character_id TEXT NOT NULL, text TEXT NOT NULL, kind TEXT NOT NULL,
+                         sources TEXT NOT NULL DEFAULT '[]', happened_world INTEGER,
+                         learned_world INTEGER NOT NULL, recorded_world INTEGER NOT NULL,
+                         semantic_watermark INTEGER NOT NULL, strength REAL NOT NULL DEFAULT 0.6,
+                         confidence REAL NOT NULL DEFAULT 0.7, state TEXT NOT NULL DEFAULT 'active',
+                         version INTEGER NOT NULL DEFAULT 1, supersedes TEXT, superseded_by TEXT,
+                         source_key TEXT, decay_world INTEGER NOT NULL DEFAULT 0,
+                         PRIMARY KEY(instance_id, timeline_id, id))"""
+                )
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO memory_new SELECT id, instance_id, timeline_id, character_id,
+                         text, kind, sources, happened_world, learned_world, recorded_world,
+                         semantic_watermark, strength, confidence, state, version, supersedes,
+                         superseded_by, source_key, decay_world FROM memory"""
+                )
+                self._conn.execute("DROP TABLE memory")
+                self._conn.execute("ALTER TABLE memory_new RENAME TO memory")
+
+        task_sql = sql_of("memory_task")
+        if task_sql and "PRIMARY KEY(instance_id, timeline_id, id)" not in task_sql:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    """CREATE TABLE memory_task_new(
+                         id TEXT NOT NULL, instance_id TEXT NOT NULL, timeline_id TEXT NOT NULL,
+                         character_id TEXT NOT NULL, source_kind TEXT NOT NULL, source_ref TEXT NOT NULL,
+                         source_world INTEGER NOT NULL, created_world INTEGER NOT NULL,
+                         text TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'pending',
+                         attempts INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '',
+                         UNIQUE(instance_id, timeline_id, character_id, source_kind, source_ref),
+                         PRIMARY KEY(instance_id, timeline_id, id))"""
+                )
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO memory_task_new SELECT id, instance_id, timeline_id,
+                         character_id, source_kind, source_ref, source_world, created_world, text,
+                         state, attempts, note FROM memory_task"""
+                )
+                self._conn.execute("DROP TABLE memory_task")
+                self._conn.execute("ALTER TABLE memory_task_new RENAME TO memory_task")
+
+        embed_sql = sql_of("memory_embedding")
+        if embed_sql and "timeline_id" not in embed_sql:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    """CREATE TABLE memory_embedding_new(
+                         memory_id TEXT NOT NULL, instance_id TEXT NOT NULL,
+                         timeline_id TEXT NOT NULL DEFAULT '', model TEXT NOT NULL, dim INTEGER NOT NULL,
+                         vector BLOB NOT NULL, source_version INTEGER NOT NULL, created_at REAL NOT NULL,
+                         PRIMARY KEY(instance_id, timeline_id, memory_id))"""
+                )
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO memory_embedding_new
+                         (memory_id, instance_id, timeline_id, model, dim, vector, source_version, created_at)
+                       SELECT e.memory_id, e.instance_id, COALESCE(m.timeline_id, ''), e.model, e.dim,
+                              e.vector, e.source_version, e.created_at
+                       FROM memory_embedding e LEFT JOIN memory m ON m.id = e.memory_id"""
+                )
+                self._conn.execute("DROP TABLE memory_embedding")
+                self._conn.execute("ALTER TABLE memory_embedding_new RENAME TO memory_embedding")
+
     def ensure_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate_memory_tables()
             self._migrate_runtime_tables()
             row = self._conn.execute("SELECT value FROM meta WHERE key='data_format'").fetchone()
             if row is None:
@@ -1026,6 +1139,8 @@ class Store:
                 "effect_state",
                 "intent",
                 "call_ledger",
+                "commit_snapshot",
+                "commit_auto_state",
                 "memory",
                 "memory_task",
                 "memory_embedding",
@@ -1090,6 +1205,88 @@ class Store:
     def timeline_set_state(self, timeline_id: str, state: str) -> None:
         with self._lock, self._conn:
             self._conn.execute("UPDATE timeline SET state=? WHERE id=?", (state, timeline_id))
+
+    def commit_add(self, row: dict[str, Any], *, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+        """记一条提交；给快照就一并落盘（一致快照，§5.1）。"""
+        payload = json.dumps(snapshot or {}, ensure_ascii=False) if snapshot is not None else None
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO commit_log(id, instance_id, timeline_id, kind, moment, note, created_at)
+                   VALUES(:id, :instance_id, :timeline_id, :kind, :moment, :note, :created_at)""",
+                row,
+            )
+            if payload is not None:
+                self._conn.execute(
+                    """INSERT INTO commit_snapshot(commit_id, instance_id, payload, size, created_at)
+                       VALUES(?,?,?,?,?)""",
+                    (row["id"], row["instance_id"], payload, len(payload), time.time()),
+                )
+        return row
+
+    def commit_state_get(self, timeline_id: str) -> dict[str, Any]:
+        row = self._conn.execute(
+            "SELECT * FROM commit_auto_state WHERE timeline_id=?", (timeline_id,)
+        ).fetchone()
+        return _row_to_dict(row) if row is not None else {
+            "timeline_id": timeline_id, "last_commit_at": 0.0, "last_commit_moment": 0
+        }
+
+    def commit_state_set(
+        self, timeline_id: str, instance_id: str, *, last_commit_at: float, last_commit_moment: int
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO commit_auto_state(timeline_id, instance_id, last_commit_at, last_commit_moment)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(timeline_id) DO UPDATE SET
+                     last_commit_at=excluded.last_commit_at,
+                     last_commit_moment=excluded.last_commit_moment""",
+                (timeline_id, instance_id, float(last_commit_at), int(last_commit_moment)),
+            )
+
+    def event_count_since(self, instance_id: str, timeline_id: str, *, since: int) -> int:
+        row = self._conn.execute(
+            """SELECT COUNT(*) n FROM event WHERE instance_id=? AND timeline_id=? AND world_seconds>?""",
+            (instance_id, timeline_id, int(since)),
+        ).fetchone()
+        return int(row["n"] if row is not None else 0)
+
+    def commit_snapshot_get(self, commit_id: str) -> dict[str, Any] | None:
+        from .runtime import versioning as versioning_mod
+
+        row = self._conn.execute("SELECT * FROM commit_snapshot WHERE commit_id=?", (commit_id,)).fetchone()
+        if row is None:
+            return None
+        return versioning_mod.parse_snapshot(row["payload"])
+
+    def commit_get(self, commit_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM commit_log WHERE id=?", (commit_id,)).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def timeline_add(self, row: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO timeline(id, instance_id, name, state, source_commit, created_at)
+                   VALUES(:id, :instance_id, :name, :state, :source_commit, :created_at)""",
+                row,
+            )
+
+    def timeline_clear_state(self, timeline_id: str) -> None:
+        """回滚 / 分叉前清空该线的运行状态（保留线身份与时钟）。"""
+        for table in (
+            "unit", "life_plan", "experience", "claim", "knowledge", "effect_state", "intent",
+            "event", "environment_state", "memory", "memory_task", "memory_citation",
+        ):
+            self._conn.execute(f"DELETE FROM {table} WHERE timeline_id=?", (timeline_id,))
+        # 向量表按 memory 归属删（自身没有 timeline_id）
+        self._conn.execute("DELETE FROM memory_embedding WHERE timeline_id=?", (timeline_id,))
+
+    def timeline_clear_dialog(self, timeline_id: str) -> None:
+        """该线会话的对话原文（回滚要把被截去的未来对话一并撤掉，§七）。"""
+        self._conn.execute(
+            """DELETE FROM message WHERE session_id IN (SELECT id FROM session WHERE timeline_id=?)""",
+            (timeline_id,),
+        )
 
     def commit_list(self, instance_id: str, timeline_id: str | None = None) -> list[dict[str, Any]]:
         if timeline_id is None:
@@ -1353,13 +1550,22 @@ class Store:
             ),
         }
 
-    def runtime_load(self, instance_id: str, timeline_id: str, payload: dict[str, Any]) -> int:
-        """导入运行层快照：整体一次提交，返回写入的行数。"""
+    def runtime_load(
+        self, instance_id: str, timeline_id: str, payload: dict[str, Any], *, clear: bool = False
+    ) -> int:
+        """导入运行层快照：整体一次提交，返回写入的行数。
+
+        `clear=True` 时在同一事务里先撤掉该线现有状态与对话——回滚用它做原子切换（§七）。
+        """
+        payload = _relabel_payload(payload, instance_id, timeline_id)
         plans = [
             {**row, "created_world": int(row.get("created_world", payload.get("watermark", 0)))}
             for row in payload.get("plans") or []
         ]
         with self._lock, self._conn:
+            if clear:
+                self.timeline_clear_state(timeline_id)
+                self.timeline_clear_dialog(timeline_id)
             for row in payload.get("characters") or []:
                 self._conn.execute(
                     """INSERT OR REPLACE INTO character_join(instance_id, timeline_id, character_id, joined_world,
@@ -1442,7 +1648,7 @@ class Store:
                               :happened_world, :learned_world, :recorded_world, :semantic_watermark,
                               :strength, :confidence, :state, :version, :supersedes, :superseded_by,
                               :source_key, :decay_world)
-                       ON CONFLICT(id) DO NOTHING""",
+                       ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
                     row,
                 )
             for row in payload.get("memory_tasks") or []:
@@ -1451,7 +1657,7 @@ class Store:
                                                source_ref, source_world, created_world, text, state, attempts, note)
                        VALUES(:id, :instance_id, :timeline_id, :character_id, :source_kind, :source_ref,
                               :source_world, :created_world, :text, :state, :attempts, :note)
-                       ON CONFLICT(id) DO NOTHING""",
+                       ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
                     row,
                 )
             for row in payload.get("intents") or []:
@@ -1588,7 +1794,8 @@ class Store:
         source_key = str(row.get("source_key") or "")
         if source_key:
             dup = self._conn.execute(
-                "SELECT * FROM memory WHERE character_id=? AND source_key=?", (character_id, source_key)
+                "SELECT * FROM memory WHERE instance_id=? AND timeline_id=? AND character_id=? AND source_key=?",
+                (row["instance_id"], row["timeline_id"], character_id, source_key),
             ).fetchone()
             if dup is not None:
                 return None  # 同源重复提取：不重复写、不重复强化
@@ -1631,18 +1838,35 @@ class Store:
         saved = self.memory_get(str(row["id"]))
         return saved
 
-    def memory_get(self, memory_id: str) -> dict[str, Any] | None:
-        row = self._conn.execute("SELECT * FROM memory WHERE id=?", (memory_id,)).fetchone()
+    def memory_get(
+        self, memory_id: str, *, instance_id: str = "", timeline_id: str = ""
+    ) -> dict[str, Any] | None:
+        if instance_id and timeline_id:
+            row = self._conn.execute(
+                "SELECT * FROM memory WHERE instance_id=? AND timeline_id=? AND id=?",
+                (instance_id, timeline_id, memory_id),
+            ).fetchone()
+        else:
+            row = self._conn.execute("SELECT * FROM memory WHERE id=?", (memory_id,)).fetchone()
         return _row_to_dict(row) if row is not None else None
 
-    def memory_update_strength(self, memory_id: str, strength: float, *, state: str | None = None) -> None:
+    def memory_update_strength(
+        self,
+        memory_id: str,
+        strength: float,
+        *,
+        state: str | None = None,
+        instance_id: str = "",
+        timeline_id: str = "",
+    ) -> None:
+        where = "id=?" if not (instance_id and timeline_id) else "instance_id=? AND timeline_id=? AND id=?"
+        args: list[Any] = [float(strength)]
+        if state is not None:
+            args.append(state)
+        args.extend([memory_id] if not (instance_id and timeline_id) else [instance_id, timeline_id, memory_id])
+        columns = "strength=?" if state is None else "strength=?, state=?"
         with self._lock, self._conn:
-            if state is None:
-                self._conn.execute("UPDATE memory SET strength=? WHERE id=?", (float(strength), memory_id))
-            else:
-                self._conn.execute(
-                    "UPDATE memory SET strength=?, state=? WHERE id=?", (float(strength), state, memory_id)
-                )
+            self._conn.execute(f"UPDATE memory SET {columns} WHERE {where}", args)
 
     def memory_task_add(self, row: dict[str, Any]) -> bool:
         """登记一条待提取来源（同角色同来源幂等，§4.1）。"""
@@ -1674,7 +1898,16 @@ class Store:
                 "UPDATE memory_task SET state=?, note=?, attempts=attempts+1 WHERE id=?", (state, note, task_id)
             )
 
-    def memory_cite(self, turn_id: str, memory_id: str, *, timeline_id: str, character_id: str, world_seconds: int) -> bool:
+    def memory_cite(
+        self,
+        turn_id: str,
+        memory_id: str,
+        *,
+        instance_id: str = "",
+        timeline_id: str,
+        character_id: str,
+        world_seconds: int,
+    ) -> bool:
         """实际被采纳一轮用到的条目才强化：同一轮幂等（§5.3）。"""
         from .runtime import memory as memory_mod
 
@@ -1687,13 +1920,20 @@ class Store:
             )
             if not cur.rowcount:
                 return False
-            row = self._conn.execute("SELECT strength FROM memory WHERE id=?", (memory_id,)).fetchone()
+            if instance_id:
+                row = self._conn.execute(
+                    "SELECT strength FROM memory WHERE instance_id=? AND timeline_id=? AND id=?",
+                    (instance_id, timeline_id, memory_id),
+                ).fetchone()
+            else:
+                row = self._conn.execute("SELECT strength FROM memory WHERE id=?", (memory_id,)).fetchone()
             if row is None:
                 return False
             strength = memory_mod.reinforce(float(row["strength"]))
             self._conn.execute(
-                "UPDATE memory SET strength=?, state=? WHERE id=?",
-                (strength, memory_mod.state_for(strength), memory_id),
+                "UPDATE memory SET strength=?, state=? WHERE instance_id=? AND timeline_id=? AND id=?",
+                (strength, memory_mod.state_for(strength), instance_id or self._scope_instance(memory_id),
+                 timeline_id, memory_id),
             )
         return True
 
@@ -1760,22 +2000,35 @@ class Store:
                 changed += 1
         return changed
 
+    def _scope_instance(self, memory_id: str) -> str:
+        row = self._conn.execute("SELECT instance_id FROM memory WHERE id=?", (memory_id,)).fetchone()
+        return str(row["instance_id"]) if row is not None else ""
+
     def memory_embedding_put(
-        self, memory_id: str, *, instance_id: str, model: str, vector: list[float], content_hash: str
+        self,
+        memory_id: str,
+        *,
+        instance_id: str,
+        timeline_id: str = "",
+        model: str,
+        vector: list[float],
+        content_hash: str,
     ) -> None:
         """落一条向量（带模型指纹与源文本版本，§5.2）。"""
         from .runtime import embedding as embedding_mod
 
         with self._lock, self._conn:
             self._conn.execute(
-                """INSERT INTO memory_embedding(memory_id, instance_id, model, dim, vector, source_version, created_at)
-                   VALUES(?,?,?,?,?,?,?)
-                   ON CONFLICT(memory_id) DO UPDATE SET
+                """INSERT INTO memory_embedding(memory_id, instance_id, timeline_id, model, dim, vector,
+                                               source_version, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(instance_id, timeline_id, memory_id) DO UPDATE SET
                      model=excluded.model, dim=excluded.dim, vector=excluded.vector,
                      source_version=excluded.source_version, created_at=excluded.created_at""",
                 (
                     memory_id,
                     instance_id,
+                    str(timeline_id or ""),
                     str(model),
                     len(vector),
                     embedding_mod.pack(vector),

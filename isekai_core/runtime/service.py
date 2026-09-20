@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import json
 import secrets
+import time
 from typing import Any
 
 from ..log import get_logger
 from ..store import Store
 from . import budget as budget_mod
-from . import cognition, embedding as embedding_mod, environment, events, intents, life, memory as memory_mod, personality, planning
+from . import cognition, embedding as embedding_mod, environment, events, intents, life
+from . import memory as memory_mod, personality, planning, versioning
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
 
@@ -46,6 +48,9 @@ class RuntimeService:
         embedding_model: str = "",
         embedding_base_url: str = "",
         embedding_api_key: str = "",
+        autocommit_enabled: bool = True,
+        autocommit_minutes: int = 60,
+        autocommit_events: int = 50,
     ) -> None:
         self.store = store
         #: 倍率上限：全局统一、仅开发者可配置（§2.2），默认 2592000 世界秒 / 现实秒
@@ -74,6 +79,10 @@ class RuntimeService:
         self.embedding_model = str(embedding_model or "")
         self.embedding_base_url = str(embedding_base_url or "")
         self.embedding_api_key = str(embedding_api_key or "")
+        #: 自动提交（§5.1）：默认现实 1 小时或新增事件 50 条，可配置可关；手动提交不受开关限制
+        self.autocommit_enabled = bool(autocommit_enabled)
+        self.autocommit_minutes = max(1, int(autocommit_minutes))
+        self.autocommit_events = max(1, int(autocommit_events))
 
     # ---------- 基础读取 ----------
 
@@ -81,6 +90,141 @@ class RuntimeService:
         """世界时刻的人话标签（历法视图，§2.1）。"""
         instance = self.store.instance_get(instance_id) or {}
         return self.calendar(instance).describe(int(world_seconds))
+
+    # ---------- 版本管理（阶段 4，§5 / §6 / §7） ----------
+
+    def commit(
+        self, instance_id: str, timeline_id: str, *, kind: str = "manual", note: str = ""
+    ) -> dict[str, Any]:
+        """在一致边界取快照（§5.1）：提交是回滚点与分叉点。"""
+        row = self.clock_row(timeline_id)
+        snapshot = versioning.snapshot_of(self.store, instance_id, timeline_id, note=note)
+        commit_id = f"cm-{secrets.token_hex(6)}"
+        record = versioning.make_commit_row(
+            commit_id, instance_id, timeline_id, kind=kind, moment=int(row["processed_world"]), note=note
+        )
+        self.store.commit_add(record, snapshot=snapshot)
+        self.store.commit_state_set(
+            timeline_id, instance_id, last_commit_at=time.time(), last_commit_moment=int(row["processed_world"])
+        )
+        return versioning.public_commit(record)
+
+    def commits(self, instance_id: str, timeline_id: str | None = None) -> list[dict[str, Any]]:
+        """提交列表只给管理元数据，不带剧情摘要（§5.1）。"""
+        return [
+            versioning.public_commit(row)
+            for row in self.store.commit_list(instance_id, timeline_id)
+        ]
+
+    def maybe_auto_commit(self, instance_id: str, timeline_id: str, *, now_real: float) -> dict[str, Any] | None:
+        """自动提交：现实时间到达间隔，或新增事件数到阈值（§5.1，可配置、可关）。"""
+        if not self.autocommit_enabled:
+            return None
+        state = self.store.commit_state_get(timeline_id)
+        events_since = self.store.event_count_since(
+            instance_id, timeline_id, since=int(state.get("last_commit_moment") or 0)
+        )
+        elapsed = float(now_real) - float(state.get("last_commit_at") or 0.0)
+        due = elapsed >= self.autocommit_minutes * 60 or events_since >= self.autocommit_events
+        if not due:
+            return None
+        return self.commit(instance_id, timeline_id, kind="auto", note="自动提交")
+
+    def fork(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        commit_id: str,
+        name: str = "",
+        activate: bool = False,
+        now_real: float | None = None,
+    ) -> dict[str, Any]:
+        """从不可变来源提交分叉（§六）：创建本身不等于激活。"""
+        source = self.store.commit_get(commit_id)
+        if source is None or str(source["instance_id"]) != instance_id:
+            raise RuntimeStateError(f"没有该提交：{commit_id}")
+        snapshot = self.store.commit_snapshot_get(commit_id) or {}
+        payload = dict(snapshot.get("runtime") or {})
+        new_id = f"tl-{secrets.token_hex(4)}"
+        self.store.timeline_add({
+            "id": new_id,
+            "instance_id": instance_id,
+            "name": name or f"{timeline_id} 的分支",
+            "state": "frozen",  # 创建不等于激活（§四）
+            "source_commit": commit_id,
+            "created_at": time.time(),
+        })
+        self.store.clock_put({
+            "timeline_id": new_id,
+            "base_real": float(now_real if now_real is not None else time.time()),
+            "base_world": int(snapshot.get("world") or 0),
+            "rate": int(snapshot.get("rate") or 1),
+            "high_water_real": float(now_real if now_real is not None else time.time()),
+            "anchor_real": float(now_real if now_real is not None else time.time()),
+            "processed_world": int(snapshot.get("world") or 0),
+            "generation": 0,
+            "catching_up": 0,
+            "limited": 0,
+        })
+        self.store.runtime_load(instance_id, new_id, payload)
+        # 分支也留一个自己的提交点（带快照，回滚 / 再分叉都指得到它）
+        record = self.commit(instance_id, new_id, kind="initial", note=f"分叉自 {commit_id}")
+        if activate:
+            self.activate(instance_id, new_id, now_real=now_real)
+        return {"timeline": self.store.timeline_get(new_id), "commit": record, "source_commit": commit_id}
+
+    def rollback(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        commit_id: str,
+        now_real: float | None = None,
+    ) -> dict[str, Any]:
+        """回滚（覆盖语义，§七）：保持线身份，把有效历史覆盖到所选可达提交。
+
+        被截去的未来退出当前线；随后以**回滚完成时的现实时间**重新锚定；本机激活 / 冻结状态
+        不来自历史，原来激活则继续、原来冻结则停在回滚点。
+        """
+        source = self.store.commit_get(commit_id)
+        if source is None or str(source["instance_id"]) != instance_id:
+            raise RuntimeStateError(f"没有该提交：{commit_id}")
+        if str(source["timeline_id"]) != timeline_id:
+            raise RuntimeStateError("只能回滚到本线自己的提交")
+        snapshot = self.store.commit_snapshot_get(commit_id)
+        if snapshot is None:
+            raise RuntimeStateError("该提交没有快照，无法回滚")
+        line = self.store.timeline_get(timeline_id) or {}
+        before_state = str(line.get("state") or "frozen")
+        before_clock = self.clock_row(timeline_id)
+        # 原子切换：先提升运行世代让迟到结果失效，再在同一事务里清空 + 写回
+        self.store.clock_put({**before_clock, "generation": int(before_clock["generation"]) + 1})
+        self.store.runtime_load(instance_id, timeline_id, dict(snapshot.get("runtime") or {}), clear=True)
+        now = float(now_real if now_real is not None else time.time())
+        self.store.clock_put({
+            **self.clock_row(timeline_id),
+            "base_real": now,
+            "base_world": int(snapshot.get("world") or 0),
+            "rate": int(snapshot.get("rate") or 1),
+            "high_water_real": now,
+            "anchor_real": now,
+            "processed_world": int(snapshot.get("world") or 0),
+            "catching_up": 0,
+            "limited": 0,
+        })
+        # 本机状态不从历史恢复：原来激活继续激活，原来冻结停在回滚点
+        self.store.timeline_set_state(timeline_id, before_state)
+        self.store.commit_state_set(
+            timeline_id, instance_id, last_commit_at=now, last_commit_moment=int(snapshot.get("world") or 0)
+        )
+        return {
+            "timeline": self.store.timeline_get(timeline_id),
+            "commit": versioning.public_commit(source),
+            "state": before_state,
+            "world": int(snapshot.get("world") or 0),
+            "generation": int(self.clock_row(timeline_id)["generation"]),
+        }
 
     # ---------- 角色记忆（MEMORY_SPEC） ----------
 

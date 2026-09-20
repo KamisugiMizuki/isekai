@@ -44,3 +44,7 @@ placeholder:
   memory_embedding_model: ""
   memory_embedding_base_url: ""
   memory_embedding_api_key: ""
+  # 版本管理（阶段 4）：自动提交默认现实 1 小时或新增事件 50 条，可关；手动提交不受开关限制
+  autocommit_enabled: true
+  autocommit_minutes: 60
+  autocommit_events: 50
