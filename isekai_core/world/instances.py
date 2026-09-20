@@ -13,6 +13,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from ..log import get_logger
@@ -20,7 +21,14 @@ from ..store import Store
 from ..version import APP_VERSION, DATA_FORMAT_VERSION, RULES_VERSION
 from . import converters
 from .cards import validate_assembly
-from .package import PackageError, clone_package, ensure_original_name, normalize_name, unique_name, PackageError, read_json_file
+from .package import (
+    PackageError,
+    clone_package,
+    ensure_original_name,
+    normalize_name,
+    read_json_file,
+    unique_name,
+)
 from .validate import validate_package
 
 log = get_logger("isekai.world.instances")
@@ -394,6 +402,7 @@ def load_cards(package: dict[str, Any], card_paths: list[str]) -> list[dict[str,
 
 def save_card(path: str, card: dict[str, Any]) -> None:
     """角色卡只保存最终确认版本：确认后写入，不保留生成历史。"""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)  # 首次导入时创作目录可能还不存在
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(json.dumps(card, ensure_ascii=False, indent=2))
 

@@ -44,6 +44,7 @@ SYNC_OPS = frozenset(
         "world.package.save",
         "world.package.validate",
         "world.package.list",
+        "world.package.import",
         "world.draft.list",
         "world.draft.save",
         "world.draft.load",
@@ -73,6 +74,7 @@ SYNC_OPS = frozenset(
         "world.card.validate",
         "world.card.confirm",
         "world.card.list",
+        "world.card.import",
         "instance.list",
         "instance.create",
         "instance.info",
@@ -177,6 +179,12 @@ def _moment(package: dict[str, Any], args: dict[str, Any]) -> int:
         return int(args["moment"])
     calendar = package.get("calendar") if isinstance(package.get("calendar"), dict) else {}
     return int(calendar.get("initial_moment") or 0)
+
+
+def _creation_path(cfg: Config, name: str) -> Path:
+    """创作目录内的落盘位置（导入用）：名字最小脱敏，避免路径穿越（同 _draft_path 口径）。"""
+    safe = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fa5.-]", "_", str(name).strip()) or "imported.json"
+    return cfg.paths.packages / safe
 
 
 def _draft_path(cfg: Config, name: str) -> Path:
@@ -383,6 +391,69 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return {"packages": _list_files(cfg, "package"), "containers": _list_files(cfg, "container")}
         if op == "world.card.list":
             return {"cards": _list_files(cfg, "card")}
+        if op == "world.package.import":
+            # 从外部文件带一个世界包进创作目录（§7.5）：读取前字节限额 → 结构校验 → 不过不落盘
+            source = resolve_path(cfg, args.get("source_path") or args.get("path"))
+            package = load_package(source)
+            errors = list(validate_package(package))
+            if errors:
+                raise UmpError(
+                    Err.INVALID,
+                    "世界包未通过校验，未落盘：" + "；".join(str(item) for item in errors[:5]),
+                    retryable=False,
+                )
+            name = str(args.get("name") or source.stem).strip() or source.stem
+            target = _creation_path(cfg, name.removesuffix(".json") + ".json")
+            replaced = target.exists()
+            if replaced and not bool(args.get("force")):
+                raise UmpError(
+                    Err.INVALID,
+                    f"同名世界包已存在：{target.name}（如需覆盖请显式确认）",
+                    retryable=False,
+                )
+            save_package(target, package)
+            meta = package.get("meta") if isinstance(package.get("meta"), dict) else {}
+            return {
+                "imported": target.name,
+                "path": str(target),
+                "name": str(meta.get("name") or ""),
+                "replaced": replaced,
+                "source": str(source),
+            }
+        if op == "world.card.import":
+            # 卡片的渠道 / 史料引用依赖包：导入时带包上下文做联合校验（CHARACTER_CARD §5）
+            source = resolve_path(cfg, args.get("source_path") or args.get("card_path"))
+            card = _read_user_json(source, what="角色卡文件")
+            if not isinstance(card, dict):
+                raise UmpError(Err.INVALID, "角色卡顶层必须是对象", retryable=False)
+            package = _package_arg(args, cfg)
+            errors = list(validate_card(card, package, moment=_moment(package, args)))
+            if errors:
+                raise UmpError(
+                    Err.INVALID,
+                    "角色卡未通过与包件的联合校验，未落盘：" + "；".join(str(item) for item in errors[:5]),
+                    retryable=False,
+                )
+            name = str(args.get("name") or source.stem).strip() or source.stem
+            target = _creation_path(cfg, name if name.endswith(".json") else name + ".json")
+            replaced = target.exists()
+            if replaced and not bool(args.get("force")):
+                raise UmpError(
+                    Err.INVALID,
+                    f"同名角色卡已存在：{target.name}（如需覆盖请显式确认）",
+                    retryable=False,
+                )
+            save_card(str(target), card)
+            identity = card.get("identity") if isinstance(card.get("identity"), dict) else {}
+            return {
+                "imported": target.name,
+                "path": str(target),
+                "card_id": str(card.get("id") or ""),
+                "name": str(identity.get("name") or ""),
+                "validated_against": str(args.get("package_path") or ""),
+                "replaced": replaced,
+                "source": str(source),
+            }
         if op == "world.draft.list":
             return {"drafts": _list_files(cfg, "draft")}
         if op == "world.draft.save":
