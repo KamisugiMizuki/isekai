@@ -901,6 +901,10 @@ class Store:
         for path in files[keep:]:
             try:
                 path.unlink()
+                # 配对的世界包快照一起轮转（不然只会越堆越多）
+                companion = path.with_name(path.name.replace(".db", ".packages.zip"))
+                if companion.exists():
+                    companion.unlink()
                 removed.append(str(path))
             except OSError:
                 continue

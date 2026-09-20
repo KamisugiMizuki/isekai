@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from pathlib import Path
 
 from isekai_core.runtime.service import RuntimeService
 from samples import DAY, sample_card, sample_package
@@ -120,3 +121,27 @@ def test_prune_keeps_newest_and_never_breaks_creation(store) -> None:
     left = sorted(item.name for item in folder.glob("isekai-*.db"))
     assert len(removed) == 3 and len(left) == 2, (removed, left)
     assert left == sorted(["isekai-20260103-000000.db", "isekai-20260104-000000.db"], reverse=False) or True
+
+
+def test_backup_covers_packages_and_drafts(store, tmp_path) -> None:
+    """备份不只 DB：确认过的世界包与草稿进配对 zip，恢复时一并放回（§3.3「不是只要 DB」）。"""
+    from isekai_core.config import load_config
+    from isekai_core.world import ops as world_ops
+
+    cfg = load_config(tmp_path)
+    packages = cfg.paths.packages
+    packages.mkdir(parents=True, exist_ok=True)
+    (packages / "keep.draft.json").write_text('{"name":"keep"}', encoding="utf-8")
+
+    folder = world_ops._backup_folder(cfg, store)  # 相对目录挂在数据根下（与 backup.create 同口径）
+    result = world_ops.backup_once(cfg, store, note="单测")
+    assert result["ok"] and result["packages"].endswith(".packages.zip")
+    assert list(folder.glob("isekai-*.packages.zip")), "备份目录里应有一份世界包快照"
+
+    # 备份之后新建的草稿：恢复后不该还在（否则就是「只覆盖 DB」）
+    (packages / "rev-after.draft.json").write_text('{"name":"after"}', encoding="utf-8")
+    companion = next(iter(folder.glob("*.packages.zip")))
+    restored = world_ops._restore_packages(cfg, Path(str(companion).replace(".packages.zip", ".db")), folder)
+    assert restored, "配对包存在时要真的放回去"
+    assert (packages / "keep.draft.json").exists()
+    assert not (packages / "rev-after.draft.json").exists(), "恢复后备份时点之后的草稿不该还在"

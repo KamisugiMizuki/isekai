@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -473,6 +474,9 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             result = store.backup_restore(
                 backup_path, safety=folder / "isekai-restore-safety.db"
             )
+            restored_packages = _restore_packages(cfg, Path(str(backup_path)), folder)
+            if restored_packages:
+                result["packages"] = restored_packages
             return {"restore": result}
         if op == "backup.list":
             folder = _backup_folder(cfg, store)
@@ -963,14 +967,59 @@ def _backup_folder(cfg: Any, store: Any) -> Path:
 
 
 def backup_once(cfg: Any, store: Any, *, note: str = "") -> dict[str, Any]:
-    """落一份一致水位备份并按保留数轮转（backup.create 与退出前补做共用同一路径）。"""
+    """落一份一致水位备份（DB + 确认过的世界包 / 草稿）并按保留数轮转。
+
+    `backup.create`、到期补做与退出前补做共用这**一条**路径——备份内容三处一致（§3.3/§五）。
+    """
     folder = _backup_folder(cfg, store)
     folder.mkdir(parents=True, exist_ok=True)  # 首次到期补做时目录还不存在
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     result = store.backup_create(folder / f"isekai-{stamp}.db", note=note)
     if result["ok"]:
+        # 世界包与草稿不是 DB 里的行：单独打一份配对 zip（§3.3「不是只要 DB」）
+        result["packages"] = _archive_packages(cfg, folder, stamp)
         store.backup_prune(folder, keep=int(getattr(cfg.backup, "keep", 7)))
     return result
+
+
+def _packages_folder(cfg: Any) -> Path | None:
+    """世界包 / 草稿目录（不存在就不备份这一半）。"""
+    raw = getattr(getattr(cfg, "paths", None), "packages", "")
+    if not raw:
+        return None
+    folder = Path(raw)
+    return folder if folder.is_dir() else None
+
+
+def _archive_packages(cfg: Any, folder: Path, stamp: str) -> str:
+    packages = _packages_folder(cfg)
+    if packages is None:
+        return ""
+    target = folder / f"isekai-{stamp}.packages"
+    try:
+        shutil.make_archive(str(target), "zip", root_dir=str(packages.parent), base_dir=packages.name)
+    except OSError as exc:  # 备份主体已成功，这一半失败只记录
+        log.warning("packages archive failed: %s", exc)
+        return ""
+    return f"{target}.zip"
+
+
+def _restore_packages(cfg: Any, backup_path: Path, folder: Path) -> str:
+    """整库恢复时把配对的世界包快照一并放回（§十.20）：先留安全副本，再整体替换目录内容。"""
+    packages = _packages_folder(cfg)
+    companion = backup_path.with_name(backup_path.name.replace(".db", ".packages.zip"))
+    if packages is None or not companion.is_file():
+        return ""
+    safety = folder / f"packages-before-restore-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    shutil.make_archive(str(safety.with_suffix("")), "zip", root_dir=str(packages.parent), base_dir=packages.name)
+    # 整库恢复=回到备份时点：先清空目录内容（解包只覆盖同名文件，不会删掉备份后新增的草稿）
+    for item in packages.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+        else:
+            item.unlink(missing_ok=True)
+    shutil.unpack_archive(str(companion), str(packages.parent))
+    return str(companion)
 
 
 def _request_exit(delay: float = 0.5) -> None:
