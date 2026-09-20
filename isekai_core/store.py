@@ -1937,6 +1937,8 @@ class Store:
                 cur = self._conn.execute(f"DELETE FROM {table} WHERE timeline_id=?", (timeline_id,))
                 counts[table] = int(cur.rowcount or 0)
             if doomed:
+                # 删之前先把「以它们为基」的 diff 物化成全量：别的线引用的祖先不能因为删除动作变不可读（§8）
+                self.unbase_dependents(doomed)
                 marks = ",".join("?" for _ in doomed)
                 cur = self._conn.execute(
                     f"DELETE FROM commit_snapshot WHERE commit_id IN ({marks})", tuple(doomed)
@@ -1955,7 +1957,7 @@ class Store:
 
     def commit_add(self, row: dict[str, Any], *, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
         """记一条提交；给快照就一并落盘（一致快照，§5.1）。"""
-        payload = json.dumps(snapshot or {}, ensure_ascii=False) if snapshot is not None else None
+        payload = self._snapshot_payload_for(row, snapshot) if snapshot is not None else None
         with self._lock, self._conn:
             self._conn.execute(
                 """INSERT INTO commit_log(id, instance_id, timeline_id, kind, moment, note, created_at)
@@ -1968,7 +1970,101 @@ class Store:
                        VALUES(?,?,?,?,?)""",
                     (row["id"], row["instance_id"], payload, len(payload), time.time()),
                 )
+        if payload is not None:
+            self.commit_snapshot_compress(str(row["id"]))  # §8：链太长就把这条物化成全量
         return row
+
+    def _snapshot_payload_for(self, row: dict[str, Any], snapshot: dict[str, Any]) -> str:
+        """这条提交的存储形态（§6）：接得上上一条就存 diff，接不上（或没有上一条）就存全量。
+
+        全量与 diff 是等价的存储方式，读的时候统一物化，调用方看不到差别。
+        """
+        from .runtime import versioning as versioning_mod
+
+        previous = self._conn.execute(
+            """SELECT id FROM commit_log WHERE instance_id=? AND timeline_id=?
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (row["instance_id"], row["timeline_id"]),
+        ).fetchone()
+        base = self.commit_snapshot_get(str(previous["id"])) if previous is not None else None
+        if base is None:
+            return versioning_mod.dump_snapshot(snapshot)
+        delta = versioning_mod.encode_delta(base, snapshot)
+        return versioning_mod.dump_snapshot(
+            delta, kind=versioning_mod.SNAPSHOT_DELTA, base=str(previous["id"])
+        )
+
+    def commit_snapshot_depth(self, commit_id: str, *, limit: int = 64) -> int:
+        """从这条沿 base 往回数到全量的距离；链断了返回 -1。"""
+        from .runtime import versioning as versioning_mod
+
+        depth, current = 0, str(commit_id)
+        while current and depth <= limit:
+            row = self._conn.execute(
+                "SELECT payload FROM commit_snapshot WHERE commit_id=?", (current,)
+            ).fetchone()
+            if row is None:
+                return -1
+            kind, base = versioning_mod.snapshot_kind(row["payload"])
+            if kind != versioning_mod.SNAPSHOT_DELTA:
+                return depth
+            depth, current = depth + 1, base
+        return -1
+
+    def commit_snapshot_compress(self, commit_id: str) -> dict[str, Any]:
+        """§8 压缩：链太长就把这条物化成全量，链从它重新开始。
+
+        不改变可观察状态（物化结果逐字段相同），也不删任何祖先——别的线引用的祖先照旧可读。
+        """
+        from .runtime import versioning as versioning_mod
+
+        row = self._conn.execute(
+            "SELECT * FROM commit_snapshot WHERE commit_id=?", (commit_id,)
+        ).fetchone()
+        if row is None:
+            return {"compressed": False, "reason": "没有该提交的快照"}
+        kind, _base = versioning_mod.snapshot_kind(row["payload"])
+        if kind != versioning_mod.SNAPSHOT_DELTA:
+            return {"compressed": False, "depth": 0}
+        depth = self.commit_snapshot_depth(commit_id)
+        if depth < 0 or depth <= versioning_mod.MAX_DELTA_CHAIN:
+            return {"compressed": False, "depth": depth}
+        payload = self.commit_snapshot_get(commit_id)
+        if payload is None:
+            return {"compressed": False, "reason": "链不完整，物化失败"}
+        dumped = versioning_mod.dump_snapshot(payload)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE commit_snapshot SET payload=?, size=? WHERE commit_id=?",
+                (dumped, len(dumped), commit_id),
+            )
+        return {"compressed": True, "depth": depth, "kind": versioning_mod.SNAPSHOT_FULL}
+
+    def unbase_dependents(self, commit_ids: list[str]) -> int:
+        """删快照前先把「以它为基」的 diff 物化成全量：祖先可读性不能被删除动作带走（§8）。"""
+        from .runtime import versioning as versioning_mod
+
+        moved = 0
+        for cid in [str(item) for item in commit_ids if str(item)]:
+            rows = self._conn.execute(
+                "SELECT commit_id, payload FROM commit_snapshot WHERE payload LIKE ?",
+                (f'%"base": "{cid}"%',),
+            ).fetchall()
+            for row in rows:
+                kind, base = versioning_mod.snapshot_kind(row["payload"])
+                if kind != versioning_mod.SNAPSHOT_DELTA or base != cid:
+                    continue
+                payload = self.commit_snapshot_get(str(row["commit_id"]))
+                if payload is None:
+                    continue
+                dumped = versioning_mod.dump_snapshot(payload)
+                with self._lock, self._conn:
+                    self._conn.execute(
+                        "UPDATE commit_snapshot SET payload=?, size=? WHERE commit_id=?",
+                        (dumped, len(dumped), str(row["commit_id"])),
+                    )
+                moved += 1
+        return moved
 
     # ---------- 多角色披露（§七） ----------
 
@@ -2098,7 +2194,31 @@ class Store:
         row = self._conn.execute("SELECT * FROM commit_snapshot WHERE commit_id=?", (commit_id,)).fetchone()
         if row is None:
             return None
-        return versioning_mod.parse_snapshot(row["payload"])
+        kind, base = versioning_mod.snapshot_kind(row["payload"])
+        if kind != versioning_mod.SNAPSHOT_DELTA:
+            data = versioning_mod.parse_snapshot(row["payload"])
+            body = data.get("body")
+            return body if isinstance(body, dict) else data  # 兼容早期的裸全量
+        # 沿 base 收集差异，到全量处自顶向下合成（§6：祖先基线与差异的状态物化）
+        chain: list[dict[str, Any]] = []
+        current, depth = str(commit_id), 0
+        while current and depth <= 64:
+            step = self._conn.execute(
+                "SELECT payload FROM commit_snapshot WHERE commit_id=?", (current,)
+            ).fetchone()
+            if step is None:
+                return None
+            step_kind, next_base = versioning_mod.snapshot_kind(step["payload"])
+            data = versioning_mod.parse_snapshot(step["payload"])
+            if step_kind != versioning_mod.SNAPSHOT_DELTA:
+                body = data.get("body")
+                out = body if isinstance(body, dict) else data
+                for delta in reversed(chain):
+                    out = versioning_mod.apply_delta(out, delta)
+                return out
+            chain.append(data.get("body") or {})
+            current, depth = next_base, depth + 1
+        return None
 
     def commit_snapshot_put(self, commit_id: str, instance_id: str, payload: str) -> None:
         """随件恢复提交快照（§7.1 提交闭包）：导入后该线仍能回滚 / 分叉。"""

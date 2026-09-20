@@ -92,3 +92,149 @@ def parse_snapshot(payload: str | bytes | None) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise VersionError("快照损坏") from exc
     return data if isinstance(data, dict) else {}
+
+
+# ---------- 快照的存储形态（§6 diff 复制 / §8 压缩）：全量与 diff 等价 ----------
+
+SNAPSHOT_FULL = "full"
+SNAPSHOT_DELTA = "delta"
+#: 链长上限：超过就把最新的那条物化成全量，链重新从它开始（§8 减少 diff 链长度）
+MAX_DELTA_CHAIN = 8
+
+
+def _ordered_sections(payload: dict[str, Any]) -> tuple[list[str], dict[str, dict[str, Any]], dict[str, Any]]:
+    """把快照拆成 (段名顺序, {段名: {行键: 行}}, 标量)，行的先后按原样保留。
+
+    容器（如 `runtime`）不整块进出：往下走一层，段名带前缀（`runtime/events`），
+    diff 才落到**行**这一级，而不是「整个 runtime 变了」。
+    """
+    order: list[str] = []
+    sections: dict[str, dict[str, Any]] = {}
+    scalars: dict[str, Any] = {}
+
+    def walk(prefix: str, node: dict[str, Any]) -> None:
+        for key, value in (node or {}).items():
+            name = f"{prefix}{key}"
+            if isinstance(value, list):
+                rows: dict[str, Any] = {}
+                for index, item in enumerate(value):
+                    if isinstance(item, dict):
+                        rows[_row_key(item, index)] = item
+                order.append(name)
+                sections[name] = rows
+            elif isinstance(value, dict) and any(isinstance(item, list) for item in value.values()):
+                walk(f"{name}/", value)
+            else:
+                scalars[name] = value
+
+    walk("", payload or {})
+    return order, sections, scalars
+
+
+def _set_nested(out: dict[str, Any], name: str, value: Any) -> None:
+    parts = str(name).split("/")
+    node = out
+    for part in parts[:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[parts[-1]] = value
+
+
+def _row_key(item: dict[str, Any], index: int) -> str:
+    """行标识：优先主键类字段；没有就用该行全部 `*_id` 字段的组合（如环境行的 type_id）。
+
+    索引只能当最后的兜底——按位置当键会让「换了一行」被误判成「改了同一行」。
+    """
+    for field in ("id", "message_id", "commit_id", "seq"):
+        value = item.get(field)
+        if value not in (None, ""):
+            return f"{field}:{value}"
+    parts = [
+        f"{field}={item[field]}"
+        for field in sorted(item)
+        if field.endswith("_id") and item[field] not in (None, "")
+    ]
+    if parts:
+        return "|".join(parts)
+    return f"#{index}"
+
+
+def encode_delta(base: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    """祖先基线 + 差异（含删除标记）→ 目标（§6）。差异只看两侧，不看祖先之外的东西。
+
+    每段带 `order`（目标里的行序）：物化时照它排，避免「排序键恰好等于主键」这种默认假设。
+    """
+    base_order, base_rows, base_scalars = _ordered_sections(base)
+    order, rows, scalars = _ordered_sections(target)
+    sections: dict[str, Any] = {}
+    for name in set(base_rows) | set(rows):
+        before, after = base_rows.get(name, {}), rows.get(name, {})
+        added = [after[key] for key in after if key not in before]
+        replaced = [after[key] for key in after if key in before and after[key] != before[key]]
+        deleted = sorted(key for key in before if key not in after)
+        row_order = list(after)
+        if added or replaced or deleted or row_order != list(before):
+            # 行序也算差异：物化要能逐字段对上，不能靠「恰好按主键排」
+            sections[name] = {
+                "added": added, "replaced": replaced, "deleted": deleted, "order": row_order,
+            }
+    return {
+        "kind": SNAPSHOT_DELTA,
+        "sections": sections,
+        "order": order,
+        "scalars": scalars if scalars != base_scalars else {},
+    }
+
+
+def apply_delta(base: dict[str, Any], delta: dict[str, Any]) -> dict[str, Any]:
+    """物化（§6 所谓「diff 合并」就是祖先基线与差异的状态合成，不是时间线合并）。
+
+    - 删除标记优先：祖先层还有旧值也不复活；
+    - 行的先后按 delta 记下的 `order`，没有就沿用基线的顺序；
+    - 标量（水位 / 规则版本等）有更新就用新值；容器照旧嵌套回原样。
+    """
+    base_order, base_rows, base_scalars = _ordered_sections(base)
+    sections = (delta or {}).get("sections") or {}
+    order = [str(name) for name in (delta or {}).get("order") or []]
+    if not order:
+        order = list(base_order)
+        for name in sections:
+            if name not in order:
+                order.append(str(name))
+    out: dict[str, Any] = {}
+    for name in order:
+        rows = dict(base_rows.get(name, {}))
+        part = sections.get(name) or {}
+        for key in part.get("deleted") or []:
+            rows.pop(key, None)
+        for item in (part.get("replaced") or []) + (part.get("added") or []):
+            if isinstance(item, dict):
+                rows[_row_key(item, 0)] = item
+        row_order = [str(key) for key in (part.get("order") or [])] or list(rows)
+        ordered = [rows[key] for key in row_order if key in rows]
+        ordered.extend(rows[key] for key in rows if key not in row_order)
+        _set_nested(out, name, ordered)
+    scalars = dict(base_scalars)
+    scalars.update((delta or {}).get("scalars") or {})
+    for name, value in scalars.items():
+        _set_nested(out, str(name), value)
+    return out
+
+
+def dump_snapshot(payload: dict[str, Any], *, kind: str = SNAPSHOT_FULL, base: str = "") -> str:
+    """序列化：全量直接存正文；diff 存差异并记下它物化自哪一条（§6 / §8）。"""
+    if kind == SNAPSHOT_DELTA:
+        return json.dumps({"kind": SNAPSHOT_DELTA, "base": str(base), "body": payload}, ensure_ascii=False)
+    return json.dumps({"kind": SNAPSHOT_FULL, "body": payload}, ensure_ascii=False)
+
+
+def snapshot_kind(payload: str | None) -> tuple[str, str]:
+    """返回值形：("delta", base_id) 或 ("full", "")；老数据（没有 kind 的裸正文）当全量。"""
+    data = parse_snapshot(payload)
+    kind = str(data.get("kind") or SNAPSHOT_FULL)
+    if kind == SNAPSHOT_DELTA:
+        return SNAPSHOT_DELTA, str(data.get("base") or "")
+    return SNAPSHOT_FULL, ""
