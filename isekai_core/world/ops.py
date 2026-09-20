@@ -72,6 +72,7 @@ ASYNC_OPS = frozenset(
     {
         "event.render",
         "event.expand",
+        "runtime.propose",
         "world.package.generate",
         "world.package.revise",
         "world.package.fill",
@@ -420,6 +421,20 @@ def _day_bucket(now_real: float) -> int:
     return int(now_real // 86400)
 
 
+async def _propose_intents(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
+    """手动触发一次角色自主提案（给 CLI / 调试用；核心 tick 自己也会跑）。"""
+    if store is None:
+        raise UmpError(Err.STATE_BLOCKED, "缺少存储上下文", retryable=False)
+    instance_id = str(args.get("instance_id") or "")
+    timeline_id = str(args.get("timeline_id") or "")
+    if not instance_id or not timeline_id:
+        raise UmpError(Err.INVALID, "缺少实例或时间线", retryable=False)
+    from ..runtime.service import RuntimeService
+
+    world = RuntimeService(store, render_calls_per_day=int(cfg.runtime.render_calls_per_day))
+    return await world.propose_intents(instance_id, timeline_id, llm=llm, now_real=time.time())
+
+
 async def _render_event(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
     """把既定骨架表述成人话（§3.2）：校验不过有界重试，仍不过就退回模板，不改任何事实。"""
     from ..runtime import render as render_mod
@@ -548,6 +563,8 @@ async def dispatch_async(
             return await _render_event(cfg, llm, store, args)
         if op == "event.expand":
             return await _expand_claim(cfg, llm, store, args)
+        if op == "runtime.propose":
+            return await _propose_intents(cfg, llm, store, args)
         if op == "world.package.generate":
             package, errors, usage = await generate_package(
                 llm, str(args.get("brief") or ""), name=str(args.get("name") or "未命名世界"), **kwargs

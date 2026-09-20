@@ -144,6 +144,7 @@ async def build_runtime(
         max_active_timelines=cfg.runtime.max_active_timelines,
         catch_up_batches=cfg.runtime.catch_up_batches,
         catch_up_lag_seconds=cfg.runtime.catch_up_lag_seconds,
+        render_calls_per_day=cfg.runtime.render_calls_per_day,
     )
     service.runtime = world  # 会话层经运行层构造扮演定义
     for row in store.instance_list():
@@ -262,3 +263,11 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
             runtime.world.catch_up_all(now_real=time.time(), max_batches=4)
         except Exception:  # 推进失败不该让核心退出
             log.exception("clock tick failed")
+        # 角色自主提案：只在激活线上、按现实日预算（§11.3 / §2.8）
+        try:
+            for instance_id, timeline_id in runtime.world.active_timelines():
+                await runtime.world.propose_intents(
+                    instance_id, timeline_id, llm=runtime.llm, now_real=time.time()
+                )
+        except Exception:
+            log.exception("intent proposal pass failed")

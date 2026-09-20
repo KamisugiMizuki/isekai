@@ -55,6 +55,7 @@ OP_BY_COMMAND = {
     ("runtime", "rate"): "runtime.rate",
     ("runtime", "advance"): "runtime.advance",
     ("runtime", "card-add"): "runtime.card.add",
+    ("runtime", "propose"): "runtime.propose",
     ("runtime", "backfill"): "runtime.backfill",
     ("event", "render"): "event.render",
     ("event", "expand"): "event.expand",

@@ -14,7 +14,7 @@ from typing import Any
 
 from ..log import get_logger
 from ..store import Store
-from . import cognition, environment, events, intents, life, personality
+from . import cognition, environment, events, intents, life, personality, planning
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
 
@@ -33,6 +33,7 @@ class RuntimeService:
         max_active_timelines: int = 4,
         catch_up_batches: int = 8,
         catch_up_lag_seconds: int = 0,
+        render_calls_per_day: int = 20,
     ) -> None:
         self.store = store
         #: 倍率上限：全局统一、仅开发者可配置（§2.2），默认 2592000 世界秒 / 现实秒
@@ -43,6 +44,8 @@ class RuntimeService:
         self.catch_up_batches = max(1, int(catch_up_batches))
         #: 滞后超过该世界秒数即进入「追赶受限」（§2.6）；0 = 与目标同步才退出受限
         self.catch_up_lag_seconds = max(0, int(catch_up_lag_seconds))
+        #: 表述 / 展开 / 自主提案的现实日调用上限（§2.8 单任务预算）
+        self.render_calls_per_day = max(0, int(render_calls_per_day))
 
     # ---------- 基础读取 ----------
 
@@ -1060,6 +1063,129 @@ class RuntimeService:
             if personality.has_consumed(row, source_key):
                 self.store.unit_put(row)
         return touched
+
+    # ---------- 角色自主生成打算（§11.3，需模型） ----------
+
+    async def propose_intents(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        llm: Any,
+        now_real: float,
+    ) -> dict[str, Any]:
+        """后台替在世角色想一步：闭集校验 + 可知目标 + 预算记账，失败就当没想过。
+
+        只有在世、未竟之事未满、且距离上次提案超过一个世界日的角色才提案。
+        """
+        from ..log import get_logger
+
+        log = get_logger("isekai.runtime.planning")
+        instance, _ = self._rows(instance_id, timeline_id)
+        timeline = next(item for item in self.store.timeline_list(instance_id) if item["id"] == timeline_id)
+        if timeline["state"] != "active":
+            return {"proposed": 0, "reason": "frozen"}
+        row = self.clock_row(timeline_id)
+        watermark = int(row["processed_world"])
+        calendar = self.calendar(instance)
+        package = self.setting(instance)["world_package"]
+        known_events = self.store.event_window(instance_id, timeline_id, until=watermark, limit=400)
+        budget_bucket = int(now_real // 86400)
+        remaining = int(self.render_calls_per_day)
+        proposed: list[dict[str, Any]] = []
+        for card in self.cards(instance, timeline_id=timeline_id, world_seconds=watermark):
+            character_id = str((card.get("meta") or {}).get("card_id") or "")
+            if not character_id or events.is_dead(instance_id, timeline_id, character_id, known_events):
+                continue
+            live = [
+                item
+                for item in self.store.intent_list(instance_id, timeline_id, character_id)
+                if str(item["stage"]) in ("adopted", "waiting")
+            ]
+            if len(live) >= planning.MAX_LIVE_INTENTS:
+                continue
+            last = max((int(item["updated_world"]) for item in live), default=0)
+            if last and watermark - last < calendar.day_seconds:
+                continue  # 同一世界日内不重复提案
+            used = self.store.call_ledger_get(instance_id, timeline_id, "intent_propose", bucket=budget_bucket)
+            if used >= remaining:
+                log.info("intent proposal paused by budget line=%s used=%s", timeline_id, used)
+                break
+            snapshot = self.character_snapshot(
+                instance_id, timeline_id, character_id, world_seconds=watermark
+            )
+            allowed = planning.allowed_targets(
+                package,
+                card,
+                knowledge=snapshot["knowledge"],
+                observations=snapshot["observations"],
+            )
+            if not any(allowed.values()):
+                continue  # 没有她可知的目标可指，就不提案
+            messages = planning.prompt(
+                name=str((card.get("identity") or {}).get("name") or ""),
+                occupation=str((card.get("identity") or {}).get("occupation") or ""),
+                world_label=calendar.describe(watermark),
+                aims=snapshot["intents"],
+                knowledge=snapshot["knowledge"],
+                effects=self.store.effect_window(
+                    instance_id,
+                    timeline_id,
+                    until=watermark,
+                    targets=[character_id, str(card.get("role_id") or "")],
+                ),
+                observations=snapshot["observations"],
+                allowed=allowed,
+            )
+            try:
+                text = await llm.chat(messages, temperature=0.7, timeout=60.0)
+            except Exception:  # 模型不可用不该影响世界推进
+                log.exception("intent proposal failed character=%s", character_id)
+                self.store.call_ledger_add(
+                    instance_id, timeline_id, "intent_propose", bucket=budget_bucket, calls=1
+                )
+                continue
+            self.store.call_ledger_add(
+                instance_id, timeline_id, "intent_propose", bucket=budget_bucket, calls=1
+            )
+            decision = planning.parse(text, allowed)
+            if decision is None:
+                continue
+            fresh = self.clock_row(timeline_id)  # 提案期间世界可能已推进：按最新水位与世代提交
+            watermark = int(fresh["processed_world"])
+            ident = f"in-auto-{events.stable_key(instance_id, timeline_id, character_id, watermark)[:10]}"
+            applied = self.store.apply_runtime_batch(
+                timeline_id=timeline_id,
+                generation=int(fresh["generation"]),
+                processed_world=watermark,
+                catching_up=False,
+                intents=[
+                    {
+                        "id": ident,
+                        "instance_id": instance_id,
+                        "timeline_id": timeline_id,
+                        "character_id": character_id,
+                        "object": decision["object"],
+                        "basis": decision["basis"],
+                        "strength": decision["strength"],
+                        "window_from": watermark,
+                        "window_to": watermark + 7 * calendar.day_seconds,
+                        "preconditions": "[]",
+                        "effect": json.dumps(decision["effect"], ensure_ascii=False),
+                        "stage": "adopted",
+                        "note": "",
+                        "source_world": watermark,
+                        "updated_world": watermark,
+                    }
+                ],
+            )
+            if not applied:
+                log.info("intent proposal discarded (stale batch) character=%s", character_id)
+                continue
+            proposed.append({"character": character_id, "intent": ident, **decision})
+            if len(proposed) >= 8:
+                break
+        return {"proposed": len(proposed), "items": proposed, "budget": {"calls": self.store.call_ledger_get(instance_id, timeline_id, "intent_propose", bucket=budget_bucket), "limit": remaining}}
 
     # ---------- 补卡（角色集合扩充） ----------
 
