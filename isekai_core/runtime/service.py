@@ -1604,13 +1604,14 @@ class RuntimeService:
         raise RuntimeStateError(f"实例兼容性阻断，不能推进：{note or status}")
 
     def activate(
-        self, instance_id: str, timeline_id: str, *, now_real: float, rate: int | None = None
+        self, instance_id: str, timeline_id: str, *, now_real: float | None = None, rate: int | None = None
     ) -> dict[str, Any]:
         """激活：以当前现实时间重新锚定，不补算冻结期间的间隔（§2.4、§2.6）。
 
         倍率超过当前上限（上限被调低 / 导入端上限更低）时不静默改写：保持冻结，
         要求调用方在激活操作中确认一个合法倍率（§2.4）。
         """
+        now_real = time.time() if now_real is None else float(now_real)
         self._require_compatible(instance_id)
         instance, timeline = self._rows(instance_id, timeline_id)
         if timeline["state"] == "active":
@@ -1649,8 +1650,12 @@ class RuntimeService:
         _ = instance
         return result
 
-    def freeze(self, instance_id: str, timeline_id: str, *, now_real: float) -> dict[str, Any]:
-        """冻结：结算已生效倍率段、取消未生效请求；冻结线不推进也不接受倍率调整。"""
+    def freeze(self, instance_id: str, timeline_id: str, *, now_real: float | None = None) -> dict[str, Any]:
+        """冻结：结算已生效倍率段、取消未生效请求；冻结线不推进也不接受倍率调整。
+
+        `now_real` 省略时取当前现实时间——归档 / 管理面这类调用方不该被迫自己算时基。
+        """
+        now_real = time.time() if now_real is None else float(now_real)
         row = self.clock_row(timeline_id)
         state, consumed = self._settle_due(timeline_id, row, now_real)
         self.store.rate_apply(consumed)
