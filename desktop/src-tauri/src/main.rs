@@ -3,6 +3,7 @@
 
 #![windows_subsystem = "windows"]
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
@@ -44,6 +45,8 @@ struct AppState {
     exit_ready: Mutex<Option<(String, bool)>>,
     //: 退出序列只跑一次
     quitting: AtomicBool,
+    //: 退出请求已发出：界面靠轮询取走（隐藏到托盘时壳叫不动页面）
+    exit_requested: AtomicBool,
 }
 
 fn log_line(root: &Path, message: &str) {
@@ -194,6 +197,40 @@ fn core_status(state: State<AppState>) -> CoreStatus {
     state.status.lock().unwrap().clone()
 }
 
+/// 界面轮询用：壳是否已请求退出（隐藏到托盘时壳发不出事件，只能让界面来取）。
+#[tauri::command]
+fn exit_pending(state: State<AppState>) -> bool {
+    state.exit_requested.load(Ordering::SeqCst)
+}
+
+/// 壳自己的设置文件（不动核心的 config.yaml）：目前只有「内建聊天开关」这类壳侧偏好。
+fn shell_settings_path(root: &Path) -> PathBuf {
+    root.join("config").join("shell.json")
+}
+
+#[tauri::command]
+fn shell_settings(state: State<AppState>) -> serde_json::Value {
+    fs::read_to_string(shell_settings_path(&state.root))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+#[tauri::command]
+fn shell_setting_set(state: State<AppState>, key: String, value: serde_json::Value) -> Result<(), String> {
+    let path = shell_settings_path(&state.root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("壳设置目录不可写：{error}"))?;
+    }
+    let mut map: serde_json::Map<String, serde_json::Value> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    map.insert(key, value);
+    let text = serde_json::to_string_pretty(&map).map_err(|error| format!("壳设置序列化失败：{error}"))?;
+    fs::write(&path, text).map_err(|error| format!("壳设置写入失败：{error}"))
+}
+
 #[tauri::command]
 fn core_restart(app: tauri::AppHandle, state: State<AppState>) -> Result<(), String> {
     kill_core(&state);
@@ -224,9 +261,84 @@ fn open_dir(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 原生文件对话框（恢复备份选文件）：用系统自带 PowerShell 的 OpenFileDialog。
+/// 本地配置里的只读设置事实（DESKTOP_SPEC §3.3 记忆向量化 / 提交 / 世界·会话 组）：
+/// 核心 settings 契约只有 llm + core 两段，这几个键由壳读本地配置文件展示可读值；
+/// 凭据只回「是否已配置」，明文不进渲染层（§二.6）。写入仍只走核心契约。
+#[derive(Clone, Default, Serialize)]
+struct ConfigFacts {
+    config_file: String,
+    mtime: f64,
+    packages_dir: String,
+    memory_model: String,
+    memory_base_url: String,
+    memory_key_set: bool,
+    commit_enabled: Option<bool>,
+    commit_minutes: Option<f64>,
+    commit_events: Option<f64>,
+    max_active_timelines: Option<f64>,
+    rate_max: Option<f64>,
+    render_calls_per_day: Option<f64>,
+}
+
+// ponytail: 逐行取首个 `key: value`，对本仓库的扁平 config.yaml 够用；
+// 配置改成嵌套同名键或多文档时换 yaml crate。
 #[tauri::command]
-fn pick_backup_file(dir: Option<String>) -> Result<Option<String>, String> {
+fn config_facts(state: State<AppState>) -> ConfigFacts {
+    let path = state.root.join("config").join("config.yaml");
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let mut facts = ConfigFacts {
+        config_file: path.to_string_lossy().to_string(),
+        packages_dir: state.root.join("packages").to_string_lossy().to_string(),
+        mtime: fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_secs_f64())
+            .unwrap_or(0.0),
+        ..Default::default()
+    };
+    let mut values: HashMap<String, String> = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let key = key.trim().trim_start_matches("- ").to_string();
+        let value = value
+            .split(" #")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        values.entry(key).or_insert(value);
+    }
+    let get = |key: &str| values.get(key).cloned().unwrap_or_default();
+    facts.memory_model = get("memory_embedding_model");
+    facts.memory_base_url = get("memory_embedding_base_url");
+    facts.memory_key_set = !get("memory_embedding_api_key").is_empty();
+    facts.commit_enabled = get("autocommit_enabled").parse::<bool>().ok();
+    facts.commit_minutes = get("autocommit_minutes").parse::<f64>().ok();
+    facts.commit_events = get("autocommit_events").parse::<f64>().ok();
+    facts.max_active_timelines = get("max_active_timelines").parse::<f64>().ok();
+    facts.rate_max = get("rate_max").parse::<f64>().ok();
+    facts.render_calls_per_day = get("render_calls_per_day").parse::<f64>().ok();
+    facts
+}
+
+/// 原生文件对话框（恢复备份选文件）：用系统自带 PowerShell 的 OpenFileDialog。
+/// 对话框会一直阻塞到用户选择（或挂起不选）：跑在阻塞线程池上，壳主线程保持可用，
+/// 托盘退出 / 关窗不会被它挂住（DESKTOP_SPEC §3.2）。
+#[tauri::command]
+async fn pick_backup_file(dir: Option<String>) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || pick_backup_file_blocking(dir))
+        .await
+        .map_err(|error| format!("文件对话框任务失败：{error}"))?
+}
+
+fn pick_backup_file_blocking(dir: Option<String>) -> Result<Option<String>, String> {
     let script = concat!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
         "Add-Type -AssemblyName System.Windows.Forms;",
@@ -284,8 +396,10 @@ fn begin_quit(app: &tauri::AppHandle) {
         return; // 退出序列只跑一次
     }
     log_line(&state.root, "exit requested: 先保存再停进程");
-    let _ = app.emit("exit-request", ());
-
+    // 隐藏到托盘后壳叫不动页面：tauri emit / eval / show 全部报 “failed to send message to the webview”，
+    // 而页面自己的定时器与 invoke 照常（2026-09 实测）。所以退出请求放在标志位上，
+    // 由界面轮询 exit_pending 取走，再回显式的「退出前保存」结果（§五：先保存再停进程）。
+    state.exit_requested.store(true, Ordering::SeqCst);
     let deadline = Instant::now() + Duration::from_millis(FLUSH_WAIT_MS);
     let mut confirmed: Option<(String, bool)> = None;
     while Instant::now() < deadline {
@@ -327,15 +441,29 @@ fn main() {
         child: Mutex::new(None),
         exit_ready: Mutex::new(None),
         quitting: AtomicBool::new(false),
+        exit_requested: AtomicBool::new(false),
     };
 
     tauri::Builder::default()
+        // 单实例插件必须最先注册（§二.1）：第二次启动只唤起已有窗口，
+        // 不再起第二个壳、第二个核心（写库进程）
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             core_status,
+            exit_pending,
+            shell_settings,
+            shell_setting_set,
             core_restart,
             log_dir,
             open_dir,
+            config_facts,
             pick_backup_file,
             exit_ready,
             quit_app

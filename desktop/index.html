@@ -11,6 +11,8 @@
         <div class="brand">isekai</div>
         <div class="section-title">会话</div>
         <ul id="sessions"></ul>
+        <div class="section-title">世界 / 时间线</div>
+        <ul id="timelines"></ul>
         <div class="spacer"></div>
         <nav>
           <button class="nav active" data-pane="chat">聊天</button>
@@ -23,6 +25,7 @@
         <header id="topbar">
           <div id="title">未连接</div>
           <div class="row">
+            <div id="degrade" class="chip small hidden"></div>
             <button id="restart" class="hidden">重启核心</button>
             <div id="status" class="chip pending">启动中…</div>
           </div>
@@ -34,6 +37,7 @@
             <span id="history-note" class="muted"></span>
           </div>
           <ol id="messages" aria-live="polite"></ol>
+          <div id="composer-note" class="muted"></div>
           <form id="composer">
             <textarea id="input" rows="1" placeholder="Enter 发送，Shift+Enter 换行"></textarea>
             <button type="submit" id="send">发送</button>
@@ -50,7 +54,7 @@
 
           <h3>世界包</h3>
           <div class="row">
-            <select id="pkg-select"></select>
+            <select id="pkg-select" aria-label="世界包"></select>
             <button id="pkg-check">校验</button>
             <input id="pkg-file" placeholder="文件名，如 greytide.json" />
             <button id="pkg-template">新建骨架</button>
@@ -64,7 +68,7 @@
 
           <h3>角色卡</h3>
           <div class="row">
-            <select id="card-select"></select>
+            <select id="card-select" aria-label="角色卡"></select>
             <button id="card-confirm">确认卡片</button>
             <input id="card-file" placeholder="文件名，如 tihe.card.json" />
             <button id="card-template">新建骨架</button>
@@ -76,7 +80,7 @@
           </div>
           <pre id="card-errors" class="muted"></pre>
           <div class="row">
-            <select id="card-add-timeline"></select>
+            <select id="card-add-timeline" aria-label="补卡的目标时间线"></select>
             <input id="card-add-note" placeholder="加入说明（可留空，如：从北岸调来）" />
             <button id="card-add">补卡：补入上面的实例 / 时间线</button>
           </div>
@@ -85,7 +89,7 @@
 
           <h3>草稿（未完成的创作）</h3>
           <div class="row">
-            <select id="draft-select"></select>
+            <select id="draft-select" aria-label="草稿"></select>
             <button id="draft-continue">继续编辑</button>
             <button id="draft-discard">丢弃草稿</button>
             <span id="draft-note" class="muted"></span>
@@ -93,20 +97,20 @@
 
           <h3>世界实例</h3>
           <div class="row">
-            <select id="inst-select"></select>
+            <select id="inst-select" aria-label="世界实例"></select>
             <input id="inst-rename-input" placeholder="新名称" />
             <button id="inst-rename-btn">重命名</button>
             <button id="inst-export">导出</button>
             <button id="inst-delete">删除</button>
           </div>
           <div class="row">
-            <select id="inst-package-select"></select>
-            <select id="inst-cards-select" multiple size="3"></select>
+            <select id="inst-package-select" aria-label="创建实例用的世界包"></select>
+            <select id="inst-cards-select" aria-label="创建实例用的角色卡" multiple size="3"></select>
             <input id="inst-name-input" placeholder="实例显示名（可留空）" />
             <button id="inst-create">创建实例</button>
           </div>
           <div class="row">
-            <select id="import-select"></select>
+            <select id="import-select" aria-label="导出件（导入为实例）"></select>
             <button id="inst-import">导入为实例</button>
           </div>
 
@@ -123,12 +127,12 @@
           </div>
           <h3>多角色与披露（阶段 5）</h3>
           <div class="row">
-            <select id="role-select"></select>
+            <select id="role-select" aria-label="会话角色"></select>
             <button id="role-switch">切换会话角色</button>
             <span id="role-note" class="muted"></span>
           </div>
           <div class="row">
-            <select id="disclose-to"></select>
+            <select id="disclose-to" aria-label="披露的接收角色"></select>
             <button id="disclose-confirm">披露选中的片段</button>
             <button id="disclose-cancel" class="hidden">取消选择</button>
             <span id="disclose-note" class="muted">在聊天里点角色消息上的「披露」选定片段</span>
@@ -142,12 +146,14 @@
         <section id="pane-settings" class="pane hidden">
           <h2>设置</h2>
           <p class="muted">凭据只保存在本机配置文件，读取时打码；写入立即生效，不进入日志与导出件。</p>
+
+          <h3>生成模型</h3>
           <form id="settings-form">
             <label>服务地址<input id="set-base-url" autocomplete="off" /></label>
             <label>模型<input id="set-model" autocomplete="off" /></label>
             <label>API Key<input id="set-api-key" type="password" autocomplete="off" placeholder="留空表示不修改" /></label>
             <label>超时（秒）<input id="set-timeout" type="number" min="1" step="1" /></label>
-            <label>输出上限（token）<input id="set-max-tokens" type="number" min="1" step="128" /></label>
+            <label>输出上限（token）<input id="set-max-tokens" type="number" min="1" step="1" /></label>
             <label>温度<input id="set-temperature" type="number" min="0" max="2" step="0.1" /></label>
             <div class="row">
               <button type="submit">保存</button>
@@ -156,6 +162,29 @@
             </div>
           </form>
           <dl id="settings-facts" class="facts"></dl>
+
+          <h3>记忆向量化（语义召回）</h3>
+          <dl id="mem-facts" class="facts"></dl>
+          <p class="muted">用于远程语义召回的地址 / 模型 / Key 由核心运行时配置管理；这里只读、读取打码，缺任一项即按全文召回降级。</p>
+
+          <h3>提交（自动提交）</h3>
+          <dl id="commit-facts" class="facts"></dl>
+          <p class="muted">自动提交按现实间隔或新增事件条数触发；关闭不影响状态日常持久化。当前为只读（核心运行时配置）。</p>
+
+          <h3>世界 / 会话</h3>
+          <dl id="worldset-facts" class="facts"></dl>
+          <p class="muted">世界包目录、激活数量上限与主动每日额度由核心运行时配置控制（只读）；倍率上限仅开发者可配置。此处显示本地配置文件里的可读值，不在界面改写。</p>
+
+          <h3>用量</h3>
+          <dl id="usage-facts" class="facts"></dl>
+          <p class="muted">生成与回填在开始前给出调用预估与上限；这里显示当前实例今日已记录的调用次数与 token 量级，不猜价格、不做费用面板。</p>
+
+          <h3>内建聊天</h3>
+          <div class="row">
+            <label><input id="set-chat-enabled" type="checkbox" checked /> 启用内建聊天通道</label>
+            <span id="chat-note" class="muted"></span>
+          </div>
+          <p class="muted">停用内建聊天后，壳不再登记 / 连接 builtin 聊天通道（不连 UMP、不提交对话），管理面、备份与设置照常可用；开关状态保存在本机。</p>
 
           <h3>备份</h3>
           <dl id="backup-facts" class="facts"></dl>

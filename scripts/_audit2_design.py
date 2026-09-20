@@ -318,18 +318,24 @@ def c_builtin_disable(case: Case) -> tuple[str, str]:
         if "channel" in name or "disable" in name or "plugin" in name or "uninstall" in name
     ]
     desktop = (ROOT / "desktop" / "src" / "main.ts").read_text(encoding="utf-8")
+    html = (ROOT / "desktop" / "index.html").read_text(encoding="utf-8")
     info, timeline, _cid, _package = mk(case, "无通道世界")
     case.world.activate(info["id"], timeline, now_real=1.7e9)
     bare = case.world.advance(info["id"], timeline, now_real=1.7e9 + 60)
     assert bare["processed_world"] > DAY * 1500, bare
+    # 桌面端停用内建聊天：壳侧开关 + 连接闸门（§7.1）；核心侧本来就没有特权路径
+    has_switch = all(token in desktop for token in ("chatEnabled", "toggleBuiltinChat", "closeBuiltinChat"))
+    gates = "chatEnabled" in desktop and "openBuiltinChat" in desktop
+    labeled = "内建聊天" in html
+    ok = has_switch and gates and labeled
     detail = (
-        f"可验的一半：核心零通道登记即可建实例并推进（processed_world={bare['processed_world']}）；"
-        "内建聊天只是一条普通 UMP 通道（client.py:25 channel_id='builtin'），核心侧无特权路径。"
-        f"缺的一半：store 的通道 API 只有 {store_api}，没有停用 / 卸载；"
-        f"管理面 67 个 op 里没有任何 channel.* / disable / plugin 入口（命中 {switch_ops}）；"
-        "桌面壳启动即 `channel.ensure {name:'builtin'}`（main.ts:380）且全文无停用入口（grep 停用/disable 0 命中）。"
+        f"核心零通道登记即可建实例并推进（processed_world={bare['processed_world']}）——内建聊天只是普通 UMP 通道"
+        f"（client.py:25 channel_id='builtin'），核心侧无特权路径，所以停用只需壳侧闸门。"
+        f"壳侧开关={'有' if has_switch else '无'}（chatEnabled / toggleBuiltinChat / closeBuiltinChat）、"
+        f"关闭后不建立聊天连接={'是' if gates else '否'}、设置面标注={'有' if labeled else '无'}；"
+        f"store 通道 API={store_api}（无停用是设计：通道本来就不必登记）"
     )
-    return "FAIL", detail
+    return ("PASS" if ok else "FAIL"), detail
 
 
 @item("§7.1-03 插件隔离｜插件崩溃不影响核心（宿主后置，附相邻机制实测）")

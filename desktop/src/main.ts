@@ -45,6 +45,35 @@ interface Message {
   time: number;
 }
 
+/// 会话行（session 表）：一个角色一条；切换会话 = 换一份历史，不迁移内容（DESKTOP_SPEC §3.1）
+interface SessionRow {
+  id: string;
+  instance_id: string;
+  timeline_id: string;
+  character_id: string;
+}
+
+/// 阶段 0 的占位三元组：老数据与老入口还在用，启动时保证它存在，但聊天面走真实会话
+const STAGE0 = { instance_id: "ph-instance", timeline_id: "main", character_id: "ph-character" };
+
+/// 本地配置文件里的只读事实（§3.3 记忆语义召回 / 提交 / 世界·会话 组）：
+/// 核心 settings 契约只有 llm + core 两段，这几个键由壳读本地配置展示可读值；
+/// 凭据只回「是否已配置」，明文不进渲染层（§二.6）。
+interface LocalFacts {
+  config_file: string;
+  mtime: number;
+  packages_dir: string;
+  memory_model: string;
+  memory_base_url: string;
+  memory_key_set: boolean;
+  commit_enabled: boolean | null;
+  commit_minutes: number | null;
+  commit_events: number | null;
+  max_active_timelines: number | null;
+  rate_max: number | null;
+  render_calls_per_day: number | null;
+}
+
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
 const state = {
@@ -53,6 +82,15 @@ const state = {
   token: "",
   sessionId: "",
   characterId: "",
+  //: 当前聊天会话所属实例 / 时间线：顶栏与历史读同一份事实，不留上一次的实例（§3.1）
+  instanceId: "",
+  timelineId: "",
+  sessions: [] as SessionRow[],
+  //: 恢复后全部世界线冻结：先在管理面激活再对话（§五 / §十.20）
+  needActivate: false,
+  //: 当前实例的线还没激活：聊天先落在内建初始会话上，界面要说清楚（§3.1 冻结线提示需激活）
+  idleLine: false,
+  facts: null as LocalFacts | null,
   endpoint: "",
   credential: null as string | null,
   bootstrap: null as string | null,
@@ -93,9 +131,58 @@ function setStatus(text: string, kind: "pending" | "ok" | "bad"): void {
   chip.className = `chip ${kind}`;
 }
 
+/// 核心状态 → 状态条文案（DESKTOP_SPEC §2.8 / §5.7：非 ready 也要给可执行提示，不能都变成「未就绪」）
+function coreStatusText(state: string, error?: string | null): { text: string; kind: "pending" | "ok" | "bad" } {
+  if (state === "ready") return { text: "已就绪", kind: "ok" };
+  if (state === "persistence_blocked") {
+    return { text: `存储不可用：${error ?? ""}${logHint()}`, kind: "bad" };
+  }
+  if (state === "compatibility_blocked") {
+    // 兼容性阻断：核心整体只读，管理面仍可用（导出 / 按兼容版本处理后重启），不接受新对话
+    return {
+      text: `兼容性阻断：有实例与当前规则 / 数据格式不兼容，核心整体只读；管理面仍可用（导出或按提示处理后「重启核心」）${error ? `：${error}` : ""}`,
+      kind: "bad",
+    };
+  }
+  if (state === "catching_up") return { text: `某条线追赶中：${error ?? ""}`, kind: "pending" };
+  if (state === "starting") return { text: "启动中…（等待核心就绪握手）", kind: "pending" };
+  return { text: `核心未就绪：${error ?? state}${logHint()}`, kind: "bad" };
+}
+
+/// 核心是否处于可接受新对话的 ready 态（非 ready 一律不提交，§2.2）
+function coreReady(): boolean {
+  return (shellStatus?.state ?? "starting") === "ready";
+}
+
+function isStage0(row: { instance_id?: string }): boolean {
+  return String(row.instance_id ?? "") === STAGE0.instance_id;
+}
+
+function timelineName(timelineId: string): string {
+  return world.timelines.find((item) => item.id === timelineId)?.name ?? timelineId;
+}
+
+function sessionLabel(row: SessionRow): string {
+  if (isStage0(row)) return "初始会话（阶段 0）";
+  return `${currentCharacterName(row.character_id)} · ${timelineName(row.timeline_id)}`;
+}
+
+/// 顶栏 = 当前上下文（实例 / 角色 / 时间线），名称以核心返回的为准（§3.1）；
+/// 内建初始会话不在实例表里时，给当前查看的实例并标明聊天落在哪个会话。
+function sessionTitle(): string {
+  if (!state.sessionId) return "未选择会话";
+  const instance = world.instances.find((item) => item.id === state.instanceId);
+  if (instance) {
+    return `${instance.name}（${instance.id}）· ${currentCharacterName(state.characterId)} · ${timelineName(state.timelineId)}`;
+  }
+  const viewing = world.instances.find((item) => item.id === world.instanceId);
+  return viewing
+    ? `${viewing.name}（${viewing.id}）· 聊天：初始会话（阶段 0）`
+    : "初始会话（阶段 0）";
+}
+
 function renderTopbar(): void {
-  const session = state.sessionId ? state.sessionId : "未连接";
-  $("title").textContent = shellStatus?.state === "ready" ? `占位会话 · ${session}` : "未连接";
+  $("title").textContent = shellStatus?.state === "ready" ? sessionTitle() : "未连接";
 }
 
 function roleLabel(role: string): string {
@@ -285,7 +372,7 @@ async function openChannel(endpoint: string, opts: { credential?: string | null;
 }
 
 function onChannelClosed(): void {
-  if (state.phase !== "ready") return;
+  if (state.phase !== "ready" || !chatEnabled()) return;
   state.phase = "starting";
   setStatus("连接已断开，正在重连…", "pending");
   void scheduleReconnect();
@@ -336,16 +423,91 @@ async function restartCore(): Promise<void> {
     return;
   }
   const status = await waitForCore();
-  if (status.state !== "ready") {
-    setStatus(`核心未就绪：${status.error ?? status.state}${logHint()}`, "bad");
+  const info = coreStatusText(status.state, status.error);
+  if (status.state === "ready" || status.state === "compatibility_blocked") {
+    // 兼容性阻断也连管理面：核心只读但管理入口保留（§5.7）
+    try {
+      await connectChat(status);
+    } catch (error) {
+      setStatus(`${info.text}（管理面未连上：${error}）`, info.kind);
+      showRestart();
+    }
+  } else {
+    setStatus(info.text, info.kind);
     showRestart();
+  }
+}
+
+/// 内建聊天开关（DESKTOP_SPEC §一 / CHANNEL_PLUGIN_SPEC）：可以停用内建聊天但保留管理面。
+/// 状态存在壳自己的设置文件里（壳侧偏好，不动核心配置）；停用后不 channel.ensure、不连 UMP、也不提交对话。
+const CHAT_FLAG = "chat_enabled";
+let chatOn = true;
+
+function chatEnabled(): boolean {
+  return chatOn;
+}
+
+/// 读壳自己的设置（非 Tauri 环境按默认值走，不影响连接与聊天）
+async function loadShellSettings(): Promise<void> {
+  try {
+    const settings = await invoke<Record<string, unknown>>("shell_settings");
+    chatOn = settings[CHAT_FLAG] !== false;
+  } catch (error) {
+    console.warn(`壳设置读取失败：${error}`);
+    chatOn = true;
+  }
+}
+
+async function setChatEnabled(enabled: boolean): Promise<void> {
+  chatOn = enabled;
+  try {
+    await invoke("shell_setting_set", { key: CHAT_FLAG, value: enabled });
+  } catch (error) {
+    $("chat-note").textContent = `壳设置写入失败：${error}`;
+  }
+}
+
+/// 停用内建聊天：断开通道连接并作废绑定令牌（管理面不动）
+function closeBuiltinChat(note = ""): void {
+  ump?.close();
+  ump = null;
+  state.token = "";
+  $("chat-note").textContent = note || "已停用：不登记 / 不连接聊天通道，管理面保留";
+  renderComposeGate();
+}
+
+/// 启用内建聊天：登记通道 → 绑定 thread → 连 UMP → 补读历史
+async function openBuiltinChat(): Promise<boolean> {
+  if (!mgmt) return false;
+  const issued = await mgmt.call("channel.ensure", { name: "builtin", version: "0.1.0" });
+  let credential = (issued.credential as string | null) ?? localStorage.getItem("isekai.credential");
+  if (!credential) {
+    credential = (await mgmt.call("channel.ensure", { name: "builtin", rotate: true })).credential as string;
+  }
+  localStorage.setItem("isekai.credential", credential);
+  state.credential = credential;
+  $("chat-note").textContent = "已启用：对话走内建通道（builtin）";
+  return openChat();
+}
+
+async function toggleBuiltinChat(enabled: boolean): Promise<void> {
+  await setChatEnabled(enabled);
+  if (!enabled) {
+    closeBuiltinChat();
+    setStatus("已就绪（内建聊天已停用：管理面仍可用）", "ok");
+    return;
+  }
+  if (!mgmt || !coreReady()) {
+    $("chat-note").textContent = "已记录启用：核心就绪后连上内建通道";
+    renderComposeGate();
     return;
   }
   try {
-    await connectChat(status);
+    const opened = await openBuiltinChat();
+    renderComposeGate();
+    setStatus(opened ? "已就绪" : "已就绪（还没有世界实例：先在管理面创建）", "ok");
   } catch (error) {
-    setStatus(`连接失败：${error}${logHint()}`, "bad");
-    showRestart();
+    $("chat-note").textContent = `启用失败：${error}`;
   }
 }
 
@@ -361,50 +523,31 @@ async function connectChat(status: CoreStatus): Promise<void> {
   state.bootstrap = status.bootstrap ?? null;
 
   const overview = await mgmt.call("status");
-  const placeholder = overview.placeholder as Record<string, string>;
-  const sessions = (overview.sessions as Array<Record<string, string>>) ?? [];
-  let session = sessions.find(
-    (item) =>
-      item.instance_id === placeholder.instance_id &&
-      item.timeline_id === placeholder.timeline_id &&
-      item.character_id === placeholder.character_id,
-  );
-  if (!session) {
-    session = ((await mgmt.call("session.ensure", placeholder)).session ?? {}) as Record<string, string>;
-  }
-  state.sessionId = String(session.id ?? "");
-  state.characterId = String(session.character_id ?? "");
-  world.characterId = state.characterId || world.characterId;
-  renderSessionList(session);
+  //: 阶段 0 的占位会话继续存在（老数据 / 老入口还在用），也是「线还没激活」时的内建会话
+  await mgmt.call("session.ensure", STAGE0);
 
-  const issued = await mgmt.call("channel.ensure", { name: "builtin", version: "0.1.0" });
-  let credential = (issued.credential as string | null) ?? localStorage.getItem("isekai.credential");
-  if (!credential) {
-    const rotated = await mgmt.call("channel.ensure", { name: "builtin", rotate: true });
-    credential = rotated.credential as string;
+  await loadWorld(); // 世界数据 + 当前实例详情：顶栏 / 侧栏 / 管理面都靠它
+  let opened = false;
+  if (chatEnabled()) {
+    opened = await openBuiltinChat(); // 登记通道 + 绑定 + 连 UMP + 补读历史
+  } else {
+    // 停用内建聊天：只接管理面（世界数据、会话列表与备份照常可读），不建聊天通道连接
+    ump?.close();
+    ump = null;
+    state.token = "";
+    closeBuiltinChat("已停用：不登记 / 不连接聊天通道，管理面保留");
+    await loadSessions();
   }
-  localStorage.setItem("isekai.credential", credential);
-  state.credential = credential;
-
-  state.token = "";
-  await openChannel(status.endpoint, { credential, bootstrap: status.bootstrap ?? null });
-  if (!state.token) {
-    // 该通道尚无此 thread 的绑定：由受信管理面创建（阶段 0 的占位会话）
-    const thread = ((await mgmt.call("thread.bind", {
-      channel: "builtin",
-      thread_id: state.threadId,
-      session_id: state.sessionId,
-    })).thread ?? {}) as Record<string, unknown>;
-    state.token = String(thread.binding_token ?? "");
-  }
-
-  await loadHistory();
   state.phase = "ready";
   reconnectAttempt = 0;
   reconnectToken += 1;
   renderTopbar();
-  hideRestart();
-  setStatus("已就绪", "ok");
+  const info = coreStatusText(status.state, status.error);
+  if (info.kind === "ok") hideRestart();
+  else showRestart(); // 阻断态仍要留恢复入口（§5.7 / §2.9）
+  const suffix = chatEnabled() && !opened ? "（还没有世界实例：先在管理面创建）" : "";
+  setStatus(`${info.text}${suffix}`, info.kind);
+  renderComposeGate();
   renderManagePane(overview);
 }
 
@@ -453,13 +596,208 @@ async function loadMoreHistory(): Promise<void> {
   }
 }
 
-function renderSessionList(session: Record<string, unknown>): void {
+/// 侧栏会话组：当前实例的会话（一个角色一条）+ 正在用的那条（含阶段 0 老会话）；点一条就换会话
+function renderSessionList(): void {
   const list = $("sessions");
   list.innerHTML = "";
-  const item = document.createElement("li");
-  item.textContent = `${session.instance_id} / ${session.timeline_id} / ${session.character_id}`;
-  item.title = `阶段 0 占位会话（${session.id}）`;
-  list.appendChild(item);
+  const shown = state.sessions.filter(
+    (row) => row.instance_id === world.instanceId || row.id === state.sessionId,
+  );
+  if (!shown.length) {
+    const empty = document.createElement("li");
+    empty.className = "muted";
+    empty.textContent = "还没有会话";
+    list.appendChild(empty);
+  }
+  for (const row of shown) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `session${row.id === state.sessionId ? " active" : ""}`;
+    button.textContent = sessionLabel(row);
+    button.title = `${sessionLabel(row)}（${row.id}）`;
+    button.addEventListener("click", () => void switchSession(row));
+    item.appendChild(button);
+    list.appendChild(item);
+  }
+}
+
+/// 侧栏世界组：当前实例的时间线与公开状态（不做世界内容浏览，§一）
+function renderTimelines(): void {
+  const list = $("timelines");
+  list.innerHTML = "";
+  if (!world.timelines.length) {
+    const empty = document.createElement("li");
+    empty.className = "muted";
+    empty.textContent = world.instanceId ? "没有时间线" : "先选一个实例";
+    list.appendChild(empty);
+    return;
+  }
+  for (const line of world.timelines) {
+    const item = document.createElement("li");
+    item.textContent = `${line.name}（${line.state === "frozen" ? "冻结" : "激活"}）`;
+    list.appendChild(item);
+  }
+}
+
+/* ---------- 会话：选会话 / 换会话（§3.1 切换角色、世界、时间线就是选择另一会话，不迁移历史） ---------- */
+
+/// 会话列表（含阶段 0 老会话）：侧栏与顶栏都读这一份真值
+async function loadSessions(): Promise<void> {
+  if (!mgmt) return;
+  try {
+    const listed = await mgmt.call("session.list");
+    state.sessions = ((listed.sessions ?? []) as unknown as SessionRow[]).slice();
+  } catch (error) {
+    console.warn(`会话列表读取失败：${error}`);
+  }
+  renderSessionList();
+}
+
+/// 该会话最后一条消息的序号（没有消息 = -1）；序号是全局自增，可跨会话比较新旧
+async function tailSeq(row: SessionRow): Promise<number> {
+  if (!mgmt) return -1;
+  try {
+    const page = await mgmt.call("history.page", { session_id: row.id, limit: 1 });
+    const rows = (page.messages ?? []) as HistoryRow[];
+    return rows.length ? Number(rows[rows.length - 1].seq) : -1;
+  } catch {
+    return -1;
+  }
+}
+
+/// 默认会话：当前查看实例的第一个角色 / 时间线——一句往来都没有时从这里开始
+async function defaultSession(): Promise<SessionRow | null> {
+  const instance = world.instances[0];
+  if (!mgmt || !instance) return null;
+  const loaded = await loadInstanceDetail(instance.id);
+  const timeline = loaded?.timelines[0]?.id ?? "";
+  const character = world.characters[0]?.card_id ?? "";
+  if (!timeline || !character) return null;
+  const ensured = await mgmt.call("session.ensure", {
+    instance_id: instance.id,
+    timeline_id: timeline,
+    character_id: character,
+  });
+  return (ensured.session ?? null) as unknown as SessionRow | null;
+}
+
+/// 切换会话：换一份历史，不迁移内容；顶栏 / 侧栏 / 聊天历史跟着同一条事实更新
+async function switchSession(row: SessionRow, connect = false): Promise<void> {
+  if (!mgmt) return;
+  if (!chatEnabled()) {
+    // 内建聊天已停用：不绑定 thread、不连 UMP（管理面仍可用）
+    closeBuiltinChat("已停用：不建立聊天通道连接；要换会话先在设置面启用内建聊天");
+    return;
+  }
+  // 先按选中的会话把顶栏 / 侧栏 / 角色刷成目标值（切换立即生效），再异步绑定与补读
+  state.sessionId = row.id;
+  state.instanceId = row.instance_id;
+  state.timelineId = row.timeline_id;
+  state.characterId = row.character_id;
+  renderTopbar();
+  renderSessionList();
+  const thread = ((await mgmt.call("thread.bind", {
+    channel: "builtin",
+    thread_id: state.threadId,
+    session_id: row.id,
+  })).thread ?? {}) as Record<string, unknown>;
+  state.token = String(thread.binding_token ?? "");
+  if (!isStage0(row)) {
+    state.idleLine = false; // 用户明确切到了世界会话：不再提示「当前线未激活」
+    renderComposeGate();
+    const loaded = await loadInstanceDetail(row.instance_id);
+    world.timeline = row.timeline_id; // 会话所在的那条线，不是实例的第一条线
+    world.characterId = row.character_id;
+    if (loaded) {
+      renderRoleControls();
+      renderTimelines();
+      await refreshClock(row.instance_id, row.timeline_id);
+    }
+  }
+  renderTopbar();
+  if ((connect || !ump) && state.endpoint) {
+    // 没有连接（首次进入 / 恢复后重来）时才建通道：换会话本身不重连，免得平白换代令牌
+    await openChannel(state.endpoint, { credential: state.credential, bootstrap: state.bootstrap });
+  }
+  await loadHistory();
+  await loadSessions();
+  renderTopbar();
+  hideRestart();
+}
+
+/// 回到最近有往来的会话；一句往来都没有时用默认会话（best<0 表示没有任何往来）
+async function pickSessionRow(): Promise<{ target: SessionRow | null; fallback: SessionRow | null; best: number }> {
+  if (!mgmt) return { target: null, fallback: null, best: -1 };
+  const fallback = await defaultSession();
+  await loadSessions();
+  let target = fallback;
+  let best = fallback ? await tailSeq(fallback) : -1;
+  for (const row of state.sessions) {
+    if (fallback && row.id === fallback.id) continue;
+    const seq = await tailSeq(row);
+    if (seq > best) {
+      best = seq;
+      target = row;
+    }
+  }
+  return { target, fallback, best };
+}
+
+/// 打开聊天面：回到最近有往来的会话（阶段 0 的老会话也算候选）；
+/// 一句往来都没有时，当前实例的线已激活就用它的第一个角色会话，线还没激活则用内建初始会话（始终可对话）。
+async function openChat(): Promise<boolean> {
+  if (!mgmt) return false;
+  const { target: picked, fallback, best } = await pickSessionRow();
+  let target = picked;
+  state.idleLine = false;
+  if (best < 0 && !(fallback && (await lineActive(fallback)))) {
+    const stage0 = state.sessions.find(isStage0) ?? null;
+    if (stage0) {
+      target = stage0;
+      state.idleLine = true;
+    }
+  }
+  if (!target) {
+    setStatus(`还没有可用的会话：先在管理面创建实例${logHint()}`, "bad");
+    return false;
+  }
+  await switchSession(target, true);
+  renderComposeGate();
+  return true;
+}
+
+/// 重新握手：重新绑定 thread 并连回通道（恢复后旧令牌已失效；用户明确激活线之后才走这一步）
+async function rehandshake(): Promise<void> {
+  if (!mgmt || !chatEnabled() || !state.sessionId) return;
+  try {
+    const thread = ((await mgmt.call("thread.bind", {
+      channel: "builtin",
+      thread_id: state.threadId,
+      session_id: state.sessionId,
+    })).thread ?? {}) as Record<string, unknown>;
+    state.token = String(thread.binding_token ?? "");
+    await openChannel(state.endpoint, { credential: state.credential, bootstrap: state.bootstrap });
+    await loadHistory();
+    renderTopbar();
+  } catch (error) {
+    setStatus(`重新握手失败：${error}${logHint()}`, "bad");
+    showRestart();
+  }
+}
+
+/// 会话所在线是否可对话（已激活）；阶段 0 的内建会话没有时间线行，按可对话处理
+async function lineActive(row: SessionRow): Promise<boolean> {
+  if (!mgmt || isStage0(row)) return true;
+  try {
+    const clock = (await mgmt.call("runtime.clock", {
+      instance_id: row.instance_id,
+      timeline_id: row.timeline_id,
+    })).clock as unknown as ClockView;
+    return clock.state === "active";
+  } catch {
+    return false;
+  }
 }
 
 function renderManagePane(overview: Record<string, unknown>): void {
@@ -561,7 +899,7 @@ function mergeReply(payload: Record<string, unknown>): void {
 /* ---------- 交互 ---------- */
 
 function sendMessage(text: string): void {
-  if (!ump || state.phase !== "ready") return;
+  if (!ump || state.phase !== "ready" || !coreReady()) return;
   const message: Message = { role: "user", text, parts: [], state: "queued", time: Date.now() / 1000 };
   try {
     message.envId = ump.userMessage(state.threadId, state.token, text);
@@ -581,6 +919,24 @@ function retryMessage(message: Message): void {
   renderMessages();
 }
 
+/// 恢复后全部线冻结 / 当前线还没激活 / 核心阻断的提示：写在输入框上方，不冒充系统消息
+function renderComposeGate(): void {
+  const notes: string[] = [];
+  if (state.needActivate) {
+    notes.push("恢复后全部世界线已冻结：先到管理页「运行」里激活这条线，再继续对话。");
+  } else if (state.idleLine && world.instances.length) {
+    notes.push("当前实例的线还没激活：聊天先用内建初始会话；要跟角色对话，先在管理页激活这条线。");
+  }
+  if (!chatEnabled()) {
+    notes.push("内建聊天已停用：不建立聊天通道连接；可在设置面重新启用。");
+  } else if (shellStatus?.state === "compatibility_blocked") {
+    notes.push("核心因兼容性阻断处于只读：管理面仍可用，按提示处理后再「重启核心」。");
+  } else if (shellStatus?.state === "persistence_blocked") {
+    notes.push("存储不可用：先恢复数据目录可写，再由核心从最后完整水位继续。");
+  }
+  $("composer-note").textContent = notes.join(" ");
+}
+
 function bindComposer(): void {
   const form = $<HTMLFormElement>("composer");
   const input = $<HTMLTextAreaElement>("input");
@@ -598,6 +954,12 @@ function bindComposer(): void {
     event.preventDefault();
     const text = input.value.trim();
     if (!text) return;
+    if (state.needActivate || !coreReady() || !chatEnabled()) {
+      // 恢复后全部线冻结 / 核心非 ready / 内建聊天已停用：一律不提交给核心（§五 / §十.20 / §2.2）
+      input.value = "";
+      renderComposeGate();
+      return;
+    }
     input.value = "";
     input.style.height = "auto";
     sendMessage(text);
@@ -626,6 +988,13 @@ interface SettingsPayload {
   core: Record<string, unknown>;
 }
 
+/// 最近一次变更时间：核心 settings 段不带时间字段，壳读本地配置文件的 mtime 补上（不伪造服务端字段）
+function changedLabel(seconds: number): string {
+  return seconds
+    ? new Date(seconds * 1000).toLocaleString("zh-CN", { hour12: false })
+    : "未知（配置文件还没写过）";
+}
+
 function fillSettings(settings: SettingsPayload): void {
   $<HTMLInputElement>("set-base-url").value = String(settings.llm.base_url ?? "");
   $<HTMLInputElement>("set-model").value = String(settings.llm.model ?? "");
@@ -636,22 +1005,114 @@ function fillSettings(settings: SettingsPayload): void {
   $<HTMLInputElement>("set-max-tokens").value = String(settings.llm.max_tokens ?? "");
   $<HTMLInputElement>("set-temperature").value = String(settings.llm.temperature ?? "");
   renderFacts($("settings-facts"), [
+    ["当前模型", String(settings.llm.model ?? "-")],
+    ["最近一次变更", changedLabel(Number(settings.llm.changed_at ?? 0))],
     ["配置文件", String(settings.core.config_file ?? "-")],
     ["单段上限 / 单批段数", `${settings.core.max_text_len} / ${settings.core.max_parts}`],
     ["上下文条数", String(settings.core.context_history_max ?? "-")],
   ]);
 }
 
+/// 记忆检索是否走远程语义召回：判据与核心一致（模型 + 地址 + 凭据都齐才可用），缺任一项即全文降级（§六 / §十.7）
+function recallReady(): boolean {
+  const facts = state.facts;
+  return Boolean(facts && facts.memory_model && facts.memory_base_url && facts.memory_key_set);
+}
+
+/// 降级只在顶栏给一句标识，不带地址与凭据（§二.6 / §十.7）
+function renderDegrade(): void {
+  const chip = $("degrade");
+  const degraded = Boolean(state.facts) && !recallReady();
+  chip.classList.toggle("hidden", !degraded);
+  chip.textContent = degraded ? "语义召回不可用（已降级为全文）" : "";
+}
+
+/// 只读设置事实（记忆 / 提交 / 世界·会话 组）：核心 settings 契约不含这些键，
+/// 壳读本地配置只展示可读值与说明，不伪造保存成功（§3.3）。
+async function loadLocalFacts(): Promise<void> {
+  try {
+    state.facts = await invoke<LocalFacts>("config_facts");
+  } catch (error) {
+    console.warn(`本地配置事实读取失败：${error}`); // 非 Tauri 环境（浏览器调试）不影响连接与聊天
+  }
+  renderLocalFacts();
+}
+
+function renderLocalFacts(): void {
+  const facts = state.facts;
+  if (!facts) {
+    renderFacts($("mem-facts"), [["配置", "（壳未提供本地配置事实）"]]);
+    renderFacts($("commit-facts"), [["配置", "（壳未提供本地配置事实）"]]);
+    renderFacts($("worldset-facts"), [["配置", "（壳未提供本地配置事实）"]]);
+    return;
+  }
+  renderFacts($("mem-facts"), [
+    ["服务地址", facts.memory_base_url || "未配置"],
+    ["模型", facts.memory_model || "未配置"],
+    ["API Key", facts.memory_key_set ? "已配置（读取打码）" : "尚未配置"],
+    ["当前状态", recallReady() ? "可用：记忆检索走远程语义召回" : "不可用：已降级为全文召回"],
+    ["说明", "这组键由核心运行时配置管理，本界面只读"],
+  ]);
+  renderFacts($("commit-facts"), [
+    ["提交开关", facts.commit_enabled === null ? "（未知）" : facts.commit_enabled ? "开启" : "关闭"],
+    ["现实间隔", facts.commit_minutes === null ? "（未知）" : `${facts.commit_minutes} 分钟`],
+    ["事件阈值", facts.commit_events === null ? "（未知）" : `${facts.commit_events} 条新增事件`],
+  ]);
+  renderFacts($("worldset-facts"), [
+    ["创作目录（世界包 / 角色卡）", facts.packages_dir || "-"],
+    ["可同时激活的线", facts.max_active_timelines === null ? "（未知）" : `${facts.max_active_timelines} 条`],
+    ["主动每日额度", facts.render_calls_per_day === null ? "（未知）" : `${facts.render_calls_per_day} 次 / 现实日`],
+    ["倍率上限（仅开发者）", facts.rate_max === null ? "（未知）" : `${facts.rate_max} 世界秒 / 现实秒`],
+  ]);
+  renderDegrade();
+}
+
+/// 用量（§3.3 / §十.11）：只显示调用次数与 token 量级；含正文的账目核心不会给，壳也不猜价格
+async function loadUsage(): Promise<void> {
+  const instanceId = state.instanceId || world.instanceId;
+  if (!mgmt || !instanceId) {
+    renderFacts($("usage-facts"), [["用量", "还没有选实例"]]);
+    return;
+  }
+  try {
+    const budget = await mgmt.call("runtime.budget", { instance_id: instanceId });
+    const limits = (budget.limits ?? {}) as Record<string, number>;
+    const rows = (budget.rows ?? []) as Array<{ task: string; calls: number; tokens: number }>;
+    const usage = (budget.usage ?? {}) as { instance?: number };
+    const paused = (budget.paused_tasks ?? []) as string[];
+    renderFacts($("usage-facts"), [
+      [
+        "调用上限（实例 / 单线 / 单任务）",
+        `${limits.instance_tokens_per_day ?? "-"} / ${limits.timeline_tokens_per_day ?? "-"} / ${limits.task_tokens_per_day ?? "-"} token`,
+      ],
+      ["今日已记 token 量级", String(usage.instance ?? 0)],
+      [
+        "今日调用记录",
+        rows.length
+          ? rows.map((row) => `${row.task} ${row.calls} 次 / ${row.tokens} token`).join("；")
+          : "无",
+      ],
+      ["暂停的派生任务", paused.length ? paused.join("、") : "无"],
+    ]);
+  } catch (error) {
+    renderFacts($("usage-facts"), [["用量", String(error)]]);
+  }
+}
+
 async function loadSettings(): Promise<void> {
   if (!mgmt) return;
   try {
-    fillSettings((await mgmt.call("settings.get")) as unknown as SettingsPayload);
+    const settings = (await mgmt.call("settings.get")) as unknown as SettingsPayload;
+    await loadLocalFacts();
+    if (state.facts) settings.llm.changed_at = state.facts.mtime; // 本地文件 mtime，不是服务端字段
+    fillSettings(settings);
     $("settings-note").textContent = "";
   } catch (error) {
     $("settings-note").textContent = String(error);
   }
   await loadBackups();
   await loadAbout();
+  await loadUsage();
 }
 
 /* ---------- 备份组（DESKTOP_SPEC §3.3）：入口与展示在壳里，备份由核心执行 ---------- */
@@ -677,7 +1138,10 @@ async function loadBackups(): Promise<void> {
     state.backupDir = String(listed.dir ?? "");
     renderFacts($("backup-facts"), [
       ["备份目录", state.backupDir || "-"],
-      ["检查间隔", `${listed.interval_hours ?? "-"} 小时（到期由核心补做）`],
+      [
+        "检查间隔",
+        `${listed.interval_hours ?? "-"} 小时（暂不支持运行期自动补做：只有「立即备份」与显式退出前的补做会真正落盘）`,
+      ],
       ["保留份数", String(listed.keep ?? "-")],
       [
         "最近一份",
@@ -744,13 +1208,50 @@ async function restoreBackup(): Promise<void> {
   try {
     const result = await mgmt.call("backup.restore", { path: picked }, 120000);
     const info = result.restore as { restored?: boolean; timelines?: number; safety?: string } | undefined;
-    $("backup-note").textContent = info?.restored
-      ? `已恢复：${info.timelines ?? 0} 条线已冻结（安全副本 ${info.safety ?? ""}）`
-      : "恢复未完成，现有数据保留";
+    if (info?.restored) {
+      $("backup-note").textContent = `已恢复：${info.timelines ?? 0} 条线已冻结（安全副本 ${info.safety ?? ""}）`;
+      await resyncAfterRestore();
+    } else {
+      $("backup-note").textContent = "恢复未完成，现有数据保留";
+    }
   } catch (error) {
     $("backup-note").textContent = `恢复失败，现有数据保留：${error}`;
   }
   await loadBackups();
+}
+
+/// 整库恢复后：旧连接、绑定令牌与在途任务统一失效（§五 / §十.20）。
+/// 壳不再用旧连接发消息：断开通道、按恢复后的库重载世界数据与会话历史、提示需先激活；
+/// 重新握手留到用户明确激活线之后（§五「用户明确激活后再按运行层规则恢复」），期间不提交对话。
+async function resyncAfterRestore(): Promise<void> {
+  ump?.close(); // 旧连接作废；主动关闭不触发自动重连链
+  ump = null;
+  state.token = "";
+  reconnectToken += 1;
+  state.needActivate = true;
+  renderComposeGate();
+  try {
+    await loadWorld();
+    const { target } = await pickSessionRow();
+    if (target) {
+      state.sessionId = target.id;
+      state.instanceId = target.instance_id;
+      state.timelineId = target.timeline_id;
+      state.characterId = target.character_id;
+      await loadHistory();
+    } else {
+      state.messages = [];
+      renderMessages();
+    }
+    renderTopbar();
+    renderSessionList();
+    state.phase = "ready";
+    setStatus("已就绪（恢复后全部世界线已冻结：先在管理页激活这条线再对话）", "ok");
+  } catch (error) {
+    state.phase = "failed";
+    setStatus(`恢复后重新握手失败：${error}${logHint()}`, "bad");
+    showRestart();
+  }
 }
 
 /* ---------- 关于 / 诊断（§3.3）：版本、日志目录与打开入口 ---------- */
@@ -843,6 +1344,7 @@ interface WorldCache {
   timeline: string;
   characterId: string;
   characters: Array<{ card_id: string; name: string; occupation?: string }>;
+  timelines: Array<{ id: string; name: string; state: string }>;
   clock: ClockView | null;
 }
 
@@ -870,6 +1372,7 @@ const world: WorldCache = {
   timeline: "",
   characterId: "",
   characters: [],
+  timelines: [],
   clock: null,
 };
 let disclosureSelection: DisclosureSelection | null = null;
@@ -944,19 +1447,31 @@ async function loadWorld(): Promise<void> {
   void loadDrafts();
 }
 
+/// 实例详情：元数据 + 时间线 + 角色，都以核心返回为准填进 world 缓存（顶栏 / 侧栏 / 运行面共用一份事实）
+async function loadInstanceDetail(
+  instanceId: string,
+): Promise<{ info: InstanceEntry; timelines: Array<{ id: string; name: string; state: string }> } | null> {
+  if (!mgmt) return null;
+  const detail = await mgmt.call("instance.info", { id: instanceId });
+  const info = detail.instance as unknown as InstanceEntry;
+  const characters = (detail.characters ?? []) as Array<Record<string, string>>;
+  const timelines = (detail.timelines ?? []) as Array<{ id: string; name: string; state: string }>;
+  world.instanceId = info.id; // 运行面状态跟着渲染的事实走，避免实例与时间线拼成混合参数
+  world.timeline = timelines[0]?.id ?? "";
+  world.timelines = timelines;
+  world.characters = (characters as unknown as WorldCache["characters"]) ?? [];
+  if (!world.characters.some((item) => item.card_id === world.characterId)) {
+    world.characterId = world.characters[0]?.card_id ?? "";
+  }
+  return { info, timelines };
+}
+
 async function showInstance(instanceId: string): Promise<void> {
   if (!mgmt) return;
   try {
-    const detail = await mgmt.call("instance.info", { id: instanceId });
-    const info = detail.instance as unknown as InstanceEntry;
-    const characters = (detail.characters ?? []) as Array<Record<string, string>>;
-    const timelines = (detail.timelines ?? []) as Array<Record<string, string>>;
-    world.instanceId = info.id; // 运行面状态跟着渲染的事实走，避免实例与时间线拼成混合参数
-    world.timeline = timelines[0]?.id ?? "";
-    world.characters = (characters as unknown as WorldCache["characters"]) ?? [];
-    if (!world.characters.some((item) => item.card_id === world.characterId)) {
-      world.characterId = world.characters[0]?.card_id ?? "";
-    }
+    const loaded = await loadInstanceDetail(instanceId);
+    if (!loaded) return;
+    const { info, timelines } = loaded;
     renderRoleControls();
     await renderDisclosures();
     // 补卡的目标时间线：跟当前查看的实例走（§3.2 角色行「选择目标时间线」）
@@ -967,7 +1482,7 @@ async function showInstance(instanceId: string): Promise<void> {
     renderFacts($("world-facts"), [
       ["实例", `${info.name}（原始名称：${info.original_name}${info.imported ? "，导入" : ""}）`],
       ["初始世界时刻", `${info.moment} 世界秒`],
-      ["角色", characters.map((item) => `${item.name}｜${item.occupation}`).join("；") || "无"],
+      ["角色", world.characters.map((item) => `${item.name}｜${item.occupation}`).join("；") || "无"],
       ["时间线", timelines.map((item) => `${item.name}（${item.state === "frozen" ? "冻结" : "激活"}）`).join("；")],
       [
         "兼容性",
@@ -977,7 +1492,10 @@ async function showInstance(instanceId: string): Promise<void> {
       ],
       ["世界内部", "不可浏览：管理面只暴露元数据与公开时钟"],
     ]);
+    renderTimelines();
+    renderSessionList();
     await refreshClock(info.id, world.timeline);
+    void loadUsage();
   } catch (error) {
     worldNote(String(error), true);
   }
@@ -1052,29 +1570,32 @@ async function switchRole(): Promise<void> {
     note.textContent = "缺实例 / 时间线 / 角色，无法切换";
     return;
   }
+  // 切换前的事实快照：乐观更新失败时回退，别把没发生的切换显示成已切好
+  const before = {
+    instanceId: state.instanceId,
+    timelineId: state.timelineId,
+    characterId: state.characterId,
+  };
   try {
-    world.characterId = cardId;
+    // 用户已经点了「切换会话角色」：顶栏立刻跟上目标实例 / 角色 / 时间线，
+    // 会话 id 由核心确认（session.ensure）
+    state.instanceId = world.instanceId;
+    state.timelineId = world.timeline;
     state.characterId = cardId;
+    renderTopbar();
     // 切换角色 = 换一个会话：历史不迁移，各自读自己的
     const session = ((await mgmt.call("session.ensure", {
       instance_id: world.instanceId,
       timeline_id: world.timeline,
       character_id: cardId,
-    })).session ?? {}) as Record<string, string>;
-    state.sessionId = String(session.id ?? "");
-    const thread = ((await mgmt.call("thread.bind", {
-      channel: "builtin",
-      thread_id: state.threadId,
-      session_id: state.sessionId,
-    })).thread ?? {}) as Record<string, unknown>;
-    state.token = String(thread.binding_token ?? "");
-    await openChannel(state.endpoint ?? "", { credential: state.credential, bootstrap: state.bootstrap });
-    await loadHistory();
-    renderSessionList(session);
-    renderRoleControls();
-    state.phase = "ready";
-    setStatus(`已切到 ${currentCharacterName(cardId)}`, "ok");
+    })).session ?? {}) as unknown as SessionRow;
+    await switchSession(session);
+    world.characterId = cardId;
+    note.textContent = `当前会话角色：${currentCharacterName(cardId)}`;
+    setStatus(`已就绪 · 已切到 ${currentCharacterName(cardId)}`, "ok");
   } catch (error) {
+    Object.assign(state, before);
+    renderTopbar();
     note.textContent = String(error);
   }
 }
@@ -1141,6 +1662,13 @@ async function refreshClock(instanceId = world.instanceId, timelineId = world.ti
     if (clock.state !== "active") {
       label.textContent = `已冻结（已处理 ${clock.processed_world ?? 0} 世界秒）`;
       return;
+    }
+    if (state.needActivate && timelineId === state.timelineId) {
+      // 用户明确激活了当前会话这条线：解除「恢复后先激活」的闸门，并按 §五 重新握手
+      state.needActivate = false;
+      renderComposeGate();
+      await rehandshake();
+      setStatus("已就绪", "ok");
     }
     label.textContent =
       `${clock.label}　倍率 ${clock.rate}` +
@@ -1508,7 +2036,12 @@ function bindWorld(): void {
 
 /// 壳要退出时叫我们：停掉新工作 → 走管理面 op app.shutdown（一致水位备份 + 请求核心自行退出）
 /// → 回报壳，让壳按上限等核心退出，超时才硬杀。退出前保存失败也照实回报，不拖着不退。
+/// 壳可能重发退出请求（隐藏到托盘时事件投递会被挂起）：只跑一次，别用后一次覆盖前一次的结果。
+let exitHandshakeDone = false;
+
 async function flushBeforeExit(): Promise<void> {
+  if (exitHandshakeDone) return;
+  exitHandshakeDone = true;
   state.phase = "stopping";
   $<HTMLTextAreaElement>("input").disabled = true;
   $<HTMLButtonElement>("send").disabled = true;
@@ -1534,6 +2067,7 @@ async function flushBeforeExit(): Promise<void> {
 /* ---------- 启动 ---------- */
 
 async function boot(): Promise<void> {
+  await loadShellSettings(); // 壳侧偏好（内建聊天开关）先读出来，再决定要不要建聊天通道
   bindComposer();
   bindNav();
   bindWorld();
@@ -1554,32 +2088,47 @@ async function boot(): Promise<void> {
   );
   $("settings-form").addEventListener("submit", (event) => void saveSettings(event));
   $("settings-reload").addEventListener("click", () => void loadSettings());
+  // 内建聊天开关（默认开）：状态在壳自己的设置里，停用后不建立聊天通道连接
+  const chatBox = $<HTMLInputElement>("set-chat-enabled");
+  chatBox.checked = chatEnabled();
+  chatBox.addEventListener("change", () => void toggleBuiltinChat(chatBox.checked));
+  $("chat-note").textContent = chatEnabled()
+    ? "已启用：对话走内建通道（builtin）"
+    : "已停用：不登记 / 不连接聊天通道，管理面保留";
   $("restart").addEventListener("click", () => void restartCore());
-  // 壳的退出请求：先保存再让它停核心（有上限，超时由壳硬杀）
-  await listen("exit-request", () => void flushBeforeExit());
+  renderComposeGate();
+  await loadLocalFacts(); // 顶栏的语义召回降级标识来自本地配置事实（§六）
+  // 壳的退出请求：先保存再让它停核心（有上限，超时由壳硬杀）。
+  // 隐藏到托盘时壳叫不动页面（tauri emit / eval / show 全报 failed to send message to the webview，
+  // 2026-09 实测），而页面自己的定时器与 invoke 照常 —— 所以这里轮询壳的 exit_pending 取退出请求。
+  setInterval(() => {
+    if (exitHandshakeDone) return;
+    void invoke<boolean>("exit_pending")
+      .then((pending) => (pending ? flushBeforeExit() : undefined))
+      .catch(() => undefined);
+  }, 600);
   await listen("core-status", (event) => {
     shellStatus = event.payload as CoreStatus;
     if (shellStatus.state === "ready") return;
     state.phase = "starting";
-    if (shellStatus.state === "persistence_blocked") {
-      setStatus(`存储不可用：${shellStatus.error ?? ""}${logHint()}`, "bad");
-    } else {
-      setStatus(`核心未就绪：${shellStatus.error ?? shellStatus.state}${logHint()}`, "bad");
-    }
+    const info = coreStatusText(shellStatus.state, shellStatus.error);
+    setStatus(info.text, info.kind);
+    renderComposeGate();
     showRestart();
   });
   const status = await waitForCore();
-  if (status.state !== "ready") {
-    setStatus(`核心未就绪：${status.error ?? status.state}`, "bad");
-    showRestart();
+  const info = coreStatusText(status.state, status.error);
+  if (status.state === "ready" || status.state === "compatibility_blocked") {
+    try {
+      await connectChat(status);
+    } catch (error) {
+      setStatus(`${info.text}（管理面未连上：${error}）`, info.kind);
+      showRestart();
+    }
     return;
   }
-  try {
-    await connectChat(status);
-  } catch (error) {
-    setStatus(`连接失败：${error}`, "bad");
-    showRestart();
-  }
+  setStatus(info.text, info.kind);
+  showRestart();
 }
 
 void boot();

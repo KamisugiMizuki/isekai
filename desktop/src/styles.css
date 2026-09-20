@@ -431,3 +431,58 @@ h2 {
 #history-more {
   font-size: 12px;
 }
+
+/* 侧栏：会话（可切换，§3.1）与世界 / 时间线（§三） */
+#sessions,
+#timelines {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* 设置面控件：焦点一律可见（§四） */
+#pane-settings input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+#pane-settings input[type="checkbox"] {
+  margin-right: 6px;
+}
+
+button.session {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+button.session.active {
+  font-weight: 600;
+}
+
+button.session:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 顶栏：语义召回降级标识与输入框上方的提示（§六 / §五） */
+#degrade {
+  border-color: var(--muted);
+  color: var(--muted);
+}
+
+#composer-note {
+  font-size: 12px;
+}
