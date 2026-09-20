@@ -241,6 +241,10 @@ def _restore_runtime_state(
             "units": _remap_rows(payload.get("units"), instance_id, new_id),
             "plans": _remap_rows(payload.get("plans"), instance_id, new_id),
             "experiences": _remap_rows(payload.get("experiences"), instance_id, new_id),
+            "events": _remap_rows(payload.get("events"), instance_id, new_id),
+            "claims": _remap_rows(payload.get("claims"), instance_id, new_id),
+            "knowledge": _remap_rows(payload.get("knowledge"), instance_id, new_id),
+            "effects": _remap_rows(payload.get("effects"), instance_id, new_id),
         }
         loaded += store.runtime_load(instance_id, new_id, rows)
         store.clock_put(

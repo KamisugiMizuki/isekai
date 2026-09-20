@@ -158,6 +158,75 @@ CREATE TABLE IF NOT EXISTS timeline_clock(
   limited INTEGER NOT NULL DEFAULT 0     -- 追赶受限：滞后超过预算，停止扩大目标（§2.6）
 );
 
+-- ---------- 事件引擎（阶段 3）：事件 / 说法 / 获知 / 效果状态 ----------
+
+CREATE TABLE IF NOT EXISTS event(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  id TEXT NOT NULL,                      -- 稳定事件标识（种子 + 规则 + 历法日 + 槽）
+  world_seconds INTEGER NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,        -- 同刻顺序（固定规则，不随消费者执行先后变）
+  kind TEXT NOT NULL,                    -- world | character
+  family TEXT NOT NULL DEFAULT '',
+  template TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL,                  -- engine | backfill | life | character_action
+  summary TEXT NOT NULL,                 -- 事实骨架（确定性；写后不可原地改写）
+  detail TEXT NOT NULL DEFAULT '',       -- 实情文本（模板或 LLM 表述，固化后不改）
+  text_source TEXT NOT NULL DEFAULT 'template',
+  effects TEXT NOT NULL DEFAULT '[]',
+  share_value INTEGER NOT NULL DEFAULT 0,
+  importance REAL NOT NULL DEFAULT 0.0,
+  created_real REAL NOT NULL DEFAULT 0.0,
+  PRIMARY KEY(instance_id, timeline_id, id)
+);
+CREATE INDEX IF NOT EXISTS ix_event_window ON event(instance_id, timeline_id, world_seconds);
+
+CREATE TABLE IF NOT EXISTS claim(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  source_id TEXT NOT NULL DEFAULT '',
+  text TEXT NOT NULL,
+  audience TEXT NOT NULL DEFAULT '公开',
+  earliest_world INTEGER NOT NULL,       -- 最早可传播时刻
+  credibility TEXT NOT NULL DEFAULT 'recorded',
+  PRIMARY KEY(instance_id, timeline_id, id)
+);
+CREATE INDEX IF NOT EXISTS ix_claim_event ON claim(instance_id, timeline_id, event_id);
+
+CREATE TABLE IF NOT EXISTS knowledge(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  world_seconds INTEGER NOT NULL,        -- 获知时刻
+  kind TEXT NOT NULL,                    -- claim | observation | experience
+  target TEXT NOT NULL,                  -- 说法标识或事件标识
+  source TEXT NOT NULL DEFAULT '',       -- 渠道 / 亲历
+  stance TEXT NOT NULL DEFAULT 'recorded',
+  text TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(instance_id, timeline_id, character_id, id)
+);
+CREATE INDEX IF NOT EXISTS ix_knowledge_character ON knowledge(instance_id, timeline_id, character_id, world_seconds);
+
+CREATE TABLE IF NOT EXISTS effect_state(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  target TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  family TEXT NOT NULL DEFAULT '',       -- 事件族：自然恢复按同族后续事件判定（§六）
+  from_world INTEGER NOT NULL,
+  expiry TEXT NOT NULL DEFAULT 'until_cleared',
+  recovery TEXT NOT NULL DEFAULT '',
+  active INTEGER NOT NULL DEFAULT 1,
+  cleared_at INTEGER,
+  PRIMARY KEY(instance_id, timeline_id, id)
+);
+CREATE INDEX IF NOT EXISTS ix_effect_active ON effect_state(instance_id, timeline_id, active, from_world);
+
 -- 补卡：角色在某个世界时刻加入该线（实例设定锁死，加入记录只进运行层，§九 / 附录 B #18）
 CREATE TABLE IF NOT EXISTS character_join(
   instance_id TEXT NOT NULL,
@@ -302,6 +371,10 @@ class Store:
             if clock_columns and name not in clock_columns:
                 log.info("timeline_clock 增列 %s", name)
                 self._conn.execute(f"ALTER TABLE timeline_clock ADD COLUMN {name} {ddl}")
+        effect_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(effect_state)")}
+        if effect_columns and "family" not in effect_columns:
+            log.info("effect_state 增列 family")
+            self._conn.execute("ALTER TABLE effect_state ADD COLUMN family TEXT NOT NULL DEFAULT ''")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
@@ -804,7 +877,16 @@ class Store:
             self._conn.execute(
                 "DELETE FROM rate_command WHERE timeline_id NOT IN (SELECT id FROM timeline)"
             )
-            for table in ("unit", "life_plan", "experience", "character_join"):
+            for table in (
+                "unit",
+                "life_plan",
+                "experience",
+                "character_join",
+                "event",
+                "claim",
+                "knowledge",
+                "effect_state",
+            ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute("DELETE FROM commit_log WHERE instance_id=?", (instance_id,))
             self._conn.execute("DELETE FROM timeline WHERE instance_id=?", (instance_id,))
@@ -904,6 +986,11 @@ class Store:
         plans: Iterable[dict[str, Any]] = (),
         units: Iterable[dict[str, Any]] = (),
         experiences: Iterable[dict[str, Any]] = (),
+        events: Iterable[dict[str, Any]] = (),
+        claims: Iterable[dict[str, Any]] = (),
+        knowledge: Iterable[dict[str, Any]] = (),
+        effects: Iterable[dict[str, Any]] = (),
+        clear_effects: Iterable[Any] = (),
     ) -> bool:
         """把一批事实转移整体提交（§2.7：一批失败即整批回到批前水位）。
 
@@ -943,6 +1030,51 @@ class Store:
                        VALUES(:id, :instance_id, :timeline_id, :character_id, :world_seconds,
                               :kind, :summary, :source_ref, :confidence)""",
                     item,
+                )
+            for row in events:
+                self._conn.execute(
+                    """INSERT INTO event(instance_id, timeline_id, id, world_seconds, seq, kind, family,
+                                        template, source, summary, detail, text_source, effects,
+                                        share_value, importance, created_real)
+                       VALUES(:instance_id, :timeline_id, :id, :world_seconds, :seq, :kind, :family,
+                              :template, :source, :summary, :detail, :text_source, :effects,
+                              :share_value, :importance, :created_real)
+                       ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
+                    row,
+                )
+            for row in claims:
+                self._conn.execute(
+                    """INSERT INTO claim(instance_id, timeline_id, id, event_id, source_id, text,
+                                        audience, earliest_world, credibility)
+                       VALUES(:instance_id, :timeline_id, :id, :event_id, :source_id, :text,
+                              :audience, :earliest_world, :credibility)
+                       ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
+                    row,
+                )
+            for row in knowledge:
+                self._conn.execute(
+                    """INSERT INTO knowledge(instance_id, timeline_id, character_id, id, world_seconds,
+                                            kind, target, source, stance, text)
+                       VALUES(:instance_id, :timeline_id, :character_id, :id, :world_seconds,
+                              :kind, :target, :source, :stance, :text)
+                       ON CONFLICT(instance_id, timeline_id, character_id, id) DO NOTHING""",
+                    row,
+                )
+            for row in effects:
+                self._conn.execute(
+                    """INSERT INTO effect_state(instance_id, timeline_id, id, event_id, target, kind, family,
+                                               from_world, expiry, recovery, active, cleared_at)
+                       VALUES(:instance_id, :timeline_id, :id, :event_id, :target, :kind, :family,
+                              :from_world, :expiry, :recovery, :active, :cleared_at)
+                       ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
+                    row,
+                )
+            for item in clear_effects:
+                effect_id, instance_id_ = item if isinstance(item, tuple) else (item, None)
+                self._conn.execute(
+                    """UPDATE effect_state SET active=0, cleared_at=?
+                       WHERE id=? AND timeline_id=? AND active=1 AND (? IS NULL OR instance_id=?)""",
+                    (processed_world, effect_id, timeline_id, instance_id_, instance_id_),
                 )
             self._conn.execute(
                 """UPDATE timeline_clock SET processed_world=?, catching_up=?, limited=?
@@ -985,6 +1117,34 @@ class Store:
                 timeline_id,
                 watermark,
             ),
+            "events": rows(
+                """SELECT * FROM event WHERE instance_id=? AND timeline_id=? AND world_seconds<=?
+                   ORDER BY world_seconds, seq""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "claims": rows(
+                """SELECT * FROM claim WHERE instance_id=? AND timeline_id=? AND earliest_world<=?
+                   ORDER BY event_id, id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "knowledge": rows(
+                """SELECT * FROM knowledge WHERE instance_id=? AND timeline_id=? AND world_seconds<=?
+                   ORDER BY character_id, world_seconds""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "effects": rows(
+                """SELECT * FROM effect_state WHERE instance_id=? AND timeline_id=? AND from_world<=?
+                   ORDER BY from_world, id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
         }
 
     def runtime_load(self, instance_id: str, timeline_id: str, payload: dict[str, Any]) -> int:
@@ -1019,6 +1179,44 @@ class Store:
                               :windows, :state, :created_world, :note)""",
                     plan,
                 )
+            for row in payload.get("events") or []:
+                self._conn.execute(
+                    """INSERT INTO event(instance_id, timeline_id, id, world_seconds, seq, kind, family,
+                                        template, source, summary, detail, text_source, effects,
+                                        share_value, importance, created_real)
+                       VALUES(:instance_id, :timeline_id, :id, :world_seconds, :seq, :kind, :family,
+                              :template, :source, :summary, :detail, :text_source, :effects,
+                              :share_value, :importance, :created_real)
+                       ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
+                    row,
+                )
+            for row in payload.get("claims") or []:
+                self._conn.execute(
+                    """INSERT INTO claim(instance_id, timeline_id, id, event_id, source_id, text,
+                                        audience, earliest_world, credibility)
+                       VALUES(:instance_id, :timeline_id, :id, :event_id, :source_id, :text,
+                              :audience, :earliest_world, :credibility)
+                       ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
+                    row,
+                )
+            for row in payload.get("knowledge") or []:
+                self._conn.execute(
+                    """INSERT INTO knowledge(instance_id, timeline_id, character_id, id, world_seconds,
+                                            kind, target, source, stance, text)
+                       VALUES(:instance_id, :timeline_id, :character_id, :id, :world_seconds,
+                              :kind, :target, :source, :stance, :text)
+                       ON CONFLICT(instance_id, timeline_id, character_id, id) DO NOTHING""",
+                    row,
+                )
+            for row in payload.get("effects") or []:
+                self._conn.execute(
+                    """INSERT INTO effect_state(instance_id, timeline_id, id, event_id, target, kind, family,
+                                               from_world, expiry, recovery, active, cleared_at)
+                       VALUES(:instance_id, :timeline_id, :id, :event_id, :target, :kind, :family,
+                              :from_world, :expiry, :recovery, :active, :cleared_at)
+                       ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
+                    row,
+                )
             for item in payload.get("experiences") or []:
                 self._conn.execute(
                     """INSERT OR IGNORE INTO experience(id, instance_id, timeline_id, character_id, world_seconds,
@@ -1027,7 +1225,95 @@ class Store:
                               :kind, :summary, :source_ref, :confidence)""",
                     item,
                 )
-        return sum(len(payload.get(key) or []) for key in ("characters", "units", "plans", "experiences"))
+        return sum(
+            len(payload.get(key) or [])
+            for key in (
+                "characters",
+                "units",
+                "plans",
+                "experiences",
+                "events",
+                "claims",
+                "knowledge",
+                "effects",
+            )
+        )
+
+    # ---------- 事件 / 说法 / 获知 / 效果 ----------
+
+    def event_window(
+        self, instance_id: str, timeline_id: str, *, until: int, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT * FROM event WHERE instance_id=? AND timeline_id=? AND world_seconds<=?
+               ORDER BY world_seconds DESC, seq DESC LIMIT ?""",
+            (instance_id, timeline_id, until, limit),
+        ).fetchall()
+        return [_row_to_dict(r) for r in reversed(rows)]
+
+    def event_ids(self, instance_id: str, timeline_id: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT id FROM event WHERE instance_id=? AND timeline_id=?", (instance_id, timeline_id)
+        ).fetchall()
+        return {str(r["id"]) for r in rows}
+
+    def claim_list(
+        self, instance_id: str, timeline_id: str, *, event_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        if event_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM claim WHERE instance_id=? AND timeline_id=? ORDER BY earliest_world, id",
+                (instance_id, timeline_id),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT * FROM claim WHERE instance_id=? AND timeline_id=? AND event_id=?
+                   ORDER BY earliest_world, id""",
+                (instance_id, timeline_id, event_id),
+            ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def knowledge_window(
+        self, instance_id: str, timeline_id: str, character_id: str, *, until: int, limit: int = 40
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT * FROM knowledge WHERE instance_id=? AND timeline_id=? AND character_id=?
+               AND world_seconds<=? ORDER BY world_seconds DESC, id DESC LIMIT ?""",
+            (instance_id, timeline_id, character_id, until, limit),
+        ).fetchall()
+        return [_row_to_dict(r) for r in reversed(rows)]
+
+    def knowledge_ids(self, instance_id: str, timeline_id: str, character_id: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT id FROM knowledge WHERE instance_id=? AND timeline_id=? AND character_id=?",
+            (instance_id, timeline_id, character_id),
+        ).fetchall()
+        return {str(r["id"]) for r in rows}
+
+    def effect_active_ids(self, instance_id: str, timeline_id: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT id FROM effect_state WHERE instance_id=? AND timeline_id=? AND active=1",
+            (instance_id, timeline_id),
+        ).fetchall()
+        return {str(r["id"]) for r in rows}
+
+    def effect_window(
+        self, instance_id: str, timeline_id: str, *, until: int, targets: Iterable[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """仍有效的后果（§六）：过期或已解除的不再参与因果。"""
+        rows = self._conn.execute(
+            """SELECT * FROM effect_state WHERE instance_id=? AND timeline_id=? AND active=1
+               AND from_world<=? ORDER BY from_world, id""",
+            (instance_id, timeline_id, until),
+        ).fetchall()
+        wanted = {str(item) for item in targets} if targets else None
+        out = []
+        for row in rows:
+            item = _row_to_dict(row)
+            if wanted is not None and str(item.get("target")) not in wanted:
+                continue
+            out.append(item)
+        return out
 
     # ---------- 补卡 ----------
 

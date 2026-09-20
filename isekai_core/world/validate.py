@@ -88,6 +88,7 @@ def validate_package(package: dict[str, Any]) -> list[str]:
     _validate_races_entities(package, errors)
     _validate_historiography(package, known, errors)
     _validate_events(package, known, errors)
+    _validate_event_calendar(package, errors)
     _validate_life_roles(package, errors)
     _validate_initial_state(package, known, errors)
     return errors
@@ -424,6 +425,24 @@ def _all_ids(package: dict[str, Any]) -> set[str]:
     return found
 
 
+#: 事件密度档 → 每历法日的目标区间（上限是硬预算，下限是「有合法来源时」的目标）
+DENSITY_TARGETS: dict[str, tuple[int, int]] = {"稀疏": (0, 1), "常规": (1, 3), "丰盛": (2, 5)}
+
+#: 效果失效方式（EVENT_ENGINE_SPEC §二：三类须可区分）
+EXPIRY_KINDS: tuple[str, ...] = ("with_cause", "until_cleared", "natural_recovery")
+
+#: 首版受支持的事实效果闭集（EVENT_ENGINE_SPEC §六 / §十一）：未声明的类型必须被拒绝，
+#: 不能让生成器临场发明数值系统或未被支持的效果。
+SUPPORTED_EFFECTS: dict[str, str] = {
+    "source_delay": "渠道受阻",
+    "route_blocked": "通行受阻",
+    "activity_constraint": "活动受限",
+    "public_notice": "公开通告",
+    "rumor_spread": "风闻流传",
+    "institution_state": "制度状态",
+}
+
+
 def _validate_events(package: dict[str, Any], known: set[str], errors: list[str]) -> None:
     targets = _all_ids(package)
     events = package.get("events")
@@ -431,6 +450,10 @@ def _validate_events(package: dict[str, Any], known: set[str], errors: list[str]
     if not isinstance(families, list) or not families:
         errors.append("events.families: 至少一个事件族（阻断项）")
         return
+    # 事件密度是体裁必填属性（EVENT_ENGINE_SPEC §四）
+    density = events.get("density") if isinstance(events, dict) else None
+    if density not in DENSITY_TARGETS:
+        errors.append(f"events.density: 必须是 {' / '.join(DENSITY_TARGETS)} 之一（体裁必填）")
     _check_unique(families, "events.families", errors)
     for index, family in enumerate(families):
         if not isinstance(family, dict):
@@ -460,7 +483,48 @@ def _validate_events(package: dict[str, Any], known: set[str], errors: list[str]
                 target = effect.get("target")
                 if target is not None and target not in targets:
                     errors.append(f"{t_where}.effects[{e_index}].target: 指向未登记对象 {target!r}")
+                if str(effect.get("kind")) not in SUPPORTED_EFFECTS:
+                    errors.append(
+                        f"{t_where}.effects[{e_index}].kind: 未支持的效果类型 {effect.get('kind')!r}"
+                        f"（可用：{' / '.join(SUPPORTED_EFFECTS)}）"
+                    )
+                # 效果必须声明失效方式（EVENT_ENGINE_SPEC §二）
+                expiry = effect.get("expiry")
+                if expiry not in EXPIRY_KINDS:
+                    errors.append(
+                        f"{t_where}.effects[{e_index}].expiry: 必须是 {' / '.join(EXPIRY_KINDS)} 之一"
+                    )
+                elif expiry == "natural_recovery" and not _text(effect.get("recovery")):
+                    errors.append(f"{t_where}.effects[{e_index}].recovery: 自然恢复须写明条件")
             _check_refs(template.get("preconditions"), known, f"{t_where}.preconditions", errors)
+
+
+def _validate_event_calendar(package: dict[str, Any], errors: list[str]) -> None:
+    """包内固定事件（节庆）：只校验可判定部分——历法内的月日与所属族。"""
+    events = package.get("events")
+    fixed = events.get("calendar") if isinstance(events, dict) else None
+    if fixed is None:
+        return
+    if not isinstance(fixed, list):
+        errors.append("events.calendar: 必须是列表")
+        return
+    calendar = package.get("calendar") if isinstance(package.get("calendar"), dict) else {}
+    months = calendar.get("months") if isinstance(calendar.get("months"), list) else []
+    families = {str(item.get("id")) for item in events.get("families") or [] if isinstance(item, dict)}
+    _check_unique(fixed, "events.calendar", errors)
+    for index, item in enumerate(fixed):
+        where = f"events.calendar[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{where}: 条目必须是对象")
+            continue
+        month = item.get("month")
+        day = item.get("day")
+        if not isinstance(month, int) or not 1 <= month <= max(1, len(months)):
+            errors.append(f"{where}.month: 超出历法月表范围")
+        elif not isinstance(day, int) or not 1 <= day <= int(months[month - 1].get("days") or 0):
+            errors.append(f"{where}.day: 超出该月天数")
+        if str(item.get("family")) not in families:
+            errors.append(f"{where}.family: 未登记的事件族 {item.get('family')!r}")
 
 
 def _validate_life_roles(package: dict[str, Any], errors: list[str]) -> None:

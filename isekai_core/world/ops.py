@@ -51,6 +51,7 @@ SYNC_OPS = frozenset(
         "runtime.rate",
         "runtime.advance",
         "runtime.card.add",
+        "runtime.backfill",
         "world.card.template",
         "world.card.load",
         "world.card.save",
@@ -219,6 +220,8 @@ def _runtime_op(
         if op == "runtime.rate":
             result = runtime.set_rate(instance_id, timeline_id, rate=int(args.get("rate") or 0), now_real=now)
             return {"rate": result, "clock": runtime.view(instance_id, timeline_id, now_real=now)}
+        if op == "runtime.backfill":
+            return {"backfill": {"rows": runtime.backfill(instance_id, timeline_id)}}
         if op == "runtime.card.add":
             card = args.get("card")
             if not isinstance(card, dict):

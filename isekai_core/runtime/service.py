@@ -14,7 +14,7 @@ from typing import Any
 
 from ..log import get_logger
 from ..store import Store
-from . import cognition, life, personality
+from . import cognition, events, life, personality
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
 
@@ -77,6 +77,13 @@ class RuntimeService:
             except json.JSONDecodeError:
                 log.warning("补入角色卡损坏 card=%s", row.get("character_id"))
         return cards
+
+    def seed_of(self, instance: dict[str, Any]) -> str:
+        """锁定种子：候选抽样只依赖它 + 规则版本 + 历法日 + 槽序（附录 A）。"""
+        return str(instance.get("seed") or "")
+
+    def rules_of(self, instance: dict[str, Any]) -> str:
+        return str(instance.get("rules_version") or "")
 
     def clock_row(self, timeline_id: str) -> dict[str, Any]:
         row = self.store.clock_get(timeline_id)
@@ -345,6 +352,12 @@ class RuntimeService:
             plans, units, experiences = self._collect_batch(
                 instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
             )
+            world_rows = self._world_event_rows(
+                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
+            )
+            spread = self._propagate_and_clear(
+                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
+            )
             committed = self.store.apply_runtime_batch(
                 timeline_id=timeline_id,
                 generation=generation,
@@ -354,6 +367,11 @@ class RuntimeService:
                 plans=plans,
                 units=units,
                 experiences=experiences,
+                events=world_rows['events'],
+                claims=world_rows['claims'],
+                knowledge=world_rows['knowledge'] + spread['knowledge'],
+                effects=world_rows['effects'],
+                clear_effects=spread['clear_effects'],
             )
             if not committed:
                 # 世代已变（冻结 / 重启后迟到）或水位已被别的批次推过：本批整批不落盘
@@ -385,7 +403,7 @@ class RuntimeService:
         from_world: int,
         to_world: int,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-        """收集一批事实转移（不落盘）：次日计划、按世界时长衰减的单元、已完成窗口的经历。"""
+        """收集一批事实转移（不落盘）：事件与后果、次日计划、单元衰减、已完成窗口的经历。"""
         plans: list[dict[str, Any]] = []
         units: list[dict[str, Any]] = []
         experiences: list[dict[str, Any]] = []
@@ -416,6 +434,18 @@ class RuntimeService:
                 )
             # 收割昨日与今日的计划：跨日窗口属于昨日，其尾部落在今日（§11 附录 B #7）
             day_here = calendar.day_index(from_world)
+            constraints = self.store.effect_window(
+                instance_id,
+                timeline_id,
+                until=to_world,
+                targets=[character_id, str(card.get("role_id") or ""), str((card.get("identity") or {}).get("region") or "")],
+            )
+            note = life.effect_note(
+                constraints,
+                character_id,
+                str(card.get("role_id") or ""),
+                str((card.get("identity") or {}).get("region") or ""),
+            )
             for day_index in (day_here - 1, day_here):
                 plan = self.store.plan_get(instance_id, timeline_id, character_id, day_index)
                 if plan is None:
@@ -424,10 +454,135 @@ class RuntimeService:
                     windows = json.loads(str(plan["windows"])).get("windows", [])
                 except json.JSONDecodeError:
                     continue
-                experiences.extend(
-                    self._harvest(instance_id, timeline_id, character_id, calendar, windows, from_world, to_world)
-                )
+                items = self._harvest(instance_id, timeline_id, character_id, calendar, windows, from_world, to_world)
+                if note:
+                    for item in items:
+                        item["summary"] = f"{item['summary']}（受影响的后果：{note}）"
+                        item["source_ref"] = constraints[0]["id"] if constraints else None
+                experiences.extend(items)
         return plans, units, experiences
+
+    def _world_event_rows(
+        self,
+        instance: dict[str, Any],
+        instance_id: str,
+        timeline_id: str,
+        cards: list[dict[str, Any]],
+        calendar: Calendar,
+        *,
+        from_world: int,
+        to_world: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """当日世界级事件：固定节庆先占名额 → 随机候选 → 前置条件（§3.1、§四）。
+
+        事件只在**已推进到的那一段**落成：当日更晚的时刻留到下一批再判，重算不重抽。
+        """
+        out: dict[str, list[dict[str, Any]]] = {"events": [], "claims": [], "knowledge": [], "effects": []}
+        package = self.setting(instance)["world_package"]
+        seed, rules = self.seed_of(instance), self.rules_of(instance)
+        day_index = calendar.day_index(from_world)
+        known_events = self.store.event_ids(instance_id, timeline_id)
+        known_effects = self.store.effect_active_ids(instance_id, timeline_id)
+        for candidate in events.plan_day(
+            package,
+            seed=seed,
+            rules_version=rules,
+            day_index=day_index,
+            calendar=calendar,
+            events=known_events,
+            effects=known_effects,
+        ):
+            ident = events.event_id(seed, rules, day_index, str(candidate["slot"]))
+            at = events.event_moment(seed, rules, day_index, str(candidate["slot"]), calendar.day_seconds)
+            if ident in known_events or at > to_world:
+                continue
+            row = {
+                "id": ident,
+                "instance_id": instance_id,
+                "timeline_id": timeline_id,
+                "world_seconds": at,
+                "seq": int(events.stable_key(ident)[:6], 16),
+                "kind": "world",
+                "family": str(candidate["family"]),
+                "template": str(candidate["template"]),
+                "source": "engine",
+                "summary": str(candidate["summary"]),
+                "detail": events.detail_text(candidate),
+                "text_source": "template",
+                "effects": events.as_json(candidate["effects"]),
+                "share_value": 1 if candidate.get("fixed") else 0,
+                "importance": 0.6 if candidate.get("fixed") else 0.4,
+                "created_real": 0.0,
+            }
+            if not events.share_qualified(row):
+                row["importance"] = 0.5
+            out["events"].append(row)
+            out["effects"].extend(
+                events.effect_rows(
+                    candidate,
+                    instance_id=instance_id,
+                    timeline_id=timeline_id,
+                    event_ident=ident,
+                    world_seconds=at,
+                    family=str(candidate["family"]),
+                )
+            )
+            claims = events.dump_rows(
+                events.claim_rows(
+                    candidate,
+                    package=package,
+                    instance_id=instance_id,
+                    timeline_id=timeline_id,
+                    event_ident=ident,
+                    world_seconds=at,
+                    calendar=calendar,
+                )
+            )
+            out["claims"].extend(claims)
+            for card in cards:
+                out["knowledge"].extend(events.grants(row, claims, card, world_seconds=at, calendar=calendar))
+        return out
+
+    def _propagate_and_clear(
+        self,
+        instance: dict[str, Any],
+        instance_id: str,
+        timeline_id: str,
+        cards: list[dict[str, Any]],
+        calendar: Calendar,
+        *,
+        from_world: int,
+        to_world: int,
+    ) -> dict[str, list[Any]]:
+        """传播到达的获知（§五）与后果的解除（§六）。"""
+        rows: dict[str, list[Any]] = {"knowledge": [], "clear_effects": []}
+        for claim in self.store.claim_list(instance_id, timeline_id):
+            earliest = int(claim.get("earliest_world") or 0)
+            if not (from_world < earliest <= to_world):
+                continue
+            for card in cards:
+                grant = events.claim_grant(claim, card, world_seconds=earliest)
+                if grant is not None:
+                    rows["knowledge"].append(grant)
+        day_seconds = calendar.day_seconds
+        # 同族的后续事件（自然恢复的判定依据）：按世界时刻排一次即可
+        later_by_family: dict[str, int] = {}
+        for item in self.store.event_window(instance_id, timeline_id, until=to_world, limit=200):
+            family = str(item.get("family") or "")
+            if family:
+                later_by_family[family] = max(later_by_family.get(family, 0), int(item["world_seconds"]))
+        for effect in self.store.effect_window(instance_id, timeline_id, until=to_world):
+            expiry = str(effect.get("expiry"))
+            started = int(effect["from_world"])
+            if expiry == "with_cause" and started + day_seconds <= to_world:
+                rows["clear_effects"].append((str(effect["id"]), instance_id))
+            elif expiry == "natural_recovery":
+                family = str(effect.get("family") or "")
+                # 同族在该后果之后仍有新事件 → 声明的自然条件成立；没有依据就保持有效
+                if family and later_by_family.get(family, 0) > started:
+                    rows["clear_effects"].append((str(effect["id"]), instance_id))
+        _ = instance
+        return rows
 
     def _harvest(
         self,
@@ -500,13 +655,61 @@ class RuntimeService:
         experiences = self.store.experience_window(
             instance_id, timeline_id, character_id, until=world_seconds, limit=12
         )
+        knowledge = self.store.knowledge_window(
+            instance_id, timeline_id, character_id, until=world_seconds, limit=20
+        )
+        card = self.card_of(
+            self.store.instance_get(instance_id) or {},
+            character_id,
+            timeline_id=timeline_id,
+            world_seconds=world_seconds,
+        )
+        effects = self.store.effect_window(
+            instance_id,
+            timeline_id,
+            until=world_seconds,
+            targets=[
+                character_id,
+                str(card.get("role_id") or ""),
+                str((card.get("identity") or {}).get("region") or ""),
+            ],
+        )
+        activity = life.activity_label(life.current_window(plan, world_seconds))
+        note = life.effect_note(
+            effects,
+            character_id,
+            str(card.get("role_id") or ""),
+            str((card.get("identity") or {}).get("region") or ""),
+        )
+        if note and activity:
+            activity = f"{activity}（受影响的后果：{note}）"
         return {
             "units": personality.visible(units),
             "all_units": units,
             "plan": plan,
-            "current_activity": life.activity_label(life.current_window(plan, world_seconds)),
+            "current_activity": activity,
             "experiences": experiences,
+            "knowledge": knowledge,
+            "effects": effects,
         }
+
+    def backfill(self, instance_id: str, timeline_id: str) -> int:
+        """历史回填（§3.3）：把包内既定的史料与初始事实落成历史条目，不施加效果、不产生获知。"""
+        instance, _ = self._rows(instance_id, timeline_id)
+        if self.store.event_ids(instance_id, timeline_id):
+            return 0
+        rows, claims = events.backfill_rows(
+            self.setting(instance)["world_package"],
+            instance_id=instance_id,
+            timeline_id=timeline_id,
+            seed=self.seed_of(instance),
+            rules_version=self.rules_of(instance),
+        )
+        if not rows:
+            return 0
+        return self.store.runtime_load(
+            instance_id, timeline_id, {"watermark": 0, "events": rows, "claims": claims}
+        )
 
     def ensure_instance(self, instance_id: str, *, now_real: float) -> dict[str, int]:
         """补齐运行层状态：缺时钟的时间线建时钟，缺角色状态的按初始水位补齐（幂等）。"""
@@ -515,6 +718,7 @@ class RuntimeService:
             raise RuntimeStateError(f"实例不存在：{instance_id}")
         clocks = 0
         for timeline in self.store.timeline_list(instance_id):
+            self.backfill(instance_id, timeline["id"])  # 幂等：已有条目即跳过
             row = self.store.clock_get(timeline["id"])
             if row is None:
                 row = self.init_timeline(
@@ -769,5 +973,6 @@ class RuntimeService:
             current_activity=str(snapshot["current_activity"] or ""),
             units=snapshot["units"],
             experiences=snapshot["experiences"],
+            knowledge=snapshot["knowledge"],
         )
         return cognition.render_prompt(context)

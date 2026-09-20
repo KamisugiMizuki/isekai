@@ -38,6 +38,7 @@ def knowledge_slice(
     *,
     world_seconds: int,
     experiences: list[dict[str, Any]] | None = None,
+    knowledge: list[dict[str, Any]] | None = None,
     topic: str | None = None,
     limit: int = 24,
 ) -> list[dict[str, Any]]:
@@ -138,6 +139,20 @@ def knowledge_slice(
                 "stance": STANCE_LABEL["experienced"],
             }
         )
+    for row in knowledge or []:
+        if int(row.get("world_seconds") or 0) > world_seconds:
+            continue
+        source = str(row.get("source") or "")
+        if hard and source not in ("亲历", "自己的经历", "") and not source.startswith("sr-"):
+            continue
+        out.append(
+            {
+                "text": str(row.get("text") or ""),
+                "source": "亲历" if source in ("", "亲历") else source,
+                "learned": int(row.get("world_seconds") or 0),
+                "stance": STANCE_LABEL.get(str(row.get("stance")), STANCE_LABEL["recorded"]),
+            }
+        )
     if topic:
         needle = topic.strip().lower()
         out.sort(key=lambda item: 0 if needle and needle in str(item.get("text", "")).lower() else 1)
@@ -203,6 +218,7 @@ def play_context(
     calendar_label: str,
     topic: str | None = None,
     current_activity: str = "",
+    knowledge: list[dict[str, Any]] | None = None,
     units: list[dict[str, Any]] | None = None,
     experiences: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -245,6 +261,11 @@ def play_context(
         "comms": comms,
         "topic": topic or "",
         "knowledge": knowledge_slice(
-            package, card, world_seconds=world_seconds, experiences=experiences, topic=topic
+            package,
+            card,
+            world_seconds=world_seconds,
+            experiences=experiences,
+            knowledge=knowledge,
+            topic=topic,
         ),
     }

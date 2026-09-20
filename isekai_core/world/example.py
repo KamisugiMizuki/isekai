@@ -118,6 +118,8 @@ def example_package(name: str = "灰潮纪", *, moment: int = DAY * 1500) -> dic
         },
     ]
     package["events"] = {
+        "density": "常规",  # 体裁必填：每历法日世界级事件的目标区间（§四）
+        "calendar": [{"id": "fc-1", "name": "开滩祭", "month": 2, "day": 3, "family": "ef-1"}],
         "families": [
             {
                 "id": "ef-1",
@@ -127,7 +129,15 @@ def example_package(name: str = "灰潮纪", *, moment: int = DAY * 1500) -> dic
                         "id": "et-1",
                         "summary": "退潮延误导致城外驿站停摆一日",
                         "preconditions": ["cf-1"],
-                        "effects": [{"kind": "source_delay", "target": "src-1"}],
+                        "effects": [
+                            {"kind": "source_delay", "target": "src-1", "expiry": "with_cause"},
+                            {
+                                "kind": "route_blocked",
+                                "target": "src-2",
+                                "expiry": "natural_recovery",
+                                "recovery": "下一轮大潮退去后自行恢复",
+                            },
+                        ],
                         "weight": 1,
                     }
                 ],

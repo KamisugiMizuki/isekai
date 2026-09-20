@@ -89,6 +89,19 @@ def describe_plan(plan: dict[str, Any] | None, calendar: Calendar, world_seconds
     }
 
 
+def effect_note(effects: list[dict[str, Any]] | None, character_id: str, role_id: str, region: str) -> str:
+    """仍有效的后果对该角色当前活动的约束说明（§六）：只影响描述与经历，不改计划本身。"""
+    targets = {character_id, role_id, region}
+    kinds = sorted(
+        {
+            str(item.get("kind"))
+            for item in effects or []
+            if str(item.get("target")) in targets and str(item.get("kind"))
+        }
+    )
+    return "、".join(kinds)
+
+
 def activity_label(window: dict[str, Any] | None) -> str:
     if not window:
         return ""

@@ -255,11 +255,15 @@ def test_unknown_required_capability_is_rejected() -> None:
 def test_effect_target_must_be_registered() -> None:
     """效果目标指向未登记对象时创建失败（附录 C #10）。"""
     package = sample_package()
-    package["events"]["families"][0]["templates"][0]["effects"] = [{"kind": "rumor", "target": "某个没登记的人"}]
+    package["events"]["families"][0]["templates"][0]["effects"] = [
+        {"kind": "rumor_spread", "target": "某个没登记的人", "expiry": "with_cause"}
+    ]
     assert any("未登记对象" in item for item in validate_package(package))
 
     package = sample_package()
-    package["events"]["families"][0]["templates"][0]["effects"] = [{"kind": "rumor", "target": "en-1"}]
+    package["events"]["families"][0]["templates"][0]["effects"] = [
+        {"kind": "rumor_spread", "target": "en-1", "expiry": "with_cause"}
+    ]
     assert validate_package(package) == []
 
 
