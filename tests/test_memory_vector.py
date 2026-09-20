@@ -132,6 +132,7 @@ def test_embedding_failure_leaves_items_pending(store) -> None:
         _StubHandler.fail = True
         result = asyncio.run(world_service.embed_memories(info["id"], timeline_id))
         assert result["embedded"] == 0 and result["error"] == "EmbeddingError"
+        assert "503" in result["reason"] and result["model"] == "stub-embed", "失败原因要一眼看得出"
         assert store.memory_missing_embeddings(info["id"], timeline_id, model="stub-embed")
         assert asyncio.run(world_service.embed_query("潮位", instance_id=info["id"], timeline_id=timeline_id)) is None, "查询向量拿不到就退化全文"
         _StubHandler.fail = False

@@ -544,7 +544,14 @@ class RuntimeService:
             vectors = await self._embed([str(item["text"]) for item in rows])
         except Exception as exc:
             self.settle_call(reservation, outcome="error")
-            return {"embedded": 0, "error": type(exc).__name__}
+            # 配置错字（模型名 / 地址 / 凭据）要一眼看得出来，别只回一个异常类名
+            return {
+                "embedded": 0,
+                "error": type(exc).__name__,
+                "reason": str(exc)[:200],
+                "model": self.embedding_model,
+                "base_url": self.embedding_base_url,
+            }
         self.settle_call(reservation, reply="".join(str(item["text"]) for item in rows))
         for row, vector in zip(rows, vectors):
             self.store.memory_embedding_put(
