@@ -32,6 +32,8 @@ runtime:
   memory_brief_tokens: 900        # 单轮简报预算（字符量级）
   memory_decay_per_day: 0.02      # 每世界日强度衰减率
   # 远程 embedding（§5.2）：三项留空即只用全文召回；地址需 OpenAI 兼容 /v1/embeddings
+  # 注意：填上模型与地址后，记忆向量化会把**该任务需要的记忆文本**发往这个服务（只发需要的文本，
+  # 不整包上传实例 / 对话 / 材料）；第一次配置远程服务请先确认这一点。
   memory_embedding_model: ""       # 裸模型名：qwen3.7-text-embedding / text-embedding-v4 / bge-m3
                                     # 别写 "openai:xxx" 这类 LiteLLM 前缀——兼容模式会 404
   memory_embedding_base_url: ""     # 例：https://dashscope.aliyuncs.com/compatible-mode/v1 或 http://127.0.0.1:1234/v1

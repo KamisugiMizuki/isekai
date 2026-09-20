@@ -15,8 +15,10 @@ from typing import Any
 
 from ..log import get_logger
 from ..store import Store
+from ..version import DEFAULT_MAX_PARTS, DEFAULT_MAX_TEXT_LEN
 from . import budget as budget_mod
 from ..world import instances
+from ..world.cards import region_of
 from ..world.validate import custom_index as _custom_index, office_index as _office_index
 
 from . import (
@@ -125,6 +127,8 @@ class RuntimeService:
         self.embedding_model = str(memory_embedding_model or "")
         self.embedding_base_url = str(memory_embedding_base_url or "")
         self.embedding_api_key = str(memory_embedding_api_key or "")
+        #: 已确认的向量维度（0 = 本次进程还没成功调用过）；同名换维度要靠它比对
+        self.embedding_dim = 0
         #: 自动提交（§5.1）：默认现实 1 小时或新增事件 50 条，可配置可关；手动提交不受开关限制
         self.autocommit_enabled = bool(autocommit_enabled)
         self.autocommit_minutes = max(1, int(autocommit_minutes))
@@ -252,9 +256,20 @@ class RuntimeService:
         for item in (package.get("environment") or {}).get("types") or []:
             if isinstance(item, dict) and item.get("id"):
                 targets.add(str(item["id"]))
+        # 制度与职位也是已登记目标：用户可借合法事件改变某职位的持有者（§八 第 3 条）
+        world = package.get("world") if isinstance(package.get("world"), dict) else {}
+        for item in world.get("institutions") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id"):
+                targets.add(str(item["id"]))
+            for office in item.get("offices") or []:
+                if isinstance(office, dict) and office.get("id"):
+                    targets.add(str(office["id"]))
         channels = sorted(
             str(item["id"]) for item in package.get("comms", {}).get("sources", []) if isinstance(item, dict) and item.get("id")
         ) if isinstance(package.get("comms"), dict) else []
+        targets.update(channels)  # 世界级渠道也是已登记来源点（docstring：效果只能指向它们）
         targets.discard("")
         return targets, channels
 
@@ -351,6 +366,15 @@ class RuntimeService:
         source_commit = str(draft["source_commit"] or "")
         payload = json.loads(draft["payload"])
         # 来源点重新校验（§八 第 7 条）：用当前提交 / 当前水位，不静默换基础
+        if not source_commit:
+            # 预览时按「当前」定的草案：世界若已走远，含义可能变了 → 要求重新起草，不静默换分叉基础
+            clock = self.clock_row(source_timeline)
+            preview_world = int(draft["created_world"] or 0)
+            if int(clock["processed_world"]) != preview_world:
+                raise RuntimeStateError(
+                    f"草案的来源点已经变化（预览在 {preview_world}，现在已到 {int(clock['processed_world'])}）："
+                    "请重新起草再确认，不静默换一个分叉基础"
+                )
         base_commit = source_commit or self.commit(instance_id, source_timeline, kind="auto", note="用户引入事件的来源点")["id"]
         branch = self.fork(
             instance_id, source_timeline, commit_id=base_commit,
@@ -384,10 +408,26 @@ class RuntimeService:
             })
             return {"scheduled": True, "at_world": int(payload["at_world"]), "event": ident}
         rows = self._user_event_rows(instance_id, timeline_id, payload, ident=ident, world=world)
+        # 效果要落成真状态才算数（§八#3）：制度 / 惯例 / 环境与引擎事件走同一条效果路径，
+        # 只在 effect_state 里留一行不改 institution_state，等于「接受了但什么都没发生」。
+        instance = self.store.instance_get(instance_id) or {}
+        institution_rows = self._institution_rows(
+            instance, instance_id, timeline_id, rows["effects"], deaths=[], from_world=world, to_world=world
+        )
+        environment_rows = self._environment_rows(
+            instance,
+            instance_id,
+            timeline_id,
+            self.calendar(instance),
+            rows["effects"],
+            from_world=world,
+            to_world=world,
+        )
         applied = self.store.apply_runtime_batch(
             timeline_id=timeline_id, generation=int(clock["generation"]), processed_world=world,
             catching_up=False, events=[rows["event"]], claims=rows["claims"], knowledge=rows["knowledge"],
-            effects=rows["effects"],
+            effects=rows["effects"], environment=environment_rows,
+            institution=institution_rows["institution"], customs=institution_rows["customs"],
         )
         if not applied:
             raise RuntimeStateError("注入被拒（世代已变）")
@@ -513,6 +553,8 @@ class RuntimeService:
         """自动提交：现实时间到达间隔，或新增事件数到阈值（§5.1，可配置、可关）。"""
         if not self.autocommit_enabled:
             return None
+        if not self.compatible(instance_id):
+            return None  # 兼容性阻断：不推进、不落提交（§7.6）
         state = self.store.commit_state_get(timeline_id)
         events_since = self.store.event_count_since(
             instance_id, timeline_id, since=int(state.get("last_commit_moment") or 0)
@@ -613,7 +655,16 @@ class RuntimeService:
             "catching_up": 0,
             "limited": 0,
         })
-        # 本机状态不从历史恢复：原来激活继续激活，原来冻结停在回滚点
+        # 回滚跨过补卡点：目标快照里没有的成员资格转为撤销（记录留着，不能复活，§3.7 末条）
+        self.store.character_join_revoke_missing(
+            timeline_id,
+            {
+                str(item.get("character_id") or "")
+                for item in (load_rows.get("characters") or [])
+                if isinstance(item, dict)
+            },
+            moment=int(snapshot.get("world") or 0),
+        )
         self.store.timeline_set_state(timeline_id, before_state)
         self.store.commit_state_set(
             timeline_id, instance_id, last_commit_at=now, last_commit_moment=int(snapshot.get("world") or 0)
@@ -801,12 +852,15 @@ class RuntimeService:
         from ..log import get_logger
 
         log = get_logger("isekai.memory")
+        if not self.compatible(instance_id):
+            return {"extracted": 0, "written": 0, "pending": 0, "calls": 0}  # 不跑派生任务（§7.6）
         cap = max(1, min(int(limit), memory_mod.BATCH_SIZE))
         tasks = self.store.memory_tasks(instance_id, timeline_id)[:cap]
         if not tasks:
             return {"extracted": 0, "written": 0, "pending": 0, "calls": 0}
         row = self.clock_row(timeline_id)
         watermark = int(row["processed_world"])
+        generation = int(row["generation"])
         day_seconds = self.calendar(self.store.instance_get(instance_id)).day_seconds
         written = calls = pending = 0
         by_character: dict[str, list[dict[str, Any]]] = {}
@@ -852,6 +906,18 @@ class RuntimeService:
             self.settle_call(reservation, prompt_text=prompt_text, reply=text)
             entries = memory_mod.parse_extraction(text, {str(item["ref"]) for item in materials})
             by_ref = {str(item["ref"]): item for item in materials}
+            fresh = self.clock_row(timeline_id)
+            if int(fresh["generation"]) != generation or str(
+                self.store.timeline_get(timeline_id)["state"]
+            ) != "active":
+                # 迟到结果不许写回：线在这轮调用期间被回滚 / 冻结 / 归档（§4.1、验收 2 / 9）。
+                # 保留待处理，重试留给下次调度；来源真没了时下轮会按「来源不可达」丢。
+                for material in materials:
+                    self.store.memory_task_set(
+                        str(material["task"]["id"]), state="pending", note="线已回滚或冻结"
+                    )
+                pending += len(materials)
+                continue
             if not entries:
                 # 分不清「确实没记下什么」与「回答不可解析」：看有没有结构化载荷。
                 # 有载荷而解析为空 = 模型说没有可记内容；没载荷 = 失败，保留待处理可重试。
@@ -887,12 +953,21 @@ class RuntimeService:
                     "semantic_watermark": watermark,
                     "strength": strength,
                     "confidence": entry["confidence"],
-                    "source_key": str(task["id"]),
+                    # 幂等键 =「来源 + 条目文本」：一个来源可以产出多条不同条目，
+                    # 只按来源去重会把第二条静默丢掉；重跑同一来源仍命中同键不重复写（§4.1）
+                    "source_key": f"{task['id']}#{events.stable_key(entry['text'])[:12]}",
                     "decay_world": watermark,
                 })
                 if saved is not None:
                     written += 1
                 self.store.memory_task_set(str(task["id"]), state="done")
+            mentioned = {str(entry["ref"]) for entry in entries}
+            for material in materials:
+                if str(material["ref"]) not in mentioned:
+                    # 本轮回答没提到它 = 看过了、没什么值得记：结算掉，别下一轮又拿它调一次模型（§4.1）
+                    self.store.memory_task_set(
+                        str(material["task"]["id"]), state="done", note="本轮未提到可记内容"
+                    )
         return {"extracted": len(tasks), "written": written, "pending": pending, "calls": calls}
 
     def turn_context(
@@ -958,8 +1033,13 @@ class RuntimeService:
         if not self.embedding_ready:
             return {"embedded": 0, "skipped": "not_configured"}
         rows = self.store.memory_missing_embeddings(
-            instance_id, timeline_id, model=self.embedding_model
+            instance_id, timeline_id, model=self.embedding_model, dim=int(self.embedding_dim or 0)
         )[: max(1, int(limit))]
+        if not rows and not self.embedding_dim:
+            # 维度还没确认过：拿一条已嵌入的当样本走一次调用，否则「同名换维度」时缺向量查询
+            # 查空就直接 return，第二段的按真实维度重建永远走不到（§5.2）
+            sample = self.store.memory_embedding_peek(instance_id, timeline_id, model=self.embedding_model)
+            rows = [sample] if sample else []
         if not rows:
             return {"embedded": 0}
         reservation = self.reserve_call(
@@ -984,6 +1064,8 @@ class RuntimeService:
                 "base_url": self.embedding_base_url,
             }
         self.settle_call(reservation, reply="".join(str(item["text"]) for item in rows))
+        if vectors:
+            self.embedding_dim = len(vectors[0])  # 一次成功调用就能确认当前维度
         for row, vector in zip(rows, vectors):
             self.store.memory_embedding_put(
                 str(row["id"]),
@@ -1011,7 +1093,7 @@ class RuntimeService:
                         timeline_id=timeline_id,
                         model=self.embedding_model,
                         vector=vector,
-                        source_version=int(row.get("source_version") or 0),
+                        content_hash=embedding_mod.content_hash(str(row["text"])),
                     )
                     rebuilt += 1
         return {"embedded": len(vectors), "rebuilt": rebuilt, "model": self.embedding_model}
@@ -1107,7 +1189,8 @@ class RuntimeService:
                     )},
                     "id": f"mm-org-{row['id'][-10:]}",
                     "text": short,
-                    "sources": row.get("sources"),
+                    # memory_scope 给的是 JSON 文本；memory_add 会再序列化一次 → 必须先解回列表
+                    "sources": json.loads(str(row.get("sources") or "[]")),
                     "recorded_world": world,
                     "strength": row.get("strength"),
                     "confidence": row.get("confidence"),
@@ -1115,6 +1198,8 @@ class RuntimeService:
                 }
                 created = self.store.memory_add(new_row)
                 if created is not None:
+                    # 整理后的版本取代原文：旧条归档留档、新版版本号 +1（§六）
+                    self.store.memory_supersede(old_id=str(row["id"]), new_id=str(created.get("id") or ""))
                     changed.append({"from": str(row["id"]), "to": str(created.get("id") or "")})
         return {"organized": len(changed), "items": changed}
 
@@ -1124,17 +1209,34 @@ class RuntimeService:
         *,
         topic: str,
         vector_scores: dict[str, float] | None = None,
+        until: int | None = None,
     ) -> list[dict[str, Any]]:
         """归档条目默认不进召回；**强相关**才唤起（§六），作用域与来源过滤已在前面做过。
 
         强相关 = 逐字命中（话题与条目文本互相包含）或向量相似度过线；唤起时打上标记，
         让表述层知道这是「模糊记起」，不是笃定的事实。
+
+        `until` 是查询水位：当时还没被替代的条目按当时认知算当前版本，不算归档（§4.2 问历史读旧版本）。
         """
         query = str(topic or "").strip()
         vec = dict(vector_scores or {})
+        pending = [str(item["id"]) for item in ranked if str(item.get("state")) == "archived"]
+        marks = {}
+        if pending and until is not None:
+            instance_id = str(ranked[0].get("instance_id") or "")
+            timeline_id = str(ranked[0].get("timeline_id") or "")
+            marks = self.store.memory_supersede_moments(instance_id, timeline_id, pending)
         out: list[dict[str, Any]] = []
         for item in ranked:
             if str(item.get("state")) != "archived":
+                out.append(item)
+                continue
+            mark = int(marks.get(str(item.get("id")) or "", 0))
+            if mark:
+                # 被新版取代（整理 / 明确纠正）：当前认知用新版，不召回旧版；
+                # 查询水位在替代之前时它还是当时的当前版本，按当时认知给出（§4.2）
+                if until is None or mark <= int(until):
+                    continue
                 out.append(item)
                 continue
             text = str(item.get("text") or "")
@@ -1188,7 +1290,9 @@ class RuntimeService:
         )
         for item in ranked:
             item["source_label"] = memory_mod.source_label(json.loads(item.get("sources") or "[]"))
-        ranked = self._drop_archived_unless_strong(ranked, topic=topic, vector_scores=vector_scores)[:40]
+        ranked = self._drop_archived_unless_strong(
+            ranked, topic=topic, vector_scores=vector_scores, until=int(world_seconds)
+        )[:40]
         brief = memory_mod.pack_brief(
             ranked, budget_tokens=self.memory_brief_tokens, limit=limit or self.memory_recall_limit
         )
@@ -1341,13 +1445,42 @@ class RuntimeService:
             # 没给水位就按该线当前水位：补入的角色默认算「已在本线」，别让她隐形
             clock = self.store.clock_get(timeline_id)
             world_seconds = int(clock["processed_world"]) if clock else 0
-        joined = self.store.character_join_list(instance["id"], timeline_id, until=int(world_seconds))
-        for row in joined:
+        world_seconds = int(world_seconds)
+        joined_ids = self.store.character_join_ids(str(instance["id"]))
+        out: list[dict[str, Any]] = []
+        known: set[str] = set()
+        for card in cards:
+            character_id = str((card.get("meta") or {}).get("card_id") or "")
+            known.add(character_id)
+            if character_id in joined_ids:
+                # 补入的角色：只有本线成员资格仍有效时她在这条线可选（§3.7 第 1 条）；
+                # 撤销过的定义留在实例快照里，但不因快照保留而在本线重新暴露。
+                if self.store.character_membership(str(instance["id"]), timeline_id, character_id, until=world_seconds) != "joined":
+                    continue
+            out.append(card)
+        # 兼容早期补卡：定义只在成员资格行里（迁移前的库）
+        for row in self.store.character_join_list(instance["id"], timeline_id, until=world_seconds):
+            if str(row["character_id"]) in known:
+                continue
             try:
-                cards.append(json.loads(str(row["card"])))
+                out.append(json.loads(str(row["card"])))
             except json.JSONDecodeError:
                 log.warning("补入角色卡损坏 card=%s", row.get("character_id"))
-        return cards
+        return out
+
+    def assert_member(self, instance: dict[str, Any], timeline_id: str, character_id: str) -> None:
+        """角色选择 / 会话创建 / 认知查询前的成员资格检查（§3.7 第 1 条）。
+
+        依据该线**当前水位**的角色集合：撤销过的补入角色与从未装配过的标识都在此被挡。
+        """
+        clock = self.store.clock_get(timeline_id)
+        world_seconds = int(clock["processed_world"]) if clock else 0
+        known = {
+            str((card.get("meta") or {}).get("card_id") or "")
+            for card in self.cards(instance, timeline_id=timeline_id, world_seconds=world_seconds)
+        }
+        if str(character_id) not in known:
+            raise RuntimeStateError(f"该角色不在本线的角色集合里：{character_id}")
 
     def seed_of(self, instance: dict[str, Any]) -> str:
         """锁定种子：候选抽样只依赖它 + 规则版本 + 历法日 + 槽序（附录 A）。"""
@@ -1387,14 +1520,18 @@ class RuntimeService:
         self.store.clock_put(row)
         return row
 
+    def compatible(self, instance_id: str) -> bool:
+        """兼容检查（§7.6）：blocked 的实例不推进、不跑派生任务、不接受新对话提交。"""
+        row = self.store.instance_get(instance_id)
+        return row is None or str(instances.compatibility(row)[0]) != "blocked"
+
     def _require_compatible(self, instance_id: str) -> None:
         """兼容检查先于推进：blocked 的实例不能激活 / 推进（只读或先转换）。"""
-        row = self.store.instance_get(instance_id)
-        if row is None:
+        if self.compatible(instance_id):
             return
+        row = self.store.instance_get(instance_id) or {}
         status, note = instances.compatibility(row)
-        if status == "blocked":
-            raise RuntimeStateError(f"实例兼容性阻断，不能推进：{note or status}")
+        raise RuntimeStateError(f"实例兼容性阻断，不能推进：{note or status}")
 
     def activate(
         self, instance_id: str, timeline_id: str, *, now_real: float, rate: int | None = None
@@ -1674,7 +1811,9 @@ class RuntimeService:
                 generation=generation,
                 processed_world=stop,
                 catching_up=stop < target,
-                limited=limited,
+                # 受限状态按**这一批之后的实况**记（附录 B #20）：追平的那一批就该清 0，
+                # 不能把循环前算出来的 True 一路写到最后一批、留到下一次 advance 才自愈
+                limited=1 if ((target - stop) > self.catch_up_lag_seconds) else 0,
                 plans=plans,
                 units=units,
                 experiences=experiences + intent_rows['experiences'],
@@ -1766,13 +1905,13 @@ class RuntimeService:
                 instance_id,
                 timeline_id,
                 until=to_world,
-                targets=[character_id, str(card.get("role_id") or ""), str((card.get("identity") or {}).get("region") or "")],
+                targets=[character_id, str(card.get("role_id") or ""), region_of(card)],
             )
             note = life.effect_note(
                 constraints,
                 character_id,
                 str(card.get("role_id") or ""),
-                str((card.get("identity") or {}).get("region") or ""),
+                region_of(card),
             )
             for day_index in (day_here - 1, day_here):
                 plan = self.store.plan_get(instance_id, timeline_id, character_id, day_index)
@@ -1847,6 +1986,8 @@ class RuntimeService:
         thread_id: str,
         llm: Any = None,
         now_real: float | None = None,
+        max_text_len: int = 0,
+        max_parts: int = 0,
     ) -> dict[str, Any]:
         """初次联络的独立开场（§5.6）：只投向触发视图的 thread，一次性，不占主动配额。
 
@@ -1864,6 +2005,9 @@ class RuntimeService:
         existing = self.store.first_contact_get(str(session["id"]))
         if existing is not None:
             return {"reused": True, "message_id": str(existing["message_id"])}
+        if self.store.session_has_inbound(str(session["id"])):
+            # 用户已经先开口：初见意向并入首轮回复，不再补一条独立开场（§5.6 不双发）
+            return {"spoken": False, "reason": "用户已先发言，不另发开场"}
 
         world = int(self.clock_row(timeline_id)["processed_world"])
         card = self.card_of(instance, character_id, timeline_id=timeline_id, world_seconds=world)
@@ -1884,7 +2028,9 @@ class RuntimeService:
             message_id=message_id,
             reply_to=None,
             covers=[],
-            batches=[[str(text).strip()]],
+            batches=self._channel_batches(
+                str(text).strip(), channel_id=channel_id, max_text_len=max_text_len, max_parts=max_parts
+            ),
             target_channel=channel_id,
             target_thread=thread_id,
             binding_version=int(target.get("binding_version") or 0),
@@ -1933,6 +2079,8 @@ class RuntimeService:
         llm: Any = None,
         now_real: float | None = None,
         per_day: int = 2,
+        max_text_len: int = 0,
+        max_parts: int = 0,
     ) -> dict[str, Any]:
         """世界源主动发言（§五）：按节律与配额，从她**已获知**的素材里挑一条固化成消息。
 
@@ -1940,6 +2088,9 @@ class RuntimeService:
         离线补算不补造过去每个发送时机（只按当前时刻评定一次）。
         """
         import time as _time
+
+        if not self.compatible(instance_id):
+            return {"spoken": 0, "messages": [], "skipped": {"compatibility": "实例兼容性阻断"}, "world": 0}
 
         now = _time.time() if now_real is None else float(now_real)
         instance = self.store.instance_get(instance_id)
@@ -2006,14 +2157,17 @@ class RuntimeService:
                 skipped[character_id] = "素材在但没想好怎么说" if text else "生成失败"
                 continue
             message_id = f"m-{__import__('secrets').token_hex(6)}"
-            batches = [self._batch_text(str(text).strip())]
+            target_channel = str((target or {}).get("channel_id") or "")
+            batches = self._channel_batches(
+                str(text).strip(), channel_id=target_channel, max_text_len=max_text_len, max_parts=max_parts
+            )
             self.store.outbound_put(
                 session_id=str(session["id"]),
                 message_id=message_id,
                 reply_to=None,
                 covers=[],
                 batches=batches,
-                target_channel=str((target or {}).get("channel_id") or ""),
+                target_channel=target_channel,
                 target_thread=str((target or {}).get("thread_id") or ""),
                 binding_version=int((target or {}).get("binding_version") or 0),
                 binding_token=str((target or {}).get("binding_token") or ""),
@@ -2050,9 +2204,31 @@ class RuntimeService:
             {"role": "user", "content": f"你想说的事：{material['text'][:200]}"},
         ]
 
-    @staticmethod
-    def _batch_text(text: str) -> list[str]:
-        return [text]
+    def _channel_batches(
+        self, text: str, *, channel_id: str, max_text_len: int = 0, max_parts: int = 0
+    ) -> list[list[str]]:
+        """按目标通道**协商的分段能力**分批（CHANNEL_PLUGIN_SPEC §2.4）。
+
+        主动消息与独立开场也走同一条：固化时不拆，投递侧只会标 incompatible，
+        这条消息就永远发不出去（普通回复在会话层已按同一口径分批）。
+        """
+        from ..session import plan_batches, split_parts  # 局部导入：session 顶层已依赖 runtime
+
+        channel = self.store.channel_get(channel_id) if channel_id else None
+        caps: dict[str, Any] = {}
+        if channel is not None:
+            try:
+                caps = json.loads(str(channel.get("capabilities") or "{}"))
+            except (json.JSONDecodeError, TypeError):
+                caps = {}
+        ceiling_len = int(max_text_len or DEFAULT_MAX_TEXT_LEN)
+        ceiling_parts = int(max_parts or DEFAULT_MAX_PARTS)
+        limit_len = min(int(caps.get("max_text_len") or ceiling_len), ceiling_len)
+        if not caps.get("segments", False):
+            limit_parts = 1
+        else:
+            limit_parts = min(int(caps.get("max_parts") or ceiling_parts), ceiling_parts)
+        return plan_batches(split_parts(str(text), max(1, limit_len)), max(1, limit_parts))
 
     def _institution_rows(
         self,
@@ -2291,6 +2467,34 @@ class RuntimeService:
                 out["knowledge"].extend(events.grants(row, claims, card, world_seconds=at, calendar=calendar))
         return out
 
+    def _entity_death_row(
+        self, entity: dict[str, Any], *, instance_id: str, timeline_id: str, world_seconds: int, calendar: Calendar
+    ) -> dict[str, Any] | None:
+        """登记实体（要点人物）的寿终行：与角色卡身故同形，单独记账、可产生死讯说法（§四）。"""
+        entity_id = str(entity.get("id") or "")
+        died = entity.get("died")
+        if not entity_id or not isinstance(died, int) or isinstance(died, bool):
+            return None
+        surrogate = {
+            "meta": {"card_id": entity_id},
+            "identity": {
+                "name": str(entity.get("name") or "某人"),
+                "born": int(entity.get("born") or 0) if isinstance(entity.get("born"), int) else 0,
+                "died": int(died),
+            },
+        }
+        instance = self.store.instance_get(instance_id) or {}
+        row = events.death_event(
+            surrogate,
+            instance_id=instance_id,
+            timeline_id=timeline_id,
+            world_seconds=int(world_seconds),
+            calendar=calendar,
+            seed=self.seed_of(instance),
+        )
+        row.pop("_seed", None)
+        return row
+
     def _death_rows(
         self,
         instance: dict[str, Any],
@@ -2341,6 +2545,40 @@ class RuntimeService:
                 out["knowledge"].extend(
                     events.grants(row, claims, other, world_seconds=moment, calendar=calendar)
                 )
+        # 登记实体的寿终（§四）：卡外的人也不是背景板——要点人物的生死同样登记为事件 + 死讯说法
+        for entity in package.get("entities") or []:
+            if not isinstance(entity, dict) or str(entity.get("kind") or "") != "person":
+                continue
+            entity_id = str(entity.get("id") or "")
+            died = entity.get("died")
+            if not entity_id or not isinstance(died, int) or isinstance(died, bool):
+                continue
+            if events.is_dead(instance_id, timeline_id, entity_id, known):
+                continue
+            if not (from_world < int(died) <= to_world):
+                continue
+            row = self._entity_death_row(
+                entity, instance_id=instance_id, timeline_id=timeline_id, world_seconds=int(died), calendar=calendar
+            )
+            if row is None:
+                continue
+            out["events"].append(row)
+            claims = events.dump_rows(
+                events.claim_rows(
+                    {"summary": row["summary"], "effects": []},
+                    package=package,
+                    instance_id=instance_id,
+                    timeline_id=timeline_id,
+                    event_ident=str(row["id"]),
+                    world_seconds=int(died),
+                    calendar=calendar,
+                )
+            )
+            out["claims"].extend(claims)
+            for other in cards:
+                out["knowledge"].extend(
+                    events.grants(row, claims, other, world_seconds=int(died), calendar=calendar)
+                )
         return out
 
     def _propagate_and_clear(
@@ -2365,22 +2603,26 @@ class RuntimeService:
                 if grant is not None:
                     rows["knowledge"].append(grant)
         day_seconds = calendar.day_seconds
-        # 同族的后续事件（自然恢复的判定依据）：按世界时刻排一次即可
-        later_by_family: dict[str, int] = {}
+        # 同族的后续事件（自然恢复的判定依据）：取**最早**那一条，解除时刻记它的世界时刻
+        family_moments: dict[str, list[int]] = {}
         for item in self.store.event_window(instance_id, timeline_id, until=to_world, limit=200):
             family = str(item.get("family") or "")
             if family:
-                later_by_family[family] = max(later_by_family.get(family, 0), int(item["world_seconds"]))
+                family_moments.setdefault(family, []).append(int(item["world_seconds"]))
         for effect in self.store.effect_window(instance_id, timeline_id, until=to_world):
             expiry = str(effect.get("expiry"))
             started = int(effect["from_world"])
-            if expiry == "with_cause" and started + day_seconds <= to_world:
-                rows["clear_effects"].append((str(effect["id"]), instance_id))
+            # 解除时刻 = 条件首次成立的世界时刻，不取批边界：换一种分批方式不改变留档
+            if expiry == "with_cause":
+                moment = started + day_seconds
+                if moment <= to_world:
+                    rows["clear_effects"].append((str(effect["id"]), instance_id, moment))
             elif expiry == "natural_recovery":
                 family = str(effect.get("family") or "")
+                later = [moment for moment in family_moments.get(family, []) if moment > started]
                 # 同族在该后果之后仍有新事件 → 声明的自然条件成立；没有依据就保持有效
-                if family and later_by_family.get(family, 0) > started:
-                    rows["clear_effects"].append((str(effect["id"]), instance_id))
+                if later:
+                    rows["clear_effects"].append((str(effect["id"]), instance_id, min(later)))
         _ = instance
         return rows
 
@@ -2503,7 +2745,7 @@ class RuntimeService:
             targets=[
                 character_id,
                 str(card.get("role_id") or ""),
-                str((card.get("identity") or {}).get("region") or ""),
+                region_of(card),
             ],
         )
         activity = life.activity_label(life.current_window(plan, world_seconds))
@@ -2511,7 +2753,7 @@ class RuntimeService:
             effects,
             character_id,
             str(card.get("role_id") or ""),
-            str((card.get("identity") or {}).get("region") or ""),
+            region_of(card),
         )
         if note and activity:
             activity = f"{activity}（受影响的后果：{note}）"
@@ -2583,6 +2825,36 @@ class RuntimeService:
             seed=self.seed_of(instance),
             rules_version=self.rules_of(instance),
         )
+        # 回填期一并确定要点人物的生死（§3.6 / §四）：早已身故的登记实体也补一条寿终事件与死讯说法，
+        # 只登记事件与说法、不施加效果（沿用回填的边界）。
+        calendar = self.calendar(instance)
+        package = self.setting(instance)["world_package"]
+        moment = int(instance["moment"] or 0)
+        for entity in package.get("entities") or []:
+            if not isinstance(entity, dict) or str(entity.get("kind") or "") != "person":
+                continue
+            died = entity.get("died")
+            if not isinstance(died, int) or isinstance(died, bool) or int(died) >= moment:
+                continue
+            row = self._entity_death_row(
+                entity, instance_id=instance_id, timeline_id=timeline_id, world_seconds=int(died), calendar=calendar
+            )
+            if row is None:
+                continue
+            rows.append(row)
+            claims.extend(
+                events.dump_rows(
+                    events.claim_rows(
+                        {"summary": row["summary"], "effects": []},
+                        package=package,
+                        instance_id=instance_id,
+                        timeline_id=timeline_id,
+                        event_ident=str(row["id"]),
+                        world_seconds=int(died),
+                        calendar=calendar,
+                    )
+                )
+            )
         if not rows:
             return 0
         return self.store.runtime_load(
@@ -2842,15 +3114,25 @@ class RuntimeService:
         joined_world: int | None = None,
         note: str = "",
         acquainted: bool = False,
+        request_id: str = "",
+        event: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """把角色锚定补入该线（§九 / 附录 B #18）。
+        """把角色锚定补入该线（§3.7 / 附录 B #18）。
 
         - 新角色一直存在：卡片自带个人史，补入只决定她自哪一刻起出现在本线；
-        - 个人史与初始知识按同一认知契约投影（卡片先在设定层过校验，此处只做锚定）；
-        - 补入不激活该线：冻结线锚定冻结时刻（调用方随后自行决定是否激活）；
-        - 加入点之前的经历与水位不变，回滚跨越加入点即一致退出（回滚属阶段 4）。
+        - 三处留痕：实例设定快照里的**不可变定义**、本线成员资格、本线**加入提交**；
+        - 同一 `request_id` 重试返回原子发布结果，不重复登记；回滚撤销过的记录不能复活；
+        - 可选 `event`：用户自定义的加入世界事件，走既有事件路径登记为世界事件；
+        - 补入不激活该线：冻结线锚定冻结时刻（调用方随后自行决定是否激活）。
         """
         instance, timeline = self._rows(instance_id, timeline_id)
+        calendar = self.calendar(instance)
+        if request_id:
+            prior = self.store.character_join_by_request(instance_id, timeline_id, request_id)
+            if prior is not None:
+                if str(prior.get("state") or "active") != "active":
+                    raise RuntimeStateError("这条补入已被回滚撤销：要再补入请换新的请求标识（不能复活旧成员资格）")
+                return {**self._join_public(prior, calendar, timeline), "reused": True}
         row = self.clock_row(timeline_id)
         watermark = int(row["processed_world"])
         if joined_world is None:
@@ -2872,12 +3154,17 @@ class RuntimeService:
         died = (card.get("identity") or {}).get("died")
         if isinstance(died, int) and died <= joined_world:
             raise RuntimeStateError("补入时刻该角色已身故，不能补入（个人史与世界既定历史冲突）")
-        existing = {
-            str((item.get("meta") or {}).get("card_id"))
-            for item in self.cards(instance, timeline_id=timeline_id, world_seconds=watermark)
-        }
-        if character_id in existing:
+        if self.store.character_membership(instance_id, timeline_id, character_id, until=watermark) == "joined":
             raise RuntimeStateError(f"该角色已在本线：{character_id}")
+        # 定义是实例级不可变对象：同一 card_id 不允许第二份不同定义（含跨线补卡）
+        for item in self.setting(instance).get("cards") or []:
+            if str((item.get("meta") or {}).get("card_id") or "") != character_id:
+                continue
+            if json.dumps(item, ensure_ascii=False, sort_keys=True) != json.dumps(card, ensure_ascii=False, sort_keys=True):
+                raise RuntimeStateError(
+                    f"该角色已在本线（实例里已有同一标识的不可变定义）：补卡只增加角色，不能借同一标识改写既有角色卡 {character_id}"
+                )
+            break
         from ..world.cards import validate_card  # 局部导入：设定层与运行层不互相依赖
 
         errors = validate_card(card, self.setting(instance)["world_package"], moment=joined_world)
@@ -2885,19 +3172,6 @@ class RuntimeService:
             errors.append("meta: 角色卡未确认，不能补入")
         if errors:
             raise RuntimeStateError("补入校验未通过：" + "；".join(str(item) for item in errors[:6]))
-        calendar = self.calendar(instance)
-        self.store.character_join_add(
-            {
-                "instance_id": instance_id,
-                "timeline_id": timeline_id,
-                "character_id": character_id,
-                "joined_world": joined_world,
-                "card": json.dumps(card, ensure_ascii=False, sort_keys=True),
-                "note": note,
-                "acquainted": 1 if acquainted else 0,
-                "created_real": float(now_real),
-            }
-        )
         units = personality.initial_rows(
             card, instance_id=instance_id, timeline_id=timeline_id, world_seconds=joined_world
         )
@@ -2918,29 +3192,91 @@ class RuntimeService:
                     "updated_world": joined_world,
                 }
             )
-        for unit in units:
-            self.store.unit_put(unit)
-        self.store.plan_put(
-            life.expand_plan(
-                card,
-                calendar,
-                day_index=calendar.day_index(joined_world),
-                instance_id=instance_id,
-                timeline_id=timeline_id,
-                created_world=joined_world,
-            )
+        plan = life.expand_plan(
+            card,
+            calendar,
+            day_index=calendar.day_index(joined_world),
+            instance_id=instance_id,
+            timeline_id=timeline_id,
+            created_world=joined_world,
         )
+        # 定义进实例快照（实例级不可变对象）；成员资格、状态与日程只进本线——一次原子发布
+        setting = self.setting(instance)
+        definitions = [
+            item for item in (setting.get("cards") or []) if str((item.get("meta") or {}).get("card_id") or "") != character_id
+        ]
+        definitions.append(card)
+        join_row = {
+            "instance_id": instance_id,
+            "timeline_id": timeline_id,
+            "character_id": character_id,
+            "joined_world": joined_world,
+            "card": json.dumps(card, ensure_ascii=False, sort_keys=True),
+            "note": note,
+            "acquainted": 1 if acquainted else 0,
+            "created_real": float(now_real),
+            "request_id": str(request_id),
+        }
+        self.store.character_join_publish(
+            join_row, units=units, plan=plan, setting={**setting, "cards": definitions}
+        )
+        # 加入提交：补卡在目标线留下的第三个锚点（回滚点 / 分叉点）
+        commit = self.commit(instance_id, timeline_id, kind="join", note=f"补入角色 {character_id}")
+        self.store.character_join_set_commit(instance_id, timeline_id, character_id, str(commit["id"]))
+        event_ref = ""
+        if event:
+            # 用户自定义的加入世界事件：走既有待执行事件路径 + 即时施加（§3.7）
+            pending_id = f"pe-join-{character_id}-{request_id or secrets.token_hex(4)}"
+            self.store.pending_event_add(
+                {
+                    "id": pending_id,
+                    "instance_id": instance_id,
+                    "timeline_id": timeline_id,
+                    "at_world": joined_world,
+                    "payload": json.dumps(
+                        {
+                            "intent": str(event.get("summary") or event.get("intent") or "补卡时的世界事件"),
+                            "effects": list(event.get("effects") or []),
+                            "claims": list(event.get("claims") or []),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "state": "pending",
+                    "note": "补卡加入事件",
+                    "created_world": watermark,
+                    "created_at": float(now_real),
+                }
+            )
+            self.apply_due_pending_events(instance_id, timeline_id, to_world=joined_world)
+            event_ref = f"ev-user-{events.stable_key(instance_id, timeline_id, pending_id)[:12]}"
+        latest = self.store.character_join_by_request(instance_id, timeline_id, request_id) if request_id else None
+        if latest is None:
+            latest = next(
+                (
+                    item
+                    for item in self.store.character_join_list(instance_id, timeline_id, until=watermark)
+                    if str(item["character_id"]) == character_id
+                ),
+                join_row,
+            )
+        return {**self._join_public(latest, calendar, timeline), "event": event_ref}
+
+    def _join_public(self, row: dict[str, Any], calendar: Any, timeline: dict[str, Any]) -> dict[str, Any]:
+        """补入的公开结果：只给管理元数据与锚点，不带剧情摘要。"""
+        joined_world = int(row.get("joined_world") or 0)
         return {
-            "instance": instance_id,
-            "timeline": timeline_id,
-            "character": character_id,
-            "name": str((card.get("identity") or {}).get("name") or ""),
+            "instance": str(row.get("instance_id") or ""),
+            "timeline": str(row.get("timeline_id") or ""),
+            "character": str(row.get("character_id") or ""),
+            "name": str((json.loads(str(row.get("card") or "{}")).get("identity") or {}).get("name") or ""),
             "joined_world": joined_world,
             "joined_label": calendar.describe(joined_world),
-            "units": len(units),
-            "acquainted": bool(acquainted),
-            "timeline_state": timeline["state"],
-            "note": note,
+            "commit_id": str(row.get("commit_id") or ""),
+            "state": str(row.get("state") or "active"),
+            "acquainted": bool(row.get("acquainted")),
+            "timeline_state": str(timeline.get("state") or ""),
+            "note": str(row.get("note") or ""),
+            "units": len(self.store.unit_list(str(row.get("instance_id") or ""), str(row.get("timeline_id") or ""), str(row.get("character_id") or ""))),
         }
 
     # ---------- 会话接入 ----------

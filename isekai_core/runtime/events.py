@@ -17,6 +17,7 @@ import hashlib
 import json
 from typing import Any, Iterable
 
+from ..world.cards import region_of
 from ..world.validate import DENSITY_TARGETS, EXPIRY_KINDS, SUPPORTED_EFFECTS as SUPPORTED_EFFECT_NAMES
 
 #: 候选槽建议起点（附录 A）：槽数是搜索空间，不是发生数量
@@ -253,7 +254,7 @@ def grants(
     targets = {str(item.get("target") or "") for item in raw_effects or [] if isinstance(item, dict)}
     role = str(card.get("role_id") or "")
     out: list[dict[str, Any]] = []
-    involved = role in targets or str((card.get("identity") or {}).get("region") or "") in targets
+    involved = role in targets or region_of(card) in targets
     if involved:
         out.append(
             {
@@ -375,6 +376,8 @@ def backfill_rows(
         )
     for index, ident in enumerate(fixed.get("rumors") or []):
         item = narratives.get(str(ident)) or {}
+        # 说法层的正文字段是 text（实情层才是 statement）——写死 statement 会让回填退化成标识
+        statement = str(item.get("text") or item.get("statement") or ident)
         events.append(
             {
                 "id": f"ev-h{100 + index:03d}-{stable_key(seed, 'backfill', ident)[:8]}",
@@ -386,8 +389,8 @@ def backfill_rows(
                 "family": "",
                 "template": str(ident),
                 "source": "backfill",
-                "summary": str(item.get("statement") or ident),
-                "detail": str(item.get("statement") or ident),
+                "summary": statement,
+                "detail": statement,
                 "text_source": "template",
                 "effects": "[]",
                 "share_value": int(bool(item.get("share_value"))),
@@ -402,7 +405,7 @@ def backfill_rows(
                 "timeline_id": timeline_id,
                 "event_id": f"ev-h{100 + index:03d}-{stable_key(seed, 'backfill', ident)[:8]}",
                 "source_id": str(item.get("source_id") or (item.get("sources") or [""])[0] or ""),
-                "text": str(item.get("statement") or ident),
+                "text": statement,
                 "audience": str(item.get("audience") or "公开"),
                 "earliest_world": int(item.get("at") or 0),
                 "credibility": "recorded",

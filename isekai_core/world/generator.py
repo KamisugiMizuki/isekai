@@ -293,7 +293,19 @@ async def generate_card(
         )
     except BudgetExhausted as exc:
         return {**skeleton}, [str(exc)], _usage(budget, paused=True)
-    return candidate, errors, _usage(budget, paused=False)
+    return _unconfirmed(candidate), errors, _usage(budget, paused=False)
+
+
+def _unconfirmed(candidate: dict[str, Any]) -> dict[str, Any]:
+    """AI 候选一律「未确认」：确认只能由用户显式完成（§5.2）。
+
+    形状参考里的 `"confirmed": true` 是示例卡自身的状态，模型照抄会把用户确认这一步绕过去。
+    """
+    meta = candidate.get("meta") if isinstance(candidate.get("meta"), dict) else {}
+    if "confirmed" in meta:
+        meta["confirmed"] = False
+        candidate["meta"] = meta
+    return candidate
 
 
 async def _generate_with_retry(

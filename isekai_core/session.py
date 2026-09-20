@@ -124,6 +124,16 @@ class SessionService:
                     ref=env_id,
                     stage=Stage.RECEIVE,
                 )
+            # 兼容性阻断的实例不接受新对话提交（§7.6）：检查先于提交、不静默按当前规则作答
+            runtime = getattr(self, "runtime", None)
+            if runtime is not None and not runtime.compatible(instance_id):
+                raise UmpError(
+                    Err.STATE_BLOCKED,
+                    "实例兼容性阻断：只读历史，等兼容版本或用户确认转换后再对话",
+                    retryable=False,
+                    ref=env_id,
+                    stage=Stage.RECEIVE,
+                )
 
         try:
             row, created = self.store.inbound_put(
@@ -163,7 +173,20 @@ class SessionService:
             return
         target = self.store.thread_for_session(session_id) or {}
         message_id = f"m-{secrets.token_hex(6)}"
-        text = f"{character_id} 已经不在了。之后的消息不会再转给她，早先的对话都还留着。"
+        who = ""
+        runtime = getattr(self, "runtime", None)
+        try:
+            if runtime is not None:
+                candidate = runtime._display_name(
+                    str(session_row.get("instance_id") or ""),
+                    str(session_row.get("timeline_id") or ""),
+                    character_id,
+                )
+                who = "" if candidate == character_id else candidate
+        except Exception:
+            who = ""
+        # 说明是联络系统 / 管理机制发的（role=notice），不冒充成她本人的新发言，也不带内部标识
+        text = f"{who or '她'}已经不在了。之后的消息不会再转给她，早先的对话都还留着。"
         self.store.outbound_put(
             session_id=session_id,
             message_id=message_id,
@@ -174,6 +197,7 @@ class SessionService:
             target_thread=str(target.get("thread_id") or ""),
             binding_version=int(target.get("binding_version") or 0),
             binding_token=str(target.get("binding_token") or ""),
+            role="notice",
         )
         self.store.session_notice_put(
             {
@@ -191,6 +215,13 @@ class SessionService:
                 await self._send_batches(fixed)
         except Exception:
             pass  # 投递失败不留半成品：消息已在历史与待投递里
+
+    async def flush_proactive(self, session_id: str) -> int:
+        """投递仍有效的主动消息（§5.3）：核心 tick 与入站路径共用这一条。」
+
+        只发最新一条，积压留在历史里，不做洪峰补发。
+        """
+        return await self._flush_proactive(session_id)
 
     async def _flush_proactive(self, session_id: str) -> int:
         """投递仍有效的主动消息（§5.3）：只发最新一条，积压留在历史里，不做洪峰补发。"""
@@ -241,6 +272,15 @@ class SessionService:
         if state == "cancelled":
             raise UmpError(Err.VOIDED, "该输入已作废", retryable=False, ref=ref, stage=Stage.RECEIVE)
         # failed：恢复同一逻辑轮次的新尝试
+        if self.store.has_later_success(str(outbound["session_id"] or ""), int(outbound["seq"])):
+            # 这轮之后已经聊过新的了：重放旧轮次会插队，让用户直接重发（§4.3）
+            raise UmpError(
+                Err.CONFLICT,
+                "这轮之后已经有过新的对话，旧消息不能插队重试；请直接重发",
+                retryable=False,
+                ref=ref,
+                stage=Stage.RECEIVE,
+            )
         self.store.inbound_set_state(outbound["seq"], "queued", error_code=None)
         self._schedule(outbound["seq"])
         return {"ref": ref, "state": "processing", "message_id": None}
@@ -341,13 +381,12 @@ class SessionService:
             )
             return
 
-        if self.store.void_has(
-            str(row.get("channel_id") or ""), str(row.get("thread_id") or ""), str(row.get("env_id") or "")
-        ):
-            # 处理期间被回滚 / 重绑作废：不写回、不投递（§七）
-            log.info("turn dropped: input voided seq=%s", row["seq"])
+        # 提交前核对作废 / 换代 / 冻结 / 归档 / 身故：迟到结果不写入、不投递（§七、§4.5、§5.7）
+        stale = self._stale_code(row)
+        if stale:
+            log.info("turn dropped: %s seq=%s", stale, row["seq"])
             for seq in seqs:
-                self.store.inbound_set_state(seq, "cancelled", error_code=Err.VOIDED)
+                self.store.inbound_set_state(seq, "cancelled", error_code=stale)
             await self._status(row, "idle")
             return
         thread = self.store.thread_get(row["channel_id"], row["thread_id"])
@@ -377,7 +416,52 @@ class SessionService:
         )
         self._settle_memory(rows, message_id=str(message_id), reply_text=chr(10).join(parts))
         await self._send_batches(msg)
+        # 追赶中要说清（§2.6 条 5）：回复按已完成的过去作答（安全侧），但别让通道端以为世界停下不动
+        await self._catching_up_notice(row, binding_token=str(thread["binding_token"]))
         await self._status(row, "idle")
+
+    async def _catching_up_notice(self, row: dict[str, Any], *, binding_token: str) -> None:
+        """追赶期的系统提示：每个追赶档只发一条（session_notice 去重），追平后自动解除。"""
+        session_id = str(row["session_id"])
+        session = self.store.session_get(session_id) or {}
+        timeline_id = str(session.get("timeline_id") or "")
+        clock = self.store.clock_get(timeline_id) if timeline_id else None
+        if clock is None:
+            return
+        catching = int(clock.get("catching_up") or 0)
+        existing = self.store.session_notice_get(session_id, "catching_up")
+        if not catching:
+            if existing is not None:
+                self.store.session_notice_clear(session_id, "catching_up")
+            return
+        if existing is not None:
+            return
+        message_id = f"m-{secrets.token_hex(6)}"
+        self.store.outbound_put(
+            session_id=session_id,
+            message_id=message_id,
+            reply_to=None,
+            covers=[],
+            batches=[["世界还在追赶：这条回复按已完成的过去作答，追平后我接着往下说。"]],
+            target_channel=str(row["channel_id"]),
+            target_thread=str(row["thread_id"]),
+            binding_version=int(row["binding_version"]),
+            binding_token=binding_token,
+            role="notice",
+        )
+        self.store.session_notice_put(
+            {
+                "session_id": session_id,
+                "instance_id": str(session.get("instance_id") or ""),
+                "timeline_id": timeline_id,
+                "kind": "catching_up",
+                "message_id": message_id,
+                "created_real": time.time(),
+            }
+        )
+        fixed = self.store.outbound_by_message_id(message_id)
+        if fixed is not None:
+            await self._send_batches(fixed)
 
     def _collect_batch(self, row: dict[str, Any]) -> list[dict[str, Any]]:
         """封口（§4.5）：到点、达到容量、或遇到其他来源 / 已作废的入站即止，后来输入属下一批。"""
@@ -412,6 +496,10 @@ class SessionService:
         line = self.store.timeline_get(timeline_id) if timeline_id else None
         if line is not None and str(line.get("state") or "") != "active":
             return Err.STATE_BLOCKED  # 冻结 / 归档
+        instance_id = str(session.get("instance_id") or "")
+        character_id = str(session.get("character_id") or "")
+        if instance_id and character_id and self.store.death_exists(instance_id, timeline_id, character_id):
+            return Err.STATE_BLOCKED  # 角色已归档（身故）：迟到轮次同样不写回、不投递（§5.7）
         return ""
 
     def _sleep_delay(self) -> float:
@@ -578,6 +666,7 @@ class SessionService:
         max_len, max_parts = self._limits(msg["channel_id"])
         batches = json.loads(msg["parts"] or "[]")
         states = {r["batch_index"]: r["state"] for r in self.store.delivery_rows(msg["seq"])}
+        notice = str(msg.get("role") or "") == "notice"
         incompatible = False
         for index, batch in enumerate(batches):
             if states.get(index) == "accepted":  # 部分成功不重发已确认批次
@@ -588,20 +677,30 @@ class SessionService:
                     self.store.delivery_set(msg["seq"], index, "incompatible")
                 incompatible = True
                 continue
-            envelope = ump.make(
-                "reply",
-                {
-                    "message_id": msg["message_id"],
-                    "reply_to": msg["reply_to"],
-                    "covers": json.loads(msg["covers"] or "[]"),
-                    "batch_index": index,
-                    "batch_count": len(batches),
-                    "parts": [{"text": text} for text in batch],
-                },
-                thread_id=msg["thread_id"],
-                binding_token=token,
-                id=ump.new_id("s"),
-            )
+            if notice:
+                # 联络系统 / 管理机制的说明以 system_notice 分类上线，不伪装成角色回复（§2.3）
+                envelope = ump.make(
+                    "system_notice",
+                    {"text": "\n".join(str(text) for text in batch)},
+                    thread_id=msg["thread_id"],
+                    binding_token=token,
+                    id=ump.new_id("s"),
+                )
+            else:
+                envelope = ump.make(
+                    "reply",
+                    {
+                        "message_id": msg["message_id"],
+                        "reply_to": msg["reply_to"],
+                        "covers": json.loads(msg["covers"] or "[]"),
+                        "batch_index": index,
+                        "batch_count": len(batches),
+                        "parts": [{"text": text} for text in batch],
+                    },
+                    thread_id=msg["thread_id"],
+                    binding_token=token,
+                    id=ump.new_id("s"),
+                )
             delivered = False
             try:
                 delivered = await asyncio.wait_for(
@@ -632,9 +731,22 @@ class SessionService:
             )
 
     async def resend_pending(self, channel_id: str, thread_id: str, limit: int = 20) -> int:
-        """重连后有界补投仍在投递资格内的已固化回复；不重新生成。"""
+        """重连后有界补投仍在投递资格内的已固化回复；不重新生成。
+
+        主动消息只补发**最新一条**（§5.2 / §5.3）：离线积压留在历史里，不因重连变成补发洪峰。
+        """
+        rows = self.store.pending_outbound(channel_id, thread_id, limit=limit)
+        proactive_by_session: dict[str, list[str]] = {}
+        for session_id in {str(msg.get("session_id") or "") for msg in rows}:
+            proactive_by_session[session_id] = [
+                str(item["message_id"]) for item in self.store.proactive_pending(session_id, since_world=0)
+            ]
         sent = 0
-        for msg in self.store.pending_outbound(channel_id, thread_id, limit=limit):
+        for msg in rows:
+            message_id = str(msg.get("message_id") or "")
+            ids = proactive_by_session.get(str(msg.get("session_id") or "")) or []
+            if ids and message_id in ids and message_id != ids[-1]:
+                continue  # 旧的主动消息：留在历史里，不补发
             await self._send_batches(msg)
             sent += 1
         return sent

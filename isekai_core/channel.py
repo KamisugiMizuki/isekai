@@ -22,6 +22,7 @@ from .config import Config, SettingsError, mask_api_key, save_llm_settings
 from .log import get_logger
 from .session import SessionService
 from .store import Store
+from .runtime.service import RuntimeStateError
 from .ump import Envelope, Err, Stage, UmpError
 from .world import ops as world_ops
 from .version import (
@@ -400,6 +401,7 @@ class CoreServer:
                             op,
                             dict(frame.get("args") or {}),
                             store=self.store,
+                            runtime=getattr(self.service, "runtime", None),
                         )
                     else:
                         result = self._mgmt_call(op, dict(frame.get("args") or {}))
@@ -499,11 +501,18 @@ class CoreServer:
                 "placeholder": dict(self.cfg.placeholder),  # 阶段 0 占位会话三元组
             }
         if op == "session.ensure":
-            row = self.store.session_ensure(
-                str(args.get("instance_id") or ""),
-                str(args.get("timeline_id") or ""),
-                str(args.get("character_id") or ""),
-            )
+            instance_id = str(args.get("instance_id") or "")
+            timeline_id = str(args.get("timeline_id") or "")
+            character_id = str(args.get("character_id") or "")
+            runtime = getattr(self.service, "runtime", None)
+            instance = self.store.instance_get(instance_id)
+            if runtime is not None and instance is not None:
+                # 会话创建先查成员资格（§3.7 第 1 条）：撤销过的补入角色与未装配标识都挡在这里
+                try:
+                    runtime.assert_member(instance, timeline_id, character_id)
+                except RuntimeStateError as exc:
+                    raise UmpError(Err.STATE_BLOCKED, str(exc), retryable=False, stage=Stage.RECEIVE) from exc
+            row = self.store.session_ensure(instance_id, timeline_id, character_id)
             return {"session": row}
         if op == "session.list":
             return {"sessions": self.store.session_list()}
@@ -550,6 +559,8 @@ class CoreServer:
                 "messages": [_public_message(row) for row in page["messages"]],
                 "has_more": page["has_more"],
                 "next_before_seq": page["next_before_seq"],
+                # 历史版本（回滚会让它倒退）：客户端拿它作废本地缓存与旧游标（§3 验收 8）
+                "revision": page["revision"],
             }
         raise UmpError(Err.UNSUPPORTED_TYPE, f"未知管理操作 {op}", retryable=False)
 

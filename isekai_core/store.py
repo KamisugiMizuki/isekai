@@ -360,7 +360,7 @@ CREATE TABLE IF NOT EXISTS memory_citation(
   character_id TEXT NOT NULL,
   world_seconds INTEGER NOT NULL,
   created_at REAL NOT NULL,
-  PRIMARY KEY(turn_id, memory_id)
+  PRIMARY KEY(timeline_id, turn_id, memory_id)
 );
 
 CREATE TABLE IF NOT EXISTS memory_embedding(
@@ -494,10 +494,14 @@ CREATE TABLE IF NOT EXISTS character_join(
   timeline_id TEXT NOT NULL,
   character_id TEXT NOT NULL,
   joined_world INTEGER NOT NULL,
-  card TEXT NOT NULL,                    -- 卡片快照（复核后固化）
+  card TEXT NOT NULL,                    -- 卡片快照（复核后固化；实例级定义另见 instance.setting.cards）
   note TEXT NOT NULL DEFAULT '',
   acquainted INTEGER NOT NULL DEFAULT 0, -- 「已相识」声明：补一条对话单元
   created_real REAL NOT NULL,
+  commit_id TEXT NOT NULL DEFAULT '',    -- 加入提交（§3.7 三处留痕之一）
+  state TEXT NOT NULL DEFAULT 'active',  -- active|revoked：回滚跨过加入点时撤销，记录留着不复活
+  request_id TEXT NOT NULL DEFAULT '',   -- 稳定请求标识：同一请求重试返回原子发布结果
+  revoked_world INTEGER,
   PRIMARY KEY(instance_id, timeline_id, character_id)
 );
 
@@ -693,6 +697,12 @@ class Store:
                                                         message_id, created_real)
                    VALUES(:session_id, :instance_id, :timeline_id, :kind, :message_id, :created_real)""",
                 row,
+            )
+
+    def session_notice_clear(self, session_id: str, kind: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM session_notice WHERE session_id=? AND kind=?", (str(session_id), str(kind))
             )
 
     def first_contact_get(self, session_id: str) -> dict[str, Any] | None:
@@ -962,6 +972,26 @@ class Store:
                 self._conn.execute("DROP TABLE memory_embedding")
                 self._conn.execute("ALTER TABLE memory_embedding_new RENAME TO memory_embedding")
 
+        # 引用记录也要按线隔离：导入副本 / 分叉线会持有同一 turn_id+memory_id，
+        # 单主键会把副本那份静默吞掉（派生表一律复合主键）
+        citation_sql = sql_of("memory_citation")
+        if citation_sql and "PRIMARY KEY(timeline_id" not in citation_sql:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    """CREATE TABLE memory_citation_new(
+                         turn_id TEXT NOT NULL, memory_id TEXT NOT NULL, timeline_id TEXT NOT NULL,
+                         character_id TEXT NOT NULL, world_seconds INTEGER NOT NULL, created_at REAL NOT NULL,
+                         PRIMARY KEY(timeline_id, turn_id, memory_id))"""
+                )
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO memory_citation_new(turn_id, memory_id, timeline_id, character_id,
+                                                                world_seconds, created_at)
+                       SELECT turn_id, memory_id, timeline_id, character_id, world_seconds, created_at
+                       FROM memory_citation"""
+                )
+                self._conn.execute("DROP TABLE memory_citation")
+                self._conn.execute("ALTER TABLE memory_citation_new RENAME TO memory_citation")
+
     def ensure_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
@@ -1044,6 +1074,16 @@ class Store:
         if message_columns and "wait_until" not in message_columns:
             log.info("message 增列 wait_until（睡眠期合并批的截止点，§4.5）")
             self._conn.execute("ALTER TABLE message ADD COLUMN wait_until REAL NOT NULL DEFAULT 0")
+        join_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(character_join)")}
+        for name, ddl in (
+            ("commit_id", "TEXT NOT NULL DEFAULT ''"),
+            ("state", "TEXT NOT NULL DEFAULT 'active'"),
+            ("request_id", "TEXT NOT NULL DEFAULT ''"),
+            ("revoked_world", "INTEGER"),
+        ):
+            if join_columns and name not in join_columns:
+                log.info("character_join 增列 %s", name)
+                self._conn.execute(f"ALTER TABLE character_join ADD COLUMN {name} {ddl}")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
@@ -1316,8 +1356,13 @@ class Store:
         target_thread: str,
         binding_version: int,
         binding_token: str,
+        role: str = "character",
     ) -> dict[str, Any]:
-        """固化回复（一次逻辑轮次的产物）。batches 是分批后的分段计划。"""
+        """固化回复（一次逻辑轮次的产物）。batches 是分批后的分段计划。
+
+        `role` 区分作者分类：角色发言是 `character`，联络系统 / 管理机制的说明是 `notice`
+        （不进角色上下文，投递走 `system_notice` 信封——CHANNEL_PLUGIN_SPEC §2.3）。
+        """
         with self._lock, self._conn:
             return self._outbound_put_locked(
                 session_id=session_id,
@@ -1329,6 +1374,7 @@ class Store:
                 target_thread=target_thread,
                 binding_version=binding_version,
                 binding_token=binding_token,
+                role=role,
             )
 
     def _outbound_put_locked(self, **kwargs: Any) -> dict[str, Any]:
@@ -1341,9 +1387,10 @@ class Store:
             """INSERT INTO message(session_id, role, channel_id, thread_id, binding_version, binding_token,
                                    message_id, reply_to, batch_id, batch_index, batch_count, parts, covers,
                                    state, created_at)
-               VALUES(?, 'character', ?,?,?,?, ?,?, ?, 0, ?, ?, ?, 'fixed', ?)""",
+               VALUES(?, ?, ?,?,?,?, ?,?, ?, 0, ?, ?, ?, 'fixed', ?)""",
             (
                 session_id,
+                str(kwargs.get("role") or "character"),
                 kwargs["target_channel"],
                 kwargs["target_thread"],
                 kwargs["binding_version"],
@@ -1438,6 +1485,21 @@ class Store:
             return "sent"
         return "pending"
 
+    def session_has_inbound(self, session_id: str) -> bool:
+        """该会话是否已有用户侧来言（初见不双发用，§5.6）。"""
+        row = self._conn.execute(
+            "SELECT 1 FROM message WHERE session_id=? AND role='user' LIMIT 1", (str(session_id),)
+        ).fetchone()
+        return row is not None
+
+    def has_later_success(self, session_id: str, seq: int) -> bool:
+        """该轮次之后是否已经有成功轮次（旧失败轮次的显式重试要拒，§4.3）。"""
+        row = self._conn.execute(
+            """SELECT 1 FROM message WHERE session_id=? AND seq>? AND role='user' AND state='done' LIMIT 1""",
+            (str(session_id), int(seq)),
+        ).fetchone()
+        return row is not None
+
     def pending_outbound(self, channel_id: str, thread_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """仍可投递的已固化回复（未确认成功的批次）。"""
         rows = self._conn.execute(
@@ -1465,10 +1527,16 @@ class Store:
         rows = list(reversed(rows))
         has_more = len(rows) > limit
         rows = rows[-limit:] if has_more else rows
+        # 历史版本：本会话的最大序号。回滚会删掉行让这个值倒退，客户端据此判定本地
+        # 缓存与旧分页游标失效（§3 / 验收 8），不必自己猜。
+        head = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS revision FROM message WHERE session_id=?", (session_id,)
+        ).fetchone()
         return {
             "messages": [_row_to_dict(r) for r in rows],
             "has_more": has_more,
             "next_before_seq": rows[0]["seq"] if rows else None,
+            "revision": int(head["revision"] if head is not None else 0),
         }
 
     def context_window(self, session_id: str, limit: int) -> list[dict[str, Any]]:
@@ -1892,10 +1960,11 @@ class Store:
             "unit", "life_plan", "experience", "claim", "knowledge", "effect_state", "intent",
             "event", "environment_state", "institution_state", "custom_state",
             "proactive_log",   # 回滚撤销还没投出去的主动消息与素材消费（§5.3 末条）
-            "first_contact",   # 回滚撤销开场资格（开场也是已固化消息）
             "session_notice",  # 回滚撤销通告资格
+            # 注意：`first_contact` **不在这里**——「初见已完成」记号属控制状态，不随回滚倒退（§5.6）
+            # 注意：`character_join` **不在这里**——成员资格记录要留着并转为 revoked（§3.7 末条：
+            # 回滚后再次补入必须用新的加入版本，不能复活被撤销的旧记录），撤销由回滚流程显式执行。
             "memory", "memory_task", "memory_citation",
-            "character_join",   # 跨越补卡点的回滚要让补入角色在本线退出（§七）
             "rate_command",     # 历史里的待生效倍率不是现时控制命令（§七）
             "pending_event",    # 回滚撤销待执行状态及其后果（§八 末条）
             "disclosure",       # 回滚同时撤销授权与依赖它的派生（§7.2）
@@ -2145,11 +2214,18 @@ class Store:
                     row,
                 )
             for item in clear_effects:
-                effect_id, instance_id_ = item if isinstance(item, tuple) else (item, None)
+                # 解除时刻由调用方给（条件首次成立的世界时刻）；缺省才退回批边界——
+                # 退回会让「同一区间换一种分批」记出不同的 cleared_at（§2.6 分批与在线等价）
+                if isinstance(item, tuple):
+                    effect_id = item[0]
+                    instance_id_ = item[1] if len(item) > 1 else None
+                    cleared_at = int(item[2]) if len(item) > 2 and item[2] is not None else int(processed_world)
+                else:
+                    effect_id, instance_id_, cleared_at = item, None, int(processed_world)
                 self._conn.execute(
                     """UPDATE effect_state SET active=0, cleared_at=?
                        WHERE id=? AND timeline_id=? AND active=1 AND (? IS NULL OR instance_id=?)""",
-                    (processed_world, effect_id, timeline_id, instance_id_, instance_id_),
+                    (cleared_at, effect_id, timeline_id, instance_id_, instance_id_),
                 )
             self._conn.execute(
                 """UPDATE timeline_clock SET processed_world=?, catching_up=?, limited=?
@@ -2196,6 +2272,12 @@ class Store:
                 """SELECT * FROM memory_task WHERE instance_id=? AND timeline_id=? AND source_world<=?
                    ORDER BY character_id, source_world""",
                 instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "citations": rows(
+                """SELECT * FROM memory_citation WHERE timeline_id=? AND world_seconds<=?
+                   ORDER BY turn_id, memory_id""",
                 timeline_id,
                 watermark,
             ),
@@ -2288,11 +2370,20 @@ class Store:
                 self.timeline_clear_state(timeline_id)
                 self.timeline_clear_dialog(timeline_id)
             for row in payload.get("characters") or []:
+                row = {
+                    "commit_id": "", "state": "active", "request_id": "", "revoked_world": None,
+                    **{k: v for k, v in row.items() if k in (
+                        "instance_id", "timeline_id", "character_id", "joined_world", "card", "note",
+                        "acquainted", "created_real", "commit_id", "state", "request_id", "revoked_world",
+                    )},
+                }
                 self._conn.execute(
                     """INSERT OR REPLACE INTO character_join(instance_id, timeline_id, character_id, joined_world,
-                                                             card, note, acquainted, created_real)
-                       VALUES(:instance_id, :timeline_id, :character_id, :joined_world, :card, :note,
-                              :acquainted, :created_real)""",
+                                                             card, note, acquainted, created_real,
+                                                             commit_id, state, request_id, revoked_world)
+                       VALUES(:instance_id, :timeline_id, :character_id, :joined_world,
+                              :card, :note, :acquainted, :created_real,
+                              :commit_id, :state, :request_id, :revoked_world)""",
                     row,
                 )
             for row in payload.get("units") or []:
@@ -2426,6 +2517,14 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
                     row,
                 )
+            for row in payload.get("citations") or []:
+                # 引用记录随件（MEMORY_SPEC 验收 8）：主键带线，导入副本与源线不会互相吞
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO memory_citation(turn_id, memory_id, timeline_id, character_id,
+                                                             world_seconds, created_at)
+                       VALUES(:turn_id, :memory_id, :timeline_id, :character_id, :world_seconds, :created_at)""",
+                    row,
+                )
             for row in payload.get("intents") or []:
                 self._conn.execute(
                     """INSERT INTO intent(instance_id, timeline_id, character_id, id, object, basis, strength,
@@ -2458,6 +2557,7 @@ class Store:
                 "effects",
                 "intents",
                 "environment",
+                "citations",
             )
         )
 
@@ -2631,10 +2731,14 @@ class Store:
             for item in self.memory_scope(str(row["instance_id"]), str(row["timeline_id"]), character_id)
             if str(item["kind"]) == str(row["kind"])
         ]
-        # 矛盾链只挂到「不晚于本行」的最近一条：迟到提取不许把后来固化的纠正顶掉
-        incoming_world = int(
-            row.get("semantic_watermark") or row.get("recorded_world") or row.get("learned_world") or 0
-        )
+        # 矛盾链的新旧只看**获知时刻**：记录水位会被迟到提取带成「最新」，把已固化的纠正顶掉（验收 14）
+        def knowledge_world(item: dict[str, Any]) -> int:
+            return int(
+                item.get("learned_world") or item.get("happened_world")
+                or item.get("semantic_watermark") or item.get("recorded_world") or 0
+            )
+
+        incoming_world = knowledge_world(row)
         supersedes = None
         best_world = -1
         newest_contradiction = None
@@ -2644,13 +2748,8 @@ class Store:
                 if memory_mod.same_fact(str(item["text"]), str(row["text"])):
                     return None  # 同事实：合并来源即可，不新增条目
                 continue
-            item_world = int(
-                item.get("semantic_watermark") or item.get("recorded_world") or item.get("learned_world") or 0
-            )
-            if newest_contradiction is None or item_world > int(
-                newest_contradiction.get("semantic_watermark")
-                or newest_contradiction.get("recorded_world") or 0
-            ):
+            item_world = knowledge_world(item)
+            if newest_contradiction is None or item_world > knowledge_world(newest_contradiction):
                 newest_contradiction = item
             if item_world <= incoming_world and (supersedes is None or item_world > best_world):
                 supersedes = str(item["id"])
@@ -2683,10 +2782,10 @@ class Store:
                 },
             )
             if late:
-                # 迟到提取：把既有纠正标成「取代了它」，本行只作历史
+                # 迟到提取：本行只是「当时认知」，记「被既有纠正取代」入档；既有纠正保持有效
                 self._conn.execute(
                     "UPDATE memory SET superseded_by=? WHERE instance_id=? AND timeline_id=? AND id=?",
-                    (str(row.get("id")), row.get("instance_id"), row.get("timeline_id"), supersedes),
+                    (supersedes, row.get("instance_id"), row.get("timeline_id"), str(row.get("id"))),
                 )
             elif supersedes:
                 # 明确纠正：新条目替代旧的，旧条目保留（历史可查当时认知）
@@ -2900,7 +2999,7 @@ class Store:
     ) -> list[dict[str, Any]]:
         """缺向量或指纹不符的条目（模型 / 维度变了就重建，旧向量不再参与召回）。"""
         rows = self._conn.execute(
-            """SELECT m.id, m.text, m.character_id, e.model AS embed_model, e.source_version
+            """SELECT m.id, m.text, m.character_id, e.model AS embed_model
                FROM memory m LEFT JOIN memory_embedding e ON e.memory_id = m.id
                WHERE m.instance_id=? AND m.timeline_id=?
                  AND (e.memory_id IS NULL OR e.model <> ? OR (? > 0 AND e.dim <> ?))
@@ -2908,6 +3007,46 @@ class Store:
             (instance_id, timeline_id, str(model), int(dim), int(dim), int(limit)),
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
+
+    def memory_supersede(self, *, old_id: str, new_id: str) -> None:
+        """记「新版取代旧版」：旧条目归档留档、新版版本号 +1（§六 整理结果固化并版本化）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE memory SET superseded_by=?, state='archived' WHERE id=?", (str(new_id), str(old_id))
+            )
+            self._conn.execute(
+                "UPDATE memory SET version=COALESCE(version, 1) + 1, supersedes=? WHERE id=?",
+                (str(old_id), str(new_id)),
+            )
+
+    def memory_supersede_moments(
+        self, instance_id: str, timeline_id: str, memory_ids: Iterable[str]
+    ) -> dict[str, int]:
+        """被替代条目的替代时刻（= 替代行的获知时间）。历史水位召回用它判断「当时还是当前版本」（§4.2）。"""
+        wanted = [str(item) for item in memory_ids]
+        if not wanted:
+            return {}
+        marks = ",".join("?" * len(wanted))
+        rows = self._conn.execute(
+            f"""SELECT m.id AS id, s.learned_world AS mark FROM memory m
+                JOIN memory s ON s.instance_id = m.instance_id AND s.timeline_id = m.timeline_id
+                             AND s.id = m.superseded_by
+                WHERE m.instance_id=? AND m.timeline_id=? AND m.id IN ({marks})""",
+            (instance_id, timeline_id, *wanted),
+        ).fetchall()
+        return {str(row["id"]): int(row["mark"] or 0) for row in rows}
+
+    def memory_embedding_peek(
+        self, instance_id: str, timeline_id: str, *, model: str = ""
+    ) -> dict[str, Any] | None:
+        """取一条已嵌入的条目当维度探测样本（§5.2 同名换维度：不比对就没法发现变了）。"""
+        row = self._conn.execute(
+            """SELECT m.* FROM memory_embedding e JOIN memory m ON m.id = e.memory_id
+               WHERE e.instance_id=? AND e.timeline_id=? AND (?='' OR e.model=?)
+               ORDER BY e.created_at DESC, m.id LIMIT 1""",
+            (instance_id, timeline_id, str(model or ""), str(model or "")),
+        ).fetchone()
+        return _row_to_dict(row) if row is not None else None
 
     def memory_count(self, instance_id: str, timeline_id: str, character_id: str) -> int:
         row = self._conn.execute(
@@ -3213,22 +3352,147 @@ class Store:
     # ---------- 补卡 ----------
 
     def character_join_add(self, row: dict[str, Any]) -> None:
+        payload = {
+            "commit_id": "", "state": "active", "request_id": "", "revoked_world": None,
+            **row,
+        }
         with self._lock, self._conn:
             self._conn.execute(
                 """INSERT INTO character_join(instance_id, timeline_id, character_id, joined_world,
-                                              card, note, acquainted, created_real)
+                                              card, note, acquainted, created_real,
+                                              commit_id, state, request_id, revoked_world)
                    VALUES(:instance_id, :timeline_id, :character_id, :joined_world, :card, :note,
-                          :acquainted, :created_real)
+                          :acquainted, :created_real, :commit_id, :state, :request_id, :revoked_world)
                    ON CONFLICT(instance_id, timeline_id, character_id) DO UPDATE SET
-                     joined_world=:joined_world, card=:card, note=:note, acquainted=:acquainted""",
-                row,
+                     joined_world=:joined_world, card=:card, note=:note, acquainted=:acquainted,
+                     commit_id=:commit_id, state=:state, request_id=:request_id,
+                     revoked_world=:revoked_world""",
+                payload,
             )
 
+    def character_join_publish(
+        self,
+        join_row: dict[str, Any],
+        *,
+        units: list[dict[str, Any]],
+        plan: dict[str, Any],
+        setting: dict[str, Any],
+    ) -> None:
+        """补卡的原子发布（§3.7 第 6 条）：实例定义、线内成员资格、角色状态与日程一次落盘。
+
+        定义写进实例设定快照（实例级不可变对象），成员资格只进本线——两者分开留痕。
+        """
+        payload = {"commit_id": "", "state": "active", "request_id": "", "revoked_world": None, **join_row}
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE instance SET setting=? WHERE id=?",
+                (json.dumps(setting, ensure_ascii=False), str(join_row["instance_id"])),
+            )
+            self._conn.execute(
+                """INSERT INTO character_join(instance_id, timeline_id, character_id, joined_world,
+                                              card, note, acquainted, created_real,
+                                              commit_id, state, request_id, revoked_world)
+                   VALUES(:instance_id, :timeline_id, :character_id, :joined_world, :card, :note,
+                          :acquainted, :created_real, :commit_id, :state, :request_id, :revoked_world)
+                   ON CONFLICT(instance_id, timeline_id, character_id) DO UPDATE SET
+                     joined_world=:joined_world, card=:card, note=:note, acquainted=:acquainted,
+                     created_real=:created_real,
+                     commit_id=:commit_id, state=:state, request_id=:request_id,
+                     revoked_world=:revoked_world""",
+                payload,
+            )
+            self._conn.executemany(
+                """INSERT INTO unit(id, instance_id, timeline_id, character_id, mode, semantic, basis,
+                                    confidence, stability, archived, consumed, updated_world)
+                   VALUES(:id, :instance_id, :timeline_id, :character_id, :mode, :semantic, :basis,
+                          :confidence, :stability, :archived, :consumed, :updated_world)
+                   ON CONFLICT(instance_id, timeline_id, character_id, id) DO UPDATE SET
+                     confidence=:confidence, stability=:stability, archived=:archived,
+                     consumed=:consumed, updated_world=:updated_world""",
+                units,
+            )
+            self._conn.execute(
+                """INSERT OR IGNORE INTO life_plan(id, instance_id, timeline_id, character_id, day_index,
+                                                   windows, state, created_world, note)
+                   VALUES(:id, :instance_id, :timeline_id, :character_id, :day_index,
+                          :windows, :state, :created_world, :note)""",
+                plan,
+            )
+
+    def character_join_set_commit(self, instance_id: str, timeline_id: str, character_id: str, commit_id: str) -> None:
+        """把加入提交记到成员资格行上（§3.7 三处留痕之三）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """UPDATE character_join SET commit_id=? WHERE instance_id=? AND timeline_id=? AND character_id=?""",
+                (str(commit_id), instance_id, timeline_id, character_id),
+            )
+
+    def character_join_by_request(self, instance_id: str, timeline_id: str, request_id: str) -> dict[str, Any] | None:
+        """同一补卡请求的既往结果（幂等重试用，§3.7 末条）。"""
+        if not str(request_id):
+            return None
+        row = self._conn.execute(
+            """SELECT * FROM character_join WHERE instance_id=? AND timeline_id=? AND request_id=? LIMIT 1""",
+            (instance_id, timeline_id, str(request_id)),
+        ).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def character_join_revoke_missing(self, timeline_id: str, keep: set[str], *, moment: int) -> int:
+        """回滚跨过补卡点：目标快照里没有的成员资格转为撤销（记录留着，不能复活，§3.7 末条）。
+
+        按快照比对而不是比水位——补卡锚定的就是当时的已完成水位，回滚到补卡前的同一水位提交时
+        两者相等，只有「目标提交里有没有这条成员资格」才是准的。
+        """
+        with self._lock, self._conn:
+            if keep:
+                marks = ",".join("?" for _ in keep)
+                cursor = self._conn.execute(
+                    f"""UPDATE character_join SET state='revoked', revoked_world=?
+                        WHERE timeline_id=? AND state='active' AND character_id NOT IN ({marks})""",
+                    [int(moment), timeline_id, *sorted(keep)],
+                )
+            else:
+                cursor = self._conn.execute(
+                    """UPDATE character_join SET state='revoked', revoked_world=?
+                       WHERE timeline_id=? AND state='active'""",
+                    (int(moment), timeline_id),
+                )
+            return int(cursor.rowcount)
+
+    def character_join_ids(self, instance_id: str) -> set[str]:
+        """该实例下所有补入过的角色标识（含已撤销的线级记录，跨线合并）。
+
+        用来把「补入定义」与「初始定义」分开：两者都住在实例设定快照里，但只有前者受
+        线级成员资格约束（§3.7 第 1 条）。
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT character_id FROM character_join WHERE instance_id=?", (str(instance_id),)
+        ).fetchall()
+        return {str(row["character_id"]) for row in rows}
+
+    def character_membership(self, instance_id: str, timeline_id: str, character_id: str, *, until: int) -> str:
+        """本线成员资格（§3.7 第 1 条）：member=初始定义 / joined=已补入 / revoked / unjoined=非成员。"""
+        row = self._conn.execute(
+            """SELECT * FROM character_join WHERE instance_id=? AND timeline_id=? AND character_id=?""",
+            (instance_id, timeline_id, str(character_id)),
+        ).fetchone()
+        if row is None:
+            return "unjoined"
+        item = _row_to_dict(row) or {}
+        if str(item.get("state") or "active") != "active":
+            return "revoked"
+        if int(item.get("joined_world") or 0) > int(until):
+            return "revoked"  # 水位还没到她加入的那一刻：本线暂时不暴露
+        return "joined"
+
     def character_join_list(
-        self, instance_id: str, timeline_id: str, *, until: int | None = None
+        self, instance_id: str, timeline_id: str, *, until: int | None = None, state: str | None = "active"
     ) -> list[dict[str, Any]]:
         sql = "SELECT * FROM character_join WHERE instance_id=? AND timeline_id=?"
         args: list[Any] = [instance_id, timeline_id]
+        if state is not None:
+            sql += " AND state=?"
+            args.append(str(state))
         if until is not None:
             sql += " AND joined_world<=?"
             args.append(int(until))

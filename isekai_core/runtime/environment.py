@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..world.cards import region_of
 from . import events
 
 #: 自然变化来源前缀：`natural:<名称>` 表示该类型按世界时间确定地走
@@ -153,7 +154,7 @@ def observations(
         str((card.get("meta") or {}).get("card_id") or ""),
         str(card.get("role_id") or ""),
         str(identity.get("race_id") or ""),
-        str(identity.get("region") or ""),
+        region_of(card),
     }
     who.discard("")
     out: list[dict[str, Any]] = []

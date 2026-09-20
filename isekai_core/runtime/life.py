@@ -27,6 +27,7 @@ def expand_plan(
     """按角色卡模板展开一个世界日的计划（跨日窗口按世界秒展开，不按现实日切）。"""
     character_id = str((card.get("meta") or {}).get("card_id") or "")
     template = card.get("life_template") or {}
+    day_seconds = calendar.day_seconds
     day_start = day_index * calendar.day_seconds
     day_end = day_start + calendar.day_seconds
     windows: list[dict[str, Any]] = []
@@ -43,6 +44,17 @@ def expand_plan(
                 "note": str(item.get("note") or ""),
             }
         )
+        if day_seconds and end > day_seconds:
+            # 跨日窗口在本日也有日首那一段（校验器同口径）：不展开它，次日 00:00 起就没有活动解释
+            windows.append(
+                {
+                    "start": day_start,
+                    "end": day_start + (end - day_seconds),
+                    "activity": str(item.get("activity") or ""),
+                    "alternatives": [str(alt) for alt in item.get("alternatives") or []],
+                    "note": str(item.get("note") or ""),
+                }
+            )
     windows.sort(key=lambda item: item["start"])
     return {
         "id": f"lp-{secrets.token_hex(6)}",

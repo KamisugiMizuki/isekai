@@ -11,6 +11,8 @@ import json
 import re
 from typing import Any
 
+from ..world.cards import region_of
+
 #: 角色行动可用的效果闭集：世界级效果（渠道延迟 / 环境改值）不由角色直接选
 ACTION_KINDS: tuple[str, ...] = (
     "activity_constraint",
@@ -34,7 +36,7 @@ def allowed_targets(
     """她可知的目标集合：自己的角色 / 地区 / 组织、她掌握的渠道、她观察到的环境类型。"""
     identity = card.get("identity") if isinstance(card.get("identity"), dict) else {}
     role = str(card.get("role_id") or "")
-    region = str(identity.get("region") or "")
+    region = region_of(card)
     roles = {str(item.get("id")) for item in card.get("roles") or []}
     channels = {str(item.get("source_id")) for item in card.get("channels") or [] if item.get("source_id")}
     env_types = {str(item.get("type_id")) for item in observations if item.get("type_id")}

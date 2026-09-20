@@ -37,7 +37,7 @@ def _payload(**over) -> dict:
     payload = {
         "intent": "堤务吏换人：柳氏接任堤长",
         "when": "now",
-        "effects": [{"kind": "institution_state", "target": "rl-1", "expiry": "until_cleared"}],
+        "effects": [{"kind": "institution_state", "target": "off-1", "expiry": "until_cleared"}],
         "claims": [{"text": "堤务吏换人，柳氏接任堤长", "source_id": "src-1", "audience": "public"}],
     }
     payload.update(over)
@@ -70,7 +70,7 @@ def test_draft_shows_only_user_intent_and_validated_parts(store) -> None:
     assert result["accepted"] is True
     draft = result["draft"]
     assert draft["intent"] == "堤务吏换人：柳氏接任堤长"
-    assert draft["effects"][0]["target"] == "rl-1" and draft["when"] == "now"
+    assert draft["effects"][0]["target"] == "off-1" and draft["when"] == "now"
     blob = json.dumps(draft, ensure_ascii=False)
     assert "秘密" not in blob and "实情" not in blob
     assert set(draft) == {"draft_id", "intent", "when", "at_world", "effects", "claims", "participants",
@@ -92,7 +92,7 @@ def test_confirm_creates_new_line_with_event_and_keeps_original(store) -> None:
     assert len(events) == 1 and "堤务吏换人" in events[0]["summary"]
     effects = [row for row in store.effect_window(info["id"], new_line, until=10**15)
                if row["event_id"] == events[0]["id"]]
-    assert effects and effects[0]["target"] == "rl-1", "效果落在新线上"
+    assert effects and effects[0]["target"] == "off-1", "效果落在新线上"
     assert len(store.event_window(info["id"], timeline_id, until=10**15, limit=500)) == before_events, "原线不动"
 
     again = world_service.confirm_user_event(info["id"], draft["draft_id"])
@@ -138,7 +138,7 @@ def test_scheduled_event_waits_then_applies_or_cancels(store) -> None:
                    if row["source"] == "user"]
     assert user_events == [], "到点前不注入事件"
     assert [row for row in store.effect_window(info["id"], new_line, until=10**15)
-            if row["target"] == "rl-1" and int(row["from_world"]) > watermark] == [], "到点前不施加效果"
+            if row["target"] == "off-1" and int(row["from_world"]) > watermark] == [], "到点前不施加效果"
 
     world_service.activate(info["id"], new_line, now_real=1.7e9 + 5 * DAY)
     world_service.advance(info["id"], new_line, now_real=1.7e9 + 16 * DAY)  # 越过预约时刻

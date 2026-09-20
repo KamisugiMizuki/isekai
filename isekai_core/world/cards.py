@@ -75,6 +75,19 @@ def template_card(package: dict[str, Any], *, name: str = "未命名角色") -> 
     }
 
 
+def region_of(card: dict[str, Any]) -> str:
+    """角色的生活区域：卡片顶层字段 `region`（供认知与事件范围匹配）。
+
+    早期草稿把它写在 `identity.region` 下，这里兜底读一次——两处读法不一致会让
+    「按区域声明的观察条件 / 事件范围」永远匹配不上。
+    """
+    top = str(card.get("region") or "")
+    if top:
+        return top
+    identity = card.get("identity") if isinstance(card.get("identity"), dict) else {}
+    return str(identity.get("region") or "")
+
+
 def validate_card(card: dict[str, Any], package: dict[str, Any], *, moment: int) -> list[str]:
     """单卡校验：身份 / 渠道 / 知识 / 单元 / 认知 / 日程。moment = 实例初始世界秒。"""
     errors: list[str] = []
@@ -208,15 +221,29 @@ def _validate_cognition(card: dict[str, Any]) -> list[str]:
     mode = cognition.get("mode")
     if mode not in ("soft", "hard"):
         return ["cognition.mode: 必须是 soft 或 hard"]
-    if mode == "soft":
-        return []
     sources = cognition.get("sources")
     if not isinstance(sources, list) or not sources:
-        return ["cognition.sources: 硬约束必须列出允许的信息来源"]
-    errors = []
-    for index, source in enumerate(sources):
-        if source not in HARD_ALLOWED:
-            errors.append(f"cognition.sources[{index}]: 硬约束不得开放 {source!r}（仅限自身经历 / 小环境 / 用户通讯）")
+        # 附录 A：不能只写一个 mode 而省掉过滤依据（soft 也要写清来源范围）
+        return [
+            "cognition.sources: 必须列出信息来源范围（soft / hard 都要写过滤依据）"
+            if mode == "soft"
+            else "cognition.sources: 硬约束必须列出允许的信息来源"
+        ]
+    errors: list[str] = []
+    if mode == "hard":
+        for index, source in enumerate(sources):
+            if source not in HARD_ALLOWED:
+                errors.append(f"cognition.sources[{index}]: 硬约束不得开放 {source!r}（仅限自身经历 / 小环境 / 用户通讯）")
+        # 硬约束把自身经历挡在外面、卡片却带着自身经历条目：确认前就该挡住（§5.2）
+        if "self_experience" not in sources:
+            has_self = any(
+                isinstance(entry, dict) and entry.get("ref_type") == "self"
+                for entry in (card.get("initial_knowledge") or [])
+            )
+            if has_self:
+                errors.append(
+                    "cognition: 硬约束未开放 self_experience，但初始知识里有自身经历条目（自相矛盾）"
+                )
     return errors
 
 
@@ -270,6 +297,7 @@ def _validate_units(card: dict[str, Any]) -> list[str]:
         return ["initial_units: 至少一个初始性格单元"]
     errors: list[str] = []
     seen: set[str] = set()
+    semantics: dict[str, str] = {}
     anchors = 0
     for index, unit in enumerate(units):
         where = f"initial_units[{index}]"
@@ -285,6 +313,13 @@ def _validate_units(card: dict[str, Any]) -> list[str]:
             seen.add(ident)
         if not _text(unit.get("semantic")):
             errors.append(f"{where}.semantic: 缺少语义")
+        else:
+            # 同一语义换 id 重复登记＝重复计权（§5.2）；确认前就挡住，别让运行期到场两次
+            key = " ".join(str(unit["semantic"]).split())
+            if key in semantics:
+                errors.append(f"{where}.semantic: 与 {semantics[key]} 语义重复（同一句换名字重复计权）")
+            else:
+                semantics[key] = str(ident or where)
         if not _text(unit.get("basis")):
             errors.append(f"{where}.basis: 缺少驱动依据")
         driver = unit.get("driver")
@@ -360,16 +395,22 @@ def _validate_life(card: dict[str, Any], package: dict[str, Any], *, day: int) -
 
 
 def _allowed_activities(package: dict[str, Any], card: dict[str, Any]) -> set[str] | None:
-    """卡片引用角色模板时，活动必须来自该模板的允许集合；模板缺失则不额外约束。"""
-    role_id = card.get("role_id")
-    if not role_id:
-        return None
+    """活动必须真实存在于世界包：挂角色模板时限于该模板，未挂模板时限于世界级合法活动集合。"""
     life = {t.get("id"): t for t in package.get("life", []) if isinstance(t, dict)}
-    for role in package.get("roles", []):
-        if isinstance(role, dict) and role.get("id") == role_id:
-            template = life.get(role.get("life_template")) or {}
-            return {w.get("activity") for w in template.get("windows", []) if isinstance(w, dict)}
-    return None
+    role_id = card.get("role_id")
+    if role_id:
+        for role in package.get("roles", []):
+            if isinstance(role, dict) and role.get("id") == role_id:
+                template = life.get(role.get("life_template")) or {}
+                return {w.get("activity") for w in template.get("windows", []) if isinstance(w, dict)}
+        return None
+    # 未挂模板不等于可以自创活动（§5.2「引用的活动真实存在」）：仍要落在世界包声明过的活动里
+    declared: set[str] = set()
+    for template in life.values():
+        for window in template.get("windows") or []:
+            if isinstance(window, dict) and _text(window.get("activity")):
+                declared.add(str(window["activity"]))
+    return declared or None
 
 
 def validate_assembly(package: dict[str, Any], cards: list[dict[str, Any]], *, moment: int) -> list[str]:
@@ -384,9 +425,12 @@ def validate_assembly(package: dict[str, Any], cards: list[dict[str, Any]], *, m
         if not isinstance(meta, dict) or meta.get("confirmed") is not True:
             errors.append(f"cards[{index}]: 角色卡未经用户确认（meta.confirmed）")
         card_id = (meta or {}).get("card_id")
-        if isinstance(card_id, str):
-            if card_id in seen:
-                errors.append(f"cards[{index}]: 角色标识在实例内重复 {card_id}")
+        if not isinstance(card_id, str) or not card_id.strip():
+            # 姓名只用于呈现；没有稳定标识的角色在实例里既记不了状态也取不回来（§4 / 附录 A）
+            errors.append(f"cards[{index}]: 缺少稳定角色标识（meta.card_id）")
+        elif card_id in seen:
+            errors.append(f"cards[{index}]: 角色标识在实例内重复 {card_id}")
+        else:
             seen.add(card_id)
         for message in validate_card(card, package, moment=moment):
             errors.append(f"cards[{index}]: {message}")

@@ -52,6 +52,20 @@ def normalize_draft(
         target = str(item.get("target") or "")
         if target not in known_targets:
             raise ValueError(f"效果目标未登记：{target or '（空）'}")
+        # 制度 / 惯例效果只能指向世界包登记过的职位 / 惯例：目标对了才不会被「接受然后静默失效」
+        world = package.get("world") if isinstance(package.get("world"), dict) else {}
+        if kind == "institution_state":
+            offices = {
+                str(office.get("id"))
+                for entry in world.get("institutions") or [] if isinstance(entry, dict)
+                for office in entry.get("offices") or [] if isinstance(office, dict)
+            }
+            if target not in offices:
+                raise ValueError(f"制度效果只能指向世界包登记的职位：{target}")
+        elif kind == "custom_state":
+            customs = {str(entry.get("id")) for entry in world.get("customs") or [] if isinstance(entry, dict)}
+            if target not in customs:
+                raise ValueError(f"惯例效果只能指向世界包登记的惯例：{target}")
         effect = {"kind": kind, "target": target, "expiry": str(item.get("expiry") or "with_cause")}
         if item.get("value") is not None:
             effect["value"] = str(item["value"])

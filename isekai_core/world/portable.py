@@ -72,7 +72,8 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
                 {
                     "id": item["id"],
                     "name": item["name"],
-                    "state": item["state"],
+                    # 便携包不带本机控制状态（§7.1 / 附录 B）：激活集合与当前视图留在本机
+                    "state": "frozen",
                     "source_commit": item["source_commit"],
                     "created_at": item["created_at"],
                 }
@@ -252,6 +253,7 @@ def _restore_runtime_state(
             "disclosure": _remap_rows(payload.get("disclosure"), instance_id, new_id),
             "memories": _remap_rows(payload.get("memories"), instance_id, new_id),
             "memory_tasks": _remap_rows(payload.get("memory_tasks"), instance_id, new_id),
+            "citations": [dict(row) for row in (payload.get("citations") or []) if isinstance(row, dict)],
         }
         loaded += store.runtime_load(instance_id, new_id, rows)
         store.clock_put(

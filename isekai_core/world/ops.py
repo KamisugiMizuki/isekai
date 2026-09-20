@@ -251,6 +251,7 @@ def _runtime_op(
             card = args.get("card")
             if not isinstance(card, dict):
                 card = json.loads(Path(resolve_path(cfg, args.get("card_path"))).read_text(encoding="utf-8"))
+            event = args.get("event")
             return {
                 "join": runtime.add_character(
                     instance_id,
@@ -260,6 +261,8 @@ def _runtime_op(
                     joined_world=int(args["joined_world"]) if args.get("joined_world") is not None else None,
                     note=str(args.get("note") or ""),
                     acquainted=bool(args.get("acquainted")),
+                    request_id=str(args.get("request_id") or ""),
+                    event=event if isinstance(event, dict) else None,
                 )
             }
         if op == "runtime.advance":
@@ -840,9 +843,19 @@ async def _expand_claim(cfg: Config, llm: Any, store: Store | None, args: dict[s
 
 
 async def dispatch_async(
-    cfg: Config, llm: Any, op: str, args: dict[str, Any], *, store: Store | None = None
+    cfg: Config,
+    llm: Any,
+    op: str,
+    args: dict[str, Any],
+    *,
+    store: Store | None = None,
+    runtime: Any = None,
 ) -> dict[str, Any]:
-    """异步操作：涉及模型调用（生成 / 修订 / 补全）。候选一律不落盘，并带回调用用量。"""
+    """异步操作：涉及模型调用（生成 / 修订 / 补全）。候选一律不落盘，并带回调用用量。
+
+    `runtime` = 运行层服务（或持有它的会话服务）：主动发言与初见要靠它，缺了就报错而不是
+    NameError（这两个 op 是壳 / CLI 触发主动消息与开场的唯一入口）。
+    """
     limit = args.get("max_calls")
     max_calls = int(limit) if isinstance(limit, int) and limit > 0 else None
     kwargs = {"max_calls": max_calls} if max_calls else {}
@@ -853,15 +866,21 @@ async def dispatch_async(
             return await _expand_claim(cfg, llm, store, args)
         if op == "runtime.first_contact":
             service = getattr(runtime, "service", runtime)
+            if service is None or not hasattr(service, "first_contact"):
+                raise UmpError(Err.INTERNAL, "本次调用没有带上运行层服务，无法生成开场", retryable=False)
             return await service.first_contact(
                 str(args.get("instance_id") or ""),
                 str(args.get("timeline_id") or ""),
                 str(args.get("character_id") or ""),
-                channel_id=str(args.get("channel_id") or "builtin"),
+                channel_id=_channel_ref(store, args),
                 thread_id=str(args.get("thread_id") or "main"),
                 llm=llm,
+                max_text_len=int(getattr(cfg, "max_text_len", 0) or 0),
+                max_parts=int(getattr(cfg, "max_parts", 0) or 0),
             )
         if op == "runtime.proactive":
+            if runtime is None:
+                raise UmpError(Err.INTERNAL, "本次调用没有带上运行层服务，无法生成主动消息", retryable=False)
             return await _proactive_tick(cfg, llm, store, runtime, args)
         if op == "runtime.propose":
             return await _propose_intents(cfg, llm, store, args)
@@ -930,9 +949,18 @@ def _request_exit(delay: float = 0.5) -> None:
     asyncio.get_running_loop().call_later(delay, raise_exit)
 
 
+def _channel_ref(store: Store | None, args: dict[str, Any]) -> str:
+    """管理面按**通道名**给参数（与 channel.ensure / thread.bind 同一口径），存储要的是通道标识。"""
+    raw = str(args.get("channel_id") or args.get("channel") or "builtin")
+    if store is None or not raw or raw.startswith("ci-"):
+        return raw
+    row = store.channel_by_name(raw)
+    return str((row or {}).get("id") or raw)
+
+
 async def _proactive_tick(cfg: Any, llm: Any, store: Any, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
-    """世界源主动发言：管理面 / CLI 触发一次（补算后由调用方决定何时调）。"""
-    _ = cfg
+    """世界源主动发言：管理面 / CLI / 核心 tick 触发一次（补算后由调用方决定何时调）。"""
+    _ = store
     service = getattr(runtime, "service", runtime)
     per_day = int(args.get("per_day") or 2)
     return await service.proactive_tick(
@@ -940,4 +968,6 @@ async def _proactive_tick(cfg: Any, llm: Any, store: Any, runtime: Any, args: di
         str(args.get("timeline_id") or ""),
         llm=llm,
         per_day=per_day,
+        max_text_len=int(getattr(cfg, "max_text_len", 0) or 0),
+        max_parts=int(getattr(cfg, "max_parts", 0) or 0),
     )

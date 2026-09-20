@@ -20,6 +20,7 @@ from .runtime.service import RuntimeService
 from .session import SessionService
 from .runtime.service import from_config as runtime_service_from_config
 from .store import Store
+from .world import instances
 from .version import APP_VERSION, DATA_FORMAT_VERSION, RULES_VERSION
 
 log = get_logger("isekai.app")
@@ -220,6 +221,15 @@ async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | N
 
     try:
         await runtime.server.start()
+        blocked_ids = [
+            str(row["id"])
+            for row in runtime.store.instance_list()
+            if runtime.world is not None and str(instances.compatibility(row)[0]) == "blocked"
+        ]
+        if blocked_ids:
+            # 兼容性阻断没有「部分可用」的说法：核心整体进入只读状态，壳据此给恢复入口（§7.6 / DESKTOP_SPEC）
+            runtime.server.state = "compatibility_blocked"
+            log.error("compatibility blocked instances=%s", blocked_ids)
         if print_ready:
             # 就绪握手固定 UTF-8：不经控制台代码页，壳按字节读
             line = json.dumps(ready_line(runtime), ensure_ascii=False) + "\n"
@@ -253,13 +263,17 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
             pass
         if runtime.world is None:
             continue
+        # 兼容性阻断的实例不进这一轮的推进与派生任务（§7.6：blocked 只读，等用户确认转换）
+        active = [
+            pair for pair in runtime.world.active_timelines() if runtime.world.compatible(pair[0])
+        ]
         try:
             runtime.world.catch_up_all(now_real=time.time(), max_batches=4)
         except Exception:  # 推进失败不该让核心退出
             log.exception("clock tick failed")
         # 角色自主提案：只在激活线上、按现实日预算（§11.3 / §2.8）
         try:
-            for instance_id, timeline_id in runtime.world.active_timelines():
+            for instance_id, timeline_id in active:
                 await runtime.world.propose_intents(
                     instance_id, timeline_id, llm=runtime.llm, now_real=time.time()
                 )
@@ -267,13 +281,13 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
             log.exception("intent proposal pass failed")
         # 自动提交（§5.1）：现实间隔或新增事件数到阈值，可配置可关
         try:
-            for instance_id, timeline_id in runtime.world.active_timelines():
+            for instance_id, timeline_id in active:
                 runtime.world.maybe_auto_commit(instance_id, timeline_id, now_real=time.time())
         except Exception:
             log.exception("auto commit pass failed")
         # 证据充分后提取记忆：有界、按现实日预算、失败留待处理（§4.1）
         try:
-            for instance_id, timeline_id in runtime.world.active_timelines():
+            for instance_id, timeline_id in active:
                 runtime.world.queue_world_sources(instance_id, timeline_id)
                 await runtime.world.extract_memories(
                     instance_id, timeline_id, llm=runtime.llm, now_real=time.time(), limit=6
@@ -281,3 +295,19 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
                 await runtime.world.embed_memories(instance_id, timeline_id, now_real=time.time(), limit=8)
         except Exception:
             log.exception("memory extraction pass failed")
+        # 世界源主动发言（§5.2 / §5.3）：按节律与配额从她已获知的素材里挑一条固化，并当场投给唯一目标
+        try:
+            for instance_id, timeline_id in active:
+                spoken = await runtime.world.proactive_tick(
+                    instance_id,
+                    timeline_id,
+                    llm=runtime.llm,
+                    max_text_len=int(runtime.cfg.max_text_len),
+                    max_parts=int(runtime.cfg.max_parts),
+                )
+                for item in spoken.get("messages") or []:
+                    row = runtime.store.outbound_by_message_id(str(item.get("message_id") or ""))
+                    if row is not None:
+                        await runtime.service.flush_proactive(str(row["session_id"]))
+        except Exception:
+            log.exception("proactive pass failed")
