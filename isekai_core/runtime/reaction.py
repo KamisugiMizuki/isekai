@@ -131,7 +131,7 @@ def from_experience(experience: dict[str, Any], *, character_id: str) -> dict[st
         tendency=str(experience.get("summary") or ""),
         basis=f"亲身经历：{kind}",
         started_world=int(experience.get("world_seconds") or 0),
-        expiry_condition="",
+        expiry_condition="被后续经历覆盖，或该情境过去",
     )
 
 
@@ -158,7 +158,7 @@ def from_dialog(
         tendency=tendency,
         basis=basis or "对话里定下的事",
         started_world=int(world_seconds),
-        expiry_condition="",
+        expiry_condition="被后续对话改变，或轮次过去",
     )
 
 

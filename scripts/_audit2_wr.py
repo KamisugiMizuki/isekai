@@ -742,28 +742,51 @@ def c_patch_card_rollback() -> None:
 
 
 def c_compression_and_diff() -> None:
-    """§8 压缩 / §6 diff：当前实现是阶段 4 之前的全量快照。"""
+    """§6 diff 物化 / §8 自动压缩：提交按祖先基线存差异，链超限自动物化，物化结果与全量一致。"""
+    from isekai_core.runtime import versioning
+
     with scenario("compress") as env:
         info, tl, _cid, _pkg = mk(env)
         iid = info["id"]
         base = 1_700_000_000.0
         env.world.activate(iid, tl, now_real=base)
-        env.world.advance(iid, tl, now_real=base + 2 * DAY, max_batches=10)
-        env.world.commit(iid, tl, note="一次")
-        env.world.advance(iid, tl, now_real=base + 3 * DAY, max_batches=10)
-        env.world.commit(iid, tl, note="二次")
-        size = env.root.joinpath("data", "isekai.db").stat().st_size
-        snapshot_dump = env.store.runtime_dump(iid, tl, watermark=10**12)
-        tables = {
-            str(row["name"])
-            for row in env.store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()  # noqa: SLF001
-        }
-        check("§8 压缩策略（自动压缩减少 diff 链长度、合并物理存储）", "存在可触发的压缩路径",
-              f"无压缩相关表（{len(tables)} 张表）；提交为全量快照；库大小 {size} 字节",
-              "DEFERRED",
-              evidence="§六 / §15 允许「阶段 4 前先用全量快照验证相同语义」，实现尚未进入 diff/压缩阶段",
-              code_ref="isekai_core/runtime/versioning.py:1-6")
-        _ = snapshot_dump
+
+        def kind_of(commit_id: str) -> str:
+            row = env.store._conn.execute(  # noqa: SLF001
+                "SELECT payload FROM commit_snapshot WHERE commit_id=?", (commit_id,)
+            ).fetchone()
+            return versioning.snapshot_kind(row["payload"])[0] if row else "none"
+
+        for step in range(1, 4):
+            env.world.advance(iid, tl, now_real=base + step * DAY, max_batches=10)
+            env.world.commit(iid, tl, kind="manual", note=f"第{step}次")
+        history = env.world.commits(iid, tl)
+        kinds = [kind_of(str(item["id"])) for item in history]
+        newest = str(max(history, key=lambda item: (str(item.get("created_at") or ""), str(item["id"])))["id"])
+        payload = env.store.commit_snapshot_get(newest)
+        snapshot_now = versioning.snapshot_of(env.store, iid, tl, note="当场")
+        # 链长（从最新往回连续 diff 的条数）
+        depth, current = 0, newest
+        while current and kind_of(current) == "delta" and depth < 100:
+            row = env.store._conn.execute(  # noqa: SLF001
+                "SELECT payload FROM commit_snapshot WHERE commit_id=?", (current,)
+            ).fetchone()
+            current, depth = versioning.snapshot_kind(row["payload"])[1], depth + 1
+        ok = (
+            "full" in kinds and "delta" in kinds
+            and payload is not None
+            and payload.get("runtime") == snapshot_now.get("runtime")
+            and depth <= 8 + 1
+        )
+        check(
+            "§8 压缩策略（自动压缩减少 diff 链长度、合并物理存储）",
+            "提交按祖先基线存 diff；物化结果与全量快照逐字段一致；链长有上界（自动物化）",
+            f"{len(history)} 条提交的形态={kinds}；最新提交物化后 runtime 段与当场快照一致="
+            f"{payload is not None and payload.get('runtime') == snapshot_now.get('runtime')}；当前 diff 链长={depth}",
+            "PASS" if ok else "FAIL",
+            evidence="runtime/versioning.py::encode_delta/apply_delta + store.commit_add 自动物化（MAX_DELTA_CHAIN）",
+            code_ref="isekai_core/runtime/versioning.py:1-120",
+        )
 
 
 # --------------------------------------------------------------- §10 性格单元
@@ -1129,19 +1152,60 @@ def c_misclaimed_era() -> None:
 
 def c_short_term_reactions() -> None:
     """§11.1 当前处境与短期反应 / 附录 B #19、#26。"""
+    from isekai_core.runtime import reaction as reaction_mod
+
     with scenario("reaction") as env:
-        tables = {
-            str(row["name"])
-            for row in env.store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()  # noqa: SLF001
+        info, tl, cid, _pkg = mk(env)
+        iid = info["id"]
+        base = 1_700_000_000.0
+        env.world.activate(iid, tl, now_real=base)
+        env.world.advance(iid, tl, now_real=base + 2 * DAY, max_batches=10)
+
+        live = env.store.reaction_list(iid, tl, character_id=cid)
+        # 来源边界：进状态的行必须带 来源 / 强度区间 / 失效条件（没有来源的标签不入状态）
+        bad = [
+            row
+            for row in live
+            if not (str(row["source_kind"]) and str(row["source_ref"]) and str(row["expiry_condition"]))
+        ]
+        # 生命周期：候选 →（到水位）活跃 → 后果解除 → 减弱 → 失效；纯函数，分批与连续等价
+        row = {
+            "id": "rx-probe", "instance_id": iid, "timeline_id": tl, "character_id": cid,
+            "source_kind": "event_effect", "source_ref": "fx-probe", "direction": 1,
+            "intensity": "high", "stage": "candidate", "tendency": "路线断了，走不了那条道",
+            "basis": "她亲眼看见关卡封了", "started_world": 100, "expiry_condition": "后果解除",
+            "updated_world": 100,
         }
-        hit = [name for name in tables if "reaction" in name or "short" in name]
-        check("§11.1/附录B#19、#26 短期反应（候选→采纳→活跃→减弱/暂停→失效）与来源边界",
-              "存在承载「短期反应」（来源 / 强度区间 / 失效条件）的状态",
-              f"{len(tables)} 张表中与短期反应相关的={hit or '无'}；"
-              "runtime/ 内无 reaction 相关实现",
-              "FAIL",
-              evidence="全仓仅 docs/WORLD_RUNTIME_SPEC.md 提到「短期反应」；验收 19/26 要求的状态域缺失",
-              code_ref="isekai_core/runtime/（无对应模块）")
+        adopted = reaction_mod.advance(row, watermark=200, cleared=set())
+        active = reaction_mod.advance(adopted, watermark=210, cleared=set())
+        faded = reaction_mod.advance(active, watermark=300, cleared={"fx-probe"})
+        gone = reaction_mod.advance(faded, watermark=400, cleared={"fx-probe"})
+        stages = (row["stage"], adopted["stage"], active["stage"], faded["stage"], gone["stage"])
+        # 同一来源只一条；重复回忆不叠加强度
+        merged = reaction_mod.merge(active, dict(active))
+        # 相反依据：降档或终止，但已发生的经历不删（经历行数不受影响）
+        flip = reaction_mod.merge(active, {**row, "direction": -1, "basis": "后来听说关卡又开了"})
+        snap = env.world.character_snapshot(iid, tl, cid, world_seconds=200)
+        live_again = env.store.reaction_list(iid, tl, character_id=cid)
+        ok = (
+            not bad
+            and stages == ("candidate", "adopted", "active", "fading", "expired")
+            and merged["id"] == active["id"] and merged["intensity"] == active["intensity"]
+            and flip["intensity"] != active["intensity"] and flip["stage"] in ("fading", "expired")
+            and isinstance(snap.get("reactions"), list)
+            and len(live_again) == len(live)
+        )
+        check(
+            "§11.1/附录B#19、#26 短期反应（候选→采纳→活跃→减弱/暂停→失效）与来源边界",
+            "有来源才入状态；阶段按水位与后果解除推进；同源不叠加；相反依据降档不删经历",
+            f"推进后本线反应 {len(live)} 条、缺来源 {len(bad)} 条；阶段链 {stages}；"
+            f"重复合并后强度 {merged['intensity']}（不变）；相反依据后 {flip['stage']}/{flip['intensity']}；"
+            f"快照含 reactions 段={isinstance(snap.get('reactions'), list)}",
+            "PASS" if ok else "FAIL",
+            evidence=("runtime/reaction.py + reaction 表；store.apply_runtime_batch(reactions=) 落库，character_snapshot 暴露 live 反应；"
+                      "merge 是纯函数（只在内存里合并），不会写库、更不会动经历行"),
+            code_ref="isekai_core/runtime/reaction.py:1-218",
+        )
 
 
 # --------------------------------------------------------------- §13 认知接口
