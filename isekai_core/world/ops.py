@@ -24,12 +24,12 @@ from .instances import (
     InstanceError,
     create_instance,
     delete_instance,
-    get_setting,
     list_instances,
     load_cards,
     public_info,
     rename_instance,
     save_card,
+    public_setting,
 )
 from .package import PackageError, load_package, save_package, template_package
 from .portable import import_instance, read_container, write_export
@@ -486,7 +486,7 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return {"log": store.proactive_list(str(args.get("instance_id") or ""),
                                                 str(args.get("timeline_id") or ""))}
         if op == "instance.setting":
-            return {"setting": get_setting(store, str(args.get("id") or ""))}
+            return {"setting": public_setting(store, str(args.get("id") or ""))}
         if op == "instance.rename":
             return {"instance": rename_instance(store, str(args.get("id") or ""), str(args.get("name") or ""))}
         if op == "instance.delete":
@@ -719,6 +719,26 @@ async def _propose_intents(cfg: Config, llm: Any, store: Store | None, args: dic
     return await world.propose_intents(instance_id, timeline_id, llm=llm, now_real=time.time())
 
 
+async def _grounded_else_numeric(llm: Any, base: str, candidate: str) -> bool:
+    """骨架里没有可核对的数字时，再花一次便宜调用问「有没有添骨架外的事实」（§3.2 / §3.4）。
+
+    判不出来（超时 / 解析失败 / 模型抽风）按**通过**处理：数字护栏仍然生效，
+    不能因为一次判断失败就把正常表述全退回模板（退回模板同样是损失）。
+    """
+    from ..runtime import render as render_mod
+
+    if render_mod.has_checkable_facts(base):
+        return True
+    try:
+        text = await llm.chat(
+            render_mod.grounding_prompt(str(base), str(candidate)), temperature=0.0, timeout=20.0
+        )
+    except Exception:
+        return True
+    verdict = render_mod.parse_grounding(text)
+    return True if verdict is None else verdict
+
+
 async def _render_event(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
     """把既定骨架表述成人话（§3.2）：校验不过有界重试，仍不过就退回模板，不改任何事实。"""
     from ..runtime import render as render_mod
@@ -756,8 +776,13 @@ async def _render_event(cfg: Config, llm: Any, store: Store | None, args: dict[s
         replies.append(text)
         parsed = render_mod.parse_render(text, claims)
         if parsed and render_mod.facts_preserved(parsed["detail"], str(event.get("summary") or "")):
-            detail, rendered_claims = parsed["detail"], parsed["claims"]
-            break
+            if render_mod.has_checkable_facts(str(event.get("summary") or "")):
+                detail, rendered_claims = parsed["detail"], parsed["claims"]
+                break
+            calls += 1  # 第二道护栏也是真调用，记进账本
+            if await _grounded_else_numeric(llm, str(event.get("summary") or ""), parsed["detail"]):
+                detail, rendered_claims = parsed["detail"], parsed["claims"]
+                break
     if not rendered_claims:
         world.settle_call(
             reservation, prompt_text=prompt_text, reply="".join(replies), outcome="rejected", calls=calls
@@ -816,6 +841,16 @@ async def _expand_claim(cfg: Config, llm: Any, store: Store | None, args: dict[s
             "note": "展开引入了原记载之外的事实，已丢弃（保留不知道）",
             "budget": {"paused": False, "calls": total, "limit": limit},
         }
+    if not render_mod.has_checkable_facts(str(original.get("text") or "")):
+        total = store.call_ledger_add(instance_id, timeline_id, "claim_expand", bucket=bucket, calls=1)
+        if not await _grounded_else_numeric(llm, str(original.get("text") or ""), text):
+            return {
+                "claim": claim_id,
+                "text": "",
+                "calls": 2,
+                "note": "展开补出了原记载之外的事实，已丢弃（保留不知道）",
+                "budget": {"paused": False, "calls": total, "limit": limit},
+            }
     derived_id = f"cl-x-{str(original['id']).replace('cl-', '')}-{int(time.time())}"
     store.claim_put(
         {

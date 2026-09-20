@@ -530,15 +530,16 @@ async def a3_add_card_extend_only(ctx: Ctx) -> tuple[str, str]:
     joins = q(ctx.store, "SELECT * FROM character_join WHERE instance_id=?", (info["id"],))
     watermark_after = int(ctx.store.clock_get(timeline)["processed_world"])
 
+    snapshot_ids = [str((c.get("meta") or {}).get("card_id")) for c in setting["cards"]]
     ok = (
-        len(setting["cards"]) == 1
+        len(setting["cards"]) == 2 and "cc-桑叶" in snapshot_ids  # §3.7：定义写进实例设定快照
         and len(joins) == 1
         and str(joins[0]["character_id"]) == "cc-桑叶"
         and watermark_before == watermark_after
         and result["timeline_state"] == "frozen"
     )
     return ("PASS" if ok else "FAIL"), (
-        f"补入「桑叶」：实例快照角色数 {len(setting['cards'])}（原 1，只增不减体现在 character_join）、"
+        f"补入「桑叶」：实例快照角色数 {len(setting['cards'])}={snapshot_ids}（原 1，§3.7 要求定义进快照）、"
         f"成员资格行 {len(joins)} 条（角色={joins[0]['character_id'] if joins else '无'}，加入水位={joins[0]['joined_world'] if joins else '-'}）、"
         f"线状态仍 {result['timeline_state']}、水位 {watermark_before}→{watermark_after}（未推进）"
     )
@@ -852,8 +853,11 @@ async def d1b_commit_closure(ctx: Ctx) -> tuple[str, str]:
         source_messages = n(ctx.store, "SELECT COUNT(*) FROM message WHERE session_id IN (SELECT id FROM session WHERE instance_id=?)", (info["id"],))
 
     ok = not snapshot_missing and rollback == "成功" and fork_messages == source_messages
+    carried = {str(item.get("id")): bool(item.get("snapshot")) for item in (json.loads(export.read_text(encoding="utf-8"))["runtime"]["commits"])}
     return ("PASS" if ok else "FAIL"), (
-        f"导入后提交 {len(mapped_commit)} 条，缺快照的={len(snapshot_missing)} 条；"
+        f"导入后提交 {len(mapped_commit)} 条，缺快照的={len(snapshot_missing)} 条"
+        f"（缺的 kind={[r['kind'] for r in mapped_commit if r['id'] in snapshot_missing]}，"
+        f"导出件各提交带快照={list(carried.values())}）；"
         f"回滚到导入提交={rollback[:48]}；从导入提交分叉得到的新线：对话 {fork_messages} 条（原实例 {source_messages} 条）、"
         f"性格单元 {fork_units} 行；build_container（portable.py:40-121）只带 commit 元数据、不带 commit_snapshot"
     )
@@ -1375,7 +1379,16 @@ async def f2_rollback_membership(ctx: Ctx) -> tuple[str, str]:
     units_before = n(ctx.store, "SELECT COUNT(*) FROM unit WHERE instance_id=? AND character_id='cc-桑叶'", (info["id"],))
 
     await ctx.mgmt.call("runtime.rollback", instance_id=info["id"], timeline_id=timeline, commit_id=baseline["id"], confirm=True)
-    joins_after = n(ctx.store, "SELECT COUNT(*) FROM character_join WHERE instance_id=? AND character_id='cc-桑叶'", (info["id"],))
+    joins_after = n(
+        ctx.store,
+        "SELECT COUNT(*) FROM character_join WHERE instance_id=? AND character_id='cc-桑叶' AND state='active'",
+        (info["id"],),
+    )
+    joins_revoked = n(
+        ctx.store,
+        "SELECT COUNT(*) FROM character_join WHERE instance_id=? AND character_id='cc-桑叶' AND state='revoked'",
+        (info["id"],),
+    )
     units_after = n(ctx.store, "SELECT COUNT(*) FROM unit WHERE instance_id=? AND character_id='cc-桑叶'", (info["id"],))
     memory_after = n(ctx.store, "SELECT COUNT(*) FROM memory WHERE instance_id=? AND character_id='cc-桑叶'", (info["id"],))
     dialog_after = n(
@@ -1392,11 +1405,11 @@ async def f2_rollback_membership(ctx: Ctx) -> tuple[str, str]:
 
     ok = (
         "cc-桑叶" in cards_now
-        and joins_after == 0 and units_after == 0 and memory_after == 0 and dialog_after == 0
+        and joins_after == 0 and joins_revoked == 1 and units_after == 0 and memory_after == 0 and dialog_after == 0
         and "cc-桑叶" not in cards_rolled and "cc-桑叶" in fork_cards
     )
     return ("PASS" if ok else "FAIL"), (
-        f"补入后本线角色={cards_now}（单元 {units_before} 行）→ 回滚到补卡前提交：成员资格 {joins_after} 行、单元 {units_after} 行、"
+        f"补入后本线角色={cards_now}（单元 {units_before} 行）→ 回滚到补卡前提交：有效成员资格 {joins_after} 行（撤销留档 {joins_revoked} 行）、单元 {units_after} 行、"
         f"记忆 {memory_after} 行、对话 {dialog_after} 行、本线角色={cards_rolled}；"
         f"从补卡后提交分叉的角色={fork_cards}（继承={('cc-桑叶' in fork_cards)}）"
     )
@@ -1657,15 +1670,18 @@ async def g6_black_box_surface(ctx: Ctx) -> tuple[str, str]:
     commits = json.dumps(await ctx.mgmt.call("runtime.commits", instance_id=info["id"], timeline_id=timeline), ensure_ascii=False)
     setting = json.dumps(await ctx.mgmt.call("instance.setting", id=info["id"]), ensure_ascii=False)
     memory_leak = SECRET_MEMORY in (detail + clock + commits)
+    # 管理面只该看到「锁了什么」的公开面：性格数值、实情层正文、卡片其余字段都不该出现
     payload = json.loads(setting)["setting"]
-    unit_values = payload["cards"][0]["initial_units"]
-    canon_texts = [item.get("statement") for item in payload["world_package"].get("canon") or []]
-    exposed = [u.get("confidence") for u in unit_values if u.get("confidence") is not None]
+    blob = json.dumps(payload, ensure_ascii=False)
+    exposed = [
+        key for key in ("initial_units", "confidence", "canon", "narratives", "self_knowledge", "creator")
+        if key in blob
+    ]
     ok = not memory_leak and not exposed
     return ("PASS" if ok else "FAIL"), (
         f"instance.info / runtime.clock / runtime.commits 里出现记忆正文={memory_leak}；"
         f"instance.setting（mgmt 面可直呼，CLI 子命令 world_cli.py:47）返回整份锁定设定 {len(setting)} 字符："
-        f"性格单元数值={exposed}、实情层条目={canon_texts}；"
+        f"内部字段命中={exposed}；"
         f"§3.5 允许的是「实例 / 时间线 / 提交的必要管理元数据和操作」，性格数值与实情层不在其中"
         f"（桌面 UI 未调用该 op）"
     )

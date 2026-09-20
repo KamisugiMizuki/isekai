@@ -1600,28 +1600,46 @@ class Store:
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
 
+    def _settle_connection(self) -> None:
+        """把连接上的隐式事务收干净（并发写前的清场）。
+
+        只读方法（如 instance_names）会隐式开启一个读事务且从不提交；同一连接上随后任何
+        写方法的 rollback 都会从那个点往后卷，把别处已"提交"的写入一起带走。
+        """
+        try:
+            self._conn.rollback()
+        except sqlite3.Error:  # pragma: no cover - 连接层面没事务时忽略
+            pass
+
     def instance_create(self, row: dict[str, Any], *, timelines: list[dict[str, Any]], commits: list[dict[str, Any]]) -> None:
-        """原子固化：实例行 + 初始时间线 + 初始提交一起落入，失败不留半个实例（§3.4）。"""
-        with self._lock, self._conn:
-            self._conn.execute(
-                """INSERT INTO instance(id, name, original_name, package_id, data_format, rules_version,
-                                        app_version, seed, moment, setting, imported, created_at)
-                   VALUES(:id, :name, :original_name, :package_id, :data_format, :rules_version,
-                          :app_version, :seed, :moment, :setting, :imported, :created_at)""",
-                row,
-            )
-            for timeline in timelines:
+        """原子固化：实例行 + 初始时间线 + 初始提交一起落入，失败不留半个实例（§3.4）。
+
+        并发下连接上可能挂着别人留下的隐式事务：先收干净、再显式开一个写事务并提交，
+        否则一次 UNIQUE 冲突的 rollback 会把同一连接上还没落到盘上的行一起卷走
+        （实测：5 线程并发建同名实例时，成功的调用回来读不到自己刚建的行）。
+        """
+        with self._lock:
+            self._settle_connection()
+            with self._conn:
                 self._conn.execute(
-                    """INSERT INTO timeline(id, instance_id, name, state, source_commit, created_at)
-                       VALUES(:id, :instance_id, :name, :state, :source_commit, :created_at)""",
-                    timeline,
+                    """INSERT INTO instance(id, name, original_name, package_id, data_format, rules_version,
+                                            app_version, seed, moment, setting, imported, created_at)
+                       VALUES(:id, :name, :original_name, :package_id, :data_format, :rules_version,
+                              :app_version, :seed, :moment, :setting, :imported, :created_at)""",
+                    row,
                 )
-            for commit in commits:
-                self._conn.execute(
-                    """INSERT INTO commit_log(id, instance_id, timeline_id, kind, moment, note, created_at)
-                       VALUES(:id, :instance_id, :timeline_id, :kind, :moment, :note, :created_at)""",
-                    commit,
-                )
+                for timeline in timelines:
+                    self._conn.execute(
+                        """INSERT INTO timeline(id, instance_id, name, state, source_commit, created_at)
+                           VALUES(:id, :instance_id, :name, :state, :source_commit, :created_at)""",
+                        timeline,
+                    )
+                for commit in commits:
+                    self._conn.execute(
+                        """INSERT INTO commit_log(id, instance_id, timeline_id, kind, moment, note, created_at)
+                           VALUES(:id, :instance_id, :timeline_id, :kind, :moment, :note, :created_at)""",
+                        commit,
+                    )
 
     def instance_rename(self, instance_id: str, name: str) -> None:
         with self._lock, self._conn:
@@ -1941,6 +1959,15 @@ class Store:
         if row is None:
             return None
         return versioning_mod.parse_snapshot(row["payload"])
+
+    def commit_snapshot_put(self, commit_id: str, instance_id: str, payload: str) -> None:
+        """随件恢复提交快照（§7.1 提交闭包）：导入后该线仍能回滚 / 分叉。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO commit_snapshot(commit_id, instance_id, payload, size, created_at)
+                   VALUES(?,?,?,?,?)""",
+                (str(commit_id), str(instance_id), payload, len(payload), time.time()),
+            )
 
     def commit_get(self, commit_id: str) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM commit_log WHERE id=?", (commit_id,)).fetchone()

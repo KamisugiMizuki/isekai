@@ -91,3 +91,39 @@ def expansion_is_grounded(text: str, claim: dict[str, Any]) -> bool:
     want = set(_NUMBERS.findall(str(claim.get("text") or "")))
     got = set(_NUMBERS.findall(text))
     return got <= want
+
+
+#: 数字护栏能核对的骨架（有数字才有可核对的点）
+def has_checkable_facts(text: str) -> bool:
+    return bool(_NUMBERS.findall(str(text or "")))
+
+
+_GROUNDING_SYSTEM = """你要做一次忠实度判断：判断「候选正文」有没有给「既定骨架」添上骨架里没有的事实。
+只认四类新增：参与者 / 责任人（谁做的、经谁的手）、原因与因果、结果与状态变化、生死。
+换说法、补语气、把不确定写得更不确定、写成「不可考 / 没记下」都不算新增。
+只输出 JSON：{"grounded": true}，或 {"grounded": false, "added": "新添的那件事（不超过 20 字）"}。"""
+
+
+def grounding_prompt(base: str, candidate: str) -> list[dict[str, str]]:
+    """骨架里没有数字时的第二道护栏（§3.2 / §3.4）：只问「有没有添骨架外的事实」。"""
+    return [
+        {"role": "system", "content": _GROUNDING_SYSTEM},
+        {"role": "user", "content": f"既定骨架：{base}\n候选正文：{candidate}"},
+    ]
+
+
+def parse_grounding(text: str) -> bool | None:
+    """解析忠实度判断；解析不出来回 None（调用方按「只信数字护栏」处理，不误杀）。"""
+    import json
+
+    raw = str(text or "").strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        payload = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("grounded"), bool):
+        return None
+    return bool(payload["grounded"])

@@ -692,18 +692,17 @@ def b4c() -> str:
         invented = "告发者是城西的柳氏"
         reply = json.dumps({"detail": f"堤务吏当值失察，{invented}。", "claims": {"src-1": f"堤务吏当值失察，{invented}。"}},
                            ensure_ascii=False)
+        # 骨架里没有数字 → 第二道护栏（忠实度判断）会再问一次；脚本模型按真实模型的方式回答
         result = asyncio.run(world_ops.dispatch_async(
-            cfg, ScriptedLLM([reply]), "event.render",
+            cfg, ScriptedLLM([reply, '{"grounded": false, "added": "责任人：柳氏"}']), "event.render",
             {"instance_id": case.instance_id, "timeline_id": case.timeline_id, "event_id": ident},
             store=case.store,
         ))
         case.advance(2)
         granted = [r for r in case.claims(event_id=ident) if str(r["source_id"]) == "src-1"]
-        if result.get("text_source") != "llm":
-            raise Violation(f"该表述未被采纳，本次检查前提不成立：{result}")
         text_now = str(granted[0]["text"]) if granted else ""
         learned = [r for r in case.know("cc-堤禾") if invented in str(r["text"])]
-        if invented in text_now:
+        if invented in text_now or learned or result.get("text_source") == "llm":
             in_prompt = invented in case.prompt("cc-堤禾")
             raise Violation(
                 f"骨架里没有责任人，语言产物「{invented}」被固化进说法文本并经传播链进入角色获知"
@@ -713,7 +712,10 @@ def b4c() -> str:
                 where=("isekai_core/runtime/render.py:35 facts_preserved（只在骨架含数字时才校验）；"
                        "isekai_core/runtime/events.py:300 claim_grant（按 claim.text 发获知）"),
             )
-        return f"未复现：固化后的说法文本 {text_now[:24]!r} 未包含补出的责任人（获知 {len(learned)} 条）"
+        return (
+            f"补出的责任人被第二道护栏拒绝（text_source={result.get('text_source')}）："
+            f"固化后说法文本 {text_now[:20]!r} 不含「{invented}」，获知 {len(learned)} 条"
+        )
     finally:
         case.close()
 
@@ -1253,7 +1255,7 @@ def b9b() -> str:
         invention = "经手此事的其实是堤南史馆的一名文书"
         before = len(case.claims())
         result = asyncio.run(world_ops.dispatch_async(
-            cfg, ScriptedLLM([invention]), "event.expand",
+            cfg, ScriptedLLM([invention, '{"grounded": false, "added": "经手人"}']), "event.expand",
             {"instance_id": case.instance_id, "timeline_id": case.timeline_id,
              "claim_id": str(claim["id"]), "character_id": "cc-堤禾", "question": "是谁经手？"},
             store=case.store))

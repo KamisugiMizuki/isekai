@@ -275,7 +275,7 @@ async def test_opening_an_instance_reports_compatibility(root) -> None:
 
 
 @pytest.mark.asyncio
-async def test_instance_setting_exposes_locked_snapshot(root) -> None:
+async def test_instance_setting_is_public_surface_only(root) -> None:
     package = sample_package()
     write_json(root / "packages" / "greytide.json", package)
     write_json(root / "packages" / "tihe.json", sample_card(package))
@@ -286,13 +286,17 @@ async def test_instance_setting_exposes_locked_snapshot(root) -> None:
                 await mgmt.call("instance.create", package_path="greytide.json", card_paths=["tihe.json"])
             )["instance"]
             setting = (await mgmt.call("instance.setting", id=info["id"]))["setting"]
+            # §3.5 完全黑箱：管理面只说「锁了什么」，性格数值 / 实情层正文 / 卡片其余字段都不给
             assert setting["original_name"] == "灰潮纪"
-            assert setting["world_package"]["meta"]["package_id"] == package["meta"]["package_id"]
-            # 改文件不追溯实例
+            assert setting["world_package"]["package_id"] == package["meta"]["package_id"]
+            blob = json.dumps(setting, ensure_ascii=False)
+            assert "initial_units" not in blob and "confidence" not in blob
+            assert "每三十日" not in blob, "锁定设定的正文不该从管理面读出来"
+            # 改源文件不追溯实例：公开面里的包标识也不随文件变
             edited = json.loads((root / "packages" / "greytide.json").read_text(encoding="utf-8"))
             edited["world"]["axioms"][0]["text"] = "被改过的公理"
             write_json(root / "packages" / "greytide.json", edited)
             again = (await mgmt.call("instance.setting", id=info["id"]))["setting"]
-            assert again["world_package"]["world"]["axioms"][0]["text"].startswith("潮汐每三十日")
+            assert again["world_package"]["package_id"] == package["meta"]["package_id"]
         finally:
             await mgmt.close()

@@ -10,14 +10,23 @@ from __future__ import annotations
 
 import json
 import secrets
+import sqlite3
+import threading
 import time
 from typing import Any
 
+from ..log import get_logger
 from ..store import Store
 from ..version import APP_VERSION, DATA_FORMAT_VERSION, RULES_VERSION
 from .cards import validate_assembly
 from .package import PackageError, clone_package, ensure_original_name, normalize_name, unique_name
 from .validate import validate_package
+
+log = get_logger("isekai.world.instances")
+
+# 名称分配 + 插入要在同一个临界区里（进程内并发）；跨进程靠 UNIQUE 冲突重试兜住
+# ponytail: 进程内锁，多进程并发只靠重试，真要扛住得多进程协调（当前单机单核不必要）
+_NAME_LOCK = threading.Lock()
 
 TIMELINE_MAIN = "main"
 
@@ -132,9 +141,45 @@ def create_instance(
         "imported": 1 if imported else 0,
         "created_at": now,
     }
-    store.instance_create(row, timelines=timeline_rows, commits=commit_rows)
+    # 并发创建 / 导入：两个进程可能选中同一个候选名，UNIQUE 冲突就按最新占用重算（§7.4 全局唯一）
+    with _NAME_LOCK:
+        for attempt in range(8):
+            row["name"] = allocate_name(wanted, store.instance_names()) if attempt else name
+            if attempt:
+                row["id"] = instance_id = new_instance_id()
+                timeline_rows = [{**item, "instance_id": instance_id} for item in timeline_rows]
+                commit_rows = [{**item, "instance_id": instance_id} for item in commit_rows]
+            try:
+                store.instance_create(row, timelines=timeline_rows, commits=commit_rows)
+            except sqlite3.IntegrityError:
+                log.warning("实例名称并发冲突，重算候选名 attempt=%s name=%s", attempt, row["name"])
+                continue
+            if store.instance_get(row["id"]) is not None:
+                break
+            # 极偶发：并发下这次写入会丢在别人的事务里（提交了却读不回来）。名字仍是空的，
+            # 换个标识重来即可——重试有界，不掩盖别的问题。
+            # ponytail: 兜住共享连接隐式事务的丢写；真根因（每线程独立连接）留待 store 重构
+            log.warning("实例行未落盘，重试 attempt=%s id=%s", attempt, row["id"])
+            continue
+        else:
+            raise InstanceError("实例名称分配失败：并发冲突过多，请重试")
+    # 每个提交都要自带快照（§7.1 提交闭包）：创建期的初始提交同样得能回滚 / 分叉，
+    # 否则「回滚到创建点」「从创建提交分叉」在本地实例上就已经不可用
+    from ..runtime import versioning  # 局部导入：versioning 在 runtime 层，顶层导入会成环
+
+    for item in commit_rows:
+        if store.commit_snapshot_get(str(item["id"])) is not None:
+            continue
+        store.commit_snapshot_put(
+            str(item["id"]),
+            instance_id,
+            json.dumps(
+                versioning.snapshot_of(store, instance_id, str(item["timeline_id"])), ensure_ascii=False
+            ),
+        )
     created = store.instance_get(instance_id)
-    assert created is not None
+    created = store.instance_get(instance_id)
+    assert created is not None, f"实例创建后读不回来：{instance_id}"
     return public_info(created)
 
 
@@ -194,10 +239,52 @@ def list_instances(store: Store) -> list[dict[str, Any]]:
 
 
 def get_setting(store: Store, instance_id: str) -> dict[str, Any]:
+    """锁定的设定原文（**仅内部 / 测试**）：管理面一律走 `public_setting`（§3.5 黑箱）。"""
     row = store.instance_get(instance_id)
     if row is None:
         raise InstanceError(f"实例不存在：{instance_id}")
     return json.loads(row["setting"])
+
+
+def public_setting(store: Store, instance_id: str) -> dict[str, Any]:
+    """实例设定的**公开面**（§3.5 完全黑箱）：只说「锁了什么」，不给内部正文。
+
+    性格单元数值、实情层 / 传说条目正文、角色卡的其余字段都不在这里——要读内容只有两条正路：
+    通过角色的认知（会话）或导出件（用户自己的包）。管理面借校验错误或整份设定偷看都算泄密。
+    """
+    row = store.instance_get(instance_id)
+    if row is None:
+        raise InstanceError(f"实例不存在：{instance_id}")
+    setting = json.loads(row["setting"])
+    package = setting.get("world_package") if isinstance(setting.get("world_package"), dict) else {}
+    calendar = package.get("calendar") if isinstance(package.get("calendar"), dict) else {}
+    meta = package.get("meta") if isinstance(package.get("meta"), dict) else {}
+    cards: list[dict[str, Any]] = []
+    for card in setting.get("cards") or []:
+        if not isinstance(card, dict):
+            continue
+        card_meta = card.get("meta") if isinstance(card.get("meta"), dict) else {}
+        identity = card.get("identity") if isinstance(card.get("identity"), dict) else {}
+        cards.append(
+            {
+                "card_id": str(card_meta.get("card_id") or ""),
+                "name": str(identity.get("name") or ""),
+                "role_id": str(card.get("role_id") or ""),
+                "confirmed": bool(card_meta.get("confirmed")),
+            }
+        )
+    return {
+        "original_name": str(setting.get("original_name") or ""),
+        "world_package": {
+            "package_id": str(meta.get("package_id") or ""),
+            "original_name": str(meta.get("original_name") or ""),
+            "era": str(calendar.get("era") or ""),
+            "day_seconds": calendar.get("day_seconds"),
+            "initial_moment": calendar.get("initial_moment"),
+            "density": str(meta.get("density") or ""),
+        },
+        "cards": cards,
+    }
 
 
 def rename_instance(store: Store, instance_id: str, name: str) -> dict[str, Any]:

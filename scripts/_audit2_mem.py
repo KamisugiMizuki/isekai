@@ -14,6 +14,7 @@ import asyncio
 import dataclasses
 import hashlib
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -1200,13 +1201,19 @@ def spec_no_memory_browse() -> str:
                  .split("ASYNC_OPS = frozenset")[0].split("}")[0].splitlines())
     op_names = [line.strip().strip('",') for line in ops if line.strip().startswith('"')]
     memory_ops = [name for name in op_names if "memor" in name or "disclos" in name]
-    desktop_hits = [
-        str(path.relative_to(ROOT))
-        for path in ROOT.joinpath("desktop").rglob("*")
-        if path.is_file() and path.suffix in {".ts", ".tsx", ".html"}
-        and "node_modules" not in path.as_posix() and "target" not in path.parts
-        and "memor" in path.read_text(encoding="utf-8", errors="ignore").lower()
-    ]
+    # 只禁「浏览 / 逐条编辑记忆」的入口；embedding 配置组（memory_embedding_*）是 §3.3 要求的设置面，
+    # 先把这些键从文本里剔掉再找浏览标记，避免「配了向量化＝能看记忆」的误判。
+    browse_markers = ("memory.list", "memory.get", "memory.browse", "memory.edit", "memories",
+                      "记忆库", "查看记忆", "编辑记忆")
+    desktop_hits = []
+    for path in ROOT.joinpath("desktop").rglob("*"):
+        if not path.is_file() or path.suffix not in {".ts", ".tsx", ".html"}:
+            continue
+        if "node_modules" in path.as_posix() or "target" in path.parts:
+            continue
+        text = re.sub(r"memory_embedding[a-z_]*", "", path.read_text(encoding="utf-8", errors="ignore"))
+        if any(marker in text for marker in browse_markers):
+            desktop_hits.append(str(path.relative_to(ROOT)))
     assert memory_ops == ["disclose.confirm", "disclose.list"], f"管理面出现了记忆明文入口：{memory_ops}"
     assert desktop_hits == [], f"界面出现了记忆相关入口：{desktop_hits}"
     extract = ROOT.joinpath("isekai_core/world/ops.py").read_text(encoding="utf-8")

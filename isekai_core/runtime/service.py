@@ -603,11 +603,42 @@ class RuntimeService:
             "limited": 0,
         })
         self.store.runtime_load(instance_id, new_id, payload)
+        # 对话历史随分叉带到新线（§六 共同过去）：快照里的 dialog 要落到新线自己的会话上，
+        # 会话身份含时间线，不能直接复用旧线行
+        self._carry_dialog(instance_id, timeline_id, new_id, list(snapshot.get("dialog") or []))
         # 分支也留一个自己的提交点（带快照，回滚 / 再分叉都指得到它）
         record = self.commit(instance_id, new_id, kind="initial", note=f"分叉自 {commit_id}")
         if activate:
             self.activate(instance_id, new_id, now_real=now_real)
         return {"timeline": self.store.timeline_get(new_id), "commit": record, "source_commit": commit_id}
+
+    def _carry_dialog(
+        self, instance_id: str, source_timeline: str, target_timeline: str, rows: list[dict[str, Any]]
+    ) -> int:
+        """把来源提交点的对话搬到新线：按角色重建会话，再按会话分组写回消息。"""
+        if not rows:
+            return 0
+        sessions = {
+            str(item["id"]): item
+            for item in self.store.instance_sessions(instance_id)
+            if str(item.get("timeline_id") or "") == source_timeline
+        }
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            source = sessions.get(str(row.get("session_id") or ""))
+            if source is None:
+                continue
+            target = self.store.session_ensure(
+                instance_id, target_timeline, str(source.get("character_id") or "")
+            )
+            grouped.setdefault(str(target["id"]), []).append(row)
+        written = 0
+        for session_id, items in grouped.items():
+            self.store.instance_import_messages(session_id, items)
+            written += len(items)
+        return written
 
     def rollback(
         self,

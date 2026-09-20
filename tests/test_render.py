@@ -61,7 +61,8 @@ async def test_render_writes_text_but_never_facts(store, world, tmp_path) -> Non
     assert saved["summary"] == skeleton, "骨架不被语言产物改写"
     claims = store.claim_list(info["id"], timeline_id, event_id=event["id"])
     assert any(str(item["text"]).startswith("驿站传：") for item in claims), "说法文本一并固化"
-    assert result["budget"]["calls"] == 1
+    # 骨架里没有数字时，渲染后还会花一次便宜调用做忠实度判断（§3.2 第二道护栏），账本如实记 2 次
+    assert result["budget"]["calls"] == 2
 
     # 第二次调用复用已固化文本，不重新生成（§3.2）
     again = await world_ops.dispatch_async(
@@ -71,7 +72,8 @@ async def test_render_writes_text_but_never_facts(store, world, tmp_path) -> Non
         {"instance_id": info["id"], "timeline_id": timeline_id, "event_id": event["id"]},
         store=store,
     )
-    assert again.get("reused") is True and len(llm.calls) == 1
+    # 只有第一次渲染花了两步（表述 + 忠实度判断）；复用不再调用模型
+    assert again.get("reused") is True and len(llm.calls) == 2
 
 
 async def test_render_rejects_facts_changed_by_language(store, world, tmp_path) -> None:
@@ -191,7 +193,8 @@ async def test_expand_only_for_known_claims_and_is_derived(store, world, tmp_pat
         {"instance_id": info["id"], "timeline_id": timeline_id, "claim_id": claim["id"], "character_id": character_id},
         store=store,
     )
-    assert again.get("reused") is True and len(llm.calls) == 1
+    # 只有第一次渲染花了两步（表述 + 忠实度判断）；复用不再调用模型
+    assert again.get("reused") is True and len(llm.calls) == 2
 
 
 async def test_expand_drops_ungrounded_output(store, world, tmp_path) -> None:

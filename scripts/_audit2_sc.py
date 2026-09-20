@@ -1393,7 +1393,11 @@ async def c29(tmp: Path) -> dict[str, Any]:
         await core.raw(chan, "dm-1", "还在吗", "e-after-death")
         err1 = await chan.error()
         try:
-            notice_env = await chan.reply(timeout=6.0)
+            # 归档说明按 system_notice 投递（C30）：不能只等 reply
+            notice_env = await chan.wait(
+                lambda env: env.type == "system_notice" or bool(env.payload.get("message_id")),
+                timeout=6.0,
+            )
         except TimeoutError:
             notice_env = None
         notice = core.store.session_notice_get(session["id"], "archive")

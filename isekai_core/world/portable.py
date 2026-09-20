@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..store import Store
+from ..store import Store, _relabel_payload
 from ..version import (
     APP_VERSION,
     CAPABILITIES,
@@ -87,6 +87,8 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
                     "moment": item["moment"],
                     "note": item["note"],
                     "created_at": item["created_at"],
+                    # 提交闭包（§7.1）：没有快照，导入件就回滚不了、也分不出有历史的新线
+                    "snapshot": store.commit_snapshot_get(str(item["id"])),
                 }
                 for item in commits
             ],
@@ -202,7 +204,7 @@ def import_instance(store: Store, container: dict[str, Any], *, display_name: st
         raise InstanceError(["导入件的锁定设定未通过校验："] + errors)
 
     runtime = container.get("runtime") or {}
-    timelines, commits, timeline_map = _prepare_graph(runtime, moment)
+    timelines, commits, timeline_map, commit_map = _prepare_graph(runtime, moment)
     row = create_instance(
         store,
         package,
@@ -215,8 +217,9 @@ def import_instance(store: Store, container: dict[str, Any], *, display_name: st
         commits=commits,
     )
     try:
-        _restore_sessions(store, row["id"], runtime, timeline_map)
+        session_map = _restore_sessions(store, row["id"], runtime, timeline_map)
         _restore_runtime_state(store, row["id"], runtime, timeline_map)
+        _restore_commit_snapshots(store, row["id"], runtime, commit_map, timeline_map, session_map)
     except Exception:
         store.instance_delete(row["id"])
         raise
@@ -292,7 +295,7 @@ def _remap_rows(rows: Any, instance_id: str, timeline_id: str) -> list[dict[str,
 
 def _prepare_graph(
     runtime: dict[str, Any], moment: int
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str], dict[str, str]]:
     """时间线与提交行重新映射本地标识；导入线一律冻结（§7.3）。"""
     timeline_map: dict[str, str] = {}
     commit_map: dict[str, str] = {}
@@ -337,12 +340,53 @@ def _prepare_graph(
                 "created_at": time.time(),
             }
         ]
-    return timelines, commits, timeline_map
+    return timelines, commits, timeline_map, commit_map
+
+
+def _restore_commit_snapshots(
+    store: Store,
+    instance_id: str,
+    runtime: dict[str, Any],
+    commit_map: dict[str, str],
+    timeline_map: dict[str, str],
+    session_map: dict[str, str],
+) -> int:
+    """提交快照随件恢复（§7.1 提交闭包）：导入件的回滚 / 分叉不丢历史。
+
+    快照内部的本地标识要按新实例改写：运行载荷走 store 的载荷改写，对话行的会话标识走会话映射；
+    映射不到的对话行直接丢掉（不往新库里塞指向不存在会话的行）。
+    """
+    written = 0
+    for item in runtime.get("commits") or []:
+        if not isinstance(item, dict):
+            continue
+        old_commit = str(item.get("id") or "")
+        new_commit = commit_map.get(old_commit)
+        new_timeline = timeline_map.get(str(item.get("timeline_id") or ""))
+        snapshot = item.get("snapshot")
+        if not new_commit or not new_timeline or not isinstance(snapshot, dict):
+            continue
+        rows = dict(snapshot)
+        rows["runtime"] = _relabel_payload(
+            dict(snapshot.get("runtime") or {}), instance_id, new_timeline
+        )
+        dialog: list[dict[str, Any]] = []
+        for row in snapshot.get("dialog") or []:
+            if not isinstance(row, dict):
+                continue
+            session_id = session_map.get(str(row.get("session_id") or ""))
+            if session_id is None:
+                continue
+            dialog.append({**row, "session_id": session_id})
+        rows["dialog"] = dialog
+        store.commit_snapshot_put(new_commit, instance_id, json.dumps(rows, ensure_ascii=False))
+        written += 1
+    return written
 
 
 def _restore_sessions(
     store: Store, instance_id: str, runtime: dict[str, Any], timeline_map: dict[str, str]
-) -> None:
+) -> dict[str, str]:
     """恢复会话与对话原文；时间线标识重新映射，投递与绑定不回传（§7.1）。"""
     timelines = store.timeline_list(instance_id)
     if not timelines:
@@ -368,6 +412,7 @@ def _restore_sessions(
         grouped.setdefault(new_session, []).append(item)
     for session_id, items in grouped.items():
         store.instance_import_messages(session_id, items)
+    return id_map
 
 
 __all__ = [
