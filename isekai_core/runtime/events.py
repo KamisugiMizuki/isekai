@@ -447,6 +447,131 @@ def backfill_rows(
     return events, claims
 
 
+# ---------- 创建期历史回填的编纂计划（WORLD_SETTING_SPEC §3.6） ----------
+
+BACKFILL_VOLUME_YEARS = 10  # 暂按十年一卷（§3.6 条 3，起步口径，不冻结）
+BACKFILL_BATCH_MIN, BACKFILL_BATCH_MAX = 10, 20  # 10–20 条一批
+
+
+def backfill_volume_index(calendar: Any, at: int) -> int:
+    """所在卷（十年一卷）：按世界时刻换算，不查现实日期库。"""
+    span = max(1, int(getattr(calendar, "year_seconds", 0) or 1)) * BACKFILL_VOLUME_YEARS
+    return int(at) // span
+
+
+def backfill_batch_sizes(count: int) -> list[int]:
+    """把 count 条拆成若干批：每批尽量落在 10–20；总数不足一批就不凑量。"""
+    if count <= 0:
+        return []
+    if count <= BACKFILL_BATCH_MAX:
+        return [count]
+    parts = -(-count // BACKFILL_BATCH_MAX)
+    base, rest = divmod(count, parts)
+    return [base + (1 if index < rest else 0) for index in range(parts)]
+
+
+def backfill_plan(
+    package: dict[str, Any], *, seed: str, rules_version: str, calendar: Any
+) -> dict[str, Any]:
+    """分时代（卷）× 传本 × 10–20 条一批的编纂计划（§3.6 条 2/3）。
+
+    - 只组织包内**已写定**的材料（canon 实情条目 + narratives 说法条目）：没有合法候选就是留白，
+      不为凑量添加事实；计划里给出 `need_text`，谁缺「一句话」文本一眼可见。
+    - 批内顺序按创建期固定的种子确定（同一种子处处同序），只影响编纂顺序，不改事实。
+    - `selection` 是各传本的选载范围：哪个传本承载哪些条目。
+    """
+    fixed = package.get("initial_state") if isinstance(package.get("initial_state"), dict) else {}
+    canon = {str(i.get("id")): i for i in package.get("canon") or [] if isinstance(i, dict)}
+    narratives = {str(i.get("id")): i for i in package.get("narratives") or [] if isinstance(i, dict)}
+    entries: list[dict[str, Any]] = []
+    for ident in fixed.get("events") or []:
+        item = canon.get(str(ident)) or {}
+        entries.append(
+            {
+                "ident": str(ident),
+                "layer": "canon",
+                "at": int(item.get("at") or 0),
+                "source_id": "",
+                "need_text": not str(item.get("statement") or "").strip(),
+            }
+        )
+    for ident in fixed.get("rumors") or []:
+        item = narratives.get(str(ident)) or {}
+        text = str(item.get("text") or item.get("statement") or "").strip()
+        entries.append(
+            {
+                "ident": str(ident),
+                "layer": "claim",
+                "at": int(item.get("at") or 0),
+                "source_id": str(item.get("source_id") or (item.get("sources") or [""])[0] or ""),
+                "need_text": (not text) or text == str(ident),
+            }
+        )
+    entries.sort(key=lambda row: str(row["ident"]))  # 先立稳定基线，再按种子打散
+    entries.sort(key=lambda row: stable_key(seed, rules_version, str(row["ident"])))
+    grouped: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for row in entries:
+        grouped.setdefault((backfill_volume_index(calendar, int(row["at"])), str(row["source_id"])), []).append(row)
+    span = max(1, int(getattr(calendar, "year_seconds", 0) or 1)) * BACKFILL_VOLUME_YEARS
+    volumes: list[dict[str, Any]] = []
+    batches: list[dict[str, Any]] = []
+    selection: dict[str, list[str]] = {}
+    for (volume_index, source_id), group in sorted(grouped.items()):
+        idents = [str(row["ident"]) for row in group]
+        volumes.append(
+            {
+                "volume": volume_index,
+                "source_id": source_id,
+                "from_world": volume_index * span,
+                "to_world": (volume_index + 1) * span,
+                "entries": idents,
+            }
+        )
+        offset = 0
+        for size in backfill_batch_sizes(len(group)):
+            chunk = group[offset : offset + size]
+            offset += size
+            batches.append(
+                {
+                    "volume": volume_index,
+                    "source_id": source_id,
+                    "entries": [str(row["ident"]) for row in chunk],
+                    "need_text": [str(row["ident"]) for row in chunk if row["need_text"]],
+                }
+            )
+        selection.setdefault(source_id, []).extend(idents)
+    return {
+        "volumes": volumes,
+        "batches": batches,
+        "selection": selection,
+        "volume_years": BACKFILL_VOLUME_YEARS,
+        "batch_bounds": [BACKFILL_BATCH_MIN, BACKFILL_BATCH_MAX],
+        "total": len(entries),
+        "with_text": sum(1 for row in entries if not row["need_text"]),
+    }
+
+
+def backfill_product_errors(
+    package: dict[str, Any], rows: list[dict[str, Any]], claims: list[dict[str, Any]]
+) -> list[str]:
+    """创建期联合校验（§3.6 条 4）：回填产物自身要立得住，才谈得上固化。
+
+    - 每条历史条目都要有「一句话」级文本（退化成标识 = 没写完，不是留白）
+    - 说法条目的来源必须是包内声明过的传本（不挂到未声明来源上）
+    """
+    errors: list[str] = []
+    known_sources = {str(item.get("id")) for item in package.get("sources") or [] if isinstance(item, dict)}
+    for row in rows:
+        text = str(row.get("summary") or "").strip()
+        if not text or text == str(row.get("template") or ""):
+            errors.append(f"历史条目缺少一句话文本：{row.get('template') or row.get('id')}")
+    for claim in claims:
+        source_id = str(claim.get("source_id") or "")
+        if source_id and known_sources and source_id not in known_sources:
+            errors.append(f"说法引用了未声明的传本：{source_id}（{claim.get('id')}）")
+    return errors
+
+
 def dump_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """去掉内部排序键（`_order`）后交给存储层。"""
     return [{key: value for key, value in row.items() if not key.startswith("_")} for row in rows]

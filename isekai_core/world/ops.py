@@ -83,6 +83,7 @@ SYNC_OPS = frozenset(
         "app.shutdown",
         "backup.create",
         "claim.coverage",
+        "world.backfill.plan",
         "backup.restore",
         "backup.list",
         "proactive.list",
@@ -464,6 +465,22 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 ],
                 "timelines": store.timeline_list(row["id"]),
                 "commits": store.commit_list(row["id"]),
+            }
+        if op == "world.backfill.plan":
+            row = store.instance_get(str(args.get("instance_id") or ""))
+            if row is None:
+                raise UmpError(Err.NOT_FOUND, "实例不存在", retryable=False)
+            from ..runtime import events as events_mod
+            from ..runtime.calendar import calendar_from_package
+
+            package = (json.loads(row["setting"]) or {}).get("world_package") or {}
+            return {
+                "plan": events_mod.backfill_plan(
+                    package,
+                    seed=str(row["seed"]),
+                    rules_version=str(row["rules_version"] or ""),
+                    calendar=calendar_from_package(package),
+                )
             }
         if op == "claim.coverage":
             instance_id, timeline_id = str(args.get("instance_id") or ""), str(args.get("timeline_id") or "")

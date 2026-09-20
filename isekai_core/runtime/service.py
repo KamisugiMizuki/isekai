@@ -2889,6 +2889,10 @@ class RuntimeService:
             )
         if not rows:
             return 0
+        # 创建期联合校验（§3.6 条 4）：产物立不住就不固化，别留下可运行的半个实例
+        errors = events.backfill_product_errors(package, rows, claims)
+        if errors:
+            raise RuntimeStateError("历史回填未通过创建期联合校验：" + "；".join(errors[:5]))
         return self.store.runtime_load(
             instance_id, timeline_id, {"watermark": 0, "events": rows, "claims": claims}
         )
