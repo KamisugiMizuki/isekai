@@ -435,6 +435,19 @@ CREATE TABLE IF NOT EXISTS claim(
 );
 CREATE INDEX IF NOT EXISTS ix_claim_event ON claim(instance_id, timeline_id, event_id);
 
+-- 惰性展开的覆盖状态（EVENT_ENGINE_SPEC §3.4 / 附录B#10）：
+-- 没有行 = 尚未生成；state=absent 只表示「这条记载没写下」，不是「历史被删改」的证据。
+CREATE TABLE IF NOT EXISTS claim_coverage(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  claim_id TEXT NOT NULL,
+  state TEXT NOT NULL,                    -- done 已展开 | absent 已确认缺载
+  derived_id TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, claim_id)
+);
+
 CREATE TABLE IF NOT EXISTS knowledge(
   instance_id TEXT NOT NULL,
   timeline_id TEXT NOT NULL,
@@ -2771,6 +2784,27 @@ class Store:
             """SELECT * FROM claim WHERE instance_id=? AND timeline_id=? AND derived_from=?
                ORDER BY id LIMIT 1""",
             (instance_id, timeline_id, original_id),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def claim_coverage_put(self, row: dict[str, Any]) -> None:
+        payload = {"derived_id": "", "note": "", "updated_world": 0, **row}
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO claim_coverage(instance_id, timeline_id, claim_id, state, derived_id,
+                                              note, updated_world)
+                   VALUES(:instance_id, :timeline_id, :claim_id, :state, :derived_id, :note, :updated_world)
+                   ON CONFLICT(instance_id, timeline_id, claim_id) DO UPDATE SET
+                     state=:state, derived_id=:derived_id, note=:note, updated_world=:updated_world""",
+                payload,
+            )
+
+    def claim_coverage_get(
+        self, instance_id: str, timeline_id: str, claim_id: str
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT * FROM claim_coverage WHERE instance_id=? AND timeline_id=? AND claim_id=?""",
+            (instance_id, timeline_id, claim_id),
         ).fetchone()
         return _row_to_dict(row) if row else None
 

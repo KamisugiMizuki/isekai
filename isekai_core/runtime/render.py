@@ -67,6 +67,16 @@ def parse_render(text: str, claims: list[dict[str, Any]]) -> dict[str, Any] | No
     return out
 
 
+#: 「已确认缺载」的措辞：展开结果明确写「这里没记下」时才算，不是「展开失败」也不是「历史被删改」
+ABSENCE_MARKERS = ("不可考", "没有记下", "未记载", "无载", "没有提到", "并未记下", "无从考")
+
+
+def declares_absence(text: str) -> bool:
+    """展开结果是否在说「这条记载本身没写下」（§3.4 留白不临场填真相）。"""
+    body = str(text or "")
+    return any(marker in body for marker in ABSENCE_MARKERS)
+
+
 def expand_prompt(claim: dict[str, Any], *, question: str) -> list[dict[str, str]]:
     """惰性展开：只展开既定内容，依据不足就保留不知道（§3.4）。"""
     return [

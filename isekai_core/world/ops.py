@@ -82,6 +82,7 @@ SYNC_OPS = frozenset(
         "instance.setting",
         "app.shutdown",
         "backup.create",
+        "claim.coverage",
         "backup.restore",
         "backup.list",
         "proactive.list",
@@ -464,6 +465,19 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 "timelines": store.timeline_list(row["id"]),
                 "commits": store.commit_list(row["id"]),
             }
+        if op == "claim.coverage":
+            instance_id, timeline_id = str(args.get("instance_id") or ""), str(args.get("timeline_id") or "")
+            claim_id = str(args.get("claim_id") or "")
+            rows = [item for item in store.claim_list(instance_id, timeline_id) if str(item["id"]) == claim_id]
+            if not rows:
+                raise UmpError(Err.NOT_FOUND, f"没有该记载：{claim_id}", retryable=False)
+            coverage = store.claim_coverage_get(instance_id, timeline_id, claim_id) or {
+                "claim_id": claim_id,
+                "state": "pending",
+                "derived_id": "",
+                "note": "尚未生成（不是这条记载没写下）",
+            }
+            return {"coverage": coverage, "claim": {"id": claim_id, "text": rows[0].get("text") or ""}}
         if op == "backup.create":
             return {"backup": backup_once(cfg, store, note=str(args.get("note") or ""))}
         if op == "app.shutdown":
@@ -837,12 +851,27 @@ async def _expand_claim(cfg: Config, llm: Any, store: Store | None, args: dict[s
         raise UmpError(Err.INVALID, "该角色没有这条记载，不能凭空展开（物化不等于获知）", retryable=False)
     existing = store.claim_derived(instance_id, timeline_id, claim_id)
     if existing is not None:
-        return {"claim": claim_id, "derived": existing["id"], "text": existing["text"], "calls": 0, "reused": True}
+        coverage = store.claim_coverage_get(instance_id, timeline_id, claim_id) or {}
+        return {
+            "claim": claim_id,
+            "derived": existing["id"],
+            "text": existing["text"],
+            "state": str(coverage.get("state") or "done"),
+            "calls": 0,
+            "reused": True,
+        }
     bucket = _day_bucket(time.time())
     used = store.call_ledger_get(instance_id, timeline_id, "claim_expand", bucket=bucket)
     limit = int(cfg.runtime.render_calls_per_day)
     if used >= limit:
-        return {"claim": claim_id, "text": "", "calls": 0, "budget": {"paused": True, "calls": used, "limit": limit}}
+        return {
+            "claim": claim_id,
+            "text": "",
+            "state": "pending",
+            "note": "尚未生成（不是这条记载没写下；别把没展开当成缺载）",
+            "calls": 0,
+            "budget": {"paused": True, "calls": used, "limit": limit},
+        }
     text = await llm.chat(render_mod.expand_prompt(original, question=question), temperature=0.6, timeout=60.0)
     total = store.call_ledger_add(instance_id, timeline_id, "claim_expand", bucket=bucket, calls=1)
     if not render_mod.expansion_is_grounded(text, original):
@@ -850,7 +879,8 @@ async def _expand_claim(cfg: Config, llm: Any, store: Store | None, args: dict[s
             "claim": claim_id,
             "text": "",
             "calls": 1,
-            "note": "展开引入了原记载之外的事实，已丢弃（保留不知道）",
+            "state": "pending",
+            "note": "展开引入了原记载之外的事实，已丢弃（保留不知道；这次不算「已确认缺载」）",
             "budget": {"paused": False, "calls": total, "limit": limit},
         }
     if not render_mod.has_checkable_facts(str(original.get("text") or "")):
@@ -860,7 +890,8 @@ async def _expand_claim(cfg: Config, llm: Any, store: Store | None, args: dict[s
                 "claim": claim_id,
                 "text": "",
                 "calls": 2,
-                "note": "展开补出了原记载之外的事实，已丢弃（保留不知道）",
+                "state": "pending",
+                "note": "展开补出了原记载之外的事实，已丢弃（保留不知道；这次不算「已确认缺载」）",
                 "budget": {"paused": False, "calls": total, "limit": limit},
             }
     derived_id = f"cl-x-{str(original['id']).replace('cl-', '')}-{int(time.time())}"
@@ -878,10 +909,31 @@ async def _expand_claim(cfg: Config, llm: Any, store: Store | None, args: dict[s
             "derived_from": claim_id,
         }
     )
+    # 覆盖状态（§3.4 / 附录B#10）：说清是「展开了」还是「这条记载确实没写下」——
+    # 后者是留白，不是删改证据；前者也不冒充「全知」。
+    state = "absent" if render_mod.declares_absence(text) else "done"
+    note = (
+        "这条来源没有写下这一条（缺载≠删改，历史记录不变）"
+        if state == "absent"
+        else "已展开为派生记录"
+    )
+    store.claim_coverage_put(
+        {
+            "instance_id": instance_id,
+            "timeline_id": timeline_id,
+            "claim_id": claim_id,
+            "state": state,
+            "derived_id": derived_id,
+            "note": note,
+            "updated_world": 0,
+        }
+    )
     return {
         "claim": claim_id,
         "derived": derived_id,
         "text": text.strip(),
+        "state": state,
+        "note": note,
         "calls": 1,
         "budget": {"paused": False, "calls": total, "limit": limit},
     }
