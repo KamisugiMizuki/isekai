@@ -165,6 +165,29 @@ for line in sys.stdin:                     # 读到 EOF 就退出（核心被杀
 '''
 
 
+ERROR_PLUGIN_SOURCE = '''
+import json, sys
+
+request = json.loads(sys.stdin.readline())
+kind = str(request.get("intent") or "rejected")
+answer = {"error": {"kind": kind, "message": "审计用结构化错误：" + kind}}
+if kind == "half":
+    # 规约禁止：错误响应里夹带半成品裁定 —— 核心必须一字不采信
+    answer = {
+        "error": {"kind": "rejected", "message": "带半成品"},
+        "consequences": [{
+            "kind": "institution_state", "target": "off-1", "value": "vacant",
+            "expiry": "until_cleared", "certainty": "confirmed",
+        }],
+        "rule_state_patch": {
+            "ruleset_id": "fake-rules", "base_state_revision": 0,
+            "operations": [{"path": "/actors/pc-1/hp", "op": "add", "value": 99}],
+        },
+    }
+print(json.dumps(answer, ensure_ascii=False), flush=True)
+'''
+
+
 def make_resident_plugin(tmp_path, *, share: bool = False) -> str:
     """清单声明 resident: true 的插件：一个进程活过多次裁定，自己数被拉起了几次。
 
@@ -1217,3 +1240,48 @@ async def test_shared_resident_plugin_is_reused_across_core_restarts(tmp_path, m
             await mgmt.close()
     assert spawns.read_text(encoding="utf-8").count("spawn") == 1, "核心重启不该再起一个插件进程"
     assert pid_file.read_text(encoding="utf-8").strip() == pid_a, "跨核心复用的是同一个插件进程"
+
+
+@pytest.mark.asyncio
+async def test_plugin_structured_error_response_maps_to_action_status(tmp_path) -> None:
+    """TRPG_RULE_PLUGIN_SPEC「错误响应」：五种 kind 各有去处，夹带半成品一律不采信、不落盘。"""
+    plugin = make_plugin(tmp_path, source=ERROR_PLUGIN_SOURCE)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, _card = make_instance(harness.store, harness.runtime.service.runtime, moment=DAY * 1500)
+            campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
+            cases = {
+                "rejected": "rejected",
+                "needs_choice": "awaiting_choice",
+                "needs_input": "awaiting_gm_review",
+                "needs_review": "awaiting_gm_review",
+                "plugin_failed": "plugin_failed",
+                "half": "awaiting_gm_review",  # 夹带半成品 → 交给人看，绝不落盘
+            }
+            for intent, expected in cases.items():
+                declared = await mgmt.call(
+                    "trpg.action.declare", instance_id=info["id"], timeline_id=timeline_id,
+                    campaign_id=campaign_id, actor_id="card-1", intent=intent, raw_text=intent,
+                    auto_confirm=True, target_refs=["off-1"],
+                )
+                action_id = str(declared["action_id"])
+                resolved = await mgmt.call(
+                    "trpg.action.resolve", instance_id=info["id"], timeline_id=timeline_id,
+                    campaign_id=campaign_id, action_id=action_id, plugin_manifest=plugin,
+                )
+                assert resolved["status"] == expected, (intent, resolved)
+                row = harness.store.trpg_get(
+                    "action", instance_id=info["id"], timeline_id=timeline_id,
+                    campaign_id=campaign_id, action_id=action_id,
+                )
+                assert row is not None and str(row["status"]) == expected, (intent, row)
+                assert not (row.get("resolution") or ""), f"{intent}：错误响应不该留裁定"
+
+            # 半成品那条：规则状态与世界都没被它碰过
+            state = await mgmt.call("trpg.rule_state.read", instance_id=info["id"],
+                                    timeline_id=timeline_id, campaign_id=campaign_id)
+            assert int(state["state_revision"]) == 0, state
+            assert "pc-1" not in json.dumps(state.get("opaque_state") or {}), state
+        finally:
+            await mgmt.close()

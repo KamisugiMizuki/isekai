@@ -314,6 +314,37 @@ class RulePluginSession:
             await proc.wait()
 
 
+#: 插件结构化错误响应 → 核心侧行动状态（TRPG_RULE_PLUGIN_SPEC「错误响应」）
+ERROR_KINDS: dict[str, str] = {
+    "needs_input": "awaiting_gm_review",
+    "needs_choice": "awaiting_choice",
+    "needs_review": "awaiting_gm_review",
+    "plugin_failed": "plugin_failed",
+    "rejected": "rejected",
+}
+
+#: 错误响应里**不许**出现的东西（规约原文：不得包含可被当作规则状态 patch 或世界后果的半成品）
+ERROR_FORBIDDEN_KEYS = ("rule_state_patch", "consequences", "effects")
+
+
+def plugin_error(result: dict[str, Any]) -> dict[str, Any] | None:
+    """认出插件返回的**结构化错误响应**（`{"error": {"kind": …}}`）。
+
+    返回 `{"kind", "message", "half_baked"}`；不是错误响应就返回 None。
+    认不出的 `kind` 归 `needs_review`——既不当崩溃，也不当裁定：让人看一眼比猜强。
+    `half_baked` = 错误响应里夹带的半成品键（调用方一律不采信）。
+    """
+    error = result.get("error")
+    if not isinstance(error, dict) or not error:
+        return None
+    kind = str(error.get("kind") or error.get("status") or "").strip()
+    if kind not in ERROR_KINDS:
+        kind = "needs_review"
+    message = str(error.get("message") or error.get("detail") or error.get("reason") or "").strip()
+    half_baked = [key for key in ERROR_FORBIDDEN_KEYS if result.get(key) not in (None, [], {})]
+    return {"kind": kind, "message": message, "half_baked": half_baked}
+
+
 def share_file_for(manifest_path: Path) -> Path:
     """共享文件落在插件目录里（`<manifest 目录>/.isekai-plugin-share.json`）。
 
@@ -342,7 +373,13 @@ async def resolve(
 
 def _check_resolution(result: dict[str, Any]) -> dict[str, Any]:
     """裁定响应的共同校验：常驻与一次性两条路都必须过（别让常驻绕过边界）。"""
-    if not isinstance(result, dict) or not isinstance(result.get("resolution"), dict):
+    if not isinstance(result, dict):
+        raise RulePluginError("规则插件结果必须是 JSON 对象")
+    if plugin_error(result) is not None:
+        # 结构化错误响应是**合法**响应（§「错误响应」），不是「缺 resolution」的坏响应：
+        # 放过这一条，交给上层按 kind 映射行动状态（rejected / awaiting_choice / …）。
+        return result
+    if not isinstance(result.get("resolution"), dict):
         raise RulePluginError("规则插件结果必须包含 resolution 对象")
     # 世界后果清单：B0 resolver 用 `effects`，战役裁定器用 `consequences`——
     # 两者都要认，否则新协议一上线就被拦在插件边界（TRPG_RULE_PLUGIN_SPEC §响应）

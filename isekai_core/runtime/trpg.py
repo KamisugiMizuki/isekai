@@ -57,6 +57,8 @@ _FAIL_PATHS: dict[tuple[str, str], tuple[str, ...]] = {
     ("reviewing", "stale"): ("committing", "stale"),
     ("reviewing", "awaiting_gm_review"): ("awaiting_gm_review",),
     ("resolving", "awaiting_gm_review"): ("reviewing", "awaiting_gm_review"),
+    ("resolving", "awaiting_choice"): ("reviewing", "awaiting_choice"),
+    ("resolving", "rejected"): ("reviewing", "rejected"),
     ("reviewing", "rejected"): ("rejected",),
 }
 
@@ -495,6 +497,22 @@ class CampaignRuntime:
                                     "plugin_failed", failure_code="plugin_failed")
             raise CampaignRuntimeError(str(exc)) from exc
         normalized = normalize_result(result)
+        reported = normalized.get("plugin_error")
+        if reported is not None:
+            kind = str(reported["kind"])
+            target = str(rules.ERROR_KINDS.get(kind) or "awaiting_gm_review")
+            if normalized["errors"]:  # 夹带半成品 → 一律不采信，交给人看
+                target = "awaiting_gm_review"
+            self._fail(
+                self._action_row(instance_id, timeline_id, campaign_id, action_id), target, code=kind
+            )
+            return {
+                "status": target,
+                "kind": kind,
+                "message": str(reported.get("message") or ""),
+                "errors": normalized["errors"],
+                "action_id": action_id,
+            }
         if normalized["errors"]:
             failed = self._action_row(instance_id, timeline_id, campaign_id, action_id)
             self._fail(failed, "awaiting_gm_review", code="needs_review")
@@ -1374,6 +1392,27 @@ def normalize_result(result: dict[str, Any]) -> dict[str, Any]:
     这是「规则共用模块」的最小职责：结构、命名空间与确定性标记的检查在这里，
     目标 / 效果闭集 / 版本 / 因果的检查在 WorldRuntime 的提交边界（§六）。
     """
+    plugin_err = rules.plugin_error(result)
+    if plugin_err is not None:
+        # 结构化错误响应（§「错误响应」）：不是裁定，别往四段结果里塞；夹带半成品就一字不采信
+        errors = []
+        if plugin_err["half_baked"]:
+            errors.append(
+                "插件错误响应里带了裁定半成品（"
+                + "、".join(plugin_err["half_baked"])
+                + "）：规约禁止，一律不采信"
+            )
+        return {
+            "errors": errors,
+            "plugin_error": plugin_err,
+            "payload": {},
+            "resolution": {},
+            "rule_state_patch": None,
+            "consequences": [],
+            "scene_transition": {},
+            "participants": [],
+            "legacy_effects": False,
+        }
     errors: list[str] = []
     resolution = result.get("resolution")
     if not isinstance(resolution, dict) or not resolution:

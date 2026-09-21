@@ -154,7 +154,10 @@ TRPG 客户端
 
 - **B0 无状态 resolver（已实现）**：`trpg.action.resolve` 不带 `campaign_id` 时保持旧语义——调插件、校验 `effects`、直接落世界事件。
 - **战役裁定器（已实现）**：带 `campaign_id` 时读规则状态快照 → 调插件 → 把 `resolution` / `rule_state_patch` / `consequences` / `scene_transition` 存进行动并停在 `reviewing`，**不写世界**；世界与规则状态由 `trpg.commit` 联合提交（见 `TRPG_CAMPAIGN_RUNTIME_SPEC.md`）。
-- 插件响应的世界后果清单 `effects` 与 `consequences` 现在都接受（`runtime/rules.py` 的边界检查同时认两者）；`rule_state_patch`、结构化错误响应和常驻进程形态仍按协议后续项处理。
+- 插件响应的世界后果清单 `effects` 与 `consequences` 现在都接受（`runtime/rules.py` 的边界检查同时认两者）；`rule_state_patch`、结构化错误响应与常驻进程形态均已落地（见下三条）。
+- **结构化错误响应**（2026-09-22 落地）：`{"error": {"kind": …}}` 是**合法响应**——边界检查（`rules._check_resolution`）不会把它当「缺 resolution」的坏响应拒掉，而是按 kind 落成行动状态：
+  `rejected`→`rejected`、`needs_choice`→`awaiting_choice`、`needs_input`/`needs_review`→`awaiting_gm_review`、`plugin_failed`→`plugin_failed`；认不出的 kind 归 `awaiting_gm_review`（让人看，不猜）。
+  规约那句「错误响应不得包含半成品」是**硬闸**：错误响应里若出现 `rule_state_patch` / `consequences` / `effects`，一律不采信、状态进待审，且规则状态与世界都留原样（`tests/test_trpg_campaign.py::test_plugin_structured_error_response_maps_to_action_status`）。
 - 清单里 **`share`** 是可选字段（配合 `resident: true`）：`true` = **共享承载**——核心不再直接拿插件的 stdio，而是连一个「中继桥」（本机回环 TCP），桥再以 stdio 托管真插件。桥把端口与令牌写进插件目录里的 `.isekai-plugin-share.json`，于是**核心重启后新核心能接上同一个插件进程**（跨核心复用，省掉重复加载）；插件代码不变，协议也不变（还是一行一个 JSON、`ping`/`pong`、读 EOF 自退）。没人连、静置 `ISEKAI_PLUGIN_IDLE_EXIT` 秒（缺省 600）桥会带着插件一起退出。
 - 清单里 `resident` 是**可选**字段：`true` = 核心保持一个插件进程服务多次裁定（一行一 JSON，`{"type":"ping"}` 必须回 `{"type":"pong"}`，读到 stdin EOF 必须自己退出）。常驻只省进程启动与模块加载——**状态仍然只能经快照进出**，插件不许把状态藏在进程内存里（否则回滚 / 分叉会带着不该有的记忆）。进程死在「还没发请求」时核心会重开一个；**死在半路不重发**（不重跑裁定）。
 - 清单里 `converters[]` 是**可选**字段：声明状态转换器（`converter_id` / `from_version` / `to_version` / 可选 `converter_version`、`entry`），供 `trpg.campaign.migrate` 调用；响应必须回 `opaque_state` 对象与 `losses[]`。
@@ -175,10 +178,10 @@ TRPG 客户端
 - `rule_state_ref`（战役裁定器需要时）
 - `scene_ref`（战役裁定器需要时）
 
-当前实现只返回旧 B0 结果：`accepted`、`resolution`、事件标识、世界水位和写入效果数量。未来战役路径还必须返回状态版本、规则状态引用、场景转换和联合提交结果。
+不带 `campaign_id` 的 B0 路径仍只返回旧结果（`accepted`、`resolution`、事件标识、世界水位、写入效果数量）；**带 `campaign_id` 的战役路径已返回状态版本、规则状态引用、场景转换与联合提交结果**——裁定阶段（`trpg.action.resolve`）只拿裁定并停在 `reviewing`，世界与规则状态由 `trpg.commit` 在同一个 `apply_runtime_batch` 事务里落地（见 `TRPG_CAMPAIGN_RUNTIME_SPEC.md` §十二）。
 
 ## 官方参考外壳
 
 当前 UMP、Tauri 壳、桌面管理台是 WorldRuntime 的官方参考外壳：UMP 提供受信管理调用与通道承载，Tauri 负责核心进程与窗口生命周期，管理台负责世界创作和运行管理。三者不定义 TRPG 规则；未来 TRPG 客户端只需复用管理面语义或直接调用同一核心入口。
 
-完整战斗循环、角色表编辑器、骰点 UI、规则书导入、GM 输出编排和 Campaign Runtime 不属于当前最小实现；无状态 resolver 只用于 B0 验证。规则状态快照 / patch、联合提交和场景转换属于后续协议能力，必须先完成设计与兼容策略，再声明实现。
+**Campaign Runtime 已实现**（`TRPG_CAMPAIGN_RUNTIME_SPEC.md`：战役 / 场景 / 行动状态机、规则状态附件与版本闸、转换器、联合提交、回滚分叉、重启恢复、常驻插件）。**完整战斗循环、角色表编辑器、骰点 UI、规则书导入、GM 输出编排仍然不属于核心**——那是客户端表达层的事（`TRPG_GM_USER_EVALUATION_DRAFT.md` 里评估），核心只提供管理面语义与裁定 / 提交原语；无状态 resolver 继续为 B0 兼容保留。
