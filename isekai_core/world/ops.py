@@ -1701,7 +1701,11 @@ async def dispatch_async(
             return await _trpg_campaign_migrate(cfg, store, runtime, args)
         if op == "world.package.generate":
             package, errors, usage = await generate_package(
-                llm, str(args.get("brief") or ""), name=str(args.get("name") or "未命名世界"), **kwargs
+                llm,
+                str(args.get("brief") or ""),
+                name=str(args.get("name") or "未命名世界"),
+                knobs=args.get("knobs"),
+                **kwargs,
             )
         elif op == "world.package.revise":
             package, errors, usage = await revise_package(

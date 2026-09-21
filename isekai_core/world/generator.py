@@ -29,6 +29,100 @@ GENERATOR_TIMEOUT_S = 300.0
 #: 结构化产物用低温：默认温度按对话场景设定，生成整包 JSON 时残句率明显更高
 GENERATOR_TEMPERATURE = 0.4
 
+#: 参数层旋钮（DESKTOP_GENERATION_WORKSPACE_SPEC §3.2）：只影响提示词，硬闸仍是 validate_package。
+KNOB_TONES: tuple[tuple[str, str], ...] = (
+    ("genre", "体裁"),
+    ("tone", "基调"),
+    ("supernatural", "超自然在场度"),
+    ("tech", "技术水位"),
+    ("naming", "命名风格"),
+    ("conflict", "冲突主线"),
+    ("era_start", "纪元起点"),
+    ("current_year", "当前年"),
+    ("history_depth", "史料深度"),
+)
+KNOB_COUNTS: tuple[tuple[str, str], ...] = (
+    ("axioms", "世界公理"),
+    ("regions", "区域"),
+    ("institutions", "制度（含职位）"),
+    ("customs", "惯例"),
+    ("env_types", "环境类型"),
+    ("races", "种族"),
+    ("roles", "角色位"),
+    ("lexicon", "用词表"),
+    ("sources", "传本"),
+    ("canon", "实情条目"),
+    ("narratives", "说法条目"),
+    ("entities", "登记实体"),
+    ("life", "生活线模板"),
+    ("families", "事件族"),
+    ("festivals", "节庆"),
+)
+KNOB_LISTS: tuple[tuple[str, str], ...] = (("include", "必须出现"), ("exclude", "禁止出现"), ("homage", "可参考致敬"))
+KNOB_KEYS = frozenset(key for key, _ in (*KNOB_TONES, *KNOB_COUNTS, *KNOB_LISTS))
+
+
+def parse_knobs(raw: Any) -> dict[str, Any]:
+    """旋钮载荷的信任边界：只收已知键，类型不对就报错（管理面输入，不静默吞）。
+
+    取向截到 200 字、计数截到 200、清单最多 20 条（防一句胡话把提示词撑爆）。
+    """
+    if raw in (None, "", {}):
+        return {}
+    if not isinstance(raw, dict):
+        raise PackageError("knobs: 必须是对象（键见 DESKTOP_GENERATION_WORKSPACE_SPEC §3.2）")
+    unknown = sorted(str(key) for key in raw if key not in KNOB_KEYS)
+    if unknown:
+        raise PackageError("knobs: 未知旋钮 " + "、".join(unknown))
+    knobs: dict[str, Any] = {}
+    for key, label in KNOB_TONES:
+        value = raw.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        if not isinstance(value, str):
+            raise PackageError(f"knobs.{key}: {label}必须是短文本")
+        knobs[key] = value.strip()[:200]
+    for key, label in KNOB_COUNTS:
+        value = raw.get(key)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise PackageError(f"knobs.{key}: {label}必须是非负整数（0 = 不生成该段）")
+        knobs[key] = min(int(value), 200)
+    for key, label in KNOB_LISTS:
+        value = raw.get(key)
+        if value is None or value == "":
+            continue
+        items = [value] if isinstance(value, str) else value
+        if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+            raise PackageError(f"knobs.{key}: {label}必须是字符串列表（一行一条）")
+        cleaned = [item.strip()[:200] for item in items if item.strip()][:20]
+        if cleaned:
+            knobs[key] = cleaned
+    return knobs
+
+
+def knob_brief(knobs: dict[str, Any] | None) -> str:
+    """旋钮 → 提示词的调性段 / 规模段 / 内容指定段；没给旋钮就回空串（既有生成逐字不变）。"""
+    knobs = parse_knobs(knobs)
+    if not knobs:
+        return ""
+    lines: list[str] = []
+    tone = [f"{label} {knobs[key]}" for key, label in KNOB_TONES if knobs.get(key)]
+    if tone:
+        lines.append("调性：" + "；".join(tone) + "。")
+    counts = [f"{label} {knobs[key]}" for key, label in KNOB_COUNTS if knobs.get(key) is not None]
+    if counts:
+        lines.append("规模：" + "、".join(counts) + "。")
+        zero = [label for key, label in KNOB_COUNTS if knobs.get(key) == 0]
+        if zero:
+            lines.append("标 0 的段不要生成：" + "、".join(zero) + "（校验若因此拦下，以校验为准，不要为凑数编造）。")
+    for key, label in KNOB_LISTS:
+        if knobs.get(key):
+            lines.append(f"{label}：" + "、".join(knobs[key]) + "。")
+    return "用户旋钮（按此调性与规模产出）：\n" + "\n".join(lines) + "\n"
+
+
 #: 世界包分段生成：一次调用产出整包会被长度上限截断，按语义分三段、逐段校验
 PACKAGE_SEGMENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("设定核心", ("meta", "calendar", "world")),
@@ -149,14 +243,20 @@ def _usage(budget: dict[str, int], *, paused: bool) -> dict[str, Any]:
 
 
 async def generate_package(
-    llm: LLMClient, brief: str, *, name: str = "未命名世界", max_calls: int = DEFAULT_PACKAGE_CALLS
+    llm: LLMClient,
+    brief: str,
+    *,
+    name: str = "未命名世界",
+    max_calls: int = DEFAULT_PACKAGE_CALLS,
+    knobs: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
-    """对话式：用户描述 → 候选世界包（分段生成，逐段校验）→ 整包校验。
+    """对话式：用户描述 + 参数层旋钮 → 候选世界包（分段生成，逐段校验）→ 整包校验。
 
     返回 (候选, 错误列表, 用量)；任一必需段落失败或调用预算用尽即整份不落盘，由调用方交回用户。
     """
     skeleton = template_package(name)
     package = clone_package(skeleton)
+    kwargs_knobs = knob_brief(knobs)
     budget = {"calls": 0, "limit": max(1, int(max_calls))}
     for label, keys in PACKAGE_SEGMENTS:
         sub_skeleton = {key: skeleton[key] for key in keys}
@@ -165,6 +265,8 @@ async def generate_package(
             "地理、社会、历法、势力与信息渠道必须能互相解释；不要输出现实世界专有名词。"
             f"这次只产出这些键：{'、'.join(keys)}。" + STRUCTURE_HINT + MIN_CONTENT
         )
+        if kwargs_knobs:
+            system += "\n" + kwargs_knobs
         available = _available_ids(package)
         user = (
             f"用户描述：\n{brief}\n\n"
