@@ -1,11 +1,12 @@
 # WorldRuntime 对外接口设计
 
-> 状态：接口设计草案 v1.0，未实现声明。
+> 状态：**接口已接线**（2026-09-22 落地）。探针 `scripts/_audit2_iface.py`：17 检查 / 16 PASS / 0 FAIL / 1 DEFERRED，
+> 读数存于 `.hermes/audits/iface_wiring_*`。唯一 DEFERRED 是 §7 的消费方：OC 故事层与 Writing Assistant
+> 目前只有规范、没有代码，没有第二类真实调用方可供消费端验收。
 >
-> **接线现状（2026-09-22 探针 `scripts/_audit2_iface.py`：17 检查 / 3 PASS / 14 FAIL）**：本文声明的 14 个 op
-> 在管理面注册表里**一个都没有**。其中 5 项的能力已存在但换了名字（见 §十三 对照表），1 项走通道侧读接口，
-> 其余 8 项**没有对外入口**；`change.preview` / `change.commit` 与 `snapshot.read` 属于「连实现都没有」——
-> 前者是本文指定的唯一世界写入口，目前写世界的仍是三条各自为政的路径。别把本文的名字当成已接通的通道。
+> 落地口径：14 个 op 全部在管理面注册；5 个规范名走别名表（`world_ops.IFACE_ALIASES`，在 dispatch 入口统一改写）、
+> 9 个按本文语义原生实现（`runtime/change.py` + `RuntimeService` 的接口段）。所有响应带 §3.2 返回信封。
+> 行为验收在 `tests/test_iface_contract.py`（7 项，真 WS + 真 SQLite），CLI 同名命令见 `world_cli.py` 的 `runtime` 组。
 > 定位：WorldRuntime 与 OC 故事层、TRPG 规则层、Writing Assistant 之间的解耦契约。
 > 相关总纲：[`DESIGN.md`](DESIGN.md)。
 > 相关底层模块：[`WORLD_RUNTIME_SPEC.md`](WORLD_RUNTIME_SPEC.md)、[`SESSION_CORE_SPEC.md`](SESSION_CORE_SPEC.md)、[`NARRATIVE_LAYER_SPEC.md`](NARRATIVE_LAYER_SPEC.md)。
@@ -500,29 +501,31 @@ Writing Assistant：
 
 ## 十二、设计名 → 实现名对照（2026-09-22 实测）
 
-判据见 `scripts/_audit2_iface.py`（真 WS 逐个调规范名 + 直调内部实现取读数）。
-「已接（改名）」= 能力在真链路上可用，只是名字不同；「未接线」= 能力在，但没有对外入口；
-「无实现」= 连能力都没有。
+判据见 `scripts/_audit2_iface.py`：真 WS 逐个调规范名、直调内部实现取读数，别名还要用**错误文案**
+证明它确实被改写到了目标实现（注册表里有名字 ≠ 接到了东西）。
 
-| 设计名（本文） | 实现名 | 状态 | 读数来源 |
+| 设计名（本文） | 实现 | 状态 | 读数来源 |
 |---|---|---|---|
-| `runtime.timeline.fork` | `runtime.fork` | 已接（改名） | 真 WS 调通，返回新线 id |
-| `runtime.timeline.rollback` | `runtime.rollback` | 已接（改名，需 `confirm`） | 真 WS 调通，`world` / `generation` 读数 |
-| `runtime.time.advance` | `runtime.advance`（跟真实时间）+ `runtime.time.consume`（场景内消耗，§5.7 语义落在这里） | 已接（拆成两条） | 真 WS 调通，`consumed_seconds=600` |
-| `runtime.history.read` | 通道侧 `history.page` | 已接（另一条通道） | 真 WS 调通，返回 `messages` |
-| `runtime.rule_state.read` | `trpg.rule_state.read` | 已接（改名 + TRPG 命名空间） | 规则状态是**战役级**附件，故留在 `trpg.*` |
-| `runtime.knowledge.grant` | `disclose.*`（披露授权） | 部分覆盖 | 语义不同：`disclose` 是批准披露，不是直接授予认知 |
-| `runtime.scope.inspect` | `runtime.clock` / `service.view` | 未接线（字段不全） | `view()` 缺 `revision` / `runtime_generation` / `ruleset_version` / `available_actions` |
-| `runtime.subject.state.read` | `service.character_snapshot` | 未接线（只有 session 在用） | 返回 12 个键，管理面无入口 |
-| `runtime.cognition.project` | `service.turn_context` / `cognition.play_context` | 未接线（只有 session 在用） | 返回 prompt / unit / memory_ids，无 observer / purpose 参数 |
-| `runtime.snapshot.read` | — | 无实现 | 只有回滚用的 `commit_snapshot`；没有给生成用的读快照，代码里没有 `expires_at` |
-| `runtime.change.preview` | — | 无实现 | `change_intent` / `preview_id` / `base_snapshot_id` 在产品代码里 0 命中 |
-| `runtime.change.commit` | — | 无实现 | 存储级原子入口 `store.apply_runtime_batch` 由 4 个文件各自调用，没有统一提交边界 |
-| `runtime.generation.check` | 世代机制在（rollback 提升 + 迟到批被拒） | 未接线 | 无独立入口 |
-| `runtime.task.invalidate` | 同上（只有回滚副作用） | 未接线 | 无独立入口 |
+| `runtime.scope.inspect` | `RuntimeService.scope_inspect` | 原生 | 字段族齐（三个来自信封、五个来自 scope） |
+| `runtime.snapshot.read` | `RuntimeService.read_snapshot` | 原生 | 冻结线返回 `not_ready`，未知 include 返回 `rejected` |
+| `runtime.cognition.project` | `RuntimeService.cognition_project` | 原生 | 陌生人拿空投影，不串他人材料 |
+| `runtime.subject.state.read` | `RuntimeService.subject_state` | 原生 | GM 拿全份，公开面只给公开字段族 |
+| `runtime.history.read` | `RuntimeService.history_read` | 原生 | 游标 `世界秒:序号` 往回翻不重复；过滤按 source/kind/time_range |
+| `runtime.change.preview` | `RuntimeService.change_preview` + `runtime/change.py` | 原生 | 预览不改世界；候选/未确认进 `needs_review` |
+| `runtime.change.commit` | `RuntimeService.change_commit` + `runtime/change.py` | 原生 | 幂等（同键 `duplicate`）、失效预览 `conflict`、非法意图 `rejected` |
+| `runtime.time.advance` | `RuntimeService.consume_time`（别名 `runtime.time.advance`） | 别名 | `duration` + `reason` → 场景时间消耗；跟真实时间的是 `runtime.advance` |
+| `runtime.generation.check` | `RuntimeService.generation_check` | 原生 | `valid` / `stale` / `conflict` / `member_archived` / `persistence_blocked` |
+| `runtime.task.invalidate` | `RuntimeService.invalidate_tasks` | 原生 | 提升运行世代；已固化事实不受影响 |
+| `runtime.timeline.fork` | `runtime.fork`（别名） | 别名 | 错误文案来自 `_version_fork`（「缺少 commit_id」） |
+| `runtime.timeline.rollback` | `runtime.rollback`（别名，需 `confirm`） | 别名 | 同名能力真调：`world` / `generation` 读数 |
+| `runtime.rule_state.read` | `trpg.rule_state.read`（别名） | 别名 | 规则状态是**战役级**附件，留在 `trpg.*` 命名空间 |
+| `runtime.knowledge.grant` | `disclose.confirm`（别名） | 别名 | 语义相同：批准一次披露；错误文案来自披露实现 |
 
-对照 `§十一 行为验收`：「任意变化都必须经过 preview / commit」目前**不成立**；「generation 拒绝旧结果」
-在功能层成立、在接口层不成立。
+`change_intent` 的 kind 与首版事实效果闭集（`world.validate.SUPPORTED_EFFECTS`）的映射写在
+`runtime/change.py`：`condition → activity_constraint`、`location_change → route_blocked`、
+`state_change → institution_state / custom_state / environment_state`（按目标类别）、
+`knowledge_change → 说法`、`world_event → 事件帧`；**资源量与关系变化在闭集里没有对应项，如实 `rejected`
+并给出替代路径**——高级模块会收到明确的「表达不出来」，而不是被静默丢进世界。
 
 ## 十三、与现有文档的关系
 

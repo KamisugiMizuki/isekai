@@ -69,6 +69,22 @@ SYNC_OPS = frozenset(
         "runtime.rate",
         "runtime.advance",
         "runtime.time.consume",
+        # 对外接口（WORLD_RUNTIME_INTERFACE_SPEC）：读 / 变化 / 版本与异步
+        "runtime.scope.inspect",
+        "runtime.snapshot.read",
+        "runtime.cognition.project",
+        "runtime.subject.state.read",
+        "runtime.history.read",
+        "runtime.change.preview",
+        "runtime.change.commit",
+        "runtime.generation.check",
+        "runtime.task.invalidate",
+        "runtime.time.advance",
+        # 规范名别名（§十二 对照表）：改名不改能力
+        "runtime.timeline.fork",
+        "runtime.timeline.rollback",
+        "runtime.rule_state.read",
+        "runtime.knowledge.grant",
         "runtime.card.add",
         "runtime.backfill",
         "world.card.template",
@@ -369,6 +385,9 @@ def _log_runtime_failure(instance_id: str) -> None:
 
 def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: Any = None) -> dict[str, Any]:
     """同步操作：只读写文件与库，不调用模型。"""
+    # 规范名先归位（WORLD_RUNTIME_INTERFACE_SPEC §十二）：别名必须在任何 op 分支之前
+    # 改写，否则改完的实名会落到后面的前缀兜底里，报「未知运行层操作」
+    op = IFACE_ALIASES.get(op, op)
     try:
         # 预算视图 / 设置：只按实例（不要求时间线），不进 runtime.* 前缀分发
         if op == "disclose.confirm":
@@ -426,6 +445,8 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return _trpg_commit(cfg, store, runtime, args)
         if op == "trpg.gm.change":
             return _trpg_gm_change(cfg, store, runtime, args)
+        if op in IFACE_OPS:
+            return _iface_op(cfg, store, runtime, op, args)
         if op == "trpg.recover":
             return _trpg_recover(cfg, store, runtime, args)
 
@@ -986,6 +1007,24 @@ async def _draft_user_event(cfg: Config, llm: Any, store: Store | None, args: di
 # 规则私有状态由插件解释、由核心托管版本，世界后果仍走 WorldRuntime 的统一提交边界。
 
 
+#: 对外接口里由新接口层自行处理的 op（其余规范名走 IFACE_ALIASES 改写）
+IFACE_OPS = frozenset({
+    "runtime.scope.inspect", "runtime.snapshot.read", "runtime.cognition.project",
+    "runtime.subject.state.read", "runtime.history.read", "runtime.change.preview",
+    "runtime.change.commit", "runtime.generation.check", "runtime.task.invalidate",
+    "runtime.time.advance",
+})
+
+#: 规范名 → 已实现的名字（WORLD_RUNTIME_INTERFACE_SPEC §十二 对照表）。
+#: 只在这里改写一次：别名不进 dispatch 分支，也不多出一份实现。
+IFACE_ALIASES: dict[str, str] = {
+    "runtime.timeline.fork": "runtime.fork",
+    "runtime.timeline.rollback": "runtime.rollback",
+    "runtime.rule_state.read": "trpg.rule_state.read",
+    "runtime.knowledge.grant": "disclose.confirm",
+}
+
+
 def _campaign_service(runtime: Any) -> Any:
     service = getattr(runtime, "campaign", None)
     if service is None:
@@ -1147,6 +1186,102 @@ def _trpg_commit(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) 
         audience=str(args.get("audience") or "public_party"),
         source_mode=str(args.get("source_mode") or "action"),
     )
+
+
+def _iface_op(cfg: Config, store: Store, runtime: Any, op: str, args: dict[str, Any]) -> dict[str, Any]:
+    """对外接口的统一入口（WORLD_RUNTIME_INTERFACE_SPEC §四~§六）。
+
+    作用域是显式的：`instance_id` / `timeline_id` 必填，接口拒绝隐含的「当前世界 / 当前线」。
+    """
+    from ..runtime.service import RuntimeStateError
+
+    instance_id = str(args.get("instance_id") or "")
+    timeline_id = str(args.get("timeline_id") or "")
+    if not instance_id or not timeline_id:
+        raise UmpError(Err.INVALID, "对外接口要求显式的 instance_id 与 timeline_id", retryable=False)
+    world = _world_service(cfg, store)
+    now = args.get("now_real")
+    now_real = float(now) if isinstance(now, (int, float)) else None
+    try:
+        if op == "runtime.scope.inspect":
+            return _iface_call(world.scope_inspect, instance_id, timeline_id, now_real=now_real)
+        if op == "runtime.snapshot.read":
+            return _iface_call(
+                world.read_snapshot, instance_id, timeline_id,
+                request=_json_arg(args, "request", {}),
+                now_real=now_real,
+                ttl_seconds=int(args.get("ttl_seconds") or 300),
+            )
+        if op == "runtime.cognition.project":
+            return _iface_call(
+                world.cognition_project, instance_id, timeline_id,
+                observer_id=str(args.get("observer_id") or args.get("actor_scope") or ""),
+                query=_json_arg(args, "query", {}),
+                at_revision=int(args["at_revision"]) if args.get("at_revision") is not None else None,
+            )
+        if op == "runtime.subject.state.read":
+            return _iface_call(
+                world.subject_state, instance_id, timeline_id,
+                subject_id=str(args.get("subject_id") or args.get("actor_scope") or ""),
+                fields=_json_arg(args, "fields", None),
+                audience=str(args.get("audience") or "gm_only"),
+            )
+        if op == "runtime.history.read":
+            return _iface_call(
+                world.history_read, instance_id, timeline_id,
+                cursor=str(args.get("cursor") or ""),
+                limit=int(args.get("limit") or 50),
+                filters=_json_arg(args, "filters", {}),
+            )
+        if op == "runtime.change.preview":
+            return _iface_call(
+                world.change_preview, instance_id, timeline_id,
+                changes=_json_arg(args, "changes", []),
+                rule_state_patches=_json_arg(args, "rule_state_patches", []),
+                expected_revision=int(args["expected_revision"]) if args.get("expected_revision") is not None else None,
+            )
+        if op == "runtime.change.commit":
+            return _iface_call(
+                world.change_commit, instance_id, timeline_id,
+                changes=_json_arg(args, "changes", []),
+                idempotency_key=str(args.get("idempotency_key") or ""),
+                preview_id=str(args.get("preview_id") or ""),
+                expected_revision=int(args["expected_revision"]) if args.get("expected_revision") is not None else None,
+                source_module=str(args.get("source_module") or ""),
+            )
+        if op == "runtime.generation.check":
+            generation = args.get("runtime_generation")
+            return _iface_call(
+                world.generation_check, instance_id, timeline_id,
+                snapshot_id=str(args.get("snapshot_id") or ""),
+                runtime_generation=int(generation) if generation is not None else None,
+                source_refs=_json_arg(args, "source_refs", []),
+            )
+        if op == "runtime.task.invalidate":
+            return _iface_call(
+                world.invalidate_tasks, instance_id, timeline_id,
+                generation=int(args["runtime_generation"]) if args.get("runtime_generation") is not None else None,
+                reason=str(args.get("reason") or ""),
+            )
+        if op == "runtime.time.advance":
+            # §5.7 的语义落在场景时间消耗上（跟真实时间的推进是 runtime.advance）
+            seconds = args.get("duration") or args.get("seconds")
+            return _iface_call(
+                world.consume_time, instance_id, timeline_id,
+                seconds=int(seconds or 0),
+                cause=str(args.get("reason") or args.get("cause") or ""),
+                source=str(args.get("source") or "world_process"),
+                now_real=now_real,
+                max_batches=int(args["max_batches"]) if args.get("max_batches") else None,
+            )
+    except RuntimeStateError as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+    raise UmpError(Err.UNSUPPORTED_TYPE, f"未知的对外接口：{op}", retryable=False)
+
+
+def _iface_call(fn: Any, instance_id: str, timeline_id: str, **kwargs: Any) -> dict[str, Any]:
+    """接口层调用：把 None 关键字去掉（服务方法用默认值表达"不传"）。"""
+    return fn(instance_id, timeline_id, **{key: value for key, value in kwargs.items() if value is not None})
 
 
 def _trpg_gm_change(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:

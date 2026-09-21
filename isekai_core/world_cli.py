@@ -79,6 +79,17 @@ OP_BY_COMMAND = {
     ("runtime", "rollback"): "runtime.rollback",
     ("runtime", "budget-set"): "runtime.budget.set",
     ("runtime", "consume-time"): "runtime.time.consume",
+    # 对外接口（WORLD_RUNTIME_INTERFACE_SPEC §四~§六）
+    ("runtime", "scope"): "runtime.scope.inspect",
+    ("runtime", "snapshot"): "runtime.snapshot.read",
+    ("runtime", "cognition"): "runtime.cognition.project",
+    ("runtime", "subject"): "runtime.subject.state.read",
+    ("runtime", "history"): "runtime.history.read",
+    ("runtime", "gen-check"): "runtime.generation.check",
+    ("runtime", "invalidate"): "runtime.task.invalidate",
+    ("runtime", "change-preview"): "runtime.change.preview",
+    ("runtime", "change-commit"): "runtime.change.commit",
+    ("runtime", "time-advance"): "runtime.time.advance",
     # TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）
     ("trpg", "campaign-new"): "trpg.campaign.create",
     ("trpg", "campaign-list"): "trpg.campaign.list",
@@ -252,6 +263,54 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args["seconds"] = int(ns.seconds or 0)
             args["cause"] = ns.cause or ""
             args["time_source"] = ns.time_source or "world_process"
+        if cmd == "scope":
+            pass
+        if cmd == "snapshot":
+            if ns.request:
+                args["request"] = ns.request
+            if ns.ttl_seconds is not None:
+                args["ttl_seconds"] = int(ns.ttl_seconds)
+        if cmd == "cognition":
+            args["observer_id"] = ns.observer or ns.actor or ""
+            if ns.query:
+                args["query"] = ns.query
+            if ns.at_revision is not None:
+                args["at_revision"] = int(ns.at_revision)
+        if cmd == "subject":
+            args["subject_id"] = ns.subject or ""
+            if ns.fields:
+                args["fields"] = ns.fields
+            if ns.audience:
+                args["audience"] = ns.audience
+        if cmd == "history":
+            args["cursor"] = ns.cursor or ""
+            args["limit"] = int(ns.limit or 50)
+            if ns.filters:
+                args["filters"] = ns.filters
+        if cmd in ("change-preview", "change-commit"):
+            args["changes"] = ns.changes or "[]"
+            if ns.ruleset_patches:
+                args["rule_state_patches"] = ns.ruleset_patches
+            if ns.expected_revision is not None:
+                args["expected_revision"] = int(ns.expected_revision)
+        if cmd == "change-commit":
+            args["idempotency_key"] = ns.idempotency or ""
+            args["preview_id"] = ns.preview_id or ""
+            args["source_module"] = ns.source_module or ""
+        if cmd == "gen-check":
+            args["snapshot_id"] = ns.snapshot_id or ""
+            if ns.generation is not None:
+                args["runtime_generation"] = int(ns.generation)
+            if ns.source_refs:
+                args["source_refs"] = ns.source_refs
+        if cmd == "invalidate":
+            if ns.generation is not None:
+                args["runtime_generation"] = int(ns.generation)
+            args["reason"] = ns.reason or ""
+        if cmd == "time-advance":
+            args["duration"] = int(ns.duration or ns.seconds or 0)
+            args["reason"] = ns.reason or ns.cause or ""
+            args["source"] = ns.time_source or "world_process"
         if cmd == "timeline-rename":
             args["name"] = ns.display_name or ""
             args["description"] = ns.note
@@ -430,6 +489,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--accept-losses", dest="accept_losses", action="store_true",
                         help="TRPG：显式接受有信息损失的规则状态转换")
     parser.add_argument("--changes", default=None, help="TRPG：GM 直接变化的 changes（内联 JSON 或文件路径）")
+    parser.add_argument("--observer", default=None, help="接口：观察者角色标识")
+    parser.add_argument("--subject", default=None, help="接口：主体标识")
+    parser.add_argument("--query", default=None, help="接口：认知投影 query（内联 JSON）")
+    parser.add_argument("--fields", default=None, help="接口：字段选择（内联 JSON 数组）")
+    parser.add_argument("--cursor", default=None, help="接口：历史游标（世界秒:序号）")
+    parser.add_argument("--filters", default=None, help="接口：历史过滤（内联 JSON）")
+    parser.add_argument("--request", default=None, help="接口：快照请求（内联 JSON）")
+    parser.add_argument("--ttl-seconds", dest="ttl_seconds", type=int, default=None, help="接口：快照有效期（秒）")
+    parser.add_argument("--at-revision", dest="at_revision", type=int, default=None, help="接口：读取基准修订")
+    parser.add_argument("--expected-revision", dest="expected_revision", type=int, default=None,
+                        help="接口：写入方基于的版本")
+    parser.add_argument("--preview-id", dest="preview_id", default=None, help="接口：预览标识")
+    parser.add_argument("--source-module", dest="source_module", default=None, help="接口：调用方模块标识")
+    parser.add_argument("--duration", type=int, default=None, help="接口：时间推进秒数（time-advance）")
+    parser.add_argument("--source-refs", dest="source_refs", default=None, help="接口：来源引用（内联 JSON 数组）")
+    parser.add_argument("--generation", type=int, default=None, help="接口：运行世代")
+    parser.add_argument("--snapshot-id", dest="snapshot_id", default=None, help="接口：快照标识")
+    parser.add_argument("--ruleset-patches", dest="ruleset_patches", default=None,
+                        help="接口：规则状态 patch（内联 JSON 数组）")
     parser.add_argument("--source-mode", dest="source_mode", default=None,
                         help="TRPG：后果来源 action（角色行动）/ gm_declaration（GM 直接裁定）")
     ns = parser.parse_args(argv)

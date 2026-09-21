@@ -23,6 +23,7 @@ from ..world.cards import region_of
 from ..world.validate import custom_index as _custom_index, office_index as _office_index
 
 from . import (
+    change as change_mod,
     cognition,
     disclosure,
     drafts,
@@ -1745,6 +1746,503 @@ class RuntimeService:
             rate=int(row["rate"]),
             high_water_real=float(row["high_water_real"]),
         )
+
+    # ------------------------------------------------ 对外接口（WORLD_RUNTIME_INTERFACE_SPEC）
+
+    def envelope(
+        self, instance_id: str, timeline_id: str, *, status: str = "ok", extra: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """返回信封（§3.2）：所有对外接口响应都带这一套，省得每个调用方自己拼。"""
+        row = self.clock_row(timeline_id)
+        out: dict[str, Any] = {
+            "status": str(status),
+            "instance_id": instance_id,
+            "timeline_id": timeline_id,
+            "observed_revision": int(row["processed_world"]),
+            "world_time": int(row["processed_world"]),
+            "processed_watermark": int(row["processed_world"]),
+            "runtime_generation": int(row["generation"]),
+        }
+        out.update(extra or {})
+        return out
+
+    def scope_inspect(
+        self, instance_id: str, timeline_id: str, *, now_real: float | None = None
+    ) -> dict[str, Any]:
+        """§4.1：底层 ready 与否 + 管理元数据。不返回世界实情、角色状态或任务正文。"""
+        instance, timeline = self._rows(instance_id, timeline_id)
+        row = self.clock_row(timeline_id)
+        state = self.state_of(row)
+        now = float(now_real if now_real is not None else time.time())
+        target = target_world(state, now)
+        processed = int(row["processed_world"])
+        timeline_state = str(timeline["state"])
+        catching = processed < target or int(row.get("catching_up") or 0)
+        if timeline_state == "active" and catching:
+            timeline_state = "catching_up"
+        ruleset_version = ""
+        campaigns = getattr(self.campaign, "campaigns", None) if getattr(self, "campaign", None) else None
+        if campaigns is not None:
+            for item in campaigns(instance_id, timeline_id) or []:
+                if str(item.get("status")) in ("active", "waiting", "preparing"):
+                    ruleset_version = str(item.get("ruleset_version") or "")
+                    break
+        actions = {
+            "active": ["read", "preview", "commit", "advance", "fork", "rollback"],
+            "catching_up": ["read"],
+            "frozen": ["read", "activate", "fork", "rollback"],
+            "archived": ["read", "fork"],
+        }.get(timeline_state, ["read"])
+        return self.envelope(instance_id, timeline_id, extra={
+            "timeline_state": timeline_state,
+            "target_watermark": int(target),
+            "revision": int(row["processed_world"]),
+            "ruleset_version": ruleset_version,
+            "available_actions": actions,
+        })
+
+    #: §4.2 `include` 的可选投影 → character_snapshot 的键
+    SNAPSHOT_INCLUDES = {
+        "time": "world_seconds",
+        "current_activity": "current_activity",
+        "active_effects": "effects",
+        "experiences": "experiences",
+        "claims": "knowledge",
+        "plans": "plan",
+    }
+
+    def read_snapshot(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        request: dict[str, Any] | None = None,
+        now_real: float | None = None,
+        ttl_seconds: int = 300,
+    ) -> dict[str, Any]:
+        """§4.2：一致、可复用的世界快照句柄。**不等于写入许可**。
+
+        追赶中 / 冻结 / 归档时明确不可用（`not_ready`），不用旧状态冒充当前状态。
+        """
+        request = request if isinstance(request, dict) else {}
+        _instance, timeline = self._rows(instance_id, timeline_id)
+        row = self.clock_row(timeline_id)
+        processed = int(row["processed_world"])
+        now = float(now_real if now_real is not None else time.time())
+        target = target_world(self.state_of(row), now)
+        if str(timeline["state"]) != "active":
+            return self.envelope(instance_id, timeline_id, status="not_ready", extra={
+                "reason": f"时间线当前是 {timeline['state']}", "snapshot_id": "", "payload": {},
+            })
+        if processed < target:
+            return self.envelope(instance_id, timeline_id, status="not_ready", extra={
+                "reason": f"还在追赶：水位 {processed} < 目标 {target}", "snapshot_id": "", "payload": {},
+            })
+        includes = [str(item) for item in (request.get("include") or [])] or list(self.SNAPSHOT_INCLUDES)
+        unknown = [item for item in includes if item not in self.SNAPSHOT_INCLUDES]
+        if unknown:
+            return self.envelope(instance_id, timeline_id, status="rejected", extra={
+                "reason": f"未知的 include：{unknown}", "snapshot_id": "", "payload": {},
+            })
+        payload: dict[str, Any] = {}
+        for character_id in [str(item) for item in (request.get("characters") or [])]:
+            snapshot = self.character_snapshot(instance_id, timeline_id, character_id, world_seconds=processed)
+            selected: dict[str, Any] = {}
+            for key in includes:
+                if key == "time":
+                    selected[key] = int(snapshot.get("world_seconds") or processed)
+                elif self.SNAPSHOT_INCLUDES[key] in snapshot:
+                    selected[key] = snapshot[self.SNAPSHOT_INCLUDES[key]]
+            payload[character_id] = selected
+        return self.envelope(instance_id, timeline_id, extra={
+            "snapshot_id": f"snap-{processed}",
+            "revision": processed,
+            "expires_at": now + max(0, int(ttl_seconds)),
+            "payload": payload,
+        })
+
+    #: §4.3 purpose 闭集
+    COGNITION_PURPOSES = ("dialogue", "player_observation", "narrative_candidate", "audit")
+
+    def cognition_project(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        observer_id: str,
+        query: dict[str, Any] | None = None,
+        at_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """§4.3：按观察者取合法可知投影——上层生成角色视角材料的唯一底层入口。
+
+        只读该观察者自己的经历与获知（窗口本来就按角色存储），不返回未获知事件、
+        他人私聊或实情层字段；「不知道」是合法结果（`known_unknowns`）。
+        """
+        query = query if isinstance(query, dict) else {}
+        observer = str(observer_id or "")
+        if not observer:
+            return self.envelope(instance_id, timeline_id, status="rejected", extra={"reason": "缺少 observer_id"})
+        purpose = str(query.get("purpose") or "dialogue")
+        if purpose not in self.COGNITION_PURPOSES:
+            return self.envelope(instance_id, timeline_id, status="rejected", extra={
+                "reason": f"未知 purpose：{purpose}",
+            })
+        row = self.clock_row(timeline_id)
+        until = int(at_revision if at_revision is not None else row["processed_world"])
+        observations = [
+            {"text": str(item.get("summary") or ""), "kind": str(item.get("kind") or ""),
+             "world_seconds": int(item["world_seconds"]), "ref": str(item["id"]),
+             "when": self.describe_world(instance_id, int(item["world_seconds"]))}
+            for item in self.store.experience_window(instance_id, timeline_id, observer, until=until, limit=50)
+        ]
+        claims = [
+            {"text": str(item.get("text") or ""), "kind": str(item.get("kind") or ""),
+             "target": str(item.get("target") or ""), "source": str(item.get("source") or ""),
+             "stance": str(item.get("stance") or ""), "world_seconds": int(item["world_seconds"]),
+             "ref": str(item["id"])}
+            for item in self.store.knowledge_window(instance_id, timeline_id, observer, until=until, limit=50)
+        ]
+        known_unknowns = [
+            {"ref": str(item["id"]), "text": str(item.get("intent") or ""), "stage": str(item.get("stage") or "")}
+            for item in self.store.intent_list(instance_id, timeline_id, observer)
+            if str(item.get("stage")) in ("waiting", "deferred")
+        ]
+        source_refs = sorted({item["ref"] for item in observations} | {item["ref"] for item in claims})
+        return self.envelope(instance_id, timeline_id, extra={
+            "observer_id": observer,
+            "purpose": purpose,
+            "observed_revision": until,
+            "observations": observations,
+            "claims": claims,
+            "known_unknowns": known_unknowns,
+            "source_refs": source_refs,
+        })
+
+    def subject_state(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        subject_id: str,
+        fields: list[str] | None = None,
+        audience: str = "gm_only",
+    ) -> dict[str, Any]:
+        """§4.4：主体的结构化状态投影。非 GM 受众只拿公开字段族（规则属性、会话历史不在此）。"""
+        subject = str(subject_id or "")
+        if not subject:
+            return self.envelope(instance_id, timeline_id, status="rejected", extra={"reason": "缺少 subject_id"})
+        row = self.clock_row(timeline_id)
+        world = int(row["processed_world"])
+        snapshot = self.character_snapshot(instance_id, timeline_id, subject, world_seconds=world)
+        join = next(
+            (item for item in self.store.character_join_list(instance_id, timeline_id, state=None)
+             if str(item["character_id"]) == subject),
+            {},
+        )
+        public = {
+            "subject_id": subject,
+            "state_at_revision": world,
+            "active_effects": snapshot.get("effects") or [],
+            "current_activity": str(snapshot.get("current_activity") or ""),
+            "membership": str(join.get("state") or ""),
+            "archive_state": "archived" if str(snapshot.get("archived")) not in ("", "0") else "active",
+            "source_refs": [],
+        }
+        if audience != "gm_only":
+            picked = {key: value for key, value in public.items() if not fields or key in fields}
+            return self.envelope(instance_id, timeline_id, extra={"audience": audience, "subject": picked})
+        full = {
+            **public,
+            "units": snapshot.get("units") or [],
+            "all_units": snapshot.get("all_units") or [],
+            "knowledge": snapshot.get("knowledge") or [],
+            "experiences": snapshot.get("experiences") or [],
+            "plan": snapshot.get("plan") or {},
+            "reactions": snapshot.get("reactions") or [],
+            "institutions": snapshot.get("institutions") or [],
+        }
+        picked = {key: value for key, value in full.items() if not fields or key in fields}
+        return self.envelope(instance_id, timeline_id, extra={"audience": audience, "subject": picked})
+
+    def history_read(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        cursor: str = "",
+        limit: int = 50,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """§4.5：已固化的世界事件与说法的只读历史。
+
+        游标是 `世界秒:序号`（事件表主序），往回翻用 `until=游标世界秒`。事件层是**已发生事实**
+        的公开层，按观察者是否合法获知要看 `cognition.project`；这里 `audience` 过滤只作用在
+        说法（claim 自带受众列）上，不假装事件层有受众。
+        """
+        filters = filters if isinstance(filters, dict) else {}
+        row = self.clock_row(timeline_id)
+        until = int(row["processed_world"])
+        if cursor:
+            try:
+                until = min(until, int(str(cursor).split(":")[0]))
+            except ValueError:
+                return self.envelope(instance_id, timeline_id, status="rejected", extra={"reason": f"游标不可解析：{cursor}"})
+        count = max(1, min(int(limit), 200))
+        wanted_kind = str(filters.get("event_kind") or "")
+        wanted_source = str(filters.get("source") or "")
+        wanted_subject = str(filters.get("subject") or "")
+        wanted_audience = str(filters.get("audience") or "")
+        time_range = filters.get("time_range") or []
+        since = int(time_range[0]) if len(time_range) == 2 else 0
+        to = int(time_range[1]) if len(time_range) == 2 else until
+        events = [
+            item for item in self.store.event_window(instance_id, timeline_id, until=until, limit=count * 3)
+            if (not wanted_kind or str(item.get("kind")) == wanted_kind)
+            and (not wanted_source or str(item.get("source")) == wanted_source)
+            and (not wanted_subject or wanted_subject in str(item.get("effects") or ""))
+            and since <= int(item["world_seconds"]) <= to
+        ][-count:]
+        claims = [
+            {"ref": str(item["id"]), "event_id": str(item["event_id"]), "text": str(item["text"]),
+             "source": str(item["source_id"]), "audience": str(item["audience"]),
+             "world_seconds": int(item["earliest_world"]), "kind": "claim"}
+            for item in self.store.claim_list(instance_id, timeline_id)
+            if int(item["earliest_world"]) <= until
+            and (not wanted_audience or str(item.get("audience")) == wanted_audience)
+            and since <= int(item["earliest_world"]) <= to
+        ]
+        items = [
+            {"ref": str(item["id"]), "kind": "event", "event_kind": str(item.get("kind")),
+             "family": str(item.get("family")), "template": str(item.get("template")),
+             "source": str(item.get("source")), "summary": str(item.get("summary")),
+             "world_seconds": int(item["world_seconds"]), "seq": int(item.get("seq") or 0),
+             "effects": item.get("effects") or "[]"}
+            for item in events
+        ]
+        items.sort(key=lambda item: (int(item["world_seconds"]), int(item.get("seq") or 0)))
+        next_cursor = ""
+        if items:
+            first = items[0]
+            next_cursor = f"{int(first['world_seconds'])}:{int(first.get('seq') or 0)}"
+        return self.envelope(instance_id, timeline_id, extra={
+            "items": items,
+            "claims": claims,
+            "next_cursor": next_cursor,
+            "obsolescense_note": "",  # 见 §4.5：事件区分发生 / 固化 / 传播 / 获知时刻
+        })
+
+    def generation_check(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        snapshot_id: str = "",
+        runtime_generation: int | None = None,
+        source_refs: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """§6.3：异步模块固化结果前的检查。`stale` 只能存本地，不能写回世界。"""
+        row = self.clock_row(timeline_id)
+        try:
+            self.store.write_probe()
+        except Exception:  # noqa: BLE001 - 不可写就是要报 persistence_blocked
+            return self.envelope(instance_id, timeline_id, status="persistence_blocked",
+                                 extra={"reason": "存储不可写"})
+        for ref in source_refs or []:
+            join = next(
+                (item for item in self.store.character_join_list(instance_id, timeline_id, state=None)
+                 if str(item["character_id"]) == str(ref)),
+                None,
+            )
+            if join is not None and str(join.get("state")) != "active":
+                return self.envelope(instance_id, timeline_id, status="member_archived",
+                                     extra={"reason": f"成员已撤销：{ref}"})
+        current = int(row["generation"])
+        if runtime_generation is not None and int(runtime_generation) != current:
+            return self.envelope(instance_id, timeline_id, status="stale",
+                                 extra={"reason": f"世代不一致：请求 {runtime_generation}，当前 {current}"})
+        if snapshot_id:
+            want = str(snapshot_id)
+            processed = int(row["processed_world"])
+            if want.startswith("snap-") and want[5:].isdigit() and int(want[5:]) > processed:
+                return self.envelope(instance_id, timeline_id, status="conflict",
+                                     extra={"reason": f"快照 {want} 比当前水位 {processed} 新"})
+        return self.envelope(instance_id, timeline_id, status="valid")
+
+    def invalidate_tasks(
+        self, instance_id: str, timeline_id: str, *, generation: int | None = None, reason: str = ""
+    ) -> dict[str, Any]:
+        """§6.4：让指定世代的派生任务失效（只取消未提交的候选 / 生成 / 投递工作）。
+
+        实现就是提升运行世代——迟到结果按世代被拒，**已固化历史不受影响**（撤销事实只能走回滚）。
+        """
+        row = self.clock_row(timeline_id)
+        before = int(row["generation"])
+        self.store.clock_put({**row, "generation": before + 1})
+        return self.envelope(instance_id, timeline_id, extra={
+            "invalidated_generation": before if generation is None else int(generation),
+            "runtime_generation": before + 1,
+            "reason": str(reason or "管理面要求使旧世代任务失效"),
+        })
+
+    def change_preview(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        changes: list[dict[str, Any]] | None = None,
+        rule_state_patches: list[dict[str, Any]] | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """§5.2：不改世界地检查一批变化意图。预览不是提交承诺。"""
+        changes = changes if isinstance(changes, list) else []
+        errors = change_mod.validate_intents(changes)
+        if errors:
+            return self.envelope(instance_id, timeline_id, status="rejected", extra={
+                "errors": errors, "accepted_candidates": [], "rejected_candidates": [],
+                "needs_review": [], "projected_effects": [], "conflicts": [],
+            })
+        instance = self.store.instance_get(instance_id) or {}
+        row = self.clock_row(timeline_id)
+        world = int(row["processed_world"])
+        translated = change_mod.translate(changes, package=self.setting(instance)["world_package"], world_seconds=world)
+        conflicts: list[dict[str, Any]] = []
+        if expected_revision is not None and int(expected_revision) != world:
+            conflicts.append({"kind": "revision", "expected": int(expected_revision), "current": world})
+        projected: list[dict[str, Any]] = []
+        rejected = list(translated["rejected"])
+        if translated["effects"]:
+            try:
+                targets, channels = self._known_targets(instance, timeline_id, world_seconds=world)
+                normalized = drafts.normalize_draft(
+                    self.setting(instance)["world_package"], translated,
+                    known_targets=targets, world_seconds=world, default_channels=channels,
+                )
+                projected = list(normalized.get("effects") or [])
+            except ValueError as exc:
+                rejected.append({"id": "*", "reason": f"世界后果无法映射：{exc}"})
+        elif translated["claims"]:
+            projected = []
+        else:
+            rejected.append({"id": "*", "reason": "这批意图没有能落成事实效果的内容"})
+        base = change_mod.preview_id(instance_id, timeline_id, world, changes)
+        # 一个都翻不成事实效果时如实说 rejected：预览不该报 ok 却什么都不给（§八）
+        status = "rejected" if (rejected and not projected) else "ok"
+        return self.envelope(instance_id, timeline_id, status=status, extra={
+            "preview_id": base,
+            "base_revision": world,
+            "accepted_candidates": translated["accepted"],
+            "rejected_candidates": rejected,
+            "needs_review": translated["needs_review"],
+            "projected_effects": projected,
+            "projected_observations": [],
+            "projected_rule_state_revisions": {
+                str(item.get("ruleset_id") or ""): int(item.get("base_state_revision") or 0) + 1
+                for item in (rule_state_patches or []) if isinstance(item, dict)
+            },
+            "conflicts": conflicts,
+        })
+
+    def change_commit(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        changes: list[dict[str, Any]] | None = None,
+        idempotency_key: str = "",
+        preview_id: str = "",
+        expected_revision: int | None = None,
+        source_module: str = "",
+    ) -> dict[str, Any]:
+        """§5.3：原子提交一批已确认的变化。**这是高级模块唯一的世界事实写入口。**
+
+        幂等：事件标识由幂等键派生，重放先查该事件是否已在——在就返回原结果，不再施加效果。
+        """
+        changes = changes if isinstance(changes, list) else []
+        key = str(idempotency_key or "").strip()
+        if not key:
+            return self.envelope(instance_id, timeline_id, status="rejected",
+                                 extra={"reason": "会改变状态的调用必须带 idempotency_key"})
+        errors = change_mod.validate_intents(changes)
+        if errors:
+            return self.envelope(instance_id, timeline_id, status="rejected", extra={"errors": errors})
+        instance = self.store.instance_get(instance_id) or {}
+        _inst_rows, timeline = self._rows(instance_id, timeline_id)
+        if str(timeline["state"]) != "active":
+            return self.envelope(instance_id, timeline_id, status="not_ready",
+                                 extra={"reason": f"时间线当前是 {timeline['state']}"})
+        row = self.clock_row(timeline_id)
+        world = int(row["processed_world"])
+        ident = f"ev-iface-{events.stable_key(instance_id, timeline_id, source_module or 'iface', key)[:12]}"
+        existing = self.store.event_get(instance_id, timeline_id, ident)
+        if existing is not None:
+            return self.envelope(instance_id, timeline_id, status="duplicate", extra={
+                "commit_id": str(existing["id"]), "new_revision": int(existing["world_seconds"]),
+                "event_refs": [str(existing["id"])],
+            })
+        if expected_revision is not None and int(expected_revision) != world:
+            return self.envelope(instance_id, timeline_id, status="conflict", extra={
+                "expected": int(expected_revision), "current": world,
+            })
+        if preview_id and str(preview_id) != change_mod.preview_id(instance_id, timeline_id, world, changes):
+            return self.envelope(instance_id, timeline_id, status="conflict",
+                                 extra={"reason": "预览已失效：基准版本或内容变了，请重新预览"})
+        translated = change_mod.translate(changes, package=self.setting(instance)["world_package"], world_seconds=world)
+        if translated["needs_review"]:
+            return self.envelope(instance_id, timeline_id, status="needs_review", extra={
+                "needs_review": translated["needs_review"],
+            })
+        if translated["rejected"]:
+            return self.envelope(instance_id, timeline_id, status="rejected",
+                                 extra={"rejected_candidates": translated["rejected"]})
+        try:
+            targets, channels = self._known_targets(instance, timeline_id, world_seconds=world)
+            normalized = drafts.normalize_draft(
+                self.setting(instance)["world_package"], translated,
+                known_targets=targets, world_seconds=world, default_channels=channels,
+            )
+        except ValueError as exc:
+            return self.envelope(instance_id, timeline_id, status="rejected",
+                                 extra={"reason": f"世界后果无法映射：{exc}"})
+        event_rows = self._user_event_rows(
+            instance_id, timeline_id, normalized, ident=ident, world=world,
+            source=str(source_module or "interface"), template="iface.change",
+        )
+        event_rows["event"]["detail"] = json.dumps(
+            {"changes": changes, "idempotency_key": key, "source_module": str(source_module or "")},
+            ensure_ascii=False,
+        )
+        institution_rows = self._institution_rows(
+            instance, instance_id, timeline_id, event_rows["effects"], deaths=[],
+            from_world=world, to_world=world,
+        )
+        environment_rows = self._environment_rows(
+            instance, instance_id, timeline_id, self.calendar(instance), event_rows["effects"],
+            from_world=world, to_world=world,
+        )
+        applied = self.store.apply_runtime_batch(
+            timeline_id=timeline_id,
+            generation=int(row["generation"]),
+            processed_world=world,
+            catching_up=False,
+            events=[event_rows["event"]],
+            claims=event_rows["claims"],
+            knowledge=event_rows["knowledge"],
+            effects=event_rows["effects"],
+            environment=environment_rows,
+            institution=institution_rows["institution"],
+            customs=institution_rows["customs"],
+        )
+        if not applied:
+            return self.envelope(instance_id, timeline_id, status="stale",
+                                 extra={"reason": "运行世代已变，整批未落盘"})
+        return self.envelope(instance_id, timeline_id, extra={
+            "commit_id": ident,
+            "new_revision": world,
+            "event_refs": [ident],
+            "effect_refs": [str(item.get("id") or "") for item in event_rows["effects"]],
+            "knowledge_refs": [str(item.get("id") or "") for item in event_rows["knowledge"]],
+            "rule_state_refs": [],
+        })
 
     # ---------- 生命周期 ----------
 

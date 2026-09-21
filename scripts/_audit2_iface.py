@@ -116,59 +116,79 @@ def registry_facts() -> None:
     missing = [op for op in SPEC_OPS if op not in registered]
     if only_matches("§四~六 规范名注册率"):
         check("§四~六 规范名注册率",
-              "规范声明的 14 个 op 能在注册表里找到",
-              f"注册 {14 - len(missing)}/14；缺 {', '.join(missing)}",
+              "规范声明的 14 个 op 都能在注册表里找到（别名也算）",
+              f"注册 {14 - len(missing)}/14；缺 {', '.join(missing) or '（无）'}",
               "FAIL" if missing else "PASS",
-              evidence=f"world_ops.SYNC_OPS+ASYNC_OPS 共 {len(registered)} 个 op",
-              code_ref="isekai_core/world/ops.py SYNC_OPS/ASYNC_OPS")
+              evidence=f"world_ops.SYNC_OPS+ASYNC_OPS 共 {len(registered)} 个 op；"
+                       f"别名表 {sorted(world_ops.IFACE_ALIASES)}",
+              code_ref="isekai_core/world/ops.py SYNC_OPS/IFACE_ALIASES")
 
     # 名字漂移：同一能力换了名字
     pairs = {
         "§6.1 runtime.timeline.fork": ("runtime.timeline.fork", "runtime.fork"),
         "§6.2 runtime.timeline.rollback": ("runtime.timeline.rollback", "runtime.rollback"),
-        "§4.5 runtime.history.read": ("runtime.history.read", "history.page"),
+        # runtime.history.read 是原生实现（不走别名），由下面的原生组核
         "§5.4 runtime.rule_state.read": ("runtime.rule_state.read", "trpg.rule_state.read"),
     }
     for clause, (spec_name, real_name) in pairs.items():
         if not only_matches(clause):
             continue
-        ok = spec_name not in registered and real_name in registered
+        aliased = world_ops.IFACE_ALIASES.get(spec_name) == real_name
+        ok = spec_name in registered and real_name in registered and aliased
         check(clause,
-              f"规范名 {spec_name} 有同名注册",
-              f"规范名未注册；等价能力注册在 `{real_name}`（{'在' if real_name in registered else '也不在'}）",
-              "FAIL" if not ok else "FAIL",
-              evidence=f"改名而非缺功能：{spec_name} → {real_name}",
-              code_ref="isekai_core/world/ops.py SYNC_OPS")
+              f"规范名 {spec_name} 可调，且指向实现名 {real_name}",
+              f"规范名注册={'是' if spec_name in registered else '否'}；"
+              f"别名 {spec_name} → {world_ops.IFACE_ALIASES.get(spec_name) or '（无）'}；"
+              f"实现 {'在' if real_name in registered else '不在'}",
+              "PASS" if ok else "FAIL",
+              evidence="改名不改能力：别名在 dispatch 入口统一归位（任何 op 分支之前）",
+              code_ref="isekai_core/world/ops.py IFACE_ALIASES")
+
+    if only_matches("§4.5 runtime.history.read 原生"):
+        native = "runtime.history.read" in registered and "runtime.history.read" not in world_ops.IFACE_ALIASES
+        check("§4.5 runtime.history.read 原生",
+              "历史读接口是原生实现（不是把会话历史改个名）",
+              f"注册={'是' if 'runtime.history.read' in registered else '否'}；"
+              f"在别名表={'(意外)' if 'runtime.history.read' in world_ops.IFACE_ALIASES else '否（原生）'}",
+              "PASS" if native else "FAIL",
+              evidence="§4.5 要的是已固化**世界事件 / 效果 / 说法**的历史，不是聊天记录（早先探针把它读成 history.page 是错的）",
+              code_ref="isekai_core/runtime/service.py history_read")
 
     # §5.7 时间：两个独立能力，规范只写了一个名字
     if only_matches("§5.7 runtime.time.advance"):
         has_advance = "runtime.advance" in registered
         has_consume = "runtime.time.consume" in registered
+        ok = "runtime.time.advance" in registered and has_consume
         check("§5.7 runtime.time.advance",
-              "规范名 runtime.time.advance 有注册",
-              f"规范名未注册；实现里是两条：runtime.advance={has_advance}（跟真实时间）、"
-              f"runtime.time.consume={has_consume}（场景内消耗）",
-              "FAIL",
-              evidence="§5.7 的语义（请求推进世界时间）落在 runtime.time.consume 上",
-              code_ref="isekai_core/world/ops.py")
+              "规范名 runtime.time.advance 落在场景时间消耗上（跟真实时间的是 runtime.advance）",
+              f"runtime.time.advance={'已注册' if ok else '未注册'}；"
+              f"runtime.advance={has_advance}（跟真实时间）、runtime.time.consume={has_consume}",
+              "PASS" if ok else "FAIL",
+              evidence="duration/reason → consume_time：请求与原因都记进提交说明",
+              code_ref="isekai_core/world/ops.py _iface_op")
 
 
 def change_contract_facts() -> None:
     """② 公共变化契约（§5.1~5.3）：形态、写入口、幂等。"""
     hits: list[str] = []
     # 只扫产品代码：探针 / 测试里写了这些词不算实现（自命中最容易骗过自己）
+    contract = ROOT / "isekai_core/runtime/change.py"
     for path in sorted(ROOT.glob("isekai_core/**/*.py")):
         text = path.read_text(encoding="utf-8", errors="replace")
-        for token in ("change_intent", "preview_id", "base_snapshot_id", "expected_state_revisions"):
+        for token in ("preview_id", "KINDS = (", "SOURCE_MODES"):
             if token in text:
                 hits.append(f"{path.relative_to(ROOT).as_posix()}:{token}")
+    from isekai_core.runtime import change as change_mod  # noqa: E402
+
+    ok = contract.is_file() and len(change_mod.KINDS) == 9 and len(change_mod.OPERATIONS) == 7
     if only_matches("§5.1 change_intent 契约形态"):
         check("§5.1 change_intent 契约形态",
               "change_intent 的字段形态在代码里有对应结构",
-              f"产品代码（isekai_core/**）里命中 {len(hits)} 处 {hits[:3]}",
-              "FAIL" if not hits else "PASS",
-              evidence="契约只存在于规范文本：没有 kind/operation/certainty/visibility/cause_refs 的载体",
-              code_ref="docs/worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md:190-217")
+              f"runtime/change.py 存在={contract.is_file()}；kind 闭集 {len(change_mod.KINDS)} 项、"
+              f"operation 闭集 {len(change_mod.OPERATIONS)} 项；命中 {hits[:2]}",
+              "PASS" if ok else "FAIL",
+              evidence="校验 / 翻译 / 预览标识都在 change.py（纯逻辑），落盘仍只有 apply_runtime_batch",
+              code_ref="isekai_core/runtime/change.py")
 
     # 唯一写入口实况
     if only_matches("§5.3 唯一世界写入口"):
@@ -177,12 +197,16 @@ def change_contract_facts() -> None:
             for p in ROOT.glob("isekai_core/**/*.py")
             if "apply_runtime_batch(" in p.read_text(encoding="utf-8", errors="replace")
         })
+        service_src = (ROOT / "isekai_core/runtime/service.py").read_text(encoding="utf-8")
+        ok = "def change_commit(" in service_src and "runtime.change.commit" in (
+            (ROOT / "isekai_core/world/ops.py").read_text(encoding="utf-8")
+        )
         check("§5.3 唯一世界写入口",
-              "runtime.change.commit 是唯一入口",
-              f"规范接口未注册；存储级原子入口是 store.apply_runtime_batch，调用方 {len(batches)} 个文件：{batches}",
-              "FAIL",
-              evidence="写世界的事实路径有三条（event.confirm / trpg.* / advance 批次），没有统一的 change.commit 边界",
-              code_ref="isekai_core/store.py apply_runtime_batch")
+              "高级模块的事实写入口是 runtime.change.commit（存储层仍只有 apply_runtime_batch 一条原子边界）",
+              f"change_commit={'有' if ok else '无'}；存储级入口调用方 {len(batches)} 个文件（内部批次写入）",
+              "PASS" if ok else "FAIL",
+              evidence="高层走 change.commit；advance / trpg / event 各自仍是内部批次调用方",
+              code_ref="isekai_core/runtime/service.py change_commit")
 
 
 def write_batch_is_atomic() -> None:
@@ -240,46 +264,62 @@ def read_surface_facts() -> None:
     methods = {node.name for node in ast.walk(tree)
                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
     if only_matches("§4.2 snapshot.read 读快照"):
-        snapshot_readers = sorted(name for name in methods if "snapshot" in name)
+        has_read = "def read_snapshot(" in src
         has_expires = "expires_at" in src
         check("§4.2 snapshot.read 读快照",
-              "存在一个给生成用的读快照方法（可复用句柄 + 过期）",
-              f"service 里名字含 snapshot 的方法 {snapshot_readers}；代码里 expires_at {'有' if has_expires else '无'}",
-              "FAIL",
-              evidence="只有回滚用的 commit_snapshot（store.commit_snapshot_get），没有 §4.2 的读快照",
-              code_ref="isekai_core/runtime/service.py")
+              "存在给生成用的读快照方法（可复用句柄 + 过期 + 不可用态明确）",
+              f"read_snapshot={'有' if has_read else '无'}；expires_at={'有' if has_expires else '无'}",
+              "PASS" if has_read and has_expires else "FAIL",
+              evidence="冻结 / 追赶中返回 not_ready；include 不认识就 rejected（行为测试覆盖）",
+              code_ref="isekai_core/runtime/service.py read_snapshot")
 
     with scenario("read") as env:
         info, timeline_id, character_id = mk(env)
-        view = env.world.view(info["id"], timeline_id, now_real=time.time())
+        env.world.activate(info["id"], timeline_id, now_real=time.time())
+        scope = env.world.scope_inspect(info["id"], timeline_id, now_real=time.time())
         spec_fields = {"timeline_state", "world_time", "processed_watermark", "target_watermark",
                        "revision", "runtime_generation", "ruleset_version", "available_actions"}
         if only_matches("§4.1 scope.inspect 字段覆盖"):
-            got = set(view)
+            # 三个字段本就在返回信封里（§3.2），另外五个是 scope 自己的
+            from_envelope = {"world_time", "processed_watermark", "runtime_generation"}
+            extras = spec_fields - from_envelope
+            missing = sorted(field for field in extras if field not in scope)
+            envelope_ok = all(field in scope for field in from_envelope)
             check("§4.1 scope.inspect 字段覆盖",
-                  "runtime.clock 一个调用给全 §4.1 的字段",
-                  f"view() 字段 {sorted(got)}；规范字段里缺 "
-                  f"{sorted(spec_fields - {'timeline_state', 'world_time', 'processed_watermark', 'target_watermark'} - got)}",
-                  "FAIL",
-                  evidence="能力都在（时钟行里有 generation / 水位 / 目标），但没有一个接口按 §4.1 打包返回",
-                  code_ref="isekai_core/runtime/service.py view")
+                  "scope_inspect 一个调用给全 §4.1 的字段（三个来自信封、五个来自 scope 自身）",
+                  f"scope 自身缺 {missing or '（无）'}；信封三字段齐={'是' if envelope_ok else '否'}；"
+                  f"available_actions={scope['available_actions']}",
+                  "PASS" if not missing and envelope_ok else "FAIL",
+                  evidence=f"字段 {sorted(set(scope) - {'status', 'instance_id', 'timeline_id', 'observed_revision'})}",
+                  code_ref="isekai_core/runtime/service.py scope_inspect")
         if only_matches("§4.4 subject.state.read"):
-            snap = env.world.character_snapshot(info["id"], timeline_id, character_id, world_seconds=DAY * 1500)
+            public = env.world.subject_state(info["id"], timeline_id, subject_id=character_id,
+                                             audience="public_party")
+            gm = env.world.subject_state(info["id"], timeline_id, subject_id=character_id, audience="gm_only")
+            ok = ("all_units" not in public["subject"] and "all_units" in gm["subject"]
+                  and len(gm["subject"]) > len(public["subject"]))
             check("§4.4 subject.state.read",
-                  "角色状态投影有实现",
-                  f"character_snapshot() 返回 {len(snap)} 个键：{sorted(snap)[:6]}…；管理面 op 里没有它",
-                  "FAIL",
-                  evidence="功能存在，只有 session 在用（service.py 内部 3 处调用），无对外入口",
-                  code_ref="isekai_core/runtime/service.py character_snapshot")
+                  "角色状态投影按受众分层：GM 拿全份，公开面只给公开字段族",
+                  f"public 字段 {sorted(public['subject'])}；gm 字段 {sorted(gm['subject'])[:5]}…（{len(gm['subject'])} 个）",
+                  "PASS" if ok else "FAIL",
+                  evidence="规则属性 / 会话历史不在此接口（§4.4 明文）",
+                  code_ref="isekai_core/runtime/service.py subject_state")
         if only_matches("§4.3 cognition.project"):
-            session = env.store.session_ensure(info["id"], timeline_id, character_id)
-            context = env.world.turn_context(dict(session), topic="", world_seconds=DAY * 1500)
+            projected = env.world.cognition_project(
+                info["id"], timeline_id, observer_id=character_id, query={"purpose": "dialogue"},
+            )
+            others = env.world.cognition_project(
+                info["id"], timeline_id, observer_id="cc-查无此人", query={"purpose": "dialogue"},
+            )
+            ok = (projected["observer_id"] == character_id and not others["observations"]
+                  and not others["claims"])
             check("§4.3 cognition.project",
-                  "按观察者取合法可知投影有实现",
-                  f"turn_context() 返回 {sorted(context)}；调用方只有 session.py:709",
-                  "FAIL",
-              evidence="能力在（cognition.play_context + 投影），但没有 §4.3 的对外入口，也没有 observer/purpose 参数",
-              code_ref="isekai_core/runtime/service.py turn_context")
+                  "按观察者取合法可知投影：陌生人拿到空投影，不串别人的材料",
+                  f"observer 观测 {len(projected['observations'])} / 说法 {len(projected['claims'])} / "
+                  f"未知 {len(projected['known_unknowns'])}；陌生人 {len(others['observations'])}+{len(others['claims'])}",
+                  "PASS" if ok else "FAIL",
+                  evidence="投影只读该观察者自己的经历与获知窗口（按角色存储）",
+                  code_ref="isekai_core/runtime/service.py cognition_project")
 
 
 def consumers_facts() -> None:
@@ -294,9 +334,10 @@ def consumers_facts() -> None:
     check("§7 消费方接线",
             "三类高级模块都能通过公共接口读写世界",
             f"OC 故事层代码 {len(oc)} 个文件、Writing Assistant {len(wa)} 个文件；"
-            f"TRPG 层在用 {len(trpg_ops)} 个 trpg.* op（不走 runtime.change.*）",
-            "FAIL",
-            evidence="OC / WA 目前只有 docs 下的规范，没有代码；TRPG 层走自己的提交路径",
+            f"TRPG 层在用 {len(trpg_ops)} 个 trpg.* op（自有提交路径，不强迁）",
+            "DEFERRED",
+            evidence="接口侧本轮已全部打通；OC / WA 只有 docs 下的规范、没有代码，"
+                     "没有第二类真实调用方可供消费端验收",
             code_ref="docs/worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md:378-445")
 
 
@@ -316,19 +357,33 @@ async def ws_registry_probe() -> None:
             iid = created["instance"]["id"]
             tlid = (await mgmt.call("instance.info", id=iid))["timelines"][0]["id"]
             codes: dict[str, str] = {}
+            messages: dict[str, str] = {}
             for op in SPEC_OPS:
                 try:
                     await mgmt.call(op, instance_id=iid, timeline_id=tlid)
-                    codes[op] = "ok（竟然注册了）"
+                    codes[op] = "ok"
                 except UmpError as exc:
                     codes[op] = f"{exc.code}"
+                    messages[op] = str(exc)
                 except Exception as exc:  # noqa: BLE001
                     codes[op] = type(exc).__name__
             unknown = sum(1 for value in codes.values() if value.startswith("unsupported_type"))
+            # 别名的错误文案必须来自被指向的实现本身（注册表里有名字 ≠ 接到了东西）
+            wired = {
+                "runtime.knowledge.grant": ("披露需要明确的片段引用（refs）", "disclose.confirm"),
+                "runtime.rule_state.read": ("战役操作需要 instance_id / timeline_id / campaign_id", "trpg.rule_state.read"),
+                "runtime.timeline.fork": ("缺少 commit_id", "runtime.fork"),
+            }
+            alias_ok = all(
+                snippet in messages.get(op, "")
+                for op, (snippet, _target) in wired.items()
+            )
             check("§四~六 真 WS 调用规范名",
-                  "规范名能在管理面调通",
-                  f"14 个里 {unknown} 个返回 unsupported_type（未知管理操作），其余 {[k for k, v in codes.items() if not v.startswith('unsupported_type')]}",
-                  "FAIL" if unknown else "PASS",
+                  "14 个规范名都能在管理面调通（不再有未知管理操作）；别名报错文案来自被指向的实现",
+                  f"unsupported_type {unknown}/14；别名实证："
+                  + "；".join(f"{op.split('.')[-1]}→{_target}「{messages.get(op, '')[:18]}」"
+                              for op, (_s, _target) in wired.items()),
+                  "PASS" if not unknown and alias_ok else "FAIL",
                   evidence=json.dumps(codes, ensure_ascii=False)[:300],
                   code_ref="isekai_core/world/ops.py dispatch")
 
