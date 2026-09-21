@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
 
@@ -121,6 +121,71 @@ class LLMClient:
 
         raise last or LLMError("llm_failed", "未知失败", retryable=True)
 
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+        temperature: float | None = None,
+    ) -> AsyncIterator[str]:
+        """流式补全：逐段产出正文（OpenAI 兼容 SSE）。
+
+        只在**还没产出任何字**时重试：一旦吐过增量，重放会把同一段话说两遍——那由调用方按
+        「最终帧没来就不算数」处理（§七 流式项）。
+        """
+        if not self.cfg.api_key:
+            raise LLMError("llm_not_configured", "未配置 LLM API Key", retryable=False)
+        payload = {
+            "model": self.cfg.model,
+            "messages": messages,
+            "max_tokens": max_tokens or self.cfg.max_tokens,
+            "temperature": self.cfg.temperature if temperature is None else temperature,
+            "stream": True,
+        }
+        request_timeout = timeout or self.cfg.timeout_s
+        emitted = 0
+        for attempt in (0, 1):
+            if emitted:  # 已经吐过字：不再重试
+                raise LLMError("llm_unreachable", "流式输出中途断开", retryable=True)
+            try:
+                async with self._http().stream(
+                    "POST", "/chat/completions", json=payload, timeout=request_timeout
+                ) as response:
+                    if response.status_code >= 400:
+                        await response.aread()
+                        retryable = response.status_code == 429 or response.status_code >= 500
+                        code = "llm_unavailable" if retryable else "llm_rejected"
+                        raise LLMError(code, f"HTTP {response.status_code}", retryable=retryable)
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            delta = json.loads(data)["choices"][0].get("delta") or {}
+                            piece = delta.get("content") or ""
+                        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                            continue
+                        if piece:
+                            emitted += len(piece)
+                            yield piece
+                log.debug("llm stream done len=%s", emitted)
+                return
+            except httpx.HTTPError as exc:
+                log.warning("llm stream transport error attempt=%s: %s", attempt, type(exc).__name__)
+                if attempt == 0 and not emitted:
+                    await asyncio.sleep(0.5)
+                    continue
+                raise LLMError("llm_unreachable", f"{type(exc).__name__}", retryable=True) from exc
+            except LLMError as exc:
+                if not exc.retryable or attempt != 0 or emitted:
+                    raise
+                log.warning("llm stream status retry: %s", exc.code)
+                await asyncio.sleep(0.5)
+                continue
+
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()
@@ -136,6 +201,9 @@ class FakeLLM:
         self.fail_with = fail_with
         self.delay_s = 0.0
         self.cfg: Any = None  # 由设置面写入（settings.set 生效路径与真实客户端一致）
+        #: 流式：每次产出多少字符；`stream_fail_after` 给「吐了一半才坏」的场景
+        self.stream_chunk = 4
+        self.stream_fail_after: int | None = None
 
     async def chat(
         self,
@@ -152,6 +220,15 @@ class FakeLLM:
             raise self.fail_with
         index = min(len(self.calls) - 1, len(self.replies) - 1)
         return self.replies[index]
+
+    async def chat_stream(self, messages: list[dict[str, Any]], **kwargs: Any):
+        """把同一份脚本文本按 `stream_chunk` 切开逐段产出（供流式路径的行为验收）。"""
+        text = await self.chat(messages, **kwargs)
+        pieces = [text[i : i + self.stream_chunk] for i in range(0, len(text), self.stream_chunk)] or [text]
+        for index, piece in enumerate(pieces):
+            if self.stream_fail_after is not None and index >= self.stream_fail_after:
+                raise LLMError("llm_unreachable", "流式输出中途断开", retryable=True)
+            yield piece
 
     async def aclose(self) -> None:
         return None

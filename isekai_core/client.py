@@ -30,6 +30,7 @@ class UmpClient:
     segments: bool = True
     status: bool = True
     attachments: bool = False
+    streaming: bool = False
     max_text_len: int = DEFAULT_MAX_TEXT_LEN
     max_parts: int = DEFAULT_MAX_PARTS
 
@@ -55,6 +56,7 @@ class UmpClient:
                     "segments": self.segments,
                     "status": self.status,
                     "attachments": self.attachments,
+                    "streaming": self.streaming,
                     "max_text_len": self.max_text_len,
                     "max_parts": self.max_parts,
                 },

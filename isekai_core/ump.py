@@ -49,13 +49,15 @@ class Err:
 
 CLIENT_TYPES = frozenset({"hello", "user_message", "delivery", "retry", "ping", "pong"})
 SERVER_TYPES = frozenset(
-    {"hello_ack", "binding", "accepted", "reply", "system_notice", "status", "error", "ping", "pong"}
+    {"hello_ack", "binding", "accepted", "reply", "reply_delta", "system_notice", "status", "error", "ping", "pong"}
 )
 THREAD_REQUIRED = frozenset(
-    {"user_message", "accepted", "reply", "system_notice", "delivery", "retry", "status", "binding"}
+    {"user_message", "accepted", "reply", "reply_delta", "system_notice", "delivery", "retry", "status", "binding"}
 )
 #: 必须回传绑定令牌的类型（消息 / 回执 / 重试）
 TOKEN_REQUIRED = frozenset({"user_message", "retry", "delivery"})
+#: 只有协商了 `streaming` 能力的通道才收得到（增量预览，最终以 `reply` 为准）
+DELTA_TYPES = frozenset({"reply_delta"})
 ALL_TYPES = CLIENT_TYPES | SERVER_TYPES
 
 DELIVERY_STATES = frozenset({"accepted", "failed", "unknown"})
@@ -185,7 +187,9 @@ def parse_hello(payload: dict[str, Any]) -> dict[str, Any]:
             # 附件 / 富媒体（CHANNEL_PLUGIN_SPEC §七 更后置项之一）：**由通道声明**，握手时取交集；
             # 没声明就仍然显式拒绝（见 `_attachments_of`），不静默忽略。
             "attachments": bool(caps.get("attachments", False)),
-            # v1 基线：文本。流式是仍待办的扩展点：这里显式声明不支持。
+            # 流式表达（§七 更后置项之一，2026-09-22 落地）：通道声明 `streaming` 才收 `reply_delta` 增量。
+            "streaming": bool(caps.get("streaming", False)),
+            # v1 基线：文本。`stream` 是早先的保留字段，payload 里出现仍然显式拒绝。
             "text": True,
             "stream": False,
             **limits,
@@ -253,7 +257,7 @@ def _reject_unsupported_extensions(payload: dict[str, Any]) -> None:
         if payload.get(field) not in (None, [], {}, ""):
             raise UmpError(
                 Err.UNSUPPORTED_CAPABILITY,
-                f"v1 只承担文本：{field} 属更后置的附件 / 流式扩展（不静默忽略）",
+                f"协议只承担文本 / 附件 / 流式三类内容：{field} 不在其中（不静默忽略）",
                 retryable=False,
             )
     content_type = payload.get("content_type")
@@ -332,6 +336,13 @@ def _validate_payload(
     elif env_type == "system_notice":
         if not isinstance(payload.get("text"), str) or not payload["text"]:
             raise UmpError(Err.PROTOCOL, "system_notice.text must be a non-empty string")
+    elif env_type == "reply_delta":
+        _require_str(payload, "message_id", max_len=64)
+        index = payload.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            raise UmpError(Err.PROTOCOL, "reply_delta.index must be a non-negative integer")
+        if not isinstance(payload.get("text"), str) or not payload["text"]:
+            raise UmpError(Err.PROTOCOL, "reply_delta.text must be a non-empty string")
 
 
 def parse(

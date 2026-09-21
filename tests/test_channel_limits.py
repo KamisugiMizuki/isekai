@@ -121,13 +121,18 @@ async def test_inbound_queue_cap_rejects_new_until_drained(tmp_path):
         client, bound = await bind_thread(h, mgmt, channel_id="builtin", thread_id="dm-1")
         token = bound["thread"]["binding_token"]
         session_id = bound["session"]["id"]
+        channel_instance = client.hello_ack["channel_instance"]
 
-        await client.send_user_message(thread_id="dm-1", binding_token=token, text="第一条")
-        assert await _until(lambda: h.store.inbound_queued_count(session_id) == 0), "第一条应已进入处理"
+        first_env = await client.send_user_message(thread_id="dm-1", binding_token=token, text="第一条")
+        # 等它真的进入处理（不是「还没被接受所以队列为空」这种假通过）
+        assert await _until(
+            lambda: (h.store.inbound_find(channel_instance, "dm-1", first_env) or {}).get("state") == "processing",
+            timeout=15.0,
+        ), "第一条应已进入处理"
 
         await client.send_user_message(thread_id="dm-1", binding_token=token, text="第二条")
         await client.send_user_message(thread_id="dm-1", binding_token=token, text="第三条")
-        assert await _until(lambda: h.store.inbound_queued_count(session_id) == 2), "队列应已排满"
+        assert await _until(lambda: h.store.inbound_queued_count(session_id) == 2, timeout=15.0), "队列应已排满"
 
         await client.send_user_message(thread_id="dm-1", binding_token=token, text="第四条")
         overflow = await client.expect(lambda env: env.type == "error", timeout=10.0)

@@ -361,12 +361,17 @@ class SessionService:
         started = time.monotonic()
         for seq in seqs:
             self.store.inbound_set_state(seq, "processing")
+        # 先占号：流式增量与最终固化帧共用一个 message_id（客户端据此把预览换成正文）
+        message_id = ump.new_id("m")
         await self._status(row, "thinking")
         try:
             query_vector = await self._query_vector(rows)
             messages, recalled, unit = self._build_messages(rows, query_vector=query_vector)
             self._recalled = list(recalled)
-            text = await self.llm.chat(messages)
+            if self._caps(row["channel_id"]).get("streaming") and hasattr(self.llm, "chat_stream"):
+                text = await self._stream_reply(row, message_id=message_id, messages=messages)
+            else:
+                text = await self.llm.chat(messages)
             text, audit_findings = await self._audit_or_retry(unit, text, messages)
         except LLMError as exc:
             log.warning(
@@ -418,7 +423,6 @@ class SessionService:
             await self._status(row, "idle")
             return
 
-        message_id = ump.new_id("m")
         # 追赶中要说清（§2.6 条 5）：回复按已完成的过去作答（安全侧），但别让通道端以为世界停下不动。
         # 先发提示再固化回复——客户端普遍按「最后一条＝她的回复」判断一轮结束，顺序反了会卡住。
         await self._catching_up_notice(row, binding_token=str(thread["binding_token"]))
@@ -669,6 +673,17 @@ class SessionService:
         except Exception:
             log.exception("memory settle failed session=%s", session["id"])
 
+    def _caps(self, channel_id: str) -> dict[str, Any]:
+        """该通道握手协商后的能力（缺省空）。"""
+        channel = self.store.channel_get(channel_id) if channel_id else None
+        if channel is None:
+            return {}
+        try:
+            caps = json.loads(channel["capabilities"] or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return caps if isinstance(caps, dict) else {}
+
     def _limits(self, channel_id: str) -> tuple[int, int]:
         """按通道协商结果取分段限额；未协商多段时每批一段。"""
         channel = self.store.channel_get(channel_id) if channel_id else None
@@ -864,6 +879,30 @@ class SessionService:
     async def _status(self, row: dict[str, Any], state: str) -> None:
         envelope = ump.make("status", {"state": state}, thread_id=row["thread_id"])
         await self.deliver(row["channel_id"], row["thread_id"] or "", envelope)
+
+    async def _stream_reply(self, row: dict[str, Any], *, message_id: str, messages: list[dict[str, Any]]) -> str:
+        """流式生成：逐段投递 `reply_delta`（**临时预览**），返回全文。
+
+        只发给协商了 `streaming` 的通道；增量不作数——最终正文仍以固化的 `reply` 帧为准
+        （后验检查可能改字，客户端拿最终帧覆盖缓冲区）。流到一半失败时，已发的增量由客户端按
+        「最终帧没来就不算数」处理，这里如实抛错走生成失败路径。
+        """
+        chunks: list[str] = []
+        index = 0
+        async for piece in self.llm.chat_stream(messages):
+            chunks.append(piece)
+            await self.deliver(
+                row["channel_id"],
+                row["thread_id"] or "",
+                ump.make(
+                    "reply_delta",
+                    {"message_id": message_id, "index": index, "text": piece},
+                    thread_id=row["thread_id"],
+                    id=ump.new_id("s"),
+                ),
+            )
+            index += 1
+        return "".join(chunks)
 
     async def _error(self, row: dict[str, Any], error: UmpError) -> None:
         envelope = ump.error_envelope(error, thread_id=row["thread_id"], ref=row["env_id"])

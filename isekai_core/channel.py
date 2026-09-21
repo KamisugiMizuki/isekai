@@ -61,6 +61,8 @@ def negotiate(client_caps: dict[str, Any], cfg: Config) -> dict[str, Any]:
         "status": bool(client_caps.get("status", False)),
         # 附件：通道声明才开（§七 附件项）；限额取交集
         "attachments": bool(client_caps.get("attachments", False)),
+        # 流式：通道声明才开（§七 流式项）：增量走 `reply_delta`，最终正文仍以 `reply` 为准
+        "streaming": bool(client_caps.get("streaming", False)),
         "max_attachments": min(int(client_caps.get("max_attachments", cfg.max_attachments)), cfg.max_attachments),
         "max_attachment_bytes": min(
             int(client_caps.get("max_attachment_bytes", cfg.max_attachment_bytes)), cfg.max_attachment_bytes
@@ -151,6 +153,8 @@ class CoreServer:
             return False
         if envelope.get("type") == "status" and not conn.capabilities.get("status"):
             return True  # 未协商该能力的通道不接收操作状态
+        if envelope.get("type") in ump.DELTA_TYPES and not conn.capabilities.get("streaming"):
+            return True  # 未协商流式的通道不接收增量预览（最终 `reply` 照常发）
         return await self._send_conn(conn, envelope)
 
     # ---------- 连接处理 ----------

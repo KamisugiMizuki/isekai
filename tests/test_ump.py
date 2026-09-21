@@ -94,6 +94,7 @@ def test_hello_normalises_capabilities():
         "status": True,
         "text": True,
         "attachments": False,  # 端没声明就不开；声明了才按配额收（§七 附件项）
+        "streaming": False,  # 流式同理：声明才收 reply_delta 增量（§七 流式项）
         "stream": False,
         "max_text_len": 1000,
         "max_parts": 3,

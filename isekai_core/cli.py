@@ -141,6 +141,7 @@ async def connect_channel(
         credential=credential,
         bootstrap=bootstrap,
         attachments=True,  # CLI 支持附件（§七）：声明该能力，握手时按配额取交集
+        streaming=True,  # CLI 支持增量预览（§七 流式项）：边收边打，最终以 reply 帧为准
     )
     try:
         ack = await client.connect()
@@ -149,7 +150,12 @@ async def connect_channel(
             raise
         await client.close()
         client = UmpClient(
-            endpoint=endpoint, channel_id=channel_id, name=name, bootstrap=bootstrap, attachments=True
+            endpoint=endpoint,
+            channel_id=channel_id,
+            name=name,
+            bootstrap=bootstrap,
+            attachments=True,
+            streaming=True,
         )
         ack = await client.connect()
     if ack.get("credential"):
@@ -173,12 +179,22 @@ async def run_turn(
     )
     parts: list[str] = []
     expected_batches = 1
+    streamed: list[str] = []
     while True:
         envelope = await client.expect(lambda _e: True, timeout=timeout)
         if envelope.type == "status":
             if not quiet:
                 if envelope.payload.get("state") == "thinking":
                     print("· 思考中…")
+            continue
+        if envelope.type == "reply_delta":
+            # 增量预览：边收边打；最终正文以 `reply` 帧为准（后验检查可能改字）
+            piece = str(envelope.payload.get("text") or "")
+            if not quiet:
+                if not streamed:
+                    print("角色> ", end="", flush=True)
+                print(piece, end="", flush=True)
+            streamed.append(piece)
             continue
         if envelope.type == "error":
             if envelope.payload.get("ref") in (env_id, None):
@@ -196,8 +212,17 @@ async def run_turn(
         texts = [part["text"] for part in payload.get("parts", [])]
         parts.extend(texts)
         if not quiet:
-            for text_part in texts:
-                print(f"角色> {text_part}")
+            final_text = "".join(texts)
+            if streamed:
+                # 增量与最终不一致时要说清（最终为准）；一致就只补一个换行
+                if "".join(streamed) != final_text:
+                    print("\n（最终正文与增量预览不同，以最终为准）")
+                else:
+                    print()
+                print(f"角色> {final_text}")
+            else:
+                for text_part in texts:
+                    print(f"角色> {text_part}")
         await client.report_delivery(
             thread_id=thread_id,
             binding_token=token,
