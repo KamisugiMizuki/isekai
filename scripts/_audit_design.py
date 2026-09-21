@@ -766,27 +766,35 @@ def c_migration_hidden(case: Case) -> tuple[str, str]:
 @item("§7.1-28 diff 存储｜角色状态 diff 复制与合并；自动压缩")
 def c_diff_storage(case: Case) -> tuple[str, str]:
     info, tl, _cid, _pkg = mk(case, "diff世界")
+    before = case.store._conn.execute(  # noqa: SLF001
+        "SELECT COUNT(*) FROM commit_snapshot WHERE instance_id=?", (info["id"],)
+    ).fetchone()[0]
     case.world.activate(info["id"], tl, now_real=1.7e9)
     case.world.advance(info["id"], tl, now_real=1.7e9 + 2 * DAY)
     case.world.commit(info["id"], tl, note="第一次")
     case.world.advance(info["id"], tl, now_real=1.7e9 + 4 * DAY)
     case.world.commit(info["id"], tl, note="第二次")
     snap = case.store._conn.execute(  # noqa: SLF001
-        "SELECT COUNT(*) AS n, MAX(LENGTH(payload)) AS size FROM commit_snapshot"
+        "SELECT COUNT(*) AS n, MAX(LENGTH(payload)) AS size FROM commit_snapshot WHERE instance_id=?",
+        (info["id"],),
     ).fetchone()
+    # 创建时的初始提交也带快照（§7.1 提交闭包），所以判据是「两次提交各加一份全量」，不是绝对条数
+    assert snap["n"] - before == 2, (snap["n"], before)
     hits = [
         f"{p.relative_to(ROOT)}:{i}"
         for p in (ROOT / "isekai_core").rglob("*.py")
         for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
         if "compact" in line.lower() or "压缩" in line
     ]
-    assert snap["n"] == 2
-    return "FAIL", (
+    # 判定按规范口径：DESIGN.md 状态行把 §6 diff 物化 / §8 压缩明确记成**后置优化项**
+    # （「阶段 4 按 §十五 以全量快照落地，diff 与压缩仍是优化项」），§405 同述。
+    # 所以这是「SPEC 自己写了后置·待定」，不是与设计不符 —— 按 DEFERRED 记，读数照旧给出。
+    return "DEFERRED", (
         f"提交用全量快照（{snap['n']} 份、最大 {snap['size']} 字节），没有 diff 复制/合并，也没有任何自动压缩路径"
         f"（全树 compact/压缩 命中：{hits or '无'}）。"
+        "归类依据：DESIGN.md 状态行「仍未实现（记账，不充数）」明列本条为优化项 + §405 决策「阶段 4 前先用全量快照验证机制，再引入 diff」。"
         "最小复现：scripts/_audit_design.py::c_diff_storage（两次提交 → commit_snapshot 两行全量 payload）；"
-        "证据：isekai_core/runtime/versioning.py:1-5「存储用全量快照」，service.py:522-560 fork / 566-632 rollback 只做快照装载；"
-        "DESIGN §八 自己允许阶段性等价（「阶段 4 前先用全量快照验证机制，再引入 diff」），但 §7.1 该行所述 diff 与压缩两件都未实现"
+        "证据：isekai_core/runtime/versioning.py:98 snapshot_of 全量 dump、desktop/… 无压缩入口"
     )
 
 
@@ -1198,16 +1206,14 @@ def c_roundtrip(case: Case) -> tuple[str, str]:
     assert len(case.store.unit_list(copy["id"], new_tl, cid)) == units_before, "角色状态未随件"
     assert len(case.store.event_ids(copy["id"], new_tl)) == events_before, "事件未随件"
     assert "问一句" in imported, "用户侧对话未随件"
-    # 角色侧回复：出站正文存在 parts 列，导出语句只取 text 列 → 导出件里是 null
-    assert '"role": "character"' in exported_rows and '"text": null' in exported_rows
-    assert "答一句" not in imported
-    return "FAIL", (
-        "水位、角色单元、事件、用户侧对话都随件；但**角色回复正文在导出时丢失**：出站消息正文存在 message.parts，"
-        "而导出用的 instance_messages 只 SELECT m.text → 导出件里 character 行 text=null，导入后副本里读不到那条回复。"
-        "最小复现：scripts/_audit_design.py::c_roundtrip（say() 落一轮「问一句/答一句」→ 导出 → 导入 → 副本历史里只有「问一句」；"
-        "导出行实测 " + exported_rows[:120] + "）；"
-        "证据：isekai_core/store.py:1284-1293（instance_messages 只取 text）、store.py:1385-1392（message_text：出站正文在 parts）、"
-        "isekai_core/world/portable.py:46-70 + _restore_sessions:portable.py:338-365（直接把这些行写回副本）"
+    # 角色侧回复：出站正文存在 parts 列，导出必须把正文带出来（store.instance_messages 走 message_text）
+    assert '"role": "character"' in exported_rows, exported_rows[:200]
+    assert '"text": null' not in exported_rows, "导出件里出现空正文行"
+    assert "答一句" in exported_rows and "答一句" in imported, "角色回复没随件"
+    return "PASS", (
+        f"水位随件（{watermark}）、角色单元 {units_before} 条与事件 {events_before} 条随件、"
+        f"用户侧「问一句」与角色侧「答一句」都在副本历史里可读；"
+        f"证据：portable.write_export / import_instance + store.instance_messages:1980（出站行取 message_text）"
     )
 
 
@@ -1220,26 +1226,33 @@ def c_version_duties(case: Case) -> tuple[str, str]:
     mark = case.world.commit(info["id"], tl, note="职责")
     snap = case.store.commit_snapshot_get(mark["id"])
     assert {"rules_version", "data_format", "seed"} <= set(snap), sorted(snap)
-    hits = [
-        f"{p.relative_to(ROOT).as_posix()}:{i}"
-        for p in (ROOT / "isekai_core").rglob("*.py")
-        for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
-        if "fingerprint" in line.lower()
-    ]
-    model_record = [
-        f"{p.relative_to(ROOT).as_posix()}:{i}"
-        for p in (ROOT / "isekai_core").rglob("*.py")
-        for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
-        if "llm.model" in line or "cfg.llm" in line
-    ]
-    assert hits == ["isekai_core/runtime/embedding.py:26"], hits
-    return "FAIL", (
-        "两件到位、第三件缺失：数据格式（实例行与提交快照都带 data_format，导入按主版本闸门）与规则版本"
-        "（快照带 rules_version + 实测参与事件抽样复算）都落地；但「生成器 / 提示词 / 文本模型指纹」全代码库零实现"
-        f"（fingerprint 仅 {hits} 一处，那是 embedding 向量缓存的模型指纹，不是文本产物边界）；"
-        f"管理元数据也不记录生成模型 / 提示词（全树 {len(model_record)} 处 llm 配置读取，无一处写进实例行、提交行或快照）。"
-        "最小复现：scripts/_audit_design.py::c_version_duties（断言提交快照字段 + 全库 fingerprint 命中）；"
-        "证据：isekai_core/version.py:1-20 声明三件套，实际只有 DATA_FORMAT_VERSION / RULES_VERSION 两个常量"
+    # 第三件（生成器 / 提示词 / 文本模型指纹）也已落地：
+    # ① 行为级：指纹是纯函数（同输入同值、换模型即变）——version.generator_fingerprint
+    # ② 写点：包 meta 盖 generator_fingerprint（world/generator.py）、回复行盖 model_fingerprint（session.py）
+    # ③ 边界：回复行那一处由会话服务在真实轮次里落库，本探针不经服务（say() 直写 store），
+    #    所以只验到「列存在 + store 往返 + 写点存在」；真实轮次的取证属能力边界，如实标出。
+    from isekai_core.version import generator_fingerprint
+
+    stamp = generator_fingerprint(segments=("world",), hints=("季风",), model="m-1")
+    assert stamp, "生成器指纹为空"
+    assert stamp == generator_fingerprint(segments=("world",), hints=("季风",), model="m-1"), "同输入指纹不稳"
+    assert stamp != generator_fingerprint(segments=("world",), hints=("季风",), model="m-2"), "换模型指纹没变"
+    gen_src = (ROOT / "isekai_core" / "world" / "generator.py").read_text(encoding="utf-8")
+    sess_src = (ROOT / "isekai_core" / "session.py").read_text(encoding="utf-8")
+    store_src = (ROOT / "isekai_core" / "store.py").read_text(encoding="utf-8")
+    assert "generator_fingerprint" in gen_src, "包 meta 没盖生成器指纹"
+    assert "model_fingerprint" in sess_src and "model_fingerprint" in store_src, "回复行没有模型指纹写点"
+    mid = say(case, info["id"], tl, _cid, env="env-v", text="问", reply="答")
+    con = case.store._conn  # noqa: SLF001
+    con.execute("UPDATE message SET model_fingerprint='m-1' WHERE message_id=?", (mid,))
+    con.commit()
+    got = con.execute("SELECT model_fingerprint FROM message WHERE message_id=?", (mid,)).fetchone()
+    assert got and got[0] == "m-1", f"回复行的模型指纹列不可用：{got}"
+    return "PASS", (
+        "三件各自落地且不互相替代：① 数据格式与规则版本进实例行与提交快照"
+        f"（snap 键 {sorted(snap)[:4]}…）；② 生成器指纹是纯函数（同输入同值、换模型即变：{stamp[:12]}…）；"
+        "③ 回复行带 model_fingerprint（列 + store 往返 + session.py 写点）。"
+        "边界：恢复/查询走 store 层取证；真实轮次由会话服务落库这一环本探针不经服务，未作行为级断言"
     )
 
 
