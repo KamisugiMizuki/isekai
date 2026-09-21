@@ -90,10 +90,12 @@
             <select id="inst-cards-select" aria-label="创建实例用的角色卡" multiple size="3"></select>
             <input id="inst-name-input" placeholder="实例显示名（可留空）" />
             <button id="inst-create" class="primary">创建实例</button>
+            <span id="inst-create-note" class="muted note"></span>
           </div>
           <div class="row">
             <select id="import-select" aria-label="导出件（导入为实例）"></select>
             <button id="inst-import">导入为实例</button>
+            <span id="inst-import-note" class="muted note"></span>
           </div>
           <div class="row hidden" id="inst-convert-row">
             <button id="inst-convert">转换…</button>
@@ -112,6 +114,7 @@
             <button id="card-confirm">确认卡片</button>
             <input id="card-file" placeholder="文件名，如 tihe.card.json" />
             <button id="card-template">新建骨架</button>
+            <span id="card-select-note" class="muted note"></span>
           </div>
           <div class="row">
             <select id="card-package-select" aria-label="归属世界包（导入角色卡用）"></select>
@@ -129,6 +132,7 @@
             <select id="card-add-timeline" aria-label="补卡的目标时间线"></select>
             <input id="card-add-note" placeholder="加入说明（可留空，如：从北岸调来）" />
             <button id="card-add">补卡：补入上面的实例 / 时间线</button>
+            <span id="card-add-result" class="muted note"></span>
           </div>
           <p class="muted">补入用上面「世界实例」选中的实例与上面「角色卡」选中的卡片；加入点不早于实例初始时刻、不晚于已完成水位，补入本身不激活冻结线。</p>
           <dl id="card-add-facts" class="facts"></dl>
@@ -152,6 +156,12 @@
             <button id="clock-set-rate">设定倍率</button>
             <span id="clock-note" class="muted note"></span>
           </div>
+          <div class="row">
+            <select id="commit-select" aria-label="回滚点（提交）"></select>
+            <button id="rollback">回滚到该提交…</button>
+            <span id="rollback-note" class="muted note"></span>
+          </div>
+          <p class="muted">回滚点是提交（由自动提交与退出补做产生）；回滚是覆盖语义：把这条线的有效历史退到所选提交，之后的世界时间与事件按回滚语义处理。</p>
           <h3 id="group-roles">多角色与披露（阶段 5）</h3>
           <div class="row">
             <select id="role-select" aria-label="会话角色"></select>

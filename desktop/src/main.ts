@@ -320,6 +320,33 @@ function openFirstWorld(): void {
   brief.focus();
 }
 
+/// 设置面落点：切到设置页并把生成模型的 API Key 输入框顶到眼前（同样只导航与聚焦）
+function openApiKeyField(): void {
+  document.querySelector<HTMLButtonElement>('nav .nav[data-pane="settings"]')?.click();
+  const field = $<HTMLInputElement>("set-api-key");
+  field.scrollIntoView({ block: "center" });
+  field.focus();
+}
+
+/// 生成前的付费闸门（世界包与角色卡共用这一处）：没配 API Key 就不弹确认框 ——
+/// 否则第一次生成是一堵没有门的墙：用户付出等待，只拿回核心的原始错误。
+/// 这里直接在发起按钮旁的行内槽写「去设置面填 Key」+ 一个真跳转（照 openFirstWorld 的写法）。
+function apiKeyBlocked(settings: SettingsPayload, slotId: string): boolean {
+  if (settings.llm.api_key_set) return false;
+  const note = document.getElementById(slotId);
+  if (note) {
+    note.className = "muted note bad";
+    note.textContent = "还没配 API Key：去设置面「生成模型」填 Key";
+    const jump = document.createElement("button");
+    jump.type = "button";
+    jump.className = "link api-key-jump"; // 用类不用 id：两组可能同时给出闸门提示，id 会撞
+    jump.textContent = "去填 Key";
+    jump.addEventListener("click", () => openApiKeyField());
+    note.appendChild(jump);
+  }
+  return true;
+}
+
 function chip(text: string, kind: string): HTMLElement {
   const element = document.createElement("span");
   element.className = `chip small ${kind}`;
@@ -1206,6 +1233,7 @@ function fillSettings(settings: SettingsPayload): void {
   state.configFile = String(settings.core.config_file ?? "");
   renderFacts($("settings-facts"), [
     ["当前模型", String(settings.llm.model ?? "-")],
+    ["API Key", settings.llm.api_key_set ? "已配置（读取打码）" : "未配置：AI 生成会先提示去填 Key"],
     ["最近一次变更", changedLabel(Number(settings.llm.changed_at ?? 0))],
     ["配置文件", String(settings.core.config_file ?? "-")],
     ["单段上限 / 单批段数", `${settings.core.max_text_len} / ${settings.core.max_parts}`],
@@ -1876,8 +1904,12 @@ async function loadWorld(): Promise<void> {
   const selected = $<HTMLSelectElement>("inst-select").value;
   world.instanceId = selected;
   renderDeleteGate();
-  if (selected) void showInstance(selected);
-  else renderFacts($("world-facts"), [["实例", "还没有实例"]]);
+  // 详情这次等它渲染完：不等的话 showInstance 的异步续写会晚于动作结果落槽，把结果盖回旧文案
+  if (selected) await showInstance(selected);
+  else {
+    renderFacts($("world-facts"), [["实例", "还没有实例"]]);
+    void loadCommits(); // 零实例：回滚区照实说「先选一个实例与时间线」
+  }
   void loadDrafts();
 }
 
@@ -1935,6 +1967,7 @@ async function showInstance(instanceId: string): Promise<void> {
     renderTimelines();
     renderSessionList();
     await refreshClock(info.id, world.timeline);
+    void loadCommits(); // 回滚点跟着当前查看的实例 / 时间线走
     void loadUsage();
   } catch (error) {
     // 实例详情读不出来属于跨组事实（选择、重命名、导出、删除全靠它）：写页顶并给「回到该组」锚点
@@ -1944,19 +1977,20 @@ async function showInstance(instanceId: string): Promise<void> {
 
 /* ---------- 删除闸门（§3.2）：离开实例选择行，要求键入实例名，同处写明保留什么 ---------- */
 
-let deleteResult = "";
+/// 删除行的默认提示（保留清单）：换实例时复位；删除结果留在这一行自己的槽里（#inst-delete-note）
+const DELETE_HINT = "将保留：世界包 / 角色卡 / 导出件";
 
 function instanceNameOf(id: string): string {
   return world.instances.find((item) => item.id === id)?.name ?? "";
 }
 
-/// 删除按钮只在键入的名字与选中实例完全一致时可点（浏览器原生 OK 即执行的破坏性路径先过这道闸）
+/// 删除按钮只在键入的名字与选中实例完全一致时可点（浏览器原生 OK 即执行的破坏性路径先过这道闸）。
+/// 这里只动闸门（disable / enable），不写提示槽：结果槽由动作自己写，不需要再拿缓存对抗 loadWorld。
 function renderDeleteGate(): void {
   const id = $<HTMLSelectElement>("inst-select").value;
   const name = instanceNameOf(id);
   const typed = $<HTMLInputElement>("inst-delete-name").value.trim();
   $<HTMLButtonElement>("inst-delete").disabled = !name || typed !== name;
-  $("inst-delete-note").textContent = deleteResult || "将保留：世界包 / 角色卡 / 导出件";
 }
 
 function currentCharacterName(cardId: string): string {
@@ -2173,6 +2207,97 @@ async function refreshClockChip(): Promise<void> {
   }
   chip.classList.remove("hidden");
   chip.textContent = `${clock.label}　倍率 ${clock.rate}${clock.catching_up ? "　追赶中" : ""}`;
+}
+
+/* ---------- 回滚入口（§七）：提交列表 → 二次确认 → 覆盖语义 ---------- */
+
+/// 上一次由「列表加载」写进回滚槽的文本。列表加载与回滚动作都会写这一行，
+/// 而 showInstance 里的加载不是 await 的（可能晚于动作结果落槽），所以要能分清
+/// 「槽里现在是加载写的」还是「动作结果」：只有前者允许被下一次加载改写。
+let commitsLoadText = "";
+
+function commitsNote(text: string, bad = false): void {
+  const note = $("rollback-note");
+  if (note.textContent && note.textContent !== commitsLoadText) return; // 槽里是动作结果：不动
+  note.className = bad ? "muted note bad" : "muted note";
+  note.textContent = text;
+  commitsLoadText = text;
+}
+
+/// 回滚点（提交）列表：只显示管理元数据（时间 / 世界时刻 / 备注 / 标识尾段）。
+/// 提交由自动提交与退出补做产生，壳里不提供手动提交入口（YAGNI）。
+async function loadCommits(): Promise<void> {
+  const select = $<HTMLSelectElement>("commit-select");
+  if (!mgmt || !world.instanceId || !world.timeline) {
+    fillSelect(select, []);
+    commitsNote("先选一个实例与时间线");
+    return;
+  }
+  try {
+    const listed = await mgmt.call("runtime.commits", {
+      instance_id: world.instanceId,
+      timeline_id: world.timeline,
+    });
+    const commits = (listed.commits ?? []) as Array<{
+      id: string;
+      moment: number;
+      note: string;
+      created_at: number;
+    }>;
+    // 最新的排在最前（核心按 created_at 升序给）：首次加载默认选中最近一个回滚点，
+    // 之后 fillSelect 会保留用户上一次的选择（列在下面的不会因为新提交出现而被顶掉）
+    fillSelect(
+      select,
+      [...commits].reverse().map((item) => [
+        item.id,
+        `${stamp(item.created_at)}｜世界 ${item.moment} 秒｜${item.note || "（无备注）"}｜${item.id.slice(-6)}`,
+      ]),
+    );
+    // 空列表照实说：不伪造回滚点，也不假装「暂无可回滚内容」
+    commitsNote(commits.length ? "" : "还没有回滚点：提交由自动提交与退出补做产生");
+  } catch (error) {
+    commitsNote(String(error), true);
+  }
+}
+
+/// 回滚（§七，覆盖语义）：先把后果写清楚再问一次（照现有破坏性操作的披露风格）。
+/// 参数名取自核心：ops.py `_version_rollback` 收 instance_id / timeline_id / commit_id / confirm。
+async function rollbackToCommit(): Promise<string> {
+  if (!mgmt) throw new Error("管理面未连接");
+  const select = $<HTMLSelectElement>("commit-select");
+  const commitId = select.value;
+  if (!world.instanceId || !world.timeline) throw new Error("先选一个实例与时间线");
+  if (!commitId) throw new Error("还没有回滚点：提交由自动提交与退出补做产生");
+  const label = select.selectedOptions[0]?.textContent ?? commitId;
+  const ok = window.confirm(
+    `将「${timelineName(world.timeline)}」回滚到 ${label}？\n` +
+      "· 回滚是覆盖语义：将回滚到该提交，之后的世界时间与事件会按回滚语义处理，这条线的有效历史退到该提交\n" +
+      "· 已经投递到外部平台的回复收不回来（核心会回报条数）\n" +
+      "· 本线此前若已冻结，回滚后仍停在回滚点；要对话需显式激活\n" +
+      "继续？",
+  );
+  if (!ok) return "已取消，未回滚";
+  const result = (await mgmt.call("runtime.rollback", {
+    instance_id: world.instanceId,
+    timeline_id: world.timeline,
+    commit_id: commitId,
+    confirm: true,
+  })) as unknown as {
+    commit?: { id?: string };
+    world?: number;
+    generation?: number;
+    voided_inputs?: number;
+    cancelled_replies?: number;
+    delivered_replies_kept?: number;
+    warning?: string;
+  };
+  const delivered = Number(result.delivered_replies_kept ?? 0);
+  return (
+    `已回滚到 ${result.commit?.id ?? commitId}：世界 ${result.world} 秒（世代 ${result.generation}），` +
+    `作废在途输入 ${result.voided_inputs ?? 0} 条 / 取消未投递回复 ${result.cancelled_replies ?? 0} 条` +
+    (delivered ? `，已投递回复 ${delivered} 条收不回` : "") +
+    `。${result.warning ?? ""}`
+  );
 }
 
 let mgmtRebuilding = false;
@@ -2392,8 +2517,8 @@ async function convertSelectedInstance(): Promise<string> {
     | undefined;
   if (!first) throw new Error("核心未回转换结果");
   if (!first.needs_confirmation) {
-    $("inst-convert-note").textContent = [first.reason, first.hint].filter(Boolean).join("；");
-    return first.hint ?? first.reason ?? "";
+    // 结果交给动作落槽（worldAction 在刷新之后回填）：这里不自己写槽，免得被随后的实例重渲染盖掉
+    return [first.reason, first.hint].filter(Boolean).join("；");
   }
   $("inst-convert-note").textContent = String(first.reason ?? "");
   const ok = window.confirm(
@@ -2472,18 +2597,20 @@ function bindWorld(): void {
   $("world-refresh").addEventListener("click", () => void loadWorld());
   $("world-note-jump").addEventListener("click", () => jumpToWorldGroup());
   $("pkg-import").addEventListener("click", () => void worldAction(importPackage, "pkg-note"));
-  $("card-import").addEventListener("click", () => void worldAction(importCard, "card-note"));
+  $("card-import").addEventListener("click", () => void worldAction(importCard, "card-import-note"));
   $<HTMLSelectElement>("card-package-select").addEventListener("change", () =>
     renderCardImportGate(),
   );
   $("inst-convert").addEventListener("click", () =>
     void worldAction(convertSelectedInstance, "inst-convert-note"),
   );
-  $("card-add").addEventListener("click", () => void worldAction(addCharacter, "card-note"));
+  $("card-add").addEventListener("click", () => void worldAction(addCharacter, "card-add-result"));
   $("draft-continue").addEventListener("click", () => void worldAction(continueDraft, "draft-note"));
   $("draft-discard").addEventListener("click", () => void worldAction(discardDraft, "draft-note"));
+  $("rollback").addEventListener("click", () => void worldAction(rollbackToCommit, "rollback-note"));
   $<HTMLSelectElement>("inst-select").addEventListener("change", (event) => {
-    deleteResult = "";
+    $("inst-delete-note").textContent = DELETE_HINT; // 换实例：删除行的提示回到保留清单（结果不跨实例残留）
+    commitsNote(""); // 回滚行的结果也不跨实例残留（commitsNote 不会盖掉正在显示的动作结果）
     void showInstance((event.target as HTMLSelectElement).value).then(() => renderDeleteGate());
   });
   $<HTMLInputElement>("inst-delete-name").addEventListener("input", () => renderDeleteGate());
@@ -2560,6 +2687,7 @@ function bindWorld(): void {
       if (!brief) throw new Error("先写一段世界描述");
       const file = $<HTMLInputElement>("pkg-file").value.trim() || "world.json";
       const settings = (await mgmt!.call("settings.get")) as unknown as SettingsPayload;
+      if (apiKeyBlocked(settings, "pkg-note")) return ""; // 没配 Key：不弹确认框，也不发起调用
       const ok = window.confirm(
         `将向 ${settings.llm.model}（${settings.llm.base_url}）发送你填写的世界描述与生成上下文，` +
           `预计调用 3–6 次（含重试，上限 ${GENERATE_LIMIT.package} 次），最长等 ${GENERATE_TIMEOUT_MS / 60000} 分钟；` +
@@ -2607,7 +2735,7 @@ function bindWorld(): void {
       });
       await mgmt!.call("world.card.save", { card_path: file, card: created.card });
       return `已写入 ${file}（骨架未确认）`;
-    }, "card-note"),
+    }, "card-select-note"),
   );
 
   $("card-generate").addEventListener("click", () =>
@@ -2619,6 +2747,7 @@ function bindWorld(): void {
       if (!pkg) throw new Error("先选一个世界包");
       if (!brief) throw new Error("先写一段角色描述");
       const settings = (await mgmt!.call("settings.get")) as unknown as SettingsPayload;
+      if (apiKeyBlocked(settings, "card-note")) return ""; // 没配 Key：不弹确认框，也不发起调用（与世界包共用同一道闸）
       const ok = window.confirm(
         `将向 ${settings.llm.model}（${settings.llm.base_url}）发送角色描述与目标世界包，` +
           `预计调用 1–2 次（上限 ${GENERATE_LIMIT.card} 次），最长等 ${GENERATE_TIMEOUT_MS / 60000} 分钟；` +
@@ -2663,7 +2792,7 @@ function bindWorld(): void {
       await mgmt!.call("world.card.confirm", { package_path: pkg, card_path: card });
       showErrors("card-errors", []);
       return `${card} 已确认，可用于创建实例`;
-    }, "card-note"),
+    }, "card-select-note"),
   );
 
   $("inst-create").addEventListener("click", () =>
@@ -2683,7 +2812,7 @@ function bindWorld(): void {
       });
       const info = result.instance as unknown as InstanceEntry;
       return `已创建实例「${info.name}」（默认冻结）`;
-    }, "inst-note"),
+    }, "inst-create-note"),
   );
 
   $("inst-rename-btn").addEventListener("click", () =>
@@ -2715,10 +2844,10 @@ function bindWorld(): void {
       const result = await mgmt!.call("instance.import", { path: file });
       const info = result.instance as unknown as InstanceEntry;
       return `已导入为「${info.name}」（默认冻结）`;
-    }, "inst-note"),
+    }, "inst-import-note"),
   );
 
-  /// 删除（§3.2）：独立一行 + 键入实例名确认；结果写这一行自己的槽，不动实例行
+  /// 删除（§3.2）：独立一行 + 键入实例名确认；结果与失败都写这一行自己的槽（失败也走 #inst-delete-note）
   $("inst-delete").addEventListener("click", () =>
     void worldAction(async () => {
       const id = $<HTMLSelectElement>("inst-select").value;
@@ -2737,11 +2866,9 @@ function bindWorld(): void {
         return "";
       }
       await mgmt!.call("instance.delete", { id });
-      deleteResult = `已删除「${name}」`;
       $<HTMLInputElement>("inst-delete-name").value = "";
-      $("inst-delete-note").textContent = deleteResult;
-      return "";
-    }, "inst-note"),
+      return `已删除「${name}」`;
+    }, "inst-delete-note"),
   );
 }
 

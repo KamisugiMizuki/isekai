@@ -305,27 +305,30 @@ def bring_front(hwnd: int) -> None:
     user32.SetForegroundWindow(hwnd)
 
 
-def type_keys(*vk_codes: int) -> None:
-    user32 = ctypes.windll.user32
-    for vk in vk_codes:
-        user32.keybd_event(vk, 0, 0, 0)
-    for vk in reversed(vk_codes):
-        user32.keybd_event(vk, 0, 2, 0)
-
-
 def dialog_pid(hwnd: int) -> int:
     pid = ctypes.c_ulong()
     ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return int(pid.value)
 
 
+def window_text(hwnd: int) -> str:
+    """读控件文本：必须走 WM_GETTEXT（GetWindowText 拿不到别的进程里的控件文本，返回空串）。"""
+    buffer = ctypes.create_unicode_buffer(1024)
+    ctypes.windll.user32.SendMessageW(hwnd, 0x000D, 1024, buffer)  # WM_GETTEXT
+    return buffer.value
+
+
 def drive_open_dialog(path: str, title_needle: str, timeout: float = 30.0) -> tuple[int, str]:
     """真驱动原生「打开」文件对话框，返回 (hwnd, 观察文本)。
 
     壳的 pick_file 是原生对话框，装不了 stub（`__TAURI_INTERNALS__.invoke` 是
-    writable:false，赋值静默失败；2026-09 实测），所以只能真驱动：
-    等对话框出现 → 给文件名框 WM_SETTEXT 绝对路径 → 真鼠标点「打开」按钮。
-    Shell 风格对话框不认 PostMessage(WM_COMMAND/IDOK)，必须真点按钮。
+    writable:false，赋值静默失败；2026-09 实测），只能真驱动。2026-09 实测到两条教训：
+    · 鼠标点不可靠：对话框不一定在前台（SetForegroundWindow 受前台限制），同一屏幕位置上还
+      可能压着别的进程的窗口（实测 WindowFromPoint 命中过另一个 pid 的 Button）→ 点了没反应；
+    · 光 WM_SETTEXT 不够：Shell 风格对话框靠文件名框的 EN_CHANGE 把「选了哪个文件」交给自己的
+      状态机，WM_SETTEXT 不触发那条通知，随后的按钮点击会被当成「没选文件」而取消。
+    所以主路径是「逐字 WM_CHAR 输入（与真人打字同一条通知路径）→ 直接给「打开」按钮发 BM_CLICK」，
+    不依赖焦点与屏幕坐标；失败就重打重试，最多三轮，绝不点别处的窗口。
     """
     hwnd = 0
     deadline = time.time() + timeout
@@ -334,28 +337,45 @@ def drive_open_dialog(path: str, title_needle: str, timeout: float = 30.0) -> tu
         time.sleep(0.4)
     if not hwnd:
         return 0, f"原生对话框（标题含「{title_needle}」）未出现"
-    bring_front(hwnd)
-    time.sleep(0.8)
     children = child_windows(hwnd)
+    # y 最大的是文件名框（y 最小的是地址栏 / 搜索框）
     edits = sorted({(h, r) for h, cls, _t, r in children if cls.lower() in ("edit", "richedit50w")},
-                   key=lambda item: item[1][1])            # y 最大的是文件名框（最小的是搜索框）
+                   key=lambda item: item[1][1])
     buttons = [item for item in sorted({(h, t, r) for h, cls, t, r in children
                                         if cls.lower() == "button"})
                if "Open" in item[1] or "打开" in item[1]]
     if not edits or not buttons:
         return hwnd, (f"对话框 hwnd={hwnd} 里没找到文件名框 / 「打开」按钮"
                       f"（edit={len(edits)} button={len(buttons)}）")
-    set_text(edits[-1][0], str(path))
-    time.sleep(0.5)
-    rect = buttons[0][2]
-    click_at((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
-    for _ in range(12):
+    edit_h, (btn_h, btn_label, _rect) = edits[-1][0], buttons[0]
+
+    def type_path() -> str:
+        set_text(edit_h, "")
+        time.sleep(0.2)
+        for char in str(path):
+            ctypes.windll.user32.SendMessageW(edit_h, 0x0102, ord(char), 0)  # WM_CHAR
         time.sleep(0.5)
-        if not ctypes.windll.user32.IsWindow(hwnd):
-            return hwnd, f"原生对话框 hwnd={hwnd}：文件名框写入 {path}，点「{buttons[0][1]}」后被接受"
+        return window_text(edit_h)
+
+    def closed(seconds: float) -> bool:
+        end = time.time() + seconds
+        while time.time() < end:
+            time.sleep(0.4)
+            if not ctypes.windll.user32.IsWindow(hwnd):
+                return True
+        return False
+
+    typed = ""
+    for attempt in range(3):
+        typed = type_path()          # 每轮重打一遍：对话框可能把输入重置了
+        ctypes.windll.user32.SendMessageW(btn_h, 0x00F5, 0, 0)   # BM_CLICK
+        if closed(6.0):
+            return hwnd, (f"原生对话框 hwnd={hwnd}：文件名框逐字输入 {path}（读回={typed!r}），"
+                          f"点「{btn_label}」后被接受")
     pid = dialog_pid(hwnd)
     subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)  # 别把模态框留在桌面上
-    return hwnd, f"原生对话框 hwnd={hwnd}（pid={pid}）没有关闭：写入 {path} 后点「{buttons[0][1]}」未被接受"
+    return hwnd, (f"原生对话框 hwnd={hwnd}（pid={pid}）没有关闭：逐字输入 {path}（读回={typed!r}）后"
+                  f"三轮都没能让「{btn_label}」确认")
 
 
 # ------------------------------------------------------------------ CDP
@@ -613,6 +633,8 @@ def section_static() -> None:
     css = (REPO / "desktop" / "src" / "styles.css").read_text(encoding="utf-8")
     control_ids = ["topbar-clock", "manage-facts-box", "world-note-jump", "pkg-note", "card-note",
                    "inst-note", "inst-delete-name", "inst-delete", "inst-delete-note",
+                   "card-select-note", "card-add-result", "card-import-note", "inst-create-note",
+                   "inst-import-note", "commit-select", "rollback", "rollback-note",
                    "mem-form", "set-mem-mode", "set-mem-base-url", "set-mem-model", "set-mem-api-key",
                    "mem-note", "commit-form", "set-commit-enabled", "set-commit-minutes",
                    "set-commit-events", "commit-note", "backup-form", "set-backup-dir",
@@ -622,9 +644,25 @@ def section_static() -> None:
         "生成在途闸门（禁用 + 重入守卫）": "function setGenerateGate" in src and "generateBusy.package" in src,
         "生成进度行（已用 / 上限）": "function startProgress" in src and "function elapsedLabel" in src,
         "生成确认写明无法取消": "过程中无法取消" in src,
+        "生成前 API Key 闸门（世界包 / 角色卡共用一处）":
+            "function apiKeyBlocked" in src and "function openApiKeyField" in src
+            and "还没配 API Key" in src and 'apiKeyBlocked(settings, "pkg-note")' in src
+            and 'apiKeyBlocked(settings, "card-note")' in src,
+        "设置面 API Key 事实行（已配置 / 未配置）": '"API Key", settings.llm.api_key_set' in src,
         "删除闸门（离开实例行 + 键入实例名）": "function renderDeleteGate" in src and "将保留：世界包 / 角色卡 / 导出件" in src,
         "组内结果槽": "function groupNote" in src and "function reportNote" in src,
-        "动作结果按组落槽": 'worldAction(importPackage, "pkg-note")' in src and 'worldAction(addCharacter, "card-note")' in src,
+        "动作结果按组落槽（一行一槽）":
+            'worldAction(importPackage, "pkg-note")' in src
+            and 'worldAction(addCharacter, "card-add-result")' in src
+            and 'worldAction(importCard, "card-import-note")' in src
+            and '"inst-create-note")' in src and '"inst-import-note")' in src
+            and '}, "inst-delete-note")' in src,
+        "删除结果不再靠缓存对抗 loadWorld": "deleteResult" not in src and "const DELETE_HINT" in src,
+        "实例详情先渲染完再回填动作结果": "await showInstance(selected)" in src,
+        "回滚入口（commits → 确认 → rollback）":
+            'mgmt.call("runtime.commits"' in src and 'mgmt.call("runtime.rollback"' in src
+            and 'worldAction(rollbackToCommit, "rollback-note")' in src
+            and "还没有回滚点：提交由自动提交与退出补做产生" in src,
         "页顶锚点回跳": "function jumpToWorldGroup" in src and "worldNoteAnchor" in src,
         "顶栏世界时钟": "function refreshClockChip" in src and "function clockTarget" in src,
         "时钟轮询不再限管理页": "void refreshClockChip();\n    if (!$(\"pane-manage\")" in src,
@@ -974,7 +1012,7 @@ async def section_main() -> None:
     await cdp.js("document.getElementById('card-add-note').value='审计未审定';"
                  "document.getElementById('card-add').click()")
     await asyncio.sleep(3.0)
-    note_bad = await note_of(cdp, "card-note", "world-note")
+    note_bad = await note_of(cdp, "card-add-result", "card-note", "world-note")
     units_mid = one(root, "SELECT COUNT(*) FROM unit")
     joins_mid = one(root, "SELECT COUNT(*) FROM character_join")
     check("M16 §十.19 补卡用未审定卡被拒，且不留半个角色",
@@ -1144,12 +1182,14 @@ async def section_main() -> None:
     checked_pkg = await cdp.js("document.getElementById('pkg-select').value")
     slots = await cdp.js(
         "['pkg-note','card-note','inst-note','draft-note','clock-note','role-note','disclose-note',"
-        "'card-import-note','card-add-facts','world-facts'].filter(i=>!!document.getElementById(i)).length")
+        "'card-import-note','card-select-note','card-add-result','inst-create-note','inst-import-note',"
+        "'inst-delete-note','rollback-note','card-add-facts','world-facts'].filter(i=>!!document.getElementById(i)).length")
     check("M36 §3.1 动作结果就近落在本组的行内槽（页顶只留跨组 / 严重事件）",
-          "PASS" if ("通过校验" in str(checked) and not str(top_note).strip() and (slots or 0) == 10) else "FAIL",
+          "PASS" if ("通过校验" in str(checked) and not str(top_note).strip() and (slots or 0) == 16) else "FAIL",
           f"点「校验」（选 {checked_pkg}）→ 世界包组结果槽="
           f"{checked!r}；同一时刻页顶 #world-note={top_note!r}（应为空：组内结果不再挤页顶）；"
-          f"每组行内槽存在={slots}/10（世界包 / 角色卡 / 实例 / 草稿 / 运行 / 角色 / 披露 / 卡导入 / 补卡事实 / 实例事实）",
+          f"每组行内槽存在={slots}/16（世界包 / 角色卡生成 / 实例 / 草稿 / 运行 / 角色 / 披露 / 卡导入 / "
+          f"卡选择行 / 补卡行 / 创建实例行 / 导入实例行 / 删除行 / 回滚行 / 补卡事实 / 实例事实）",
           clause="§3.1 结果回到动作旁边（1800px 长页只有一个页顶槽时，结果常落在屏幕外）",
           code="desktop/index.html（各组 .note 槽） · main.ts groupNote / reportNote / worldAction(slot)")
     # 页顶锚点：跨组事件带「回到该组」入口
@@ -1540,9 +1580,9 @@ async def section_main() -> None:
           expected="没选包时入口不可点且写明要先选包；超限文件带「加载限额」原因被拒，不落盘")
 
     # ④ 好卡：对着已导入的包做联合校验 → 卡列表出现并选中
-    await clear_notes(cdp, "card-note", "world-note")
+    await clear_notes(cdp, "card-note", "card-import-note", "world-note")
     drive4 = await pick_import_file(cdp, "card-import", good_card, "选择要导入的角色卡")
-    card_note = await wait_note(cdp, ("card-note", "world-note"), "已导入", 45)
+    card_note = await wait_note(cdp, ("card-import-note", "card-note", "world-note"), "已导入", 45)
     card_view = await cdp.js("({opts:[...document.getElementById('card-select').options].map(o=>o.value),"
                              " sel: document.getElementById('card-select').value})")
     core_cards = [str(item.get("file")) for item
@@ -1592,6 +1632,288 @@ async def section_main() -> None:
           clause="§7.6 打开实例做兼容检查：convertible / blocked 才提示转换与原因；没有可信转换器就停在提示上",
           code="desktop/src/main.ts convertSelectedInstance · isekai_core/world/instances.py:215-243",
           expected="compatible 不显示入口；不兼容显示入口，点开显示核心给的 reason 与「用兼容版本」提示，不改数据")
+
+    # ---- I6 §3.3/P0：没配 API Key 时点「AI 生成」不弹确认框，行内槽直接给「去填 Key」+ 真跳转
+    await cdp.pane("settings")
+    await cdp.wait("document.getElementById('settings-facts').textContent", "当前模型", 25)
+    facts_key_on = await cdp.js("document.getElementById('settings-facts').textContent")
+    await cdp.pane("manage")
+    key_off = ((await mgmt_call(cdp, "settings.set", llm={"api_key": ""})).get("llm") or {})
+    key_read_off = ((await mgmt_call(cdp, "settings.get")).get("llm") or {})
+    await clear_notes(cdp, "pkg-note", "world-note")
+    await cdp.js("document.getElementById('pkg-brief').value='审计 I6 未配 Key 的世界描述';"
+                 "document.getElementById('pkg-file').value='a2nokey.json';"
+                 "window.__confirmArgs=[]; window.__opLog.length=0;"
+                 "window.confirm=(m)=>{window.__confirmArgs.push(String(m)); return false;};"
+                 "document.getElementById('pkg-generate').click()")
+    gate_note = await cdp.wait("document.getElementById('pkg-note').textContent", "还没配 API Key", 25)
+    gate = await cdp.js("({text: document.getElementById('pkg-note').textContent,"
+                        " link: !!document.querySelector('#pkg-note button.api-key-jump'),"
+                        " confirms: window.__confirmArgs.length,"
+                        " called: (window.__opLog||[]).includes('world.package.generate')})")
+    await cdp.js("document.querySelector('#pkg-note button.api-key-jump').click()")
+    await asyncio.sleep(1.5)
+    jump = await cdp.js("({pane: !document.getElementById('pane-settings').classList.contains('hidden'),"
+                        " focus: (document.activeElement||{}).id || '',"
+                        " facts: document.getElementById('settings-facts').textContent})")
+    # 角色卡生成走同一道闸（共用一处）：也只在行内槽给跳转，不弹确认框
+    await cdp.pane("manage")
+    await cdp.select("pkg-select", "w0.json")
+    await clear_notes(cdp, "card-note", "world-note")
+    await cdp.js("document.getElementById('card-brief').value='审计 I6 未配 Key 的角色描述';"
+                 "window.__confirmArgs=[]; window.__opLog.length=0;"
+                 "document.getElementById('card-generate').click()")
+    card_gate = await cdp.wait("document.getElementById('card-note').textContent", "还没配 API Key", 25)
+    card_gate_state = await cdp.js("({link: !!document.querySelector('#card-note button.api-key-jump'),"
+                                   " confirms: window.__confirmArgs.length,"
+                                   " called: (window.__opLog||[]).includes('world.card.generate')})")
+    # 把 Key 配回去：正常路径必须恢复（再点一次 → 确认框回来 → 取消）
+    key_back = ((await mgmt_call(cdp, "settings.set", llm={"api_key": FAKE_KEY})).get("llm") or {})
+    await cdp.pane("settings")
+    await cdp.wait("document.getElementById('settings-facts').textContent", "当前模型", 25)
+    facts_key_back = await cdp.js("document.getElementById('settings-facts').textContent")
+    await cdp.pane("manage")
+    await clear_notes(cdp, "pkg-note", "world-note")
+    await cdp.js("window.__confirmArgs=[];"
+                 "window.confirm=(m)=>{window.__confirmArgs.push(String(m)); return false;};"
+                 "document.getElementById('pkg-generate').click()")
+    back_note = await cdp.wait("document.getElementById('pkg-note').textContent", "已取消", 30)
+    back = await cdp.js("({confirms: window.__confirmArgs.length,"
+                        " last: window.__confirmArgs.slice(-1)[0] || '',"
+                        " stale: !!document.querySelector('#pkg-note button.api-key-jump')})")
+    ok_i6 = (key_off.get("api_key_set") is False and key_read_off.get("api_key_set") is False
+             and "还没配 API Key" in str(gate_note) and "去设置面" in str(gate["text"])
+             and gate["link"] is True and int(gate["confirms"] or 0) == 0 and not gate["called"]
+             and jump["pane"] is True and jump["focus"] == "set-api-key"
+             and "已配置" in str(facts_key_on) and "未配置" in str(jump["facts"])
+             and "还没配 API Key" in str(card_gate) and card_gate_state["link"] is True
+             and int(card_gate_state["confirms"] or 0) == 0 and not card_gate_state["called"]
+             and key_back.get("api_key_set") is True and "已配置" in str(facts_key_back)
+             and int(back["confirms"] or 0) == 1 and "将向" in str(back["last"])
+             and "上限" in str(back["last"]) and "已取消" in str(back_note)
+             and back["stale"] is False)
+    check("I6 §3.3/P0 没配 API Key 时点「AI 生成」不弹确认框：行内槽给「还没配 API Key」+ 跳转聚焦，配回后路径恢复",
+          "PASS" if ok_i6 else "FAIL",
+          f"settings.set(api_key='') → llm.api_key_set={key_off.get('api_key_set')}（settings.get 回读"
+          f"{key_read_off.get('api_key_set')}）；点「AI 生成」（世界包）→ 确认框调用数={gate['confirms']}"
+          f"（应为 0）、槽={gate['text']!r}、跳转链存在={gate['link']}、是否发起生成调用={gate['called']}"
+          f"（应为 False）；点跳转链 → 设置页可见={jump['pane']}、焦点={jump['focus']!r}、"
+          f"事实行={str(jump['facts'])[:60]!r}（含「未配置」）；角色卡生成同一道闸："
+          f"槽={str(card_gate)[:60]!r}、链接={card_gate_state['link']}、确认框={card_gate_state['confirms']}、"
+          f"发起调用={card_gate_state['called']}；配回 Key 后 llm.api_key_set={key_back.get('api_key_set')}、"
+          f"事实行含「已配置」={'已配置' in str(facts_key_back)}；再点生成 → 确认框第 {back['confirms']} 条"
+          f"={str(back['last'])[:90]!r}…、槽={back_note!r}、槽内跳转链已消失={back['stale'] is False}",
+          clause="§3.3 生成模型：Key 是生成的前置；未配置时给可执行的下一步（设置面 + 聚焦），不弹必然失败的确认框",
+          code="desktop/src/main.ts apiKeyBlocked / openApiKeyField（世界包与角色卡共用）· fillSettings 事实行",
+          expected="无 Key：0 次确认框、槽内出现「还没配 API Key」+ 跳转链真的切页并聚焦 #set-api-key；配回后确认框与取消路径照旧")
+
+    # ---- I7 polish：四处影子槽归位（一行一槽，槽只服务本行）+ 角色卡组两个主人合并
+    slot_card = f"a2slot-{int(time.time())}.json"
+    (cfg.paths.packages / slot_card).write_text(
+        json.dumps(example_card(package, name="戊槽卡", confirmed=False), ensure_ascii=False),
+        encoding="utf-8")
+    await cdp.pane("manage")
+    await cdp.js("document.getElementById('world-refresh').click()")
+    await asyncio.sleep(2.5)
+    # ① 确认卡片 → 卡片行自己的槽（#card-select-note），不再答在生成行的槽
+    await cdp.select("pkg-select", "w0.json")
+    await cdp.select("card-select", slot_card)
+    await clear_notes(cdp, "card-select-note", "card-note", "card-import-note", "world-note")
+    await cdp.js("document.getElementById('card-confirm').click()")
+    confirm_slot = await cdp.wait("document.getElementById('card-select-note').textContent", "已确认", 40)
+    confirm_slots = await cdp.js("({select: document.getElementById('card-select-note').textContent,"
+                                 " generate: document.getElementById('card-note').textContent,"
+                                 " top: document.getElementById('world-note').textContent})")
+    # ② 补卡 → 补卡行自己的槽（#card-add-result）
+    await cdp.select("inst-select", inst)
+    await asyncio.sleep(2.0)
+    await clear_notes(cdp, "card-add-result", "card-note", "world-note")
+    await cdp.select("card-select", slot_card)
+    await cdp.js("document.getElementById('card-add-note').value='I7 槽位检查';"
+                 "window.__confirmArgs=[];"
+                 "window.confirm=(m)=>{window.__confirmArgs.push(String(m)); return true;};"
+                 "document.getElementById('card-add').click()")
+    add_slot = await cdp.wait("document.getElementById('card-add-result').textContent", "已补入", 45)
+    add_slots = await cdp.js("({add: document.getElementById('card-add-result').textContent,"
+                             " generate: document.getElementById('card-note').textContent,"
+                             " top: document.getElementById('world-note').textContent})")
+    # ③ 创建实例 → 创建行自己的槽（#inst-create-note）
+    await clear_notes(cdp, "inst-create-note", "inst-note", "world-note")
+    await cdp.js("(()=>{const s=document.getElementById('inst-package-select');"
+                 "const hit=[...s.options].find(o=>o.value==='w0.json'); if(hit) s.value=hit.value;"
+                 "const c=document.getElementById('inst-cards-select'); c.value=" + json.dumps(slot_card) + ";"
+                 "document.getElementById('inst-name-input').value='I7 创建行槽';"
+                 "document.getElementById('inst-create').click();})()")
+    create_slot = await cdp.wait("document.getElementById('inst-create-note').textContent", "已创建", 60)
+    create_slots = await cdp.js("({create: document.getElementById('inst-create-note').textContent,"
+                                " select_row: document.getElementById('inst-note').textContent,"
+                                " top: document.getElementById('world-note').textContent})")
+    made = [item for item in ((await mgmt_call(cdp, "instance.list")).get("instances") or [])
+            if str(item.get("name")) == "I7 创建行槽"]
+    made_id = str(made[0]["id"]) if made else ""
+    # ④ 导入实例 → 导入行自己的槽（#inst-import-note）
+    export_file = f"a2slot-export-{int(time.time())}.isekai.json"
+    if made_id:
+        await mgmt_call(cdp, "instance.export", id=made_id, path=export_file)
+    await cdp.js("document.getElementById('world-refresh').click()")
+    await asyncio.sleep(2.5)
+    await clear_notes(cdp, "inst-import-note", "inst-note", "world-note")
+    await cdp.select("import-select", export_file)
+    await cdp.js("document.getElementById('inst-import').click()")
+    import_slot = await cdp.wait("document.getElementById('inst-import-note').textContent", "已导入为", 60)
+    import_slots = await cdp.js("({import: document.getElementById('inst-import-note').textContent,"
+                                " select_row: document.getElementById('inst-note').textContent,"
+                                " top: document.getElementById('world-note').textContent})")
+    # ⑤ 删除失败 → 删除行自己的槽（#inst-delete-note）：UI 还拿着名字，核心已经没有这一行
+    await cdp.select("inst-select", made_id or inst)
+    await asyncio.sleep(2.0)
+    del_hint = await cdp.js("document.getElementById('inst-delete-note').textContent")
+    ui_name = await cdp.js("[...document.getElementById('inst-select').options]"
+                           f".find(o=>o.value==={json.dumps(made_id)})?.textContent.split('｜')[0] || ''")
+    await mgmt_call(cdp, "instance.delete", id=made_id)
+    await clear_notes(cdp, "inst-delete-note", "inst-note", "world-note")
+    await cdp.js("document.getElementById('inst-delete-name').value=" + json.dumps(str(ui_name)) + ";"
+                 "document.getElementById('inst-delete-name').dispatchEvent(new Event('input'));")
+    armed = await cdp.js("!document.getElementById('inst-delete').disabled")
+    await cdp.js("window.confirm=(m)=>{window.__confirmArgs.push(String(m)); return true;};"
+                 "document.getElementById('inst-delete').click()")
+    del_note = await cdp.wait("document.getElementById('inst-delete-note').textContent", "实例不存在", 40)
+    del_slots = await cdp.js("({del: document.getElementById('inst-delete-note').textContent,"
+                             " select_row: document.getElementById('inst-note').textContent,"
+                             " top: document.getElementById('world-note').textContent})")
+    await cdp.js("document.getElementById('world-refresh').click()")   # 收尾：列表回到核心真值
+    await asyncio.sleep(2.0)
+    ok_i7 = ("已确认" in str(confirm_slot) and not str(confirm_slots["generate"]).strip()
+             and not str(confirm_slots["top"]).strip()
+             and "已补入" in str(add_slot) and not str(add_slots["generate"]).strip()
+             and not str(add_slots["top"]).strip()
+             and "已创建" in str(create_slot) and "已创建" not in str(create_slots["select_row"])
+             and not str(create_slots["top"]).strip()
+             and "已导入为" in str(import_slot) and "已导入为" not in str(import_slots["select_row"])
+             and not str(import_slots["top"]).strip()
+             and del_hint.strip() == "将保留：世界包 / 角色卡 / 导出件" and armed is True
+             and "实例不存在" in str(del_note) and "实例不存在" not in str(del_slots["select_row"])
+             and not str(del_slots["top"]).strip())
+    check("I7 polish 四处影子槽归位：槽只服务本行（补卡 / 创建实例 / 导入实例 / 删除失败）",
+          "PASS" if ok_i7 else "FAIL",
+          f"① 确认卡片 → #card-select-note={confirm_slot!r}（生成行 #card-note={confirm_slots['generate']!r}、"
+          f"页顶={confirm_slots['top']!r}）；② 补卡 → #card-add-result={add_slot!r}"
+          f"（#card-note={add_slots['generate']!r}、页顶={add_slots['top']!r}）；"
+          f"③ 创建实例 → #inst-create-note={create_slot!r}（实例行 #inst-note={create_slots['select_row']!r}、"
+          f"页顶={create_slots['top']!r}）；④ 导入实例 → #inst-import-note={import_slot!r}"
+          f"（#inst-note={import_slots['select_row']!r}、页顶={import_slots['top']!r}）；"
+          f"⑤ 换实例后删除行提示复位={del_hint!r}、键入可点={armed}；背后删掉该实例再点删除 → "
+          f"#inst-delete-note={del_note!r}（失败也落本行；#inst-note={del_slots['select_row']!r}、"
+          f"页顶={del_slots['top']!r}）",
+          clause="§3.1 结果回到动作旁边：一行一槽，槽只服务本行；§3.2 删除失败也在删除行回报",
+          code="desktop/index.html（#card-select-note / #card-add-result / #inst-create-note / #inst-import-note）"
+               "· main.ts worldAction(slot) / renderDeleteGate（不再用缓存对抗 loadWorld）",
+          expected="每个动作的结果都落在它自己那一行的槽里，页顶只留跨组 / 严重事件；删除失败落在 #inst-delete-note")
+
+    # ---- I8 §七：回滚入口——提交列表（空列表照实说）→ 二次确认 → runtime.rollback，世界水位真的退回去
+    await cdp.pane("manage")
+    # (a) 空列表要诚实：新实例的时间线本来带一条 initial 提交，这里把它去掉，构造真正没有回滚点的线
+    #     （探针在本轮别的检查里也直接写这个临时库：data_format 改写、内部标记插入）
+    empty_inst = (await mgmt_call(cdp, "instance.create",
+                                  package_path=str(cfg.paths.packages / "w0.json"),
+                                  card_paths=[str(cfg.paths.packages / "good.json")],
+                                  display_name="I8 空回滚点")).get("instance") or {}
+    empty_id = str(empty_inst.get("id") or "")
+    empty_line = one(root, "SELECT id FROM timeline WHERE instance_id=?", (empty_id,))
+    con = sqlite3.connect(root / "data" / "isekai.db", timeout=20)
+    con.execute("PRAGMA busy_timeout=20000")
+    con.execute("DELETE FROM commit_log WHERE timeline_id=?", (empty_line,))
+    con.commit()
+    con.close()
+    empty_left = one(root, "SELECT COUNT(*) FROM commit_log WHERE timeline_id=?", (empty_line,))
+    await cdp.js("document.getElementById('world-refresh').click()")
+    await asyncio.sleep(2.5)
+    await cdp.select("inst-select", empty_id)
+    empty_view = {}
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        empty_view = await cdp.js("({opts: [...document.getElementById('commit-select').options].length,"
+                                  " note: document.getElementById('rollback-note').textContent})")
+        if str(empty_view.get("note")).strip():
+            break
+        await asyncio.sleep(0.5)
+    # (b) 本线真提交 → 界面列出 → 水位跑过提交点 → 冻结 → 回滚 → 水位退回提交点
+    await cdp.select("inst-select", inst)
+    await asyncio.sleep(2.0)
+    if "冻结" in str(await cdp.js("document.getElementById('clock-label').textContent")):
+        await cdp.js("document.getElementById('clock-activate').click()")
+        await cdp.wait("document.getElementById('clock-label').textContent", "倍率", 25)
+    commit_res = await mgmt_call(cdp, "runtime.commit", instance_id=inst, timeline_id=line,
+                                 note="I8 审计回滚点")
+    commit = commit_res.get("commit") or {}
+    commit_id, commit_moment = str(commit.get("id") or ""), int(commit.get("moment") or 0)
+    await cdp.js("window.__opLog.length=0; document.getElementById('world-refresh').click()")
+    await cdp.wait("document.getElementById('commit-select').textContent", "I8 审计回滚点", 40)
+    listed = await cdp.js("({ids: [...document.getElementById('commit-select').options].map(o=>o.value),"
+                          " pairs: [...document.getElementById('commit-select').options].map(o=>[o.value,o.text]),"
+                          " note: document.getElementById('rollback-note').textContent,"
+                          " ops: (window.__opLog||[]).filter(o=>o==='runtime.commits').length})")
+    mine = [text for value, text in (listed["pairs"] or []) if value == commit_id]
+    # 水位要真的跑过提交点（倍率由前序检查决定，所以只轮询「有没有前进」，不给判据留时间赌注）
+    level_before = commit_moment
+    deadline = time.time() + 60
+    while time.time() < deadline and level_before - commit_moment < 8:
+        before_clock = ((await mgmt_call(cdp, "runtime.clock", instance_id=inst,
+                                         timeline_id=line)).get("clock") or {})
+        level_before = int(before_clock.get("processed_world") or 0)
+        await asyncio.sleep(2.0)
+    label_before = await cdp.js("document.getElementById('clock-label').textContent")
+    # 冻结后再回滚：冻结线不推进，水位是精确值，前后可比
+    await cdp.js("document.getElementById('clock-freeze').click()")
+    await cdp.wait("document.getElementById('clock-label').textContent", "已冻结", 30)
+    frozen_clock = ((await mgmt_call(cdp, "runtime.clock", instance_id=inst,
+                                     timeline_id=line)).get("clock") or {})
+    level_frozen = int(frozen_clock.get("processed_world") or 0)
+    gen_before = one(root, "SELECT generation FROM timeline_clock WHERE timeline_id=?", (line,))
+    await cdp.select("commit-select", commit_id)
+    await cdp.js("window.__confirmArgs=[];"
+                 "window.confirm=(m)=>{window.__confirmArgs.push(String(m)); return true;};"
+                 "document.getElementById('rollback').click()")
+    roll_note = await cdp.wait("document.getElementById('rollback-note').textContent", "已回滚", 60)
+    confirm_roll = await cdp.js("window.__confirmArgs.slice(-1)[0] || ''")
+    after_clock = ((await mgmt_call(cdp, "runtime.clock", instance_id=inst,
+                                    timeline_id=line)).get("clock") or {})
+    proc_after = one(root, "SELECT processed_world FROM timeline_clock WHERE timeline_id=?", (line,))
+    gen_after = one(root, "SELECT generation FROM timeline_clock WHERE timeline_id=?", (line,))
+    state_after = one(root, "SELECT state FROM timeline WHERE id=?", (line,))
+    label_after = await cdp.wait("document.getElementById('clock-label').textContent",
+                                 f"已处理 {commit_moment} 世界秒", 30)
+    ok_i8 = ("还没有回滚点：提交由自动提交与退出补做产生" in str(empty_view["note"])
+             and int(empty_view["opts"] or 0) == 0 and int(empty_left or 0) == 0
+             and commit_id and commit_id in listed["ids"] and mine
+             and "I8 审计回滚点" in str(mine[0]) and commit_id[-6:] in str(mine[0])
+             and int(listed["ops"] or 0) >= 1
+             and level_frozen - commit_moment >= 8
+             and int(after_clock.get("processed_world") or 0) == commit_moment
+             and after_clock.get("state") == "frozen" and str(state_after) == "frozen"
+             and int(proc_after or 0) == commit_moment and gen_after == gen_before + 1
+             and "回滚" in str(confirm_roll) and "之后的世界时间与事件会按回滚语义处理" in str(confirm_roll)
+             and commit_id[-6:] in str(confirm_roll)
+             and "已回滚到" in str(roll_note) and commit_id in str(roll_note)
+             and f"已处理 {commit_moment} 世界秒" in str(label_after))
+    check("I8 §七 回滚入口：提交列表 → 二次确认 → runtime.rollback，世界水位与世代真的退回提交点",
+          "PASS" if ok_i8 else "FAIL",
+          f"空回滚点（新实例 {str(empty_inst.get('name'))!r}，先删掉它那条 initial 提交 → 库里剩 {empty_left} 条）"
+          f"→ 列表 {empty_view['opts']} 项、槽={empty_view['note']!r}；"
+          f"mgmt runtime.commit → commit={commit_id!r}（世界 {commit_moment} 秒）；"
+          f"刷新后界面列出提交 {len(listed['ids'])} 条（含本条={commit_id in (listed['ids'] or [])}），"
+          f"本条在界面上的项={str(mine)!r}（含 id 尾段 {commit_id[-6:]!r}）、槽={listed['note']!r}、"
+          f"界面 runtime.commits 调用={listed['ops']} 次；"
+          f"水位跑到提交点之后（回滚前 runtime.clock.processed_world={level_frozen}，比提交点晚 "
+          f"{level_frozen - commit_moment} 秒；冻结前界面时钟={label_before!r}）；"
+          f"点冻结 → 点回滚 → 确认框={str(confirm_roll)[:90]!r}…；槽={str(roll_note)[:110]!r}…；"
+          f"回滚后 processed_world={after_clock.get('processed_world')}（= 提交点）、线状态={state_after}、"
+          f"库里水位={proc_after}、generation {gen_before}→{gen_after}、"
+          f"界面时钟={label_after!r}（正是提交点的水位）",
+          clause="§七 回滚：破坏性能力在界面可见——列提交、写清覆盖语义、二次确认，恢复能力不再只在核心",
+          code="desktop/index.html#commit-select/#rollback/#rollback-note · main.ts loadCommits / rollbackToCommit · "
+               "isekai_core/world/ops.py:801-829（runtime.commits / runtime.rollback 的参数名）",
+          expected="界面列出真实提交；确认文案写明覆盖语义；回滚后世界水位退回提交点、世代 +1、结果落在本行槽；空列表照实说明来源")
 
     # ---- §五 关闭窗口到托盘：核心继续推进
     await cdp.pane("manage")
