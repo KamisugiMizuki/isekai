@@ -708,6 +708,7 @@ CREATE TABLE IF NOT EXISTS trpg_action(
   resolution TEXT NOT NULL DEFAULT '{}',         -- 插件原始响应（含 rule_state_patch / consequences / scene_transition）
   joint_commit_id TEXT NOT NULL DEFAULT '',
   failure_code TEXT NOT NULL DEFAULT '',
+  audience TEXT NOT NULL DEFAULT 'public_party',   -- 这份材料的受众（§十五）
   created_world INTEGER NOT NULL DEFAULT 0,
   updated_world INTEGER NOT NULL DEFAULT 0,
   created_real REAL NOT NULL DEFAULT 0,
@@ -818,7 +819,7 @@ TRPG_COLUMNS: dict[str, tuple[str, ...]] = {
         "instance_id", "timeline_id", "campaign_id", "scene_id", "action_id", "actor_id",
         "raw_text", "intent", "target_refs", "method", "expected_result", "preconditions",
         "visible_risks", "confirmation", "action_revision", "status", "resolution",
-        "joint_commit_id", "failure_code", "created_world", "updated_world",
+        "joint_commit_id", "failure_code", "audience", "created_world", "updated_world",
         "created_real", "updated_real",
     ),
     "choice": (
@@ -874,7 +875,7 @@ def _trpg_sql(kind: str) -> str:
 def _trpg_row(kind: str, item: dict[str, Any]) -> dict[str, Any]:
     """按表列补齐缺省值：调用方只给关心的字段，其余落 schema 默认之外的稳定默认。"""
     defaults: dict[str, Any] = {name: "" for name in TRPG_COLUMNS[kind]}
-    defaults.update({"expires_world": None})
+    defaults.update({"expires_world": None, "audience": "public_party"})
     for name in TRPG_COLUMNS[kind]:
         if name in ("state_revision", "action_revision", "revision", "created_revision"):
             defaults[name] = 1
@@ -1517,6 +1518,12 @@ class Store:
         if columns and "ruleset_version" not in columns:
             self._conn.execute(
                 "ALTER TABLE trpg_rule_state ADD COLUMN ruleset_version TEXT NOT NULL DEFAULT ''"
+            )
+        # 行动材料的受众列（§十五）
+        action_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(trpg_action)")}
+        if action_columns and "audience" not in action_columns:
+            self._conn.execute(
+                "ALTER TABLE trpg_action ADD COLUMN audience TEXT NOT NULL DEFAULT 'public_party'"
             )
         join_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(character_join)")}
         for name, ddl in (
@@ -2734,6 +2741,7 @@ class Store:
         clear_effects: Iterable[Any] = (),
         reactions: Iterable[dict[str, Any]] = (),
         trpg: dict[str, Any] | None = None,
+        clock_shift_seconds: int = 0,
     ) -> bool:
         """把一批事实转移整体提交（§2.7：一批失败即整批回到批前水位）。
 
@@ -2750,6 +2758,13 @@ class Store:
                 return False
             if int(row["processed_world"]) > int(processed_world):
                 return False  # 水位只前进：并发的另一批已经先写过
+            if clock_shift_seconds:
+                # 场景内时间消耗（§十四）改的是**锚点**不是水位：世界时间往前跳 N 秒，
+                # 之后由 advance 按正常批次结算这段。跟本批同一个事务、同一个世代。
+                self._conn.execute(
+                    "UPDATE timeline_clock SET base_world = base_world + ? WHERE timeline_id=?",
+                    (int(clock_shift_seconds), timeline_id),
+                )
             for plan in plans:
                 self._conn.execute(
                     """INSERT OR IGNORE INTO life_plan(id, instance_id, timeline_id, character_id, day_index,

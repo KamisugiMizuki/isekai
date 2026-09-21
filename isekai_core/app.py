@@ -269,6 +269,15 @@ async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | N
                     log.info("plugins stopped=%s", stopped_plugins)
             except Exception:  # noqa: BLE001 - 退出期异常不挡收尾
                 log.exception("stopping plugins failed")
+        world_runtime = getattr(runtime, "world", None)
+        campaign = getattr(world_runtime, "campaign", None)
+        if campaign is not None:
+            try:
+                closed = await campaign.close_rule_sessions()
+                if closed:
+                    log.info("rule sessions stopped=%s", closed)
+            except Exception:  # noqa: BLE001 - 退出期异常不挡收尾
+                log.exception("stopping rule sessions failed")
         await runtime.service.shutdown()
         await runtime.server.close()
         await runtime.llm.aclose()

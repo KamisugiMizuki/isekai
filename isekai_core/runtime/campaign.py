@@ -11,8 +11,19 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 from typing import Any
+
+
+def _loads(text: Any, fallback: Any) -> Any:
+    """宽松 JSON 解析：列里可能是 '' 或半截文本，解析不出来就给兜底。"""
+    if isinstance(text, (dict, list)):
+        return text
+    try:
+        return json.loads(str(text or ""))
+    except (TypeError, ValueError):
+        return fallback
 
 # ---------------------------------------------------------------- 状态机
 
@@ -205,6 +216,62 @@ def public_campaign(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+#: 受众集合（TRPG_CAMPAIGN_RUNTIME_SPEC §十五）：两份固定项 + 三类带标识的
+PUBLIC_PARTY = "public_party"
+GM_ONLY = "gm_only"
+_AUDIENCE_PREFIXES = ("player:", "character:", "npc:")
+
+
+def audience_ok(value: Any) -> bool:
+    """受众标识是否合法：闭集，别让「谁看得见」变成自由文本。"""
+    text = str(value or "")
+    if text in (PUBLIC_PARTY, GM_ONLY):
+        return True
+    return any(text.startswith(prefix) and len(text) > len(prefix) for prefix in _AUDIENCE_PREFIXES)
+
+
+def audience_visible(material: str, viewer: str) -> bool:
+    """材料对这位观看者可见吗：GM 全见，公开全见，其余只认精确匹配。
+
+    同一用户控制多个角色**不自动合并** `character:<id>`（§十五）——这里刻意不做
+    用户级归并，宁可让调用方显式再传一个受众。
+    """
+    material = str(material or PUBLIC_PARTY)
+    viewer = str(viewer or PUBLIC_PARTY)
+    if viewer == GM_ONLY:
+        return True
+    if material == PUBLIC_PARTY:
+        return True
+    return material == viewer
+
+
+def scene_view(scene: dict[str, Any], *, audience: str = PUBLIC_PARTY) -> dict[str, Any]:
+    """场景投影（§十五）：公共材料人人可见，私密材料只给对应受众。
+
+    - `public_facts` / `active_risks` / `available_actions`：逐项按 `audience` 字段裁剪
+      （没有该字段的项按公开处理——公共材料就是公共的）；
+    - `private_views`：只给观看者自己那一条，GM 拿全份。
+    """
+    out = {
+        **{key: value for key, value in scene.items() if not key.endswith("_world")},
+        "world_snapshot": _loads(scene.get("world_snapshot"), {}),
+        "location_refs": _loads(scene.get("location_refs"), []),
+        "participants": _loads(scene.get("participants"), []),
+        "turn_state": _loads(scene.get("turn_state"), {}),
+    }
+    for key in ("public_facts", "active_risks", "available_actions"):
+        items = _loads(scene.get(key), [])
+        out[key] = [
+            item for item in items
+            if not isinstance(item, dict) or audience_visible(str(item.get("audience") or PUBLIC_PARTY), audience)
+        ]
+    views = _loads(scene.get("private_views"), {})
+    out["private_views"] = views if audience == GM_ONLY else {
+        key: value for key, value in views.items() if audience_visible(str(key), audience)
+    }
+    return out
+
+
 def action_view(row: dict[str, Any], *, audience: str = "public_party") -> dict[str, Any]:
     """行动投影：GM 私有材料（原始 resolution）只有 gm_only 受众拿得到。"""
     out: dict[str, Any] = {
@@ -219,6 +286,7 @@ def action_view(row: dict[str, Any], *, audience: str = "public_party") -> dict[
         "status": str(row.get("status") or ""),
         "failure_code": str(row.get("failure_code") or ""),
         "joint_commit_id": str(row.get("joint_commit_id") or ""),
+        "audience": str(row.get("audience") or PUBLIC_PARTY),
     }
     if audience == "gm_only":
         out["resolution"] = row.get("resolution") or "{}"

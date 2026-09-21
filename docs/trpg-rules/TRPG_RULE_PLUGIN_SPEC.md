@@ -155,6 +155,8 @@ TRPG 客户端
 - **B0 无状态 resolver（已实现）**：`trpg.action.resolve` 不带 `campaign_id` 时保持旧语义——调插件、校验 `effects`、直接落世界事件。
 - **战役裁定器（已实现）**：带 `campaign_id` 时读规则状态快照 → 调插件 → 把 `resolution` / `rule_state_patch` / `consequences` / `scene_transition` 存进行动并停在 `reviewing`，**不写世界**；世界与规则状态由 `trpg.commit` 联合提交（见 `TRPG_CAMPAIGN_RUNTIME_SPEC.md`）。
 - 插件响应的世界后果清单 `effects` 与 `consequences` 现在都接受（`runtime/rules.py` 的边界检查同时认两者）；`rule_state_patch`、结构化错误响应和常驻进程形态仍按协议后续项处理。
+- 清单里 `resident` 是**可选**字段：`true` = 核心保持一个插件进程服务多次裁定（一行一 JSON，`{"type":"ping"}` 必须回 `{"type":"pong"}`，读到 stdin EOF 必须自己退出）。常驻只省进程启动与模块加载——**状态仍然只能经快照进出**，插件不许把状态藏在进程内存里（否则回滚 / 分叉会带着不该有的记忆）。进程死在「还没发请求」时核心会重开一个；**死在半路不重发**（不重跑裁定）。
+- 清单里 `converters[]` 是**可选**字段：声明状态转换器（`converter_id` / `from_version` / `to_version` / 可选 `converter_version`、`entry`），供 `trpg.campaign.migrate` 调用；响应必须回 `opaque_state` 对象与 `losses[]`。
 - 清单里 `ruleset_version` 是**可选**字段：声明它 = 只有 `opaque_state` 格式变化时才改；不声明则退回 `version`。核心用它做 §十六 第 2 层的版本闸比对（`runtime/rules.py::manifest_identity`）。
 
 如果具体规则的后果无法映射为结构化 `consequences`，插件必须返回待审状态，不使用万能 `custom_effect` 绕过公共层。

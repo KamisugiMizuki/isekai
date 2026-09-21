@@ -78,6 +78,7 @@ OP_BY_COMMAND = {
     ("runtime", "fork"): "runtime.fork",
     ("runtime", "rollback"): "runtime.rollback",
     ("runtime", "budget-set"): "runtime.budget.set",
+    ("runtime", "consume-time"): "runtime.time.consume",
     # TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）
     ("trpg", "campaign-new"): "trpg.campaign.create",
     ("trpg", "campaign-list"): "trpg.campaign.list",
@@ -90,6 +91,8 @@ OP_BY_COMMAND = {
     ("trpg", "abandon"): "trpg.action.abandon",
     ("trpg", "resolve"): "trpg.action.resolve",
     ("trpg", "commit"): "trpg.commit",
+    ("trpg", "gm-change"): "trpg.gm.change",
+    ("trpg", "migrate"): "trpg.campaign.migrate",
     ("trpg", "choose"): "trpg.choice.select",
     ("trpg", "rule-state"): "trpg.rule_state.read",
     ("trpg", "recover"): "trpg.recover",
@@ -200,6 +203,16 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
         if cmd == "commit":
             args["idempotency_key"] = ns.idempotency or ""
             args["source_mode"] = ns.source_mode or "action"
+        if cmd == "gm-change":
+            args["changes"] = ns.changes or ""
+            args["idempotency_key"] = ns.idempotency or ""
+        if cmd in ("commit", "gm-change", "scene"):
+            if ns.audience:
+                args["audience"] = ns.audience
+        if cmd == "migrate":
+            args["converter_id"] = ns.converter or ""
+            args["to_version"] = ns.ruleset_version or ""
+            args["accept_losses"] = bool(ns.accept_losses)
         if cmd == "resolve":
             args.update({
                 "action_id": ns.action or "",
@@ -235,6 +248,10 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args["rate"] = int(ns.rate)
         if cmd == "advance":
             args["max_batches"] = int(ns.max_batches or 16)
+        if cmd == "consume-time":
+            args["seconds"] = int(ns.seconds or 0)
+            args["cause"] = ns.cause or ""
+            args["time_source"] = ns.time_source or "world_process"
         if cmd == "timeline-rename":
             args["name"] = ns.display_name or ""
             args["description"] = ns.note
@@ -401,8 +418,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--status", default=None, help="TRPG：战役状态")
     parser.add_argument("--reason", default=None, help="TRPG：状态变更原因")
     parser.add_argument("--auto-confirm", dest="auto_confirm", action="store_true", help="TRPG：低风险行动直接确认")
+    parser.add_argument("--seconds", type=int, default=None, help="TRPG / 时钟：时间消耗秒数")
+    parser.add_argument("--cause", default=None, help="TRPG / 时钟：时间消耗原因（必填）")
+    parser.add_argument("--time-source", dest="time_source", default=None,
+                        help="时钟：时间消耗来源 world_process / player_action / gm_declaration")
     parser.add_argument("--accept-ruleset-version", dest="accept_ruleset_version", default=None,
                         help="TRPG：人工确认规则状态改用新规则版本解释（§十六）")
+    parser.add_argument("--audience", default=None,
+                        help="TRPG：受众（public_party / gm_only / player:… / character:… / npc:…）")
+    parser.add_argument("--converter", default=None, help="TRPG：状态转换器标识（规则版本迁移）")
+    parser.add_argument("--accept-losses", dest="accept_losses", action="store_true",
+                        help="TRPG：显式接受有信息损失的规则状态转换")
+    parser.add_argument("--changes", default=None, help="TRPG：GM 直接变化的 changes（内联 JSON 或文件路径）")
     parser.add_argument("--source-mode", dest="source_mode", default=None,
                         help="TRPG：后果来源 action（角色行动）/ gm_declaration（GM 直接裁定）")
     ns = parser.parse_args(argv)

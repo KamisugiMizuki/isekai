@@ -42,6 +42,10 @@ from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_
 
 log = get_logger("isekai.runtime")
 
+#: 时间消耗的来源分类（§十四）：世界过程 / 玩家行动 / GM 裁定分开记账
+TIME_CONSUME_SOURCES = ("world_process", "player_action", "gm_declaration")
+
+
 class RuntimeStateError(ValueError):
     """运行层拒绝该操作：状态不允许或参数非法。"""
 
@@ -1986,6 +1990,65 @@ class RuntimeService:
             "batches": batches,
             "experiences": produced,
             "limited": limited and processed < target,
+        }
+
+    def consume_time(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        seconds: int,
+        cause: str,
+        source: str = "world_process",
+        now_real: float | None = None,
+        max_batches: int | None = None,
+    ) -> dict[str, Any]:
+        """场景内时间消耗（§十四）：世界时间往前跳 N 秒，再按正常批次结算这段时间。
+
+        与 `advance` 的分工：`advance` 是「跟上真实时间」（动水位 `processed_world`），
+        `consume` 是「世界时间跳到尚未发生的时刻」（动锚点 `base_world`）。两者都不许倒退。
+
+        `cause` 必填：一次时间跳跃如果没有理由，以后没人答得上「这段时间为什么过去了」——
+        它会被记进提交说明，回滚与审计都靠它。
+        """
+        seconds = int(seconds or 0)
+        if seconds <= 0:
+            raise RuntimeStateError("时间消耗必须为正秒数")
+        if not str(cause or "").strip():
+            raise RuntimeStateError("时间消耗必须给出原因")
+        if source not in TIME_CONSUME_SOURCES:
+            raise RuntimeStateError(f"未知时间消耗来源：{source}（只接受 {'/'.join(TIME_CONSUME_SOURCES)}）")
+        self._require_compatible(instance_id)
+        _instance, timeline = self._rows(instance_id, timeline_id)
+        if timeline["state"] != "active":
+            return {"state": "frozen", "consumed_seconds": 0, "cause": str(cause)}
+        row = self.clock_row(timeline_id)
+        applied = self.store.apply_runtime_batch(
+            timeline_id=timeline_id,
+            generation=int(row["generation"]),
+            processed_world=int(row["processed_world"]),
+            catching_up=False,
+            clock_shift_seconds=seconds,
+        )
+        if not applied:
+            # 世代已变（冻结 / 回滚后的迟到任务）：锚点没动，如实报错，不假装消耗过
+            raise RuntimeStateError("时间线世代已变，本次时间消耗未生效")
+        # 世界过程推进与玩家行动分开记账：来源进提交说明，回滚 / 审计能按它区分
+        mark = self.commit(
+            instance_id, timeline_id, kind="time_consume", note=f"{cause}（+{seconds}s, {source}）"
+        )
+        now = float(now_real if now_real is not None else time.time())
+        settled = self.advance(instance_id, timeline_id, now_real=now, max_batches=max_batches)
+        after = self.clock_row(timeline_id)
+        return {
+            "state": str(settled.get("state") or ""),
+            "consumed_seconds": seconds,
+            "cause": str(cause),
+            "source": str(source),
+            "commit_id": str(mark.get("id") or ""),
+            "processed_world": int(after["processed_world"]),
+            "catching_up": int(after.get("catching_up") or 0),
+            "batches": int(settled.get("batches") or 0),
         }
 
     def _collect_batch(

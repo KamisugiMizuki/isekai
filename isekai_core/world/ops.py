@@ -68,6 +68,7 @@ SYNC_OPS = frozenset(
         "runtime.freeze",
         "runtime.rate",
         "runtime.advance",
+        "runtime.time.consume",
         "runtime.card.add",
         "runtime.backfill",
         "world.card.template",
@@ -113,6 +114,7 @@ SYNC_OPS = frozenset(
         "trpg.choice.select",
         "trpg.rule_state.read",
         "trpg.commit",
+        "trpg.gm.change",
         "trpg.recover",
     }
 )
@@ -129,6 +131,7 @@ ASYNC_OPS = frozenset(
         "runtime.extract",
         "event.draft",
         "trpg.action.resolve",
+        "trpg.campaign.migrate",
         "world.package.generate",
         "world.package.revise",
         "world.package.fill",
@@ -326,6 +329,18 @@ def _runtime_op(
                 max_batches=int(args["max_batches"]) if args.get("max_batches") else None,
             )
             return {"advance": advanced, "clock": runtime.view(instance_id, timeline_id, now_real=now)}
+        if op == "runtime.time.consume":
+            # 场景内时间消耗（§十四）：只有受信调用方能用，reason 必填
+            consumed = runtime.consume_time(
+                instance_id,
+                timeline_id,
+                seconds=int(args.get("seconds") or 0),
+                cause=str(args.get("cause") or ""),
+                source=str(args.get("time_source") or args.get("source") or "world_process"),
+                now_real=now,
+                max_batches=int(args["max_batches"]) if args.get("max_batches") else None,
+            )
+            return {"consume": consumed, "clock": runtime.view(instance_id, timeline_id, now_real=now)}
     except RuntimeStateError as exc:
         get_logger("isekai.world.ops").warning(
             "runtime op rejected op=%s instance_id=%s timeline_id=%s: %s",
@@ -409,6 +424,8 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return _trpg_rule_state(cfg, store, runtime, args)
         if op == "trpg.commit":
             return _trpg_commit(cfg, store, runtime, args)
+        if op == "trpg.gm.change":
+            return _trpg_gm_change(cfg, store, runtime, args)
         if op == "trpg.recover":
             return _trpg_recover(cfg, store, runtime, args)
 
@@ -1132,6 +1149,37 @@ def _trpg_commit(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) 
     )
 
 
+def _trpg_gm_change(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """GM 直接变化（§十五）：没有行动、没有插件的联合提交，来源落 gm_declaration。"""
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    raw = args.get("changes")
+    if isinstance(raw, str) and raw.strip() and not raw.lstrip().startswith("{"):
+        raw = _read_user_json(Path(resolve_path(cfg, raw)), what="GM 变化文件")
+    changes = raw if isinstance(raw, dict) else _json_arg(args, "changes", {})
+    return _campaign_call(
+        _campaign_service(runtime).gm_change, instance_id, timeline_id, campaign_id,
+        changes=changes if isinstance(changes, dict) else {},
+        idempotency_key=str(args.get("idempotency_key") or ""),
+        audience=str(args.get("audience") or "public_party"),
+    )
+
+
+async def _trpg_campaign_migrate(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """规则版本转换（§十六）：转换器由插件声明，核心只搬运与记账。"""
+    from ..runtime import campaign as campaign_mod  # 延迟导入：避免包级循环
+
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    try:
+        return await _campaign_service(runtime).migrate_ruleset(
+            instance_id, timeline_id, campaign_id,
+            converter_id=str(args.get("converter_id") or ""),
+            to_version=str(args.get("to_version") or args.get("ruleset_version") or ""),
+            accept_losses=bool(args.get("accept_losses")),
+        )
+    except campaign_mod.CampaignError as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+
+
 def _trpg_recover(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
     instance_id = str(args.get("instance_id") or "")
     timeline_id = str(args.get("timeline_id") or "")
@@ -1503,6 +1551,8 @@ async def dispatch_async(
             return await _draft_user_event(cfg, llm, store, args)
         if op == "trpg.action.resolve":
             return await _resolve_trpg_action(cfg, store, args, runtime=runtime)
+        if op == "trpg.campaign.migrate":
+            return await _trpg_campaign_migrate(cfg, store, runtime, args)
         if op == "world.package.generate":
             package, errors, usage = await generate_package(
                 llm, str(args.get("brief") or ""), name=str(args.get("name") or "未命名世界"), **kwargs

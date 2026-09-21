@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 from ..log import get_logger
@@ -67,6 +68,9 @@ class CampaignRuntime:
     def __init__(self, store: Any, runtime: Any) -> None:
         self.store = store
         self.runtime = runtime
+        # 常驻规则插件会话：按清单路径复用（状态仍走快照，见 rules.RulePluginSession）
+        self.rule_sessions: dict[str, rules.RulePluginSession] = {}
+        self.rule_session_idle_s = 900.0  # 闲置这么久就收掉，下次重开；不起后台扫
 
     # ------------------------------------------------------------ 战役
 
@@ -238,8 +242,13 @@ class CampaignRuntime:
             if scene_id
             else None
         )
+        if not campaign_mod.audience_ok(audience):
+            raise CampaignRuntimeError(f"未知受众：{audience}（§十五 闭集）")
         keys = {"instance_id": instance_id, "timeline_id": timeline_id, "campaign_id": campaign_id}
-        all_actions = self.store.trpg_list("action", **keys)
+        all_actions = [
+            row for row in self.store.trpg_list("action", **keys)
+            if campaign_mod.audience_visible(str(row.get("audience") or ""), audience)
+        ]
         actions = [
             campaign_mod.action_view(row, audience=audience)
             for row in all_actions
@@ -254,6 +263,7 @@ class CampaignRuntime:
             {**row, "choices": _loads(row.get("choices"), [])}
             for row in self.store.trpg_list("choice", **keys)
             if str(row["status"]) == "open"
+            and campaign_mod.audience_visible(str(row.get("audience") or ""), audience)
         ]
         state = self.store.trpg_get("rule_state", ruleset_id=str(campaign_row["ruleset_id"]), **keys)
         out: dict[str, Any] = {
@@ -267,17 +277,8 @@ class CampaignRuntime:
             },
         }
         if scene is not None:
-            out["scene"] = {
-                **{key: value for key, value in scene.items() if not key.endswith("_world")},
-                "world_snapshot": _loads(scene.get("world_snapshot"), {}),
-                "location_refs": _loads(scene.get("location_refs"), []),
-                "participants": _loads(scene.get("participants"), []),
-                "public_facts": _loads(scene.get("public_facts"), []),
-                "private_views": _loads(scene.get("private_views"), {}),
-                "active_risks": _loads(scene.get("active_risks"), []),
-                "available_actions": _loads(scene.get("available_actions"), []),
-                "turn_state": _loads(scene.get("turn_state"), {}),
-            }
+            # 场景材料按受众裁剪（§十五）：私密视图只给对应受众，GM 拿全份
+            out["scene"] = campaign_mod.scene_view(scene, audience=audience)
         return out
 
     # ------------------------------------------------------------ 行动
@@ -465,7 +466,11 @@ class CampaignRuntime:
         self._set_action_status(row, "snapshotting")
         self._set_action_status(self._action_row(instance_id, timeline_id, campaign_id, action_id), "resolving")
         try:
-            result = await rules.resolve(plugin_manifest or str(campaign_row["plugin_manifest"]), request, timeout=timeout)
+            session = await self._rule_session(plugin_manifest or str(campaign_row["plugin_manifest"]))
+            result = await rules.resolve(
+                plugin_manifest or str(campaign_row["plugin_manifest"]),
+                request, timeout=timeout, session=session,
+            )
         except rules.RulePluginError as exc:
             self._set_action_status(self._action_row(instance_id, timeline_id, campaign_id, action_id),
                                     "plugin_failed", failure_code="plugin_failed")
@@ -511,15 +516,13 @@ class CampaignRuntime:
         source_mode: str = "action",
         now_real: float | None = None,
     ) -> dict[str, Any]:
-        """联合提交（§十二）：规则状态 patch + 世界后果 + 场景转换，同批成功或同批失败。
+        """行动路径的联合提交（§十二）：规则状态 patch + 世界后果 + 场景转换，同批成功或同批失败。
 
         `source_mode`：`action` = 角色行动的因果后果；`gm_declaration` = GM 直接裁定
         （§十五 来源标注，审计面要能区分这两种，别混成一个来源）。
         """
         if not str(idempotency_key or "").strip():
             raise CampaignRuntimeError("联合提交必须带幂等键")
-        if source_mode not in ("action", "gm_declaration"):
-            raise CampaignRuntimeError(f"未知来源：{source_mode}（只接受 action / gm_declaration）")
         existing = self.store.trpg_commit_by_key(instance_id, timeline_id, idempotency_key)
         if existing is not None:
             return {**_loads(existing["result"], {}), "status": "duplicate",
@@ -535,7 +538,76 @@ class CampaignRuntime:
         payload = _loads(action_row.get("resolution"), {})
         if not payload:
             raise CampaignRuntimeError("该行动还没有裁定结果，先跑 resolve")
+        return self._joint_apply(
+            campaign_row, payload,
+            instance_id=instance_id, timeline_id=timeline_id, campaign_id=campaign_id,
+            action_row=action_row, action_id=action_id, source_mode=source_mode,
+            idempotency_key=idempotency_key, audience=audience, now_real=now_real,
+        )
 
+    def gm_change(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        campaign_id: str,
+        *,
+        changes: dict[str, Any],
+        idempotency_key: str,
+        audience: str = "public_party",
+        now_real: float | None = None,
+    ) -> dict[str, Any]:
+        """GM 直接变化（§十五）：不过行动、不过插件，直接提交后果。
+
+        `changes` = `{consequences[]?, claims[]?, participants[]?, rule_state_patch?, scene_transition?}`，
+        与插件响应同形状但不含 `resolution`——所以它走的是同一条联合提交管线，
+        规则状态与世界后果照样同批成功或同批失败，来源落 `gm_declaration`。
+        """
+        if not isinstance(changes, dict) or not changes:
+            raise CampaignRuntimeError("GM 直接变化必须给出 changes 对象")
+        for key in ("consequences", "claims", "participants"):
+            if key in changes and not isinstance(changes[key], list):
+                raise CampaignRuntimeError(f"changes.{key} 必须是数组")
+        if not str(idempotency_key or "").strip():
+            raise CampaignRuntimeError("联合提交必须带幂等键")
+        existing = self.store.trpg_commit_by_key(instance_id, timeline_id, idempotency_key)
+        if existing is not None:
+            return {**_loads(existing["result"], {}), "status": "duplicate",
+                    "joint_commit_id": str(existing["joint_commit_id"])}
+        campaign_row = self._campaign_row(instance_id, timeline_id, campaign_id)
+        self._require_live(campaign_row, what="提交 GM 裁定")
+        payload = {**changes, "resolution": {"system": "gm", "outcome": "declared"}}
+        return self._joint_apply(
+            campaign_row, payload,
+            instance_id=instance_id, timeline_id=timeline_id, campaign_id=campaign_id,
+            action_row=None, action_id="", source_mode="gm_declaration",
+            idempotency_key=idempotency_key, audience=audience, now_real=now_real,
+        )
+
+    def _joint_apply(
+        self,
+        campaign_row: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        instance_id: str,
+        timeline_id: str,
+        campaign_id: str,
+        action_row: dict[str, Any] | None,
+        action_id: str,
+        source_mode: str,
+        idempotency_key: str,
+        audience: str,
+        now_real: float | None = None,
+    ) -> dict[str, Any]:
+        """唯一的一条联合提交管线（§十二）：行动与 GM 直接变化共用它。
+
+        `action_row=None` 表示这次没有行动在背后（GM 直接变化）：不做行动状态迁移，
+        场景取战役当前场景，其余（规则状态、世界后果、时间消耗、幂等账本）完全一致。
+        """
+        if source_mode not in ("action", "gm_declaration"):
+            raise CampaignRuntimeError(f"未知来源：{source_mode}（只接受 action / gm_declaration）")
+        if not campaign_mod.audience_ok(audience):
+            raise CampaignRuntimeError(f"未知受众：{audience}（§十五 闭集）")
+        status = str(action_row["status"]) if action_row is not None else ""
         ruleset_id = str(campaign_row["ruleset_id"])
         state_key = {
             "instance_id": instance_id, "timeline_id": timeline_id,
@@ -546,11 +618,11 @@ class CampaignRuntime:
         patch = payload.get("rule_state_patch") or None
         patch_errors = campaign_mod.validate_patch(patch)
         if patch_errors:
-            return self._needs_review(action_row, patch_errors)
+            return self._review(action_row, patch_errors)
         new_state = None
         if patch:
             if str(patch.get("ruleset_id")) != ruleset_id:
-                return self._needs_review(action_row, ["rule_state_patch.ruleset_id 与战役不一致"])
+                return self._review(action_row, ["rule_state_patch.ruleset_id 与战役不一致"])
             base = int(patch.get("base_state_revision", -1))
             current = int(state["state_revision"]) if state else 0
             if base != current:
@@ -560,7 +632,7 @@ class CampaignRuntime:
                     _loads(state["opaque_state"], {}) if state else {}, list(patch.get("operations") or [])
                 )
             except campaign_mod.CampaignError as exc:
-                return self._needs_review(action_row, [str(exc)])
+                return self._review(action_row, [str(exc)])
 
         instance = self.store.instance_get(instance_id) or {}
         world = self._world(instance_id, timeline_id)
@@ -569,7 +641,7 @@ class CampaignRuntime:
             consequences = payload.get("effects") or []
         claims = payload.get("claims") or []
         draft_payload = {
-            "intent": str(action_row["intent"]),
+            "intent": str((action_row or {}).get("intent") or ("GM 直接裁定" if action_row is None else "")),
             "effects": [
                 {**item, "expiry": str(item.get("expiry") or "with_cause")}
                 for item in consequences if isinstance(item, dict)
@@ -584,7 +656,7 @@ class CampaignRuntime:
                 known_targets=targets, world_seconds=world, default_channels=channels,
             )
         except ValueError as exc:
-            return self._needs_review(action_row, [f"世界后果无法映射：{exc}"])
+            return self._review(action_row, [f"世界后果无法映射：{exc}"])
 
         clock = self.runtime.clock_row(timeline_id)
         ident = f"ev-trpg-{campaign_mod.new_id('x').split('-')[1]}"
@@ -605,24 +677,52 @@ class CampaignRuntime:
 
         # 场景转换：待选择只在战役侧，不进世界事实（§5.4）
         transition = payload.get("scene_transition") or {}
+        # 场景内时间消耗（§十四）：只有结构化、有原因、为正秒数的请求才允许改动世界时间。
+        # 这里只校验；实际前移锚点与规则状态 patch 在同一个批次里落（下面 apply_runtime_batch）。
+        time_request = transition.get("world_time_request") or None
+        shift_seconds = 0
+        time_cause = ""
+        time_source = ""
+        if time_request is not None:
+            if not isinstance(time_request, dict):
+                return self._review(action_row, ["world_time_request 必须是对象（{seconds, cause?}）"])
+            try:
+                shift_seconds = int(time_request.get("seconds") or 0)
+            except (TypeError, ValueError):
+                return self._review(action_row, ["world_time_request.seconds 必须是整数"])
+            if shift_seconds <= 0:
+                return self._review(action_row, ["world_time_request.seconds 必须为正秒数"])
+            time_cause = str(time_request.get("cause") or "").strip() or f"TRPG 行动 {action_id}"
+            # 来源分类（§十四 世界过程 / 玩家行动 / GM 裁定分开记账）：不给就按路径推
+            time_source = str(
+                time_request.get("source") or ("player_action" if action_row is not None else "gm_declaration")
+            )
+            if time_source not in ("world_process", "player_action", "gm_declaration"):
+                return self._review(action_row, [f"world_time_request.source 不在闭集内：{time_source}"])
         scene_rows: list[dict[str, Any]] = []
         choice_rows: list[dict[str, Any]] = []
         scene = None
         if transition:
             scene = self.store.trpg_get(
                 "scene", instance_id=instance_id, timeline_id=timeline_id,
-                campaign_id=campaign_id, scene_id=str(action_row.get("scene_id") or ""),
+                campaign_id=campaign_id,
+                scene_id=str((action_row or {}).get("scene_id") or campaign_row["current_scene_id"] or ""),
             )
             if scene is not None:
                 scene = self._apply_transition(scene, transition, world)
                 scene_rows.append(scene)
             for index, item in enumerate(transition.get("available_choices") or []):
+                if not campaign_mod.audience_ok(item.get("audience") or campaign_mod.PUBLIC_PARTY):
+                    return self._review(
+                        action_row, [f"available_choices[{index}] 的受众不在闭集内：{item.get('audience')}"]
+                    )
                 choice_rows.append(
                     {
                         "instance_id": instance_id,
                         "timeline_id": timeline_id,
                         "campaign_id": campaign_id,
-                        "scene_id": str(scene["scene_id"]) if scene else str(action_row.get("scene_id") or ""),
+                        "scene_id": str(scene["scene_id"]) if scene
+                        else str((action_row or {}).get("scene_id") or campaign_row["current_scene_id"] or ""),
                         "choice_id": str(item.get("choice_id") or campaign_mod.new_id("ch")),
                         "action_id": action_id,
                         "prompt_ref": str(item.get("prompt_ref") or ""),
@@ -636,16 +736,19 @@ class CampaignRuntime:
                 )
 
         joint_id = campaign_mod.new_id("jc")
-        next_status = "awaiting_choice" if choice_rows else "transitioned"
-        campaign_mod.transition("action", status, "committing", what="行动")
-        action_out = {
-            **action_row,
-            "status": next_status,
-            "joint_commit_id": joint_id,
-            "failure_code": "",
-            "updated_world": world,
-            "updated_real": time.time(),
-        }
+        action_out = None
+        if action_row is not None:
+            next_status = "awaiting_choice" if choice_rows else "transitioned"
+            campaign_mod.transition("action", status, "committing", what="行动")
+            action_out = {
+                **action_row,
+                "status": next_status,
+                "audience": str(audience),
+                "joint_commit_id": joint_id,
+                "failure_code": "",
+                "updated_world": world,
+                "updated_real": time.time(),
+            }
         next_campaign_status = str(campaign_row["status"])
         if choice_rows and next_campaign_status != "waiting":
             next_campaign_status = campaign_mod.transition(
@@ -680,6 +783,7 @@ class CampaignRuntime:
         result = {
             "status": "committed",
             "joint_commit_id": joint_id,
+            "audience": str(audience),
             "campaign_revision": campaign_out["state_revision"],
             "world_revision": world,
             "world_commit_id": "",
@@ -691,15 +795,16 @@ class CampaignRuntime:
             "open_choices": [str(item["choice_id"]) for item in choice_rows],
             "effects": len(event_rows["effects"]),
             "claims": len(event_rows["claims"]),
-            "world_time_request": transition.get("world_time_request") or None,
-            "world_time_applied": False,
+            "world_time_request": time_request,
+            "world_time_applied": bool(shift_seconds),
+            "world_time_source": time_source,
         }
         commit_row = {
             "joint_commit_id": joint_id,
             "instance_id": instance_id,
             "timeline_id": timeline_id,
             "campaign_id": campaign_id,
-            "action_id": action_id,
+            "action_id": str(action_id or ""),
             "idempotency_key": str(idempotency_key),
             "campaign_revision": int(campaign_out["state_revision"]),
             "world_revision": world,
@@ -710,10 +815,11 @@ class CampaignRuntime:
             "created_real": time.time(),
         }
         trpg_rows: dict[str, Any] = {
-            "action": [action_out],
             "campaign": [campaign_out],
             "commit": [commit_row],
         }
+        if action_out is not None:
+            trpg_rows["action"] = [action_out]
         if state_out is not None:
             trpg_rows["rule_state"] = [state_out]
         if scene_rows:
@@ -733,11 +839,26 @@ class CampaignRuntime:
             institution=institution_rows["institution"],
             customs=institution_rows["customs"],
             trpg=trpg_rows,
+            clock_shift_seconds=shift_seconds,
         )
         if not applied:
             # 世代已变（冻结 / 回滚后的迟到提交）：整批没落盘，如实返回 stale，不假装提交过
-            self._fail(self._action_row(instance_id, timeline_id, campaign_id, action_id), "stale", code="stale")
-            return {"status": "stale", "action_id": action_id, "reason": "运行世代已变，请重新读取场景"}
+            if action_row is not None:
+                self._fail(
+                    self._action_row(instance_id, timeline_id, campaign_id, action_id), "stale", code="stale"
+                )
+            return {"status": "stale", "action_id": str(action_id or ""), "reason": "运行世代已变，请重新读取场景"}
+        if shift_seconds:
+            # 锚点已在上面那一批里前移（与规则状态同一个事务）；这里按正常批次结算这段时间。
+            # 结算读数只出现在首次返回值里——账本是只增不改的，重放拿原结果 + runtime.clock 看收尾。
+            settled = self.runtime.advance(instance_id, timeline_id, now_real=time.time())
+            result["world_time_settled"] = {
+                "state": str(settled.get("state") or ""),
+                "processed_world": int(settled.get("processed_world") or 0),
+                "batches": int(settled.get("batches") or 0),
+                "cause": time_cause,
+                "source": time_source,
+            }
         return result
 
     # ------------------------------------------------------------ 待选择
@@ -788,6 +909,155 @@ class CampaignRuntime:
         self.store.trpg_upserts({"choice": [row], "campaign": [campaign_out]})
         return {**row, "choices": options, "idempotency_key": str(idempotency_key or ""), "duplicate": False}
 
+    async def migrate_ruleset(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        campaign_id: str,
+        *,
+        converter_id: str = "",
+        to_version: str = "",
+        accept_losses: bool = False,
+        now_real: float | None = None,
+    ) -> dict[str, Any]:
+        """规则版本转换（§十六）：由插件声明的转换器执行，核心只搬运与记账。
+
+        - 没有状态 = 没有可转的东西，直接说清楚；
+        - 幂等键 = `converter|from>to`：同一转换重放返回原记录，不重复改状态；
+        - 转换失败 / 有信息损失（未显式接受）→ 停在 needs_review，**原状态保持可恢复**；
+        - 记录写在 `trpg_commit` 账本里（`status=converted`），六个字段在 result 里。
+        """
+        campaign_row = self._campaign_row(instance_id, timeline_id, campaign_id)
+        self._require_live(campaign_row, what="转换规则版本")
+        manifest = str(campaign_row.get("plugin_manifest") or "")
+        state = self.store.trpg_get(
+            "rule_state", instance_id=instance_id, timeline_id=timeline_id,
+            campaign_id=campaign_id, ruleset_id=str(campaign_row["ruleset_id"]),
+        )
+        if state is None:
+            raise CampaignRuntimeError("战役还没有规则状态，没有可转换的内容")
+        identity = rules.manifest_identity(manifest)
+        from_version = str(state.get("ruleset_version") or "") or str(campaign_row["ruleset_version"] or "")
+        target_version = str(to_version or identity.get("ruleset_version") or "")
+        if not target_version:
+            raise CampaignRuntimeError("没有可用的目标规则版本（清单没声明，也没显式给出）")
+        if from_version == target_version:
+            # 版本已经一致：先看这是不是同一次转换的重放，不是才报错
+            done = self._converted_record(instance_id, timeline_id, campaign_id, to_version=from_version)
+            if done is not None:
+                return {**_loads(done["result"], {}), "status": "duplicate",
+                        "joint_commit_id": str(done["joint_commit_id"])}
+            raise CampaignRuntimeError(f"规则状态已经是 {target_version}，不需要转换")
+        converter = rules.pick_converter(
+            rules.converters_of(manifest), converter_id=converter_id,
+            from_version=from_version, to_version=target_version,
+        )
+        if converter is None:
+            raise CampaignRuntimeError(
+                f"插件没有声明可用的转换器（{from_version} → {target_version}）"
+                "；人工确认接受请用 trpg.campaign.status(accept_ruleset_version=…)"
+            )
+        chosen = str(converter.get("converter_id"))
+        key = f"{chosen}|{from_version}>{target_version}"
+        existing = self._converted_record(instance_id, timeline_id, campaign_id, key=key)
+        if existing is not None:
+            return {**_loads(existing["result"], {}), "status": "duplicate",
+                    "joint_commit_id": str(existing["joint_commit_id"])}
+
+        state_revision = int(state["state_revision"])
+        request = {
+            "type": "convert_state",
+            "protocol": "isekai.trpg.rules/1",
+            "converter_id": chosen,
+            "converter_version": str(converter.get("converter_version") or identity.get("ruleset_version") or ""),
+            "campaign_id": campaign_id,
+            "from_version": from_version,
+            "to_version": target_version,
+            "state_revision": state_revision,
+            "opaque_state": _loads(state["opaque_state"], {}),
+        }
+        try:
+            converted = await rules.convert(manifest, converter, request)
+        except rules.RulePluginError as exc:
+            # 转换失败保留原状态：不写新 revision，不降级、不清空
+            return {
+                "status": "needs_review",
+                "converter_id": chosen,
+                "old_ruleset_version": from_version,
+                "new_ruleset_version": target_version,
+                "old_state_revision": state_revision,
+                "errors": [str(exc)],
+            }
+        losses = list(converted.get("losses") or [])
+        if losses and not accept_losses:
+            return {
+                "status": "needs_review",
+                "converter_id": chosen,
+                "old_ruleset_version": from_version,
+                "new_ruleset_version": target_version,
+                "old_state_revision": state_revision,
+                "losses": losses,
+                "errors": ["转换有信息损失，需要显式接受（accept_losses=True）"],
+            }
+
+        now = float(now_real if now_real is not None else time.time())
+        record = {
+            "converter_id": chosen,
+            "converter_version": str(request["converter_version"]),
+            "old_ruleset_version": from_version,
+            "old_state_revision": state_revision,
+            "new_ruleset_version": target_version,
+            "new_state_revision": state_revision + 1,
+            "losses": losses,
+        }
+        joint_id = campaign_mod.new_id("jc")
+        state_out = {
+            **state,
+            "ruleset_version": target_version,
+            "state_revision": state_revision + 1,
+            "opaque_state": _dumps(converted["opaque_state"]),
+            "updated_world": self._world(instance_id, timeline_id),
+            "updated_real": now,
+        }
+        note = (
+            f"规则版本转换 {from_version} → {target_version}（{chosen}）；"
+            f"损失 {len(losses)} 项" + ("；已人工接受" if losses else "")
+        )
+        campaign_out = {
+            **campaign_row,
+            "ruleset_version": target_version,
+            "state_revision": int(campaign_row["state_revision"]) + 1,
+            "note": note,
+            "updated_world": state_out["updated_world"],
+            "updated_real": now,
+        }
+        result = {
+            "status": "converted",
+            "joint_commit_id": joint_id,
+            "campaign_id": campaign_id,
+            **record,
+            "notes": str(converted.get("notes") or ""),
+        }
+        ledger = {
+            "joint_commit_id": joint_id,
+            "instance_id": instance_id,
+            "timeline_id": timeline_id,
+            "campaign_id": campaign_id,
+            "action_id": "",
+            "idempotency_key": key,
+            "campaign_revision": int(campaign_out["state_revision"]),
+            "world_revision": int(state_out["updated_world"]),
+            "state_revisions": _dumps({str(campaign_row["ruleset_id"]): int(state_out["state_revision"])}),
+            "status": "converted",
+            "result": _dumps(result),
+            "created_world": int(state_out["updated_world"]),
+            "created_real": now,
+        }
+        self.store.trpg_upserts(
+            {"rule_state": [state_out], "campaign": [campaign_out], "commit": [ledger]}
+        )
+        return result
+
     # ------------------------------------------------------------ 规则状态与恢复
 
     def rule_state(self, instance_id: str, timeline_id: str, campaign_id: str) -> dict[str, Any]:
@@ -832,6 +1102,40 @@ class CampaignRuntime:
         return {"interrupted": interrupted, "committing_recovered": recovered}
 
     # ------------------------------------------------------------ 内部
+
+    async def _rule_session(self, manifest_path: str) -> rules.RulePluginSession | None:
+        """按清单决定走常驻会话还是一次性进程：清单 `resident: true` 才常驻。
+
+        闲置超时就地收掉（一次比较，不起后台任务）；清单读不动就退回一次性路径，
+        让它按原来的方式报错，不在这里改变错误语义。
+        """
+        try:
+            manifest = rules.load_manifest(manifest_path)
+        except rules.RulePluginError:
+            return None
+        if not manifest.get("resident"):
+            return None
+        key = str(Path(manifest_path))
+        entry = [str(part) for part in manifest["entry"] if str(part)]
+        session = self.rule_sessions.get(key)
+        if session is not None and session.last_used_real:
+            if (time.time() - session.last_used_real) > self.rule_session_idle_s:
+                await session.close()
+                session = None
+        if session is None:
+            session = rules.RulePluginSession(Path(manifest_path), entry)
+            self.rule_sessions[key] = session
+        return session
+
+    async def close_rule_sessions(self) -> int:
+        """收掉所有常驻会话（核心退出 / 测试收尾）；返回关掉几个。"""
+        closed = 0
+        for session in list(self.rule_sessions.values()):
+            if session.alive():
+                closed += 1
+            await session.close()
+        self.rule_sessions.clear()
+        return closed
 
     def _require_line(self, instance_id: str, timeline_id: str) -> None:
         if not instance_id or not timeline_id:
@@ -904,8 +1208,13 @@ class CampaignRuntime:
         self.store.trpg_upserts({"action": [out]})
         return out
 
-    def _fail(self, row: dict[str, Any], status: str, *, code: str = "") -> dict[str, Any]:
-        """把行动推到失败态：状态机不允许直达时走合法中间态（reviewing → committing → conflict/stale）。"""
+    def _fail(self, row: dict[str, Any] | None, status: str, *, code: str = "") -> dict[str, Any] | None:
+        """把行动推到失败态：状态机不允许直达时走合法中间态（reviewing → committing → conflict/stale）。
+
+        `row=None` = 这次提交背后没有行动（GM 直接变化），没有可标记的行。
+        """
+        if row is None:
+            return None
         path = _FAIL_PATHS.get((str(row["status"]), status), (status,))
         for step in path:
             row = self._set_action_status(row, step, failure_code=code)
@@ -928,18 +1237,44 @@ class CampaignRuntime:
             "updated_world": int(world),
         }
 
+    def _review(self, action_row: dict[str, Any] | None, errors: list[str]) -> dict[str, Any]:
+        """待审：有行动就把行动挂起来等 GM；GM 直接变化没有行动行，只回待审结果。"""
+        if action_row is None:
+            return {"status": "needs_review", "action_id": "", "errors": errors}
+        return self._needs_review(action_row, errors)
+
     def _needs_review(self, action_row: dict[str, Any], errors: list[str]) -> dict[str, Any]:
         self._fail(action_row, "awaiting_gm_review", code="needs_review")
         return {"status": "needs_review", "action_id": str(action_row["action_id"]), "errors": errors}
 
-    def _conflict(self, action_row: dict[str, Any], *, current_revision: int, requested: int) -> dict[str, Any]:
+    def _conflict(
+        self, action_row: dict[str, Any] | None, *, current_revision: int, requested: int
+    ) -> dict[str, Any]:
+        """版本冲突：整批不落盘；有行动就标 conflict，GM 直接变化只回报冲突读数。"""
         self._fail(action_row, "conflict", code="conflict")
         return {
             "status": "conflict",
-            "action_id": str(action_row["action_id"]),
+            "action_id": str((action_row or {}).get("action_id") or ""),
             "rule_state_revision": current_revision,
             "requested_base": requested,
         }
+
+    def _converted_record(
+        self, instance_id: str, timeline_id: str, campaign_id: str, *, key: str = "", to_version: str = ""
+    ) -> dict[str, Any] | None:
+        """账本里的转换记录（§十六 可审计 + 幂等）：按幂等键或目标版本找回原来那次。"""
+        for row in self.store.trpg_list(
+            "commit", instance_id=instance_id, timeline_id=timeline_id, campaign_id=campaign_id
+        ):
+            if str(row["status"]) != "converted":
+                continue
+            if key and str(row["idempotency_key"]) != key:
+                continue
+            result = _loads(row["result"], {})
+            if to_version and str(result.get("new_ruleset_version") or "") != to_version:
+                continue
+            return row
+        return None
 
     def _result_of(self, joint_commit_id: str) -> dict[str, Any]:
         row = self.store.trpg_get("commit", joint_commit_id=joint_commit_id)

@@ -426,19 +426,25 @@ local_progress_clocks[]
 
 这些值只对当前战役和场景有效。规则插件可以返回 `rule_time_delta`，Campaign Runtime 负责应用；它不会自动改变 WorldRuntime。
 
-只有 `world_time_request` 通过 WorldRuntime 的 `runtime.time.advance` 或联合提交校验后，才改变世界时间。请求必须说明：
+只有 `world_time_request` 通过核心校验后，才改变世界时间。请求形态：
 
 ```text
-reason
-source: player_action / gm_declaration / world_process
-requested_until | duration
+cause                             # 必填：这次时间消耗的理由（记进提交说明）
+seconds                           # 必填：正秒数
+source?                           # world_process / player_action / gm_declaration
+                                  # 缺省按路径推：行动提交 = player_action，GM 直接变化 = gm_declaration
 ```
 
+落地方式：**它和规则状态 patch、世界后果在同一个批次里**——一次性前移时钟锚点（`base_world`），而不是改水位（`processed_world`）；随后按正常批次结算这段时间（`advance`）。所以：
+
 - 玩家关键行动不能被后台自动推进消耗；
-- 世界过程推进与玩家行动分开记账；
-- 世界时间推进失败时，规则状态和场景也不能假装已完成；
+- 世界过程推进与玩家行动分开记账（`source` 进提交说明，回滚与审计按它区分）；
+- 世界时间推进失败时，规则状态和场景也不能假装已完成——同批落盘，任一步非法则整批回到批前；
 - 规则回合结束不默认等于世界时间推进；
-- 休息、旅行和调查耗时只有规则插件 / GM 明确产生结构化请求时才推进世界时间。
+- 休息、旅行和调查耗时只有规则插件 / GM 明确产生结构化请求时才推进世界时间；
+- 非法请求（非正秒数 / 非对象 / 未知 source）进 `needs_review`，**不动时钟**，不静默忽略。
+
+通用的 `runtime.time.consume(duration, cause, source)` 是同一原语的对外入口（受信调用方用）：`cause` 必填、只许前进、留下 `time_consume` 提交点；回滚越过它会把世界时间拉回提交那一刻。
 
 ## 十五、受众与信息隔离
 
@@ -452,7 +458,9 @@ gm_only
 npc:<character_id>
 ```
 
-受众只控制 Campaign Runtime 对该材料的呈现范围；世界事实本身仍由 WorldRuntime 的认知投影决定。规则插件的 `resolution` 默认 `gm_only`，除非规则层明确生成玩家可见摘要。玩家可见摘要不能包含未获知世界事实、其他角色私密信息或规则插件私有状态中不应公开的字段。
+受众只控制 Campaign Runtime 对该材料的呈现范围；世界事实本身仍由 WorldRuntime 的认知投影决定。
+
+落地：受众是**闭集**（上表 + `public_party` / `gm_only`），写入口（提交、GM 直接变化、待选择的受众）一律校验；`trpg.scene.view(audience=…)` 按受众裁剪——场景公共材料逐项看 `audience` 字段，`private_views` 只给对应受众（GM 拿全份），行动材料带自己的受众列。规则插件的 `resolution` 默认 `gm_only`，除非规则层明确生成玩家可见摘要。玩家可见摘要不能包含未获知世界事实、其他角色私密信息或规则插件私有状态中不应公开的字段。
 
 同一用户控制多个角色不自动合并 `character:<id>` 受众。队伍公开信息必须显式声明为 `public_party`。
 
@@ -482,6 +490,8 @@ losses[]
 ```
 
 有信息损失、未确认字段或转换失败时必须停在 `needs_review`，原状态保持可恢复。转换不是 WorldRuntime 的自动推断。
+
+落地：转换器由清单 `converters[]` 声明（`converter_id` / `from_version` / `to_version` / 可选 `converter_version` 与 `entry`，`entry` 缺省用插件主入口），核心经 `trpg.campaign.migrate` 调用它，只搬运与记账：请求带 `from_version` / `to_version` / `state_revision` / `opaque_state`，响应必须回 `opaque_state` 对象与 `losses[]`。幂等键是 `converter|from>to`，同一转换重放返回原记录（版本已经一致时也先认重放，不报「不需要转换」）。
 
 ## 十七、分叉与回滚的战役语义
 
@@ -565,26 +575,27 @@ created_at / updated_at
 
 ## 二十一、实施状态
 
-**已实现并通过行为验证**（`tests/test_trpg_campaign.py` 12 项：真 WebSocket + 真 SQLite + 真插件子进程；CLI 端到端 `scripts/_probe_trpg_cli.py`）：
+**已实现并通过行为验证**（`tests/test_trpg_campaign.py` 20 项 + `tests/test_time_consume.py` 3 项：真 WebSocket + 真 SQLite + 真插件子进程；CLI 端到端 `scripts/_probe_trpg_cli.py` 走完战役 → 行动 → 裁定 → 联合提交 → 时间消耗 → GM 直接变化 → 规则版本迁移）：
 
 - 战役 / 场景 / 行动 / 待选择的持久化与状态机（非法迁移给出合法去向，不静默纠正）；
-- 战役状态闸门：`blocked` / `paused` / `archived` 拒绝一切改变状态的调用；**`waiting` 只接受对应的输入**（有待选择未处理时不许再声明 / 确认 / 裁定 / 提交；选择完自动回 `active`，还有别的待选择就继续停在 `waiting`）；
-- 规则状态附件（`trpg_rule_state`）：字段不透明、只托管版本与并发；并记下**写这份状态时插件声明的规则版本**；
-- 规则版本闸（§十六 第 2 层）：裁定与提交入口比对「状态写入时的版本」与「当前插件声明的版本（清单 `ruleset_version`，缺省退回插件版本）」，不一致→战役 `blocked` + 明确原因，不静默替换；出口是人工确认 `trpg.campaign.status(accept_ruleset_version=…)`（同一批重铸状态版本并留下记录），转换器仍属未实现；
-- 联合提交 `trpg.commit`：规则状态 patch + 世界后果 + 场景转换在**同一个 `apply_runtime_batch` 事务**里落地，任一步非法则三处都不落盘；
-- 后果来源区分（§十五）：`source_mode=action`（落 `trpg_action`）/ `gm_declaration`（落 `gm_declaration`），非法来源直接拒；
+- 战役状态闸门：`blocked` / `paused` / `archived` 拒绝一切改变状态的调用；**`waiting` 只接受对应的输入**（有待选择未处理时不许再声明 / 确认 / 裁定 / 提交；选择完回 `active`，还有别的待选择就继续停在 `waiting`）；
+- 规则状态附件（`trpg_rule_state`）：字段不透明、只托管版本与并发；记下**写这份状态时插件声明的规则版本**；
+- 规则版本闸（§十六 第 2 层）：比对「状态写入时的版本」与「当前插件声明的版本（清单 `ruleset_version`，缺省退回 `version`）」，不一致→战役 `blocked` + 明确原因；
+- 规则版本**转换器**（§十六）：清单 `converters` 声明的转换器由插件执行、核心只搬运与记账；失败 / 输出非法 / 有信息损失（未显式接受）一律停在 `needs_review` 且**原状态可恢复**；记录（old_state_revision / old_ruleset_version / converter_id / converter_version / new_state_revision / losses）写进 `trpg_commit` 账本（`status=converted`），幂等键 `converter|from>to`；无转换器时的人工出口是 `trpg.campaign.status(accept_ruleset_version=…)`（同批重铸状态版本 + 留记录）；
+- 联合提交 `trpg.commit`：规则状态 patch + 世界后果 + 场景转换在**同一个 `apply_runtime_batch` 事务**里落地，任一步非法则三处都不落盘；**行动路径与 GM 直接变化共用同一条管线**（`_joint_apply`）；
+- **GM 直接变化**（§十五）：`trpg.gm.change` 不过行动、不过插件，直接提交后果；来源落 `gm_declaration`，不制造行动行，规则状态与世界后果照旧同批；角色行动落 `trpg_action`；非法来源直接拒；
+- 场景内时间消耗（§十四）：`transition.world_time_request = {seconds, cause}` 校验通过后，**与世界后果、规则状态同批前移时钟锚点**（`clock_shift_seconds`），随后按正常批次结算这段时间；`runtime.time.consume` 是同一原语的通用入口（`cause` 必填、只许前进、留下 `time_consume` 提交点、回滚会把世界时间一起拉回）；非法请求进待审且不动时钟；
+- 受众与信息隔离（§十五）：受众闭集（`public_party` / `gm_only` / `player:` / `character:` / `npc:`）校验；`trpg.scene.view(audience=…)` 按受众裁剪场景材料（`private_views` 只给对应受众，GM 拿全份）与行动（行动材料带自己的受众列）；插件原始 `resolution` 默认 `gm_only`，玩家面拿不到；
 - 幂等重放（`trpg_commit` 账本，同键返回原 `joint_commit_id`）、版本冲突（`base_state_revision` 不符→`conflict`）、世代失效（→`stale`）；
 - 回滚 / 分叉 / 导出导入随件：六张 `trpg_*` 表进 `runtime_dump` / `runtime_load` / `timeline_clear_state` / `instance_delete` / `portable`，回滚按提交快照精确恢复规则状态；
 - 重启恢复 `trpg.recover`：在途 `snapshotting`/`resolving` → `interrupted`，`committing` 按幂等账本判定，不重跑随机裁定；
-- 管理面 op（13 个）与 CLI `trpg` 命令组；
+- **规则插件常驻形态**（§五）：清单 `resident: true` 时一个插件进程服务多次裁定（心跳 `ping`/`pong`，闲置超时就地收掉，核心退出统一关闭）；进程死在「还没发请求」时重开一个，**死在半路不重发**（不重跑裁定）；常驻只省启动与加载——状态仍只经快照进出；
+- 管理面 op（16 个：`trpg.campaign.create|list|info|status|migrate`、`trpg.scene.open|view`、`trpg.action.declare|confirm|abandon|resolve`、`trpg.choice.select`、`trpg.rule_state.read`、`trpg.commit`、`trpg.gm.change`、`trpg.recover`，外加 `runtime.time.consume`）与 CLI 同名命令组；
 - B0 兼容：不带 `campaign_id` 的 `trpg.action.resolve` 语义不变。
 
 **尚未实现（记为设计义务，不充数）**：
 
-- 规则版本**转换器**：闸门与人工确认出口已具备，但转换器执行路径没写——它按设计是**插件声明才启用**的能力（清单 `converters`），当前没有任何插件声明，写了没有调用方；
-- `world_time_request` 的实际推进：当前只随提交结果回传并标 `world_time_applied=False`。**缺的不是代码而是语义**：核心现在没有「消耗 N 秒世界时间」的原始操作（时钟是水位/速率驱动的），跳跃水位会牵动到期待处理事件与世代，设计里「允许请求局部时间消耗的场景」也还没定义。要落地得先定这条语义；
-- `source=gm_declaration` 的**独立管理面入口**：来源标注已能打，但 GM 直接变化目前仍复用 `trpg.commit` / `event.draft` 的入口，没有专门的 op；
-- 多玩家受众的完整校验（受众字段已落库，但队伍 / 私密频道的界面规则未实现——§2 明确写它不属于首版前提）；
-- 规则插件常驻进程形态（当前每次裁定仍是一次调用一个进程；**状态生命周期已实现**，快照进快照出，驻留与否只是传输层优化）。
-
-
+- `source_mode` 之外的**多来源细分**：目前只有 `trpg_action` / `gm_declaration` 两种来源标注；
+- 受众的**用户级归并**：设计明确「同一用户控制多个角色不自动合并 `character:<id>`」，核心不做 `user:` 映射（需要的话由上层显式传受众）；
+- 常驻插件的**跨核心复用**：会话属于核心进程，核心重启后重开；
+- 规则状态 patch 的**分片合并**（多个来源同时对同一战役提交 patch 的合并策略）——当前按 revision 冲突处理。
