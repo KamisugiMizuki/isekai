@@ -165,8 +165,12 @@ for line in sys.stdin:                     # 读到 EOF 就退出（核心被杀
 '''
 
 
-def make_resident_plugin(tmp_path) -> str:
-    """清单声明 resident: true 的插件：一个进程活过多次裁定，自己数被拉起了几次。"""
+def make_resident_plugin(tmp_path, *, share: bool = False) -> str:
+    """清单声明 resident: true 的插件：一个进程活过多次裁定，自己数被拉起了几次。
+
+    `share=True` 再加一条 `share: true`：走共享承载（本机回环 + 桥），**跨核心复用同一个进程**
+    （TRPG §二十一 残余第 3 条）。
+    """
     folder = tmp_path / "resident_rules"
     folder.mkdir(exist_ok=True)
     (folder / "main.py").write_text(RESIDENT_SOURCE, encoding="utf-8")
@@ -174,6 +178,7 @@ def make_resident_plugin(tmp_path) -> str:
     manifest.write_text(
         json.dumps({
             "id": "fake-rules", "name": "fake resident", "version": "1.0", "resident": True,
+            "share": bool(share),
             "protocol": "isekai.trpg.rules/1", "entry": [sys.executable, "main.py"],
         }),
         encoding="utf-8",
@@ -1163,3 +1168,52 @@ async def test_multi_audience_view_is_an_explicit_union(tmp_path) -> None:
             assert "未知受众" in str(err.value) or "audience" in str(err.value).lower(), err.value
         finally:
             await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_resident_plugin_is_reused_across_core_restarts(tmp_path, monkeypatch) -> None:
+    """§二十一 残余第 3 条：`resident + share` 的插件活过核心重启，新核心接上**同一个进程**。
+
+    插件代码一个字没改（还是 stdio 一行一个 JSON），换的是核心与桥之间的承载；
+    插件自己往 `spawns.txt` 记启动次数、往 `pid.txt` 记 pid——两样都能被断言。
+    """
+    monkeypatch.setenv("ISEKAI_PLUGIN_IDLE_EXIT", "4")  # 测试收尾时桥自退，别留孤儿
+    plugin = make_resident_plugin(tmp_path, share=True)
+    folder = tmp_path / "resident_rules"
+    spawns, pid_file = folder / "spawns.txt", folder / "pid.txt"
+
+    instance: dict = {}
+    timeline_id = ""
+    campaign_id = ""
+    async with running_core(tmp_path) as first:
+        mgmt = await open_mgmt(first)
+        try:
+            instance, timeline_id, _card = make_instance(
+                first.store, first.runtime.service.runtime, moment=DAY * 1500
+            )
+            campaign_id = await _campaign(mgmt, instance, timeline_id, plugin)
+            action, _ = await _run_action(mgmt, instance, timeline_id, campaign_id, plugin=plugin)
+            committed = await mgmt.call(
+                "trpg.commit", instance_id=instance["id"], timeline_id=timeline_id,
+                campaign_id=campaign_id, action_id=action, idempotency_key="share-1",
+            )
+            assert committed["status"] == "committed", committed
+        finally:
+            await mgmt.close()
+    assert spawns.read_text(encoding="utf-8").count("spawn") == 1, "第一个核心该把插件拉起来一次"
+    pid_a = pid_file.read_text(encoding="utf-8").strip()
+
+    # 核心重启：同一个根、同一个插件目录 —— 插件进程应该被**接上**，而不是重开
+    async with running_core(tmp_path) as second:
+        mgmt = await open_mgmt(second)
+        try:
+            action, _ = await _run_action(mgmt, instance, timeline_id, campaign_id, plugin=plugin)
+            committed = await mgmt.call(
+                "trpg.commit", instance_id=instance["id"], timeline_id=timeline_id,
+                campaign_id=campaign_id, action_id=action, idempotency_key="share-2",
+            )
+            assert committed["status"] == "committed", committed
+        finally:
+            await mgmt.close()
+    assert spawns.read_text(encoding="utf-8").count("spawn") == 1, "核心重启不该再起一个插件进程"
+    assert pid_file.read_text(encoding="utf-8").strip() == pid_a, "跨核心复用的是同一个插件进程"

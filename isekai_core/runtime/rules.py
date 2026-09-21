@@ -6,6 +6,10 @@ validates the returned world effects before applying them.
 
 from __future__ import annotations
 
+import hashlib
+import secrets
+import sys as _sys
+
 import asyncio
 import json
 import time
@@ -111,18 +115,108 @@ class RulePluginSession:
     读到 stdin EOF 必须自己退出（核心被杀时不会有人来回收它）。
     """
 
-    def __init__(self, manifest_path: Path, entry: list[str], *, timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        manifest_path: Path,
+        entry: list[str],
+        *,
+        timeout: float = 60.0,
+        share: bool = False,
+    ) -> None:
         self.manifest_path = manifest_path
         self.entry = entry
         self.timeout = float(timeout)
         self.spawns = 0
         self.last_used_real = 0.0
+        #: 清单声明 `share: true` 时走「共享承载」：桥把插件挂在本机回环上，**核心重启后能再接上同一个进程**
+        #: （§二十一 残余第 3 条）。插件代码不变，还是说 stdio NDJSON——换的只是核心与桥之间的承载。
+        self.share = bool(share)
+        self.share_file = share_file_for(manifest_path) if self.share else None
+        self.reused = False
         self._proc: asyncio.subprocess.Process | None = None
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
 
     def alive(self) -> bool:
+        if self._reader is not None:
+            return not self._reader.at_eof()
         return self._proc is not None and self._proc.returncode is None
 
+    async def _attach(self) -> bool:
+        """照共享文件连上活着的桥；能 ping 通才算接上（§二十一 残余第 3 条）。"""
+        path = self.share_file
+        if path is None:
+            return False
+        try:
+            info = json.loads(path.read_text(encoding="utf-8"))
+            port = int(info.get("port") or 0)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        if port <= 0:
+            return False
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port), timeout=3.0
+            )
+        except (OSError, asyncio.TimeoutError):
+            return False
+        self._reader, self._writer = reader, writer
+        if not await self._probe():
+            await self._detach()
+            return False
+        self.reused = True
+        return True
+
+    async def _probe(self) -> bool:
+        """在当前连接上**裸问一句** ping：不走 `request()` 的自愈路径。
+
+        `request()` 在「不 alive」时会 close + spawn，而 `_attach()` 正处在 `_spawn()` 里——
+        从 `_attach` 调 `ping()`（= `request()`）会递归复习，把桥进程句柄清掉（真踩过：
+        第一版就是 `AttributeError: 'NoneType' object has no attribute 'returncode'`）。
+        """
+        reader, writer = self._reader, self._writer
+        if reader is None or writer is None:
+            return False
+        try:
+            writer.write(
+                (json.dumps({"type": "ping", "protocol": "isekai.trpg.rules/1"}) + "\n").encode("utf-8")
+            )
+            await writer.drain()
+            raw = await asyncio.wait_for(reader.readline(), timeout=3.0)
+            answer = json.loads(raw.decode("utf-8"))
+        except (OSError, asyncio.TimeoutError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        return str(answer.get("type") or "") == "pong"
+
+    async def _detach(self) -> None:
+        """放开连接但**不动**插件进程：它要活过这个核心。"""
+        writer, self._writer = self._writer, None
+        self._reader = None
+        if writer is not None:
+            try:
+                writer.close()
+            except OSError:
+                pass
+
     async def _spawn(self) -> None:
+        if self.share_file is not None:
+            if await self._attach():
+                return
+            token = secrets.token_hex(16)
+            self._proc = await asyncio.create_subprocess_exec(
+                _sys.executable, "-m", "isekai_core.runtime.plugin_bridge",
+                str(self.share_file), token, "--", *self.entry,
+                cwd=str(self.manifest_path.parent),
+            )
+            self.spawns += 1
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                if await self._attach():
+                    return
+                if self._proc.returncode is not None:
+                    raise RulePluginError("常驻规则插件桥起不来（进程已退出）")
+                await asyncio.sleep(0.05)
+            raise RulePluginError("常驻规则插件桥没有就绪（20s 内连不上共享端口）")
         self._proc = await asyncio.create_subprocess_exec(
             *self.entry,
             cwd=str(self.manifest_path.parent),
@@ -142,12 +236,18 @@ class RulePluginSession:
         if not self.alive():
             await self.close()
             await self._spawn()
-        proc = self._proc
-        assert proc is not None and proc.stdin is not None and proc.stdout is not None
+        line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         try:
-            proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-            await proc.stdin.drain()
-            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=wait)
+            if self._reader is not None and self._writer is not None:
+                self._writer.write(line)
+                await self._writer.drain()
+                raw = await asyncio.wait_for(self._reader.readline(), timeout=wait)
+            else:
+                proc = self._proc
+                assert proc is not None and proc.stdin is not None and proc.stdout is not None
+                proc.stdin.write(line)
+                await proc.stdin.drain()
+                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=wait)
         except (OSError, asyncio.TimeoutError) as exc:
             await self.close()
             raise RulePluginError(f"常驻规则插件调用失败：{type(exc).__name__}") from exc
@@ -187,7 +287,21 @@ class RulePluginSession:
         return f"：{text[-limit:]}" if text else ""
 
     async def close(self) -> None:
-        """关掉：先关 stdin 等它自己退（协议要求），超时才杀。"""
+        """关掉：先关 stdin 等它自己退（协议要求），超时才杀。
+
+        共享承载（`share: true`）例外——**只放开连接，插件留着**，下个核心会再连上来；
+        没人连、静置够了，桥自己带着插件收摊（`plugin_bridge.DEFAULT_IDLE_EXIT_S`）。
+        """
+        if self.share_file is not None:
+            proc, self._proc = self._proc, None
+            await self._detach()
+            if proc is None or proc.returncode is not None:
+                return
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=0.5)
+            except (OSError, asyncio.TimeoutError):
+                pass  # 桥是常驻的，不在这里收
+            return
         proc, self._proc = self._proc, None
         if proc is None or proc.returncode is not None:
             return
@@ -198,6 +312,15 @@ class RulePluginSession:
         except (OSError, asyncio.TimeoutError):
             proc.kill()
             await proc.wait()
+
+
+def share_file_for(manifest_path: Path) -> Path:
+    """共享文件落在插件目录里（`<manifest 目录>/.isekai-plugin-share.json`）。
+
+    同一个插件目录 = 同一个进程（跨核心、跨 roots 都复用）；位置确定、不看环境变量，
+    免得「同一个插件因为启动方式不同变成两三个进程」。
+    """
+    return Path(manifest_path).resolve().parent / ".isekai-plugin-share.json"
 
 
 async def resolve(

@@ -1165,7 +1165,9 @@ class CampaignRuntime:
                 await session.close()
                 session = None
         if session is None:
-            session = rules.RulePluginSession(Path(manifest_path), entry)
+            session = rules.RulePluginSession(
+                Path(manifest_path), entry, share=bool(manifest.get("share"))
+            )
             self.rule_sessions[key] = session
         return session
 

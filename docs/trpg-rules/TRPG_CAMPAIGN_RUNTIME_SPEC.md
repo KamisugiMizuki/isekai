@@ -598,11 +598,12 @@ created_at / updated_at
 - 幂等重放（`trpg_commit` 账本，同键返回原 `joint_commit_id`）、版本冲突（`base_state_revision` 不符→`conflict`）、世代失效（→`stale`）；
 - 回滚 / 分叉 / 导出导入随件：六张 `trpg_*` 表进 `runtime_dump` / `runtime_load` / `timeline_clear_state` / `instance_delete` / `portable`，回滚按提交快照精确恢复规则状态；
 - 重启恢复 `trpg.recover`：在途 `snapshotting`/`resolving` → `interrupted`，`committing` 按幂等账本判定，不重跑随机裁定；
-- **规则插件常驻形态**（§五）：清单 `resident: true` 时一个插件进程服务多次裁定（心跳 `ping`/`pong`，闲置超时就地收掉，核心退出统一关闭）；进程死在「还没发请求」时重开一个，**死在半路不重发**（不重跑裁定）；常驻只省启动与加载——状态仍只经快照进出；
+- **规则插件常驻形态**（§五）：清单 `resident: true` 时一个插件进程服务多次裁定（心跳 `ping`/`pong`，闲置超时就地收掉，核心退出统一关闭）；
+  **跨核心复用**（§二十一 残余第 3 条，2026-09-22）：再声明 `share: true` 时改走**共享承载**——核心连本机回环上的「中继桥」（`isekai_core/runtime/plugin_bridge.py`），桥以 stdio 托管真插件并把端口/令牌写进插件目录的 `.isekai-plugin-share.json`；新核心照这份文件**接上同一个插件进程**，插件代码与线协议都不动；核心退出只断开连接（插件留着），静置 `ISEKAI_PLUGIN_IDLE_EXIT` 秒（缺省 600）桥自退不留孤儿；进程死在「还没发请求」时重开一个，**死在半路不重发**（不重跑裁定）；常驻只省启动与加载——状态仍只经快照进出；
 - 管理面 op（16 个：`trpg.campaign.create|list|info|status|migrate`、`trpg.scene.open|view`、`trpg.action.declare|confirm|abandon|resolve`、`trpg.choice.select`、`trpg.rule_state.read`、`trpg.commit`、`trpg.gm.change`、`trpg.recover`，外加 `runtime.time.consume`）与 CLI 同名命令组；
 - B0 兼容：不带 `campaign_id` 的 `trpg.action.resolve` 语义不变。
 
 **尚未实现（记为设计义务，不充数）**：
 
-- 常驻插件的**跨核心复用**：会话属于核心进程，核心重启后重开；
+（本节原列四条残余已于 2026-09-22 全部落地：来源细分 / 受众显式并集 / 跨核心复用 / patch 分片合并。）
 
