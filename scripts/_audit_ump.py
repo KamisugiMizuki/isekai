@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """UMP 行为审计探针（只读：不改代码 / 测试 / data；临时库）。
 
-依据：docs/SESSION_CORE_SPEC.md 的 UMP 条款 + docs/CHANNEL_PLUGIN_SPEC.md 中
+依据：`docs/worldruntime/SESSION_CORE_SPEC.md` 的 UMP 条款 + `docs/worldruntime/CHANNEL_PLUGIN_SPEC.md` 中
 属「通道宿主 / 协议」的部分（信封校验、认证与持久身份、幂等去重、投递回执、
 错误模型、重连补投、能力协商与限额）。
 

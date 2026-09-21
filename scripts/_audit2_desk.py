@@ -644,7 +644,7 @@ def section_static() -> None:
           "PASS" if header and not stale and stated else "FAIL",
           f"文档状态行={'有' if header else '无'}；陈旧表述「阶段 1 起的界面与操作未实现」={'仍在' if stale else '已删'}；"
           f"已按实况写明阶段 1+ 已实现={'是' if stated else '否'}（对照 desktop/index.html 的生成 / 审定 / 实例管理 / 披露 / 草稿 / 备份）",
-          clause="DESKTOP_SPEC §八 实施分期 / 头部状态行", code="docs/DESKTOP_SPEC.md:5")
+          clause="DESKTOP_SPEC §八 实施分期 / 头部状态行", code="docs/core debugging/DESKTOP_SPEC.md:5")
 
     # ---- 2026-09-21 impeccable critique 的既定顺序修复：harden → layout/typeset → polish → onboard → 零碎 → §3.3
     css = (REPO / "desktop" / "src" / "styles.css").read_text(encoding="utf-8")
