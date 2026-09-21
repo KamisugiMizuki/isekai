@@ -29,6 +29,7 @@ class UmpClient:
     bootstrap: str | None = None
     segments: bool = True
     status: bool = True
+    attachments: bool = False
     max_text_len: int = DEFAULT_MAX_TEXT_LEN
     max_parts: int = DEFAULT_MAX_PARTS
 
@@ -53,6 +54,7 @@ class UmpClient:
                 "capabilities": {
                     "segments": self.segments,
                     "status": self.status,
+                    "attachments": self.attachments,
                     "max_text_len": self.max_text_len,
                     "max_parts": self.max_parts,
                 },
@@ -102,10 +104,20 @@ class UmpClient:
             if collect is not None:
                 collect.append(envelope)
 
-    async def send_user_message(self, *, thread_id: str, binding_token: str, text: str) -> str:
+    async def send_user_message(
+        self,
+        *,
+        thread_id: str,
+        binding_token: str,
+        text: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {"text": text}
+        if attachments:
+            payload["attachments"] = attachments
         env = ump.make(
             "user_message",
-            {"text": text},
+            payload,
             thread_id=thread_id,
             binding_token=binding_token,
             id=ump.new_id("e"),

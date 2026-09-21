@@ -194,8 +194,13 @@
 ## 七、实施分期
 
 - **阶段 0**：UMP v1、内建聊天、认证、去重 / 回执 / 错误、持久化与重连。
-- **随外部通道需求后置**：目录插件宿主、生命周期、启停与绑定 UI、文档及参考实现。
+- **随外部通道需求后置**：目录插件宿主、生命周期、启停与绑定 UI、文档及参考实现。→ **宿主 / 生命周期 / 文档 / 参考实现已落地（2026-09-21）**；壳侧启停 UI 仍后置。
 - **更后置**：附件、富媒体、流式表达、资源配额及分发渠道。
+  - **附件 / 富媒体已落地（2026-09-22）**：能力位 `attachments`（握手取交集）+ 配额 `max_attachments` / `max_attachment_bytes`；
+    帧格式见 `CHANNEL_PROTOCOL_APPENDIX.md` ② `user_message` 行；未声明的通道给附件仍是**显式拒绝**（`unsupported_capability`）。
+    行为验收 `tests/test_attachments.py`（真 WS + 真 SQLite）；客户端侧（壳的选文件与渲染）随桌面壳排期。
+  - **资源配额已落地**：通道侧容量闸（连接数 / 入站队列 / 限速 / 附件字节）见 §九；插件级 CPU / 内存配额按 §3.3 明确不做。
+  - **流式表达、分发渠道仍后置**。
 
 ## 八、与其它模块的接口
 
@@ -217,8 +222,8 @@
   `rate_limit_window_s`）；超限回 `overloaded` / `rate_limited`（都可重试），行为验收 `tests/test_channel_limits.py`。
 - 认证材料传递方式已定：核心签发通道凭据后经**该插件自己的环境**交给它（`ISEKAI_PLUGIN_ID` / `ISEKAI_PLUGIN_CREDENTIAL`；
   子进程 env 走白名单，核心的 LLM Key 与管理凭据都不进去）。
-- 附件与流式协议在启用这些能力时另行扩展，不提前铺设；当前实现**显式拒绝**相关字段
-  （`ump._reject_unsupported_extensions`，`unsupported_capability`，不静默忽略）。
+- 附件协议 **2026-09-22 落地**：`user_message.attachments`（能力位 `attachments` + 配额，图像进模型走 `image_url`，
+  其余类型只给文字标注）；未协商该能力的通道给附件仍是 `unsupported_capability`（不静默忽略）。流式仍按「启用时另行扩展」处理：`stream` 字段继续显式拒绝（`ump._reject_unsupported_extensions`）。
 
 ## 十、行为验收
 

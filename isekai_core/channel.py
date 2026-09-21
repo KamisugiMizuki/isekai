@@ -59,9 +59,22 @@ def negotiate(client_caps: dict[str, Any], cfg: Config) -> dict[str, Any]:
     return {
         "segments": bool(client_caps.get("segments", False)),
         "status": bool(client_caps.get("status", False)),
+        # 附件：通道声明才开（§七 附件项）；限额取交集
+        "attachments": bool(client_caps.get("attachments", False)),
+        "max_attachments": min(int(client_caps.get("max_attachments", cfg.max_attachments)), cfg.max_attachments),
+        "max_attachment_bytes": min(
+            int(client_caps.get("max_attachment_bytes", cfg.max_attachment_bytes)), cfg.max_attachment_bytes
+        ),
         "max_text_len": min(int(client_caps.get("max_text_len", cfg.max_text_len)), cfg.max_text_len),
         "max_parts": min(int(client_caps.get("max_parts", cfg.max_parts)), cfg.max_parts),
     }
+
+
+def attachment_limits(caps: dict[str, Any]) -> tuple[int, int] | None:
+    """把协商结果折成 `ump.parse` 要的 (条数, 字节) 元组；未协商返回 None（= 明确拒绝）。"""
+    if not caps.get("attachments"):
+        return None
+    return int(caps.get("max_attachments") or 0), int(caps.get("max_attachment_bytes") or 0)
 
 
 class CoreServer:
@@ -272,6 +285,7 @@ class CoreServer:
                         raw,
                         direction="c2s",
                         max_text_len=int(conn.capabilities.get("max_text_len") or self.cfg.max_text_len),
+                        attachments=attachment_limits(conn.capabilities),
                     )
                 except UmpError as exc:
                     conn.errors += 1

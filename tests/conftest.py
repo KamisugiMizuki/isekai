@@ -77,6 +77,7 @@ async def bind_thread(
     capabilities: dict[str, Any] | None = None,
     status: bool = True,
     segments: bool = True,
+    attachments: bool = False,
     max_text_len: int | None = None,
     max_parts: int | None = None,
 ) -> tuple[UmpClient, dict[str, Any]]:
@@ -99,6 +100,7 @@ async def bind_thread(
         credential=credential,
         status=status,
         segments=segments,
+        attachments=attachments,
         **({"max_text_len": max_text_len} if max_text_len else {}),
         **({"max_parts": max_parts} if max_parts else {}),
     )

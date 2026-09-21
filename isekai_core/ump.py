@@ -6,13 +6,22 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from .version import DEFAULT_MAX_PARTS, DEFAULT_MAX_TEXT_LEN, UMP_MAJOR, UMP_VERSION
+from .version import (
+    DEFAULT_MAX_ATTACHMENTS,
+    DEFAULT_MAX_ATTACHMENT_BYTES,
+    DEFAULT_MAX_PARTS,
+    DEFAULT_MAX_TEXT_LEN,
+    UMP_MAJOR,
+    UMP_VERSION,
+)
 
 
 class Err:
@@ -159,6 +168,10 @@ def parse_hello(payload: dict[str, Any]) -> dict[str, Any]:
     limits = {
         "max_text_len": _check_limit(caps.get("max_text_len", DEFAULT_MAX_TEXT_LEN), "max_text_len"),
         "max_parts": _check_limit(caps.get("max_parts", DEFAULT_MAX_PARTS), "max_parts"),
+        "max_attachments": _check_limit(caps.get("max_attachments", DEFAULT_MAX_ATTACHMENTS), "max_attachments"),
+        "max_attachment_bytes": _check_limit(
+            caps.get("max_attachment_bytes", DEFAULT_MAX_ATTACHMENT_BYTES), "max_attachment_bytes"
+        ),
     }
     return {
         "channel": {
@@ -169,10 +182,11 @@ def parse_hello(payload: dict[str, Any]) -> dict[str, Any]:
         "capabilities": {
             "segments": bool(caps.get("segments", False)),
             "status": bool(caps.get("status", False)),
-            # v1 基线：只文本、非流式（CHANNEL_PLUGIN_SPEC §2.1）。附件 / 富媒体 / 流式是**更后置**的
-            # 扩展点：这里显式声明不支持，收到相关字段一律明确拒绝，不静默忽略。
+            # 附件 / 富媒体（CHANNEL_PLUGIN_SPEC §七 更后置项之一）：**由通道声明**，握手时取交集；
+            # 没声明就仍然显式拒绝（见 `_attachments_of`），不静默忽略。
+            "attachments": bool(caps.get("attachments", False)),
+            # v1 基线：文本。流式是仍待办的扩展点：这里显式声明不支持。
             "text": True,
-            "attachments": False,
             "stream": False,
             **limits,
         },
@@ -181,8 +195,57 @@ def parse_hello(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-#: v1 只承担文本；这些字段出现即明确拒绝（扩展这些能力时再在此开闸，不提前铺设）
-_EXTENSION_FIELDS = ("attachments", "attachment", "media", "stream", "stream_id")
+#: v1 基线只承担文本；这些字段出现即明确拒绝（附件另行走能力位，见 `_attachments_of`）
+_EXTENSION_FIELDS = ("attachment", "media", "stream", "stream_id")
+
+
+def _attachments_of(payload: dict[str, Any], limits: tuple[int, int] | None) -> list[dict[str, Any]]:
+    """校验附件并把归一化结果写回 `payload["attachments"]`（CHANNEL_PLUGIN_SPEC §七 附件项）。
+
+    `limits` 是**协商后的** (条数, 单件字节)；`None` 表示该通道没协商附件能力——
+    这时给出来就是 `unsupported_capability`（明确拒绝，不静默丢弃）。
+    """
+    raw = payload.get("attachments")
+    if raw in (None, [], {}):
+        payload.pop("attachments", None)
+        return []
+    if limits is None:
+        raise UmpError(
+            Err.UNSUPPORTED_CAPABILITY,
+            "该通道未协商附件能力（hello.capabilities.attachments）",
+            retryable=False,
+        )
+    if not isinstance(raw, list):
+        raise UmpError(Err.PROTOCOL, "user_message.attachments must be an array")
+    max_count, max_bytes = int(limits[0]), int(limits[1])
+    if len(raw) > max_count:
+        raise UmpError(
+            Err.UNSUPPORTED_CAPABILITY, f"附件条数超出协商上限（{max_count}）", retryable=False
+        )
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise UmpError(Err.PROTOCOL, f"attachments[{index}] must be an object")
+        name = _require_str(item, "name", max_len=128)
+        media_type = str(item.get("media_type") or "").strip()
+        if not media_type or len(media_type) > 64 or any(ch.isspace() for ch in media_type) or "/" not in media_type:
+            raise UmpError(Err.PROTOCOL, f"attachments[{index}].media_type must be a MIME type")
+        data = item.get("data")
+        if not isinstance(data, str) or not data:
+            raise UmpError(Err.PROTOCOL, f"attachments[{index}].data must be a base64 string")
+        try:
+            blob = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise UmpError(Err.PROTOCOL, f"attachments[{index}].data is not valid base64") from exc
+        if len(blob) > max_bytes:
+            raise UmpError(
+                Err.UNSUPPORTED_CAPABILITY,
+                f"附件超过协商字节上限（{max_bytes} 字节）",
+                retryable=False,
+            )
+        normalized.append({"name": name, "media_type": media_type, "size": len(blob), "data": data})
+    payload["attachments"] = normalized
+    return normalized
 
 
 def _reject_unsupported_extensions(payload: dict[str, Any]) -> None:
@@ -202,7 +265,12 @@ def _reject_unsupported_extensions(payload: dict[str, Any]) -> None:
         )
 
 
-def _validate_payload(env_type: str, payload: dict[str, Any], max_text_len: int) -> None:
+def _validate_payload(
+    env_type: str,
+    payload: dict[str, Any],
+    max_text_len: int,
+    attachments: tuple[int, int] | None = None,
+) -> None:
     if env_type == "hello":
         parse_hello(payload)
         return
@@ -213,6 +281,7 @@ def _validate_payload(env_type: str, payload: dict[str, Any], max_text_len: int)
             raise UmpError(Err.PROTOCOL, "user_message.text must be a non-empty string")
         if len(text) > max_text_len:
             raise UmpError(Err.PROTOCOL, f"text exceeds {max_text_len} characters")
+        _attachments_of(payload, attachments)
     elif env_type == "delivery":
         _require_str(payload, "message_id", max_len=64)
         index = payload.get("batch_index", 0)
@@ -270,8 +339,13 @@ def parse(
     *,
     direction: str = "c2s",
     max_text_len: int = DEFAULT_MAX_TEXT_LEN,
+    attachments: tuple[int, int] | None = None,
 ) -> Envelope:
-    """解析并校验一个信封。任何不合规都抛 UmpError。"""
+    """解析并校验一个信封。任何不合规都抛 UmpError。
+
+    `attachments` = 该连接协商后的 (条数上限, 单件字节上限)；`None` 表示未协商附件能力
+    （那时带附件的帧会被显式拒绝，而不是静默丢掉字段）。
+    """
     if isinstance(raw, (str, bytes)):
         try:
             data = json.loads(raw)
@@ -318,7 +392,7 @@ def parse(
         payload = {}
     if not isinstance(payload, dict):
         raise UmpError(Err.PROTOCOL, "field 'payload' must be an object")
-    _validate_payload(env_type, payload, max_text_len)
+    _validate_payload(env_type, payload, max_text_len, attachments)
 
     return Envelope(
         type=env_type,

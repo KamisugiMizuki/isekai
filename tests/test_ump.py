@@ -93,10 +93,12 @@ def test_hello_normalises_capabilities():
         "segments": True,
         "status": True,
         "text": True,
-        "attachments": False,  # v1 只文本：能力声明里说清边界（§2.1）
+        "attachments": False,  # 端没声明就不开；声明了才按配额收（§七 附件项）
         "stream": False,
         "max_text_len": 1000,
         "max_parts": 3,
+        "max_attachments": 3,
+        "max_attachment_bytes": 512 * 1024,
     }
     assert hello["bootstrap"] == "bs-1" and hello["credential"] is None
 

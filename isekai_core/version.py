@@ -42,6 +42,10 @@ DEFAULT_MAX_QUEUED_INBOUND = 32     # 单会话排队入站上限：满了回 ra
 DEFAULT_RATE_LIMIT_MSGS = 60        # 每连接每窗口允许的入站帧数
 DEFAULT_RATE_LIMIT_WINDOW_S = 10.0
 
+#: 附件（CHANNEL_PLUGIN_SPEC §七「更后置」里的一项，2026-09-22 落地）：能力位 + 尺寸配额
+DEFAULT_MAX_ATTACHMENTS = 3                 # 单条消息附件条数上限
+DEFAULT_MAX_ATTACHMENT_BYTES = 512 * 1024   # 单个附件**解码后**字节上限（配额，按协商取小）
+
 
 def generator_fingerprint(*, segments: tuple, hints: tuple, model: str = "") -> str:
     """生成器 / 提示词 / 文本模型指纹：只负责新文本产物的边界（§5.7）。

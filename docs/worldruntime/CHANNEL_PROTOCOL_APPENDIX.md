@@ -31,10 +31,10 @@
 
 | type | 方向 | 需 thread | 需 token | payload 字段（名 · 类型 · 必填 / 校验） | 语义 | 代码出处 |
 |---|---|---|---|---|---|---|
-| `hello` | c2s | 否 | 否 | `channel{id,name,version}` 必；`capabilities{segments,status,max_text_len,max_parts}` 否；`auth{bootstrap｜credential}` 必 | 首帧必须是 hello，否则 protocol_error + 关闭 1008；`channel.id` 非空 ≤64，`name`/`version` 缺省取 id / `"0"`；`auth` 须给 bootstrap 或 credential 之一，否则 auth_required；限额须为正整数，缺省 4000 / 10 | ump.py:142-174, 177-179 · channel.py:163-168 |
-| `hello_ack` | s2c | 否 | 否 | `channel_instance`、`name`、`negotiated{segments,status,max_text_len,max_parts}`、`protocol`、`state`∈CORE_STATES、`threads[{id,binding_version,binding_token}]`、`credential`（仅引导首连） | 回协商结果与既有 thread 令牌（重连不必再问管理面）；解析期只校验 `state` 属于 `CORE_STATES` | channel.py:198-218 · ump.py:227-229, 52 |
+| `hello` | c2s | 否 | 否 | `channel{id,name,version}` 必；`capabilities{segments,status,attachments,max_text_len,max_parts,max_attachments,max_attachment_bytes}` 否；`auth{bootstrap｜credential}` 必 | 首帧必须是 hello，否则 protocol_error + 关闭 1008；`channel.id` 非空 ≤64，`name`/`version` 缺省取 id / `"0"`；`auth` 须给 bootstrap 或 credential 之一，否则 auth_required；限额须为正整数，缺省 4000 / 10 / 3 / 524288 | ump.py:142-186, 177-179 · channel.py:163-168 |
+| `hello_ack` | s2c | 否 | 否 | `channel_instance`、`name`、`negotiated{segments,status,attachments,max_text_len,max_parts,max_attachments,max_attachment_bytes}`、`protocol`、`state`∈CORE_STATES、`threads[{id,binding_version,binding_token}]`、`credential`（仅引导首连） | 回协商结果与既有 thread 令牌（重连不必再问管理面）；解析期只校验 `state` 属于 `CORE_STATES` | channel.py:198-218 · ump.py:227-229, 52 |
 | `binding` | s2c | 是 | 否 | `thread_id`、`binding_version`、`binding_token`、`state`∈{active,revoked} | 管理面绑定 / 重绑后推给在线通道：**换代先发 `revoked`（旧版本号 + 旧令牌，发给旧绑定所在连接）再发 `active`**；只发 active 会让客户端拿着旧令牌直到下一次发送才吃 `binding_expired` | channel.py::_thread_bind · ump.py:230-232 |
-| `user_message` | c2s | 是 | 是 | `text` 必：非空且非纯空白、≤协商 max_text_len | 唯一用户输入入口；去重键 = 已认证通道 + thread + `id` | ump.py:180-185 · session.py:88-167 · store.py::inbound_put |
+| `user_message` | c2s | 是 | 是 | `text` 必：非空且非纯空白、≤协商 max_text_len；`attachments` 可选：数组，每项 `{name≤128, media_type(MIME), data(base64)}`，须协商过 `attachments` 且条数 ≤ `max_attachments`、解码后单件 ≤ `max_attachment_bytes` | 唯一用户输入入口；去重键 = 已认证通道 + thread + `id`（**换附件内容也算冲突**）；附件随消息落库、进历史，图像进模型时给 `image_url`，其余类型只给一行文字标注 | ump.py::_attachments_of · session.py::_user_content · store.py::inbound_put |
 | `accepted` | s2c | 是 | 否 | `ref` ≤64 必；`state`∈ACCEPT_STATES（queued/processing/done/failed/cancelled）；`message_id`（未固化时为 null）；retry(outbound) 路径另带 `delivery` 汇总 | 「已持久接收」的确认，不等于已生成回复；重复输入返回同一逻辑轮次的最新状态 | ump.py:206-209, 51 · session.py:156-167, 252-260 |
 | `reply` | s2c | 是 | 否 | `message_id` ≤64 必；`parts` 非空数组、每项 `text` 为 str；`batch_index` ≥0；`batch_count` ≥1；另有 `reply_to`（主动消息为 null）与 `covers[]` | 已固化最终回复；批次数与序号发送前确定，重试不重排、不换 `message_id` | ump.py:210-223 · session.py:716-729 |
 | `system_notice` | s2c | 是 | 否 | `text` 必：非空字符串；`message_id` | 联络系统 / 管理机制的说明（归档、追赶提示），不是角色发言，不进角色上下文 | ump.py:233-235 · session.py:703-714, 463-474 |
@@ -114,6 +114,7 @@
 | 信封 / 载荷字符串字段 | 各字段值 | `id`/`ref`/`message_id`/`code` 64；`thread.id`/`binding_token` 128 | ump.py:125-133, 266, 277-280, 187, 194, 198, 207, 211 |
 | 出站分段 | 规范化后的回复文本（`\r\n`→`\n`、strip 后按行贪心切） | 协商 `max_text_len` | session.py:37-63, 374 |
 | 投递前复核 | 固化批次的每段 | 段长 ≤ `max_len`；批内段数 ≤ `max_parts` | session.py:697-702 |
+| 附件字节 | 每件 base64 **解码后**的长度 | 协商 `max_attachment_bytes`（缺省 512 KiB）；条数 ≤ 协商 `max_attachments`（缺省 3） | ump.py::_attachments_of |
 
 - CPython 的 `str` 是码点序列：一个 emoji / 辅助平面汉字算 **1**（UTF-8 下占 4 字节）。代码里没有 `encode()` 后的字节长度校验。
 - 帧上限是**字节**，与上面分开：`MAX_FRAME_BYTES = 1048576` 交给 websockets 的 `max_size`（服务端 channel.py:95，客户端 client.py:43, 165），按帧重组后的消息字节数判（库文档：`max_size: Maximum size of incoming messages in bytes`；超限 `fail(CloseCode.MESSAGE_TOO_BIG=1009)`，websockets/protocol.py:625-627 · websockets/frames.py:68）→ 核心不进解析、不发 error 信封。
@@ -141,6 +142,8 @@
 | `DEFAULT_MAX_QUEUED_INBOUND` | 32 | version.py:41 · config.py:145 · session.py::accept | 单会话排队入站达上限：新输入收到 `overloaded`（可重试），已接受的照常处理；重复发送（同 env_id）不走这道闸 |
 | `DEFAULT_RATE_LIMIT_MSGS` | 60 | version.py:42 · config.py:146 · channel.py::_rate_ok | 该连接本窗口入站帧超限：回 `rate_limited`（可重试）且不处理这一帧；超过 2 倍即断这条连接（1008 `rate limit`） |
 | `DEFAULT_RATE_LIMIT_WINDOW_S` | 10.0 | version.py:43 · config.py:147 · channel.py::_rate_ok | 上面那个窗口的长度（秒）；固定窗口计数，不是令牌桶 |
+| `DEFAULT_MAX_ATTACHMENTS` | 3 | version.py:46 · config.py:151 · ump.py::_attachments_of | 单条消息附件条数上限（协商取小）：超限 `unsupported_capability`，不落库 |
+| `DEFAULT_MAX_ATTACHMENT_BYTES` | 524288 | version.py:47 · config.py:152 · ump.py::_attachments_of | 单个附件解码后字节上限（协商取小）：超限同样是 `unsupported_capability` |
 
 同一类容量事实（未进上表，代码为据）：
 
@@ -156,15 +159,16 @@
 - 每连接发送队列上限 / 背压阈值：**未定义**（channel.py:50 只有串行化发送锁 `send_lock`，缓冲交给 websockets）。
 - 入站文本的**字节**上限：未单独设（只有码点数上限与 1 MiB 帧上限）。
 - 插件 stderr：**容量上限已实现**（`plugins.py:34-35` `STDERR_KEEP_LINES=200` 只留最近 200 行、`STDERR_LINE_CHARS=500` 单行截断；实测 `scripts/_audit2_chan.py` 刷 300 行 stderr 只留上限条数）；**脱敏未做**——只保证容量，不净化插件自行写出的内容（§六 已声明不给这个保证）。
-- 附件与流式的尺寸上限：随这两项能力本身一起做（§七 更后置；当前 `ump._reject_unsupported_extensions` 显式拒绝相关字段）。
+- 附件与流式的尺寸上限：**附件已落地**（`max_attachments` / `max_attachment_bytes`，见上表与 ④）；流式的尺寸上限随该能力本身一起做（§七 仍后置）。
 - 客户端重连退避（`desktop/src/main.ts:331` `RECONNECT_DELAYS_MS`）与生成 / 记忆预算类配额不属本文范围（§九 另条、各自 SPEC）。
 
-**已实现（原先记在这一节，2026-09-22 落地，行为验收 `tests/test_channel_limits.py` 5 项）：**
+**已实现（原先记在这一节，2026-09-22 落地，行为验收 `tests/test_channel_limits.py` 5 项 / `tests/test_attachments.py` 4 项）：**
 
 - 入站队列容量上限 → `core.max_queued_inbound`（默认 32）：排队满了拒新输入（`overloaded` / 可重试），已接受的不丢。
 - 在线连接数上限 → `core.max_connections`（默认 32）：超出只拒新连接（`overloaded` + 1013），不动在线的。
 - 速率限制 → `core.rate_limit_msgs` / `core.rate_limit_window_s`（默认 60 帧 / 10 秒）：超限帧回 `rate_limited`，持续超限断这条连接。
 - `binding.state=revoked` 产出方 → 换代时先给旧绑定发 revoked 再发 active（`channel.py::_thread_bind`）。
 - `status.state=interrupted` 产出方 → 轮次被打断（回滚 / 重绑 / 冻结 / 删除期间作废）时夹在 thinking 与 idle 之间发出（`session.py` 三处 drop 分支）。
+- 附件 / 富媒体（`attachments` 能力位 + 配额，`message.attachments` 列）→ 见 ② `user_message` 行与 ④；**流式仍未做**（`stream` 字段仍然显式拒绝）。
 
 复跑对拍：`.venv/Scripts/python.exe scripts/_audit2_proto_doc.py`（比对本文 ②③⑤ 的集合与数值；不一致即 FAIL 并打印两侧差异）。

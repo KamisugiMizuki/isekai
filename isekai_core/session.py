@@ -157,6 +157,7 @@ class SessionService:
                 env_id=env_id,
                 binding_version=thread_row["binding_version"],
                 text=text,
+                attachments=list(env.payload.get("attachments") or []),
             )
         except EnvelopeConflict as exc:
             raise UmpError(
@@ -756,11 +757,11 @@ class SessionService:
             if item["seq"] >= head["seq"]:
                 continue
             if item["role"] == "user":
-                messages.append({"role": "user", "content": item["text"] or ""})
+                messages.append({"role": "user", "content": _user_content(item["text"] or "", item.get("attachments"))})
             elif item["role"] == "character":
                 messages.append({"role": "assistant", "content": _flatten(item["parts"])})
         for item in rows:
-            messages.append({"role": "user", "content": item["text"] or ""})
+            messages.append({"role": "user", "content": _user_content(item["text"] or "", item.get("attachments"))})
         return messages, recalled, unit
 
     # ---------- 投递 ----------
@@ -882,6 +883,45 @@ def _flatten(parts_json: str | None) -> str:
     except json.JSONDecodeError:
         return ""
     return "\n".join(text for batch in batches for text in batch)
+
+
+def attachment_list(raw: Any) -> list[dict[str, Any]]:
+    """消息行里的附件（JSON 文本或已解析的列表）→ 列表；坏数据当没有。"""
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+    return []
+
+
+def _user_content(text: str, attachments: Any) -> Any:
+    """用户侧内容：有附件时按多模态块给（§七 附件项）。
+
+    图像直接给 `image_url`（data URL，模型能不能看由模型决定）；其余类型**只**留一行文字标注
+    （名字 / 类型 / 字节数），不把文件内容塞进提示词。
+    """
+    items = attachment_list(attachments)
+    if not items:
+        return text
+    notes = [
+        f"{item.get('name')}（{item.get('media_type')}，{int(item.get('size') or 0)} 字节）"
+        for item in items
+        if not str(item.get("media_type") or "").startswith("image/")
+    ]
+    body = text if not notes else f"{text}\n（随信附上：{'、'.join(notes)}）"
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": body}]
+    for item in items:
+        media_type = str(item.get("media_type") or "")
+        if media_type.startswith("image/") and item.get("data"):
+            blocks.append(
+                {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{item['data']}"}}
+            )
+    return blocks
 
 
 def _batch_text(rows: list[dict[str, Any]]) -> str:

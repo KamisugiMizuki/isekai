@@ -28,6 +28,26 @@ from .ump import Envelope, UmpError
 from .version import APP_VERSION
 
 
+def _attach_payload(paths: list[str] | None) -> list[dict[str, Any]]:
+    """把本地文件读成 UMP 附件载荷（base64 内联）；配额由核心按协商值判。"""
+    import base64
+    import mimetypes
+
+    out: list[dict[str, Any]] = []
+    for raw in paths or []:
+        path = Path(raw)
+        blob = path.read_bytes()
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        out.append(
+            {
+                "name": path.name,
+                "media_type": media_type,
+                "data": base64.b64encode(blob).decode("ascii"),
+            }
+        )
+    return out
+
+
 def _credentials_path(cfg: Config, channel_id: str) -> Path:
     return cfg.paths.clients / f"{channel_id}.json"
 
@@ -120,6 +140,7 @@ async def connect_channel(
         version=APP_VERSION,
         credential=credential,
         bootstrap=bootstrap,
+        attachments=True,  # CLI 支持附件（§七）：声明该能力，握手时按配额取交集
     )
     try:
         ack = await client.connect()
@@ -127,7 +148,9 @@ async def connect_channel(
         if not credential or not bootstrap:
             raise
         await client.close()
-        client = UmpClient(endpoint=endpoint, channel_id=channel_id, name=name, bootstrap=bootstrap)
+        client = UmpClient(
+            endpoint=endpoint, channel_id=channel_id, name=name, bootstrap=bootstrap, attachments=True
+        )
         ack = await client.connect()
     if ack.get("credential"):
         _save_credential(cfg, channel_id, ack["credential"])
@@ -142,9 +165,12 @@ async def run_turn(
     text: str,
     timeout: float = 180.0,
     quiet: bool = False,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> str:
     """发送一条消息并等待最终回复；打印状态与分段。返回回复全文。"""
-    env_id = await client.send_user_message(thread_id=thread_id, binding_token=token, text=text)
+    env_id = await client.send_user_message(
+        thread_id=thread_id, binding_token=token, text=text, attachments=attachments
+    )
     parts: list[str] = []
     expected_batches = 1
     while True:
@@ -305,7 +331,13 @@ async def amain(args: argparse.Namespace, cfg: Config) -> int:
                 raise SystemExit("缺少 --binding-token：无管理凭据时无法查询绑定")
 
         if args.say:
-            reply = await run_turn(client, thread_id=args.thread, token=thread["binding_token"], text=args.say)
+            reply = await run_turn(
+                client,
+                thread_id=args.thread,
+                token=thread["binding_token"],
+                text=args.say,
+                attachments=_attach_payload(args.attach),
+            )
             if args.quiet:
                 print(reply)
             return 0
@@ -335,6 +367,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--name", default="开发 CLI")
     parser.add_argument("--thread", default="dm-cli")
     parser.add_argument("--say", default=None, help="单轮模式：发送该文本并打印回复")
+    parser.add_argument(
+        "--attach",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="随消息发送附件（可重复；需核心侧协商附件能力，§七）",
+    )
     parser.add_argument("--instance", default=None, help="绑定真实世界实例（默认占位会话）")
     parser.add_argument("--timeline", default=None, help="时间线标识（默认取实例首条）")
     parser.add_argument("--character", default=None, help="角色标识（默认取实例首位角色）")

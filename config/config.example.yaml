@@ -22,6 +22,9 @@ core:
   max_queued_inbound: 32  # 单会话排队入站上限：满了回 overloaded（可重试），不丢弃已接受的
   rate_limit_msgs: 60     # 每连接每窗口允许的入站帧数
   rate_limit_window_s: 10.0
+  # 附件（CHANNEL_PLUGIN_SPEC §七）：通道在 hello 里声明 attachments 才生效，限额取交集
+  max_attachments: 3            # 单条消息附件条数上限
+  max_attachment_bytes: 524288  # 单个附件**解码后**字节上限（512 KiB）
 
 # 世界运行层参数：全局统一、仅开发者可配置（WORLD_RUNTIME_SPEC §2.2 / §2.6 / §4）
 # 刻意不提供 UI 入口：这些是世界运行预算，不是日常可调项

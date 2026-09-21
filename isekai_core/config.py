@@ -15,6 +15,8 @@ from typing import Any
 import yaml
 
 from .version import (
+    DEFAULT_MAX_ATTACHMENTS,
+    DEFAULT_MAX_ATTACHMENT_BYTES,
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_PARTS,
     DEFAULT_MAX_QUEUED_INBOUND,
@@ -145,6 +147,9 @@ class Config:
     max_queued_inbound: int = DEFAULT_MAX_QUEUED_INBOUND
     rate_limit_msgs: int = DEFAULT_RATE_LIMIT_MSGS
     rate_limit_window_s: float = DEFAULT_RATE_LIMIT_WINDOW_S
+    #: 附件配额（CHANNEL_PLUGIN_SPEC §七）：通道声明附件能力时按交集取小
+    max_attachments: int = DEFAULT_MAX_ATTACHMENTS
+    max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     backup: BackupConfig = field(default_factory=BackupConfig)
     #: 阶段 0 占位会话三元组与提示词；阶段 1 起被真实实例 / 角色卡取代
@@ -359,6 +364,8 @@ def load_config(root: str | os.PathLike[str] | None = None) -> Config:
         max_queued_inbound=int(core_raw.get("max_queued_inbound") or DEFAULT_MAX_QUEUED_INBOUND),
         rate_limit_msgs=int(core_raw.get("rate_limit_msgs") or DEFAULT_RATE_LIMIT_MSGS),
         rate_limit_window_s=float(core_raw.get("rate_limit_window_s") or DEFAULT_RATE_LIMIT_WINDOW_S),
+        max_attachments=int(core_raw.get("max_attachments") or DEFAULT_MAX_ATTACHMENTS),
+        max_attachment_bytes=int(core_raw.get("max_attachment_bytes") or DEFAULT_MAX_ATTACHMENT_BYTES),
         runtime=_runtime_config(raw),
         backup=_mapped(BackupConfig, raw, "backup"),
     )
