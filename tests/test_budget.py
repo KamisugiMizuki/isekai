@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from isekai_core.runtime import budget
@@ -177,3 +178,66 @@ def test_deterministic_advance_survives_exhausted_budget(store) -> None:
     world_service.advance(info["id"], timeline_id, now_real=1.7e9 + 3 * DAY)
     assert int(store.clock_get(timeline_id)["processed_world"]) > 0, "事实推进不因语言预算不足而跳过"
     assert world_service.reserve_call(info["id"], timeline_id, "event_render", prompt_text="x")["ok"] is False
+
+class _StubLLM:
+    """只数调用次数的最小模型替身：审计这条路径的账要看的就是「有没有发出去」。"""
+
+    def __init__(self, reply: str = '{"ok": true}') -> None:
+        self.calls = 0
+        self.reply = reply
+
+    async def chat(self, messages, **kwargs):  # noqa: ANN001, ANN003 - 测试替身
+        self.calls += 1
+        return self.reply
+
+
+def _audit_unit(instance_id: str, timeline_id: str) -> dict:
+    return {
+        "id": "u-audit",
+        "instance_id": instance_id,
+        "timeline_id": timeline_id,
+        "materials": [{"stance": "亲历", "source": "对话", "text": "她看到门外的脚印"}],
+        "activity": "值夜",
+    }
+
+
+def test_narrative_audit_records_into_the_call_budget(store) -> None:
+    """后验审计是每条可见回复的固定税：预算充足时问一次，并记进调用账。"""
+    world_service = _service(store)
+    instance_id, timeline_id, _ = _instance(store, world_service)
+    llm = _StubLLM()
+    ok, why = asyncio.run(
+        world_service.audit_reply(_audit_unit(instance_id, timeline_id), "我刚从堤上回来，潮还没退", llm=llm)
+    )
+    assert (ok, why) == (True, "")
+    assert llm.calls == 1, "预算充足时要真问一次"
+    bucket = int(time.time() // 86400)
+    assert store.call_ledger_get(instance_id, timeline_id, "narrative_audit", bucket=bucket) == 1
+
+
+def test_narrative_audit_skips_when_budget_is_gone(store) -> None:
+    """预算拒绝：不误杀（按通过），也不偷偷发调用；拒绝信号由 reserve_call 给出。"""
+    world_service = _service(store, instance_tokens_per_day=1, timeline_tokens_per_day=1, task_tokens_per_day=1)
+    instance_id, timeline_id, _ = _instance(store, world_service)
+    llm = _StubLLM()
+    ok, _why = asyncio.run(
+        world_service.audit_reply(_audit_unit(instance_id, timeline_id), "我刚从堤上回来", llm=llm)
+    )
+    assert ok is True, "审计本来就对超时 / 解析失败按通过，预算不足同理"
+    assert llm.calls == 0, "预算拒绝时不该发这次调用"
+    assert store.call_ledger_get(
+        instance_id, timeline_id, "narrative_audit", bucket=int(time.time() // 86400)
+    ) == 0, "没发的调用不该进账"
+    # 同一笔在预算充足时会被受理——确认拒绝确实来自预算而不是任务名写错
+    refused = world_service.reserve_call(instance_id, timeline_id, "narrative_audit", prompt_text="一句话")
+    assert refused["ok"] is False and refused.get("blocked"), refused
+
+
+def test_narrative_audit_without_ids_still_checks(store) -> None:
+    """合成 unit 缺实例 / 时间线时退回「照查但不记账」，不因为记不了账就不查。"""
+    world_service = _service(store)
+    llm = _StubLLM()
+    unit = {"id": "u-raw", "materials": [], "activity": ""}
+    ok, _why = asyncio.run(world_service.audit_reply(unit, "我刚从堤上回来", llm=llm))
+    assert ok is True and llm.calls == 1
+

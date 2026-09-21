@@ -33,6 +33,7 @@ TASK_PRIORITY: dict[str, str] = {
     "intent_propose": "plan_memory",
     "life_refine": "plan_memory",
     "memory_extract": "plan_memory",
+    "narrative_audit": "plan_memory",   # 每条可见回复的后验审计（§6.2）：与记忆提取同档
     "proactive_text": "proactive_text",
     "embedding": "embedding_polish",
 }

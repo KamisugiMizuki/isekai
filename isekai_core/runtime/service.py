@@ -2530,18 +2530,39 @@ class RuntimeService:
         - 数字越界 / 空文本是确定性检查；
         - 来源、时间、范围、关系、处境要看语义：正文里没有可核对数字时再花一次调用问，
           问不出来（超时 / 解析失败）按通过，不误杀合法叙述（关键词从来不是唯一判据）。
+
+        这笔调用走调用预算（§2.8）：它是每条可见回复的固定税，不能没有账。
+        预算拒绝时按通过（与超时 / 解析失败一个口径），并留一条日志——注意管理面的预算视图
+        只登记**已受理**的预占（`budget_reserve` 被拒时不写行），所以「这次没查」看日志，
+        和 memory_extract / intent_propose 的拒绝惯例保持一致。
         """
         findings = narrative.audit(text, unit, activity=activity)
         if findings:
             return False, str(findings[0].get("detail") or findings[0].get("kind") or "")
         if llm is None or narrative.has_checkable_numbers(text):
             return True, ""
-        try:
-            raw = await llm.chat(
-                narrative.audit_request(unit, text, activity=activity), temperature=0.0, timeout=12.0
+        prompt = narrative.audit_request(unit, text, activity=activity)
+        prompt_text = "\n".join(str(item.get("content") or "") for item in prompt)
+        instance_id = str(unit.get("instance_id") or "")
+        timeline_id = str(unit.get("timeline_id") or "")
+        reservation = None
+        if instance_id and timeline_id:
+            reservation = self.reserve_call(
+                instance_id, timeline_id, "narrative_audit", prompt_text=prompt_text
             )
+            if not reservation.get("ok"):
+                log.info(
+                    "narrative audit skipped line=%s blocked=%s", timeline_id, reservation.get("blocked")
+                )
+                return True, ""
+        try:
+            raw = await llm.chat(prompt, temperature=0.0, timeout=12.0)
         except Exception:
+            if reservation is not None:
+                self.settle_call(reservation, prompt_text=prompt_text, outcome="error")
             return True, ""
+        if reservation is not None:
+            self.settle_call(reservation, prompt_text=prompt_text, reply=str(raw or ""))
         parsed = narrative.parse_audit(str(raw))
         if parsed is None:
             return True, ""
@@ -3939,7 +3960,14 @@ class RuntimeService:
             observations=snapshot["observations"],
         )
         prompt = cognition.render_prompt(context)
-        block, unit = self._opening_block(snapshot, calendar=calendar, world=world, topic=topic)
+        block, unit = self._opening_block(
+            snapshot,
+            instance_id=str(session.get("instance_id") or ""),
+            timeline_id=str(session.get("timeline_id") or ""),
+            calendar=calendar,
+            world=world,
+            topic=topic,
+        )
         if block:
             prompt = prompt + chr(10) + chr(10) + block
         if with_unit:
@@ -3947,7 +3975,14 @@ class RuntimeService:
         return prompt
 
     def _opening_block(
-        self, snapshot: dict[str, Any], *, calendar: Calendar, world: int, topic: str | None
+        self,
+        snapshot: dict[str, Any],
+        *,
+        instance_id: str = "",
+        timeline_id: str = "",
+        calendar: Calendar,
+        world: int,
+        topic: str | None,
     ) -> tuple[str, dict[str, Any] | None]:
         """自然开场素材（SESSION_CORE §5.4 / NARRATIVE_LAYER §5）：给她「最近能提起的事」。
 
@@ -3973,4 +4008,9 @@ class RuntimeService:
             return "", None
         activity = str(snapshot.get("current_activity") or "")
         unit["activity"] = activity  # 后验检查核数字时与约束行同一口径
+        # 合成出来的 unit 不是数据库行：补上出处，后验审计才记得到账（§2.8）
+        if instance_id:
+            unit.setdefault("instance_id", str(instance_id))
+        if timeline_id:
+            unit.setdefault("timeline_id", str(timeline_id))
         return "\n".join(narrative.constraint_lines(unit, activity=activity)), unit
