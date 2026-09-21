@@ -456,6 +456,48 @@ nav {
   overflow-wrap: anywhere; /* 长 URL / 中文词组不再被 break-all 劈断 */
 }
 
+/* 叙事图谱：横向时间阵列，只给形状语言（实心点=讲出口，虚线空心点=没讲出口），不引入新色 */
+.story-graph {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 0;
+}
+
+.story-dot {
+  fill: var(--ink);
+}
+
+.story-dot.held {
+  fill: none;
+  stroke: var(--muted);
+  stroke-dasharray: 3 3;
+}
+
+.story-edge {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.story-label {
+  font-size: 12px;
+  text-anchor: middle;
+  fill: var(--muted);
+}
+
+.story-list,
+.picks {
+  margin: 6px 0 0;
+  padding-left: 20px;
+  font-size: 12px;
+}
+
+.story-list li,
+.picks li {
+  margin: 2px 0;
+}
+
 /* 版本与计数：零实例时不占首屏（折叠一条摘要行） */
 #manage-facts-box > summary {
   color: var(--muted);

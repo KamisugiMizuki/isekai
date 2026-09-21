@@ -850,6 +850,7 @@ async function switchSession(row: SessionRow, connect = false): Promise<void> {
       renderRoleControls();
       renderTimelines();
       await refreshClock(row.instance_id, row.timeline_id);
+      void loadStoryMap(); // 会话所在角色 / 时间线的线索
     }
   }
   renderTopbar();
@@ -2022,6 +2023,7 @@ async function loadWorld(): Promise<void> {
   else {
     renderFacts($("world-facts"), [["实例", "还没有实例"]]);
     void loadCommits(); // 零实例：回滚区照实说「先选一个实例与时间线」
+    void loadStoryMap(); // 面板同理：不留上一个实例的线索
   }
   void loadDrafts();
 }
@@ -2053,6 +2055,7 @@ async function showInstance(instanceId: string): Promise<void> {
     const { info, timelines } = loaded;
     renderRoleControls();
     await renderDisclosures();
+    void loadStoryMap(); // 图谱跟着当前实例 / 时间线 / 角色走
     // 不兼容实例（convertible / blocked）才给转换入口；compatible 时整行隐藏（§7.6）
     const incompatible = info.compatibility === "convertible" || info.compatibility === "blocked";
     $("inst-convert-row").classList.toggle("hidden", !incompatible);
@@ -2208,6 +2211,7 @@ async function switchRole(): Promise<void> {
     })).session ?? {}) as unknown as SessionRow;
     await switchSession(session);
     world.characterId = cardId;
+    void loadStoryMap(); // 换角色＝换一份线索
     note.textContent = `当前会话角色：${currentCharacterName(cardId)}`;
     setStatus(`已就绪 · 已切到 ${currentCharacterName(cardId)}`, "ok");
   } catch (error) {
@@ -2241,6 +2245,179 @@ async function confirmDisclosure(): Promise<void> {
     disclosureSelection = null;
     $("disclose-cancel").classList.add("hidden");
     await renderDisclosures();
+    await loadDisclosureCandidates(); // 刚披露掉的那条要从候选里消失
+  } catch (error) {
+    note.textContent = String(error);
+  }
+}
+
+/* ---------- 叙事图谱与披露候选（NARRATIVE_LAYER_SPEC §9.4） ---------- */
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+interface StoryNode {
+  id: string;
+  kind: string;
+  at_world: number;
+  world_day: number;
+  message_id: string;
+  label: string;
+  relation?: string;
+}
+
+interface StoryEdge {
+  from: string;
+  to: string;
+  kind: string;
+  refs: string[];
+}
+
+interface StoryMap {
+  nodes?: StoryNode[];
+  edges?: StoryEdge[];
+  counts?: Record<string, number>;
+}
+
+/// 叙事图谱：她讲过的线索 + 关系。数据只含已固化消息的正文与「没讲出口」的记号，
+/// 没有世界内部数据——管理面的黑箱口径不变（DESIGN §2.2-9）。
+async function loadStoryMap(): Promise<void> {
+  const graph = $("story-graph");
+  const list = $("story-list");
+  const note = $("story-note");
+  if (!graph || !list || !note) return;
+  graph.innerHTML = "";
+  list.innerHTML = "";
+  if (!mgmt || !world.instanceId || !world.timeline) {
+    note.textContent = "未选择实例或时间线";
+    return;
+  }
+  try {
+    const payload = await mgmt.call("narrative.map", {
+      instance_id: world.instanceId,
+      timeline_id: world.timeline,
+      character_id: world.characterId || "",
+    });
+    renderStoryMap(graph, list, note, (payload.map ?? {}) as StoryMap);
+  } catch (error) {
+    note.textContent = String(error);
+  }
+}
+
+function renderStoryMap(
+  graph: HTMLElement,
+  list: HTMLElement,
+  note: HTMLElement,
+  map: StoryMap,
+): void {
+  const nodes = map.nodes ?? [];
+  const edges = map.edges ?? [];
+  const counts = map.counts ?? {};
+  const spoken = nodes.filter((node) => node.kind === "spoken").length;
+  const who = world.characterId ? `${currentCharacterName(world.characterId)}：` : "";
+  note.textContent = `${who}讲出口 ${counts.spoken ?? spoken} 条｜没讲出口 ${counts.deferred ?? nodes.length - spoken} 条｜关系 ${counts.threads ?? edges.length} 条`;
+  if (!nodes.length) {
+    const empty = document.createElement("li");
+    empty.className = "muted";
+    empty.textContent = "她还没讲过什么";
+    list.append(empty);
+    return;
+  }
+  // 布局：按数据顺序横向排一行（左→右＝先后），间距固定不看绝对世界秒（差着好几个数量级）
+  const step = 150;
+  const width = step * nodes.length;
+  const height = 96;
+  const y = 34;
+  const x = (index: number): number => step * index + step / 2;
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("width", String(width));
+  svg.setAttribute("height", String(height));
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `她讲过的线索：讲出口 ${spoken} 条，没讲出口 ${nodes.length - spoken} 条`);
+  for (const edge of edges) {
+    const from = nodes.findIndex((node) => node.id === edge.from);
+    const to = nodes.findIndex((node) => node.id === edge.to);
+    if (from < 0 || to < 0) continue;
+    const path = document.createElementNS(SVG_NS, "path");
+    const lift = 14 + Math.min(20, Math.abs(to - from) * 3);
+    path.setAttribute("d", `M ${x(from)} ${y} Q ${(x(from) + x(to)) / 2} ${y - lift} ${x(to)} ${y}`);
+    path.setAttribute("class", "story-edge");
+    const title = document.createElementNS(SVG_NS, "title");
+    title.textContent = edge.kind;
+    path.append(title);
+    svg.append(path);
+  }
+  nodes.forEach((node, index) => {
+    const held = node.kind !== "spoken";
+    const dot = document.createElementNS(SVG_NS, "circle");
+    dot.setAttribute("cx", String(x(index)));
+    dot.setAttribute("cy", String(y));
+    dot.setAttribute("r", "7");
+    dot.setAttribute("class", held ? "story-dot held" : "story-dot");
+    const hover = document.createElementNS(SVG_NS, "title");
+    hover.textContent = held ? "没讲出口" : `世界第 ${node.world_day} 日｜${node.label}`;
+    dot.append(hover);
+    svg.append(dot);
+    const caption = document.createElementNS(SVG_NS, "text");
+    caption.setAttribute("x", String(x(index)));
+    caption.setAttribute("y", String(y + 26));
+    caption.setAttribute("class", "story-label");
+    const text = held ? "（没讲出口）" : node.label;
+    caption.textContent = text.length > 12 ? `${text.slice(0, 12)}…` : text;
+    svg.append(caption);
+    // 文字版与图同源：读屏只读这份（图只有形状 + 悬停标题）
+    const item = document.createElement("li");
+    if (held) {
+      item.className = "muted";
+      item.textContent = "（这件事她没讲出口）";
+    } else {
+      item.textContent = `世界第 ${node.world_day} 日｜${node.label}`;
+    }
+    list.append(item);
+  });
+  graph.append(svg);
+}
+
+/// 披露候选：让系统从「她讲过的线索」里挑几条摆出来（§9.4-4）。
+/// 自动的只是挑这一步——点哪条、给谁，仍由人定，授权照旧走 disclose.confirm。
+async function loadDisclosureCandidates(): Promise<void> {
+  const box = $("disclose-candidates");
+  const note = $("disclose-suggest-note");
+  if (!box || !note) return;
+  box.innerHTML = "";
+  const target = ($("disclose-to") as HTMLSelectElement | null)?.value ?? "";
+  if (!mgmt || !world.instanceId || !world.timeline || !world.characterId) {
+    note.textContent = "先在「世界实例」里选实例与角色";
+    return;
+  }
+  if (!target) {
+    note.textContent = "先选接收角色（需要至少两个角色）";
+    return;
+  }
+  try {
+    const payload = await mgmt.call("disclose.suggest", {
+      instance_id: world.instanceId,
+      timeline_id: world.timeline,
+      from_character: world.characterId,
+      to_character: target,
+      limit: 5,
+    });
+    const rows = (payload.candidates ?? []) as Array<{ ref: string; at_world: number; text: string }>;
+    if (!rows.length) {
+      note.textContent = "没有可挑的片段（她还没讲出什么，或都已经披露过）";
+      return;
+    }
+    note.textContent = `挑了 ${rows.length} 条：点一条即选定，再按「披露选中的片段」`;
+    for (const row of rows) {
+      const item = document.createElement("li");
+      const pick = document.createElement("button");
+      pick.className = "link";
+      pick.type = "button";
+      pick.textContent = row.text;
+      pick.addEventListener("click", () => selectForDisclosure(row.ref, world.characterId, currentCharacterName(world.characterId)));
+      item.append(pick);
+      box.append(item);
+    }
   } catch (error) {
     note.textContent = String(error);
   }
@@ -2255,6 +2432,8 @@ function selectForDisclosure(messageId: string, fromCharacter: string, fromName:
 function bindDisclosure(): void {
   ($("role-switch") as HTMLButtonElement).addEventListener("click", () => void switchRole());
   ($("disclose-confirm") as HTMLButtonElement).addEventListener("click", () => void confirmDisclosure());
+  ($("disclose-suggest") as HTMLButtonElement).addEventListener("click", () => void loadDisclosureCandidates());
+  ($("story-refresh") as HTMLButtonElement).addEventListener("click", () => void loadStoryMap());
   ($("disclose-cancel") as HTMLButtonElement).addEventListener("click", () => {
     disclosureSelection = null;
     $("disclose-note").textContent = "已取消选择";

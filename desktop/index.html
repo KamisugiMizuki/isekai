@@ -178,8 +178,22 @@
             <button id="disclose-cancel" class="hidden">取消选择</button>
             <span id="disclose-note" class="muted note">在聊天里点角色消息上的「披露」选定片段</span>
           </div>
+          <div class="row">
+            <button id="disclose-suggest">挑候选</button>
+            <span id="disclose-suggest-note" class="muted note"></span>
+          </div>
+          <ol id="disclose-candidates" class="picks"></ol>
           <dl id="disclosure-facts" class="facts"></dl>
           <p class="muted">披露只开放指定片段；默认互相看不见。撤回只能靠回滚。</p>
+
+          <h3 id="group-story">叙事图谱：她讲过的线索</h3>
+          <div class="row">
+            <button id="story-refresh">刷新图谱</button>
+            <span id="story-note" class="muted note"></span>
+          </div>
+          <div id="story-graph" class="story-graph"></div>
+          <ol id="story-list" class="story-list"></ol>
+          <p class="muted">只画她讲出口的线索与它们之间的关系（同一件事又被提起）；没讲出口的只留一个记号，不带内容。世界内部数据不上图。</p>
 
           <dl id="world-facts" class="facts"></dl>
         </section>
