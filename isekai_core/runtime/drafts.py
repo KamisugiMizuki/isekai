@@ -182,11 +182,14 @@ def proposal_prompt(
     allowed: dict[str, list[str]],
     channels: list[str],
 ) -> list[dict[str, str]]:
-    """让模型把管理意图翻译成受支持的效果（闭集 + 已登记目标），不做别的判断。"""
-    lines = [
-        f"玩家要对世界做一次显式修改（不是角色说话），当前世界时刻：{world_label}。",
-        f"修改意图：{intent}",
-        "把它翻译成受支持的事实效果，只输出 JSON：",
+    """让模型把管理意图翻译成受支持的效果（闭集 + 已登记目标），不做别的判断。
+
+    格式与允许清单放 system（同一个世界包内稳定），这次要翻译的意图与世界时刻放 user：
+    system 段能吃到前缀缓存，意图每次都不同则只重算 user 段。
+    """
+    rules = [
+        "玩家要对世界做一次显式修改（不是角色说话）。把他给的修改意图翻译成受支持的事实效果，",
+        "只输出 JSON：",
         '{"intent":"一句话","when":"now|scheduled","at_world":0,"effects":[{"kind":"…","target":"…"}],'
         '"claims":[{"text":"说法原文","source_id":"…","audience":"public"}]}',
         "硬约束：",
@@ -198,7 +201,11 @@ def proposal_prompt(
     ]
     for kind, targets in allowed.items():
         if targets:
-            lines.append(f"- {kind}: {', '.join(targets)}")
+            rules.append(f"- {kind}: {', '.join(targets)}")
     if channels:
-        lines.append("可用渠道：" + ", ".join(channels))
-    return [{"role": "system", "content": "\n".join(lines)}]
+        rules.append("可用渠道：" + ", ".join(channels))
+    ask = [f"当前世界时刻：{world_label}", f"修改意图：{intent}"]
+    return [
+        {"role": "system", "content": "\n".join(rules)},
+        {"role": "user", "content": "\n".join(ask)},
+    ]

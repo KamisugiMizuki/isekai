@@ -171,9 +171,13 @@ def extraction_prompt(
     items: list[dict[str, Any]],
     existing: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
-    """提取提示（§4.1）：只给该角色已接触的材料，答案必须引用给定来源。"""
-    lines = [
-        f"你在为角色「{name}」整理记忆，现在是 {world_label}。",
+    """提取提示（§4.1）：只给该角色已接触的材料，答案必须引用给定来源。
+
+    规则块放 system、会变的部分（角色名 / 世界时刻 / 已有记忆 / 材料）放 user：
+    缓存是严格前缀匹配，常量提到最前才吃得到命中价。规则块本身与角色、时刻、材料都无关，
+    于是它成了**所有提取调用共用**的前缀；反过来（时刻打头）每次都要整段重算。
+    """
+    rules = [
         "只从下面的材料里提取**她值得记住的**内容，输出 JSON 数组，每项：",
         '{"text":"一到两句话","kind":"fact|fragment|promise|impression",'
         '"ref":"材料编号","strength":0.0-1.0,"confidence":0.0-1.0}',
@@ -184,16 +188,20 @@ def extraction_prompt(
         "4) 她的打算记 kind=promise，并在 text 里写明对象与依据；",
         "5) 没有值得记的就输出 []。",
     ]
+    ask = [f"你在为角色「{name}」整理记忆，现在是 {world_label}。"]
     if existing:
-        lines.append("她已经记得的（同源重复不必再提，相反的新说法要保留来源）：")
+        ask.append("她已经记得的（同源重复不必再提，相反的新说法要保留来源）：")
         for item in existing[:8]:
-            lines.append(f"- [{item.get('id')}] {item.get('text')}")
-    lines.append("材料：")
+            ask.append(f"- [{item.get('id')}] {item.get('text')}")
+    ask.append("材料：")
     for item in items:
         when = item.get("when") or ""
         source = item.get("source") or ""
-        lines.append(f"[{item['ref']}]（{source}{('，' + when) if when else ''}）{item.get('text')}")
-    return [{"role": "system", "content": "\n".join(lines)}]
+        ask.append(f"[{item['ref']}]（{source}{('，' + when) if when else ''}）{item.get('text')}")
+    return [
+        {"role": "system", "content": "\n".join(rules)},
+        {"role": "user", "content": "\n".join(ask)},
+    ]
 
 
 def parse_extraction(text: str, valid_refs: set[str]) -> list[dict[str, Any]]:
