@@ -16,8 +16,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import signal
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +39,27 @@ STDERR_LINE_CHARS = 500   # 单行截断
 STDOUT_QUEUE_MAX = 200    # 出站帧排队上限：堵住输出不能拖死核心
 HANDSHAKE_TIMEOUT_S = 15.0
 STOP_TIMEOUT_S = 5.0
+
+#: 分发包（§七 分发渠道）：归档字节上限、解压总量上限、条目数上限——zip 炸弹闸
+ARCHIVE_MAX_BYTES = 4 << 20
+ARCHIVE_MAX_UNPACKED = 16 << 20
+ARCHIVE_MAX_ENTRIES = 200
+
+
+def _archive_members(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    """归档条目做安全闸：数量、解压总量、路径（绝对 / `..` / 盘符）——越界一律拒绝，不落盘。"""
+    items = [info for info in zf.infolist() if not info.is_dir()]
+    if len(items) > ARCHIVE_MAX_ENTRIES:
+        raise ValueError(f"归档条目过多（{len(items)} > {ARCHIVE_MAX_ENTRIES}）")
+    total = sum(info.file_size for info in items)
+    if total > ARCHIVE_MAX_UNPACKED:
+        raise ValueError(f"归档解压后超过上限（{total} > {ARCHIVE_MAX_UNPACKED} 字节）")
+    for info in items:
+        name = info.filename.replace("\\", "/")
+        parts = [part for part in name.split("/") if part]
+        if not parts or name.startswith("/") or ".." in parts or ":" in parts[0]:
+            raise ValueError(f"归档里有越界路径条目：{info.filename}")
+    return items
 
 
 def scan(folder: str | os.PathLike[str]) -> list[dict[str, Any]]:
@@ -211,6 +235,59 @@ class PluginHost:
             if str(item["id"]) == str(plugin_id):
                 return Path(str(item["directory"]))
         return self.folder
+
+    def install_from_archive(self, archive: str | os.PathLike[str], *, replace: bool = False) -> dict[str, Any]:
+        """从分发包安装插件（§七 分发渠道）：只认 zip，清单在包根或单层包装目录里。
+
+        安装 ≠ 启用：装完是 `installed`（没跑过任何插件代码），启用仍要用户显式点。安全闸在
+        `_archive_members`（越界路径 / 条目数 / 解压总量），清单校验复用 `scan` 的同一套字段检查。
+        """
+        path = Path(archive)
+        if not path.is_file():
+            raise ValueError(f"没有这个归档：{path}")
+        size = path.stat().st_size
+        if size > ARCHIVE_MAX_BYTES:
+            raise ValueError(f"归档超过上限（{size} > {ARCHIVE_MAX_BYTES} 字节）")
+        with tempfile.TemporaryDirectory(prefix="isekai-plugin-") as tmp:
+            stage = Path(tmp)
+            with zipfile.ZipFile(path) as zf:
+                items = _archive_members(zf)
+                for info in items:
+                    target = stage / info.filename.replace("\\", "/")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(zf.read(info))
+            root = stage
+            if not (root / MANIFEST_NAME).is_file():
+                candidates = [p for p in sorted(root.iterdir()) if p.is_dir() and (p / MANIFEST_NAME).is_file()]
+                if len(candidates) != 1:
+                    raise ValueError(f"归档里找不到 {MANIFEST_NAME}（要放在包根或唯一的顶层目录里）")
+                root = candidates[0]
+            found = scan(root)
+            if not found or found[0]["errors"]:
+                problems = "；".join(found[0]["errors"]) if found else "清单读不出来"
+                raise ValueError(f"清单不合规：{problems}")
+            plugin_id = str(found[0]["id"])
+            target_dir = self.folder / plugin_id
+            if target_dir.exists() and not replace:
+                raise ValueError(f"同名插件目录已存在：{target_dir}（先 uninstall，或显式 replace）")
+            self.folder.mkdir(parents=True, exist_ok=True)
+            if target_dir.exists():
+                shutil.rmtree(target_dir)  # 替换=整目录换掉，不留上一次的残件
+            shutil.copytree(root, target_dir)
+        self.store.plugin_put(
+            {
+                "id": plugin_id,
+                "path": str(target_dir),
+                "enabled": 0,
+                "state": "installed",
+                "name": str(found[0]["name"] or plugin_id),
+                "version": str(found[0]["version"] or ""),
+                "note": "已安装，未启用",
+                "updated_at": time.time(),
+            }
+        )
+        log.info("plugin installed id=%s from=%s", plugin_id, path.name)
+        return {"installed": plugin_id, "path": str(target_dir), "state": "installed", "enabled": False}
 
     def _env_for(self, plugin_id: str) -> dict[str, str]:
         """最小环境（§3.4）：只给必要变量与该插件自己的配置，不继承核心凭据。"""

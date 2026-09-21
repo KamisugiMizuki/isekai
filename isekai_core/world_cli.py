@@ -67,6 +67,8 @@ OP_BY_COMMAND = {
     ("disclose", "confirm"): "disclose.confirm",
     ("disclose", "list"): "disclose.list",
     ("disclose", "suggest"): "disclose.suggest",
+    ("plugin", "list"): "plugin.list",
+    ("plugin", "install"): "plugin.install",
     ("narrative", "map"): "narrative.map",
     ("event", "draft"): "event.draft",
     ("event", "confirm"): "event.confirm",
@@ -154,6 +156,10 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
                 "channel_id": "builtin", "thread_id": getattr(ns, "thread", "main") or "main"}
     if group == "proactive":
         return {"instance_id": ns.id, "timeline_id": ns.timeline}
+    if group == "plugin":
+        if cmd == "install":
+            return {"archive": ns.archive or ns.file or "", "replace": bool(ns.replace)}
+        return {}
     if group == "backup":
         args = {}
         if cmd == "create":
@@ -425,7 +431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "group",
         choices=[
             "package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive", "narrative",
-            "trpg",
+            "trpg", "plugin",
         ],
     )
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
@@ -466,6 +472,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--ruleset", default=None, help="TRPG：规则系统标识")
     parser.add_argument("--ruleset-version", dest="ruleset_version", default=None, help="TRPG：规则版本")
     parser.add_argument("--plugin", default=None, help="TRPG：规则插件清单路径")
+    parser.add_argument("--archive", default=None, help="插件分发包路径（zip；plugin install 用）")
+    parser.add_argument("--replace", action="store_true", help="插件事务：同名目录已存在时显式覆盖")
     parser.add_argument("--actor", default=None, help="TRPG：行动者（玩家角色标识）")
     parser.add_argument("--action", default=None, help="TRPG：行动标识")
     parser.add_argument("--revision", type=int, default=None, help="TRPG：行动 / 场景版本")

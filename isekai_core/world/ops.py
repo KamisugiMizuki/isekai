@@ -11,6 +11,7 @@ import json
 import re
 import shutil
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -109,6 +110,7 @@ SYNC_OPS = frozenset(
         "instance.convert",
         "plugin.scan",
         "plugin.list",
+        "plugin.install",
         "reaction.list",
         "reaction.note",
         "notice.create",
@@ -662,12 +664,21 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 raise UmpError(Err.NOT_FOUND, f"没有该通知：{ident}", retryable=False)
             target, _issues = store.notice_target(row)
             return {"target": target}
-        if op in ("plugin.scan", "plugin.list"):
+        if op in ("plugin.scan", "plugin.list", "plugin.install"):
             from .. import plugins as plugins_mod
 
             host = plugins_mod.HOST
             if host is None:
                 raise UmpError(Err.STATE_BLOCKED, "插件宿主未挂载（此核心不支持第三方插件）", retryable=False)
+            if op == "plugin.install":
+                # 分发包安装（§七 分发渠道）：装 ≠ 启用；越界 / 坏清单一律拒绝，不落半份
+                try:
+                    return host.install_from_archive(
+                        str(args.get("archive") or args.get("path") or ""),
+                        replace=bool(args.get("replace")),
+                    )
+                except (ValueError, OSError, zipfile.BadZipFile) as exc:
+                    raise UmpError(Err.INVALID, f"安装失败：{exc}", retryable=False) from exc
             return {"plugins": host.list_plugins()}
         if op == "reaction.list":
             rows = store.reaction_list(

@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 
-from conftest import running_core
+import pytest
+
+from conftest import open_mgmt, running_core
 from isekai_core import plugins
 
 STUBS = Path(__file__).resolve().parent / "plugin_stubs"
@@ -145,3 +148,74 @@ async def test_uninstall_also_drops_the_channel_binding(tmp_path) -> None:
         assert h.runtime.store.plugin_get("echo-plugin") is None
         sessions_after = h.runtime.store._conn.execute("SELECT COUNT(*) AS n FROM session").fetchone()["n"]  # noqa: SLF001
         assert sessions_after == sessions_before, "解绑只动通道与绑定两张表，会话不受影响"
+
+
+# ---------- 分发渠道（§七）：分发包安装 ----------
+
+
+def _make_archive(tmp_path, *, plugin_id: str = "zip-plugin", wrapper: str = "") -> Path:
+    """打一个可用的插件分发包（zip）；wrapper 非空 = 内容放进一层目录（两种放法都要认）。"""
+    archive = tmp_path / f"{plugin_id}.zip"
+    manifest = json.dumps(
+        {"id": plugin_id, "name": f"{plugin_id} 插件", "version": "0.1.0", "ump": "1.x",
+         "entry": ["python", "main.py"], "description": "测试用", "author": "测试"},
+        ensure_ascii=False,
+    )
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(f"{wrapper}manifest.json", manifest)
+        zf.writestr(f"{wrapper}main.py", _stub("echo.py"))
+    return archive
+
+
+async def test_install_from_archive_then_enable(tmp_path) -> None:
+    """装 ≠ 启用：装完是 installed（没跑过插件代码），启用才握手；走真管理面。"""
+    async with running_core(tmp_path) as h:
+        mgmt = await open_mgmt(h)
+        archive = _make_archive(tmp_path, wrapper="zip-plugin-0.1.0/")  # 单层包装目录也要认
+        out = await mgmt.call("plugin.install", archive=str(archive))
+        assert out["installed"] == "zip-plugin" and out["state"] == "installed" and out["enabled"] is False
+        assert (tmp_path / "plugins" / "zip-plugin" / "main.py").is_file()
+
+        row = h.runtime.store.plugin_get("zip-plugin")
+        assert str(row["state"]) == "installed" and not int(row["enabled"]), row
+        enabled = await mgmt.call("plugin.enable", id="zip-plugin", timeout=30.0)
+        assert enabled["enable"]["enabled"] is True, enabled
+        assert str(h.runtime.store.plugin_get("zip-plugin")["state"]) == "running"
+
+
+async def test_install_refuses_unsafe_archive(tmp_path) -> None:
+    """越界路径条目：整包拒收，一个字节都不落盘（zip 炸弹 / 穿越闸）。"""
+    async with running_core(tmp_path) as h:
+        mgmt = await open_mgmt(h)
+        archive = tmp_path / "evil.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("manifest.json", json.dumps({"id": "evil", "name": "坏", "version": "1",
+                                                     "entry": ["python", "main.py"]}, ensure_ascii=False))
+            zf.writestr("../escaped.txt", "nope")
+        with pytest.raises(Exception) as exc:
+            await mgmt.call("plugin.install", archive=str(archive))
+        assert "越界" in str(exc.value), exc.value
+        assert not (tmp_path / "escaped.txt").exists()
+        assert not (tmp_path / "plugins" / "evil").exists()
+
+
+async def test_install_refuses_bad_manifest_and_existing_dir(tmp_path) -> None:
+    """清单不合规整包拒收；同名目录已存在要显式 replace（替换=整目录换掉）。"""
+    async with running_core(tmp_path) as h:
+        mgmt = await open_mgmt(h)
+        bad = tmp_path / "bad.zip"
+        with zipfile.ZipFile(bad, "w") as zf:
+            zf.writestr("manifest.json", json.dumps({"id": "bad-plugin", "name": "坏", "version": "1"},
+                                                    ensure_ascii=False))
+        with pytest.raises(Exception) as exc:
+            await mgmt.call("plugin.install", archive=str(bad))
+        assert "清单不合规" in str(exc.value), exc.value
+        assert not (tmp_path / "plugins" / "bad-plugin").exists()
+
+        good = _make_archive(tmp_path, plugin_id="dup-plugin")
+        await mgmt.call("plugin.install", archive=str(good))
+        with pytest.raises(Exception) as exc:
+            await mgmt.call("plugin.install", archive=str(good))
+        assert "已存在" in str(exc.value), exc.value
+        again = await mgmt.call("plugin.install", archive=str(good), replace=True)
+        assert again["state"] == "installed"
