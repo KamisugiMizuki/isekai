@@ -11,9 +11,41 @@ import json
 import time
 from typing import Any
 
+from .clock import ClockState, RateCommand, settle
+
 
 class VersionError(ValueError):
     """版本操作的前置条件不满足（提交不存在、线不存在等）。"""
+
+
+def recorded_rate(store: Any, timeline_id: str) -> int:
+    """快照 / 导出要记的「有效倍率」：把待生效命令一并折进结果（§2.2 / §5.1）。
+
+    clock 行的 `rate` 只是**当前倍率段**的流速；用户刚改的倍率还停在 `rate_command`
+    里等生效整秒。快照与导出都丢弃待生效命令（§5.1 控制状态 / §七 不回放），只读行值
+    就会把已经改掉的陈旧倍率固化下来，回滚 / 导入后照它狂跑。这里按状态机结算到最后一条
+    待生效命令的生效整秒：快照记的是这条线接下来按什么速度走。
+    """
+    clock = store.clock_get(timeline_id) or {}
+    state = ClockState(
+        base_real=float(clock.get("base_real") or 0.0),
+        base_world=int(clock.get("base_world") or 0),
+        rate=int(clock.get("rate") or 1),
+        high_water_real=float(clock.get("high_water_real") or 0.0),
+    )
+    pending = [
+        RateCommand(
+            input_real=float(item["input_real"]),
+            effective_real=int(item["effective_real"]),
+            rate=int(item["rate"]),
+            seq=int(item["seq"]),
+        )
+        for item in store.rate_pending(timeline_id)
+    ]
+    if not pending:
+        return int(state.rate)
+    settled, _ = settle(state, max(float(item.effective_real) for item in pending), pending)
+    return int(settled.rate)
 
 
 def snapshot_of(store: Any, instance_id: str, timeline_id: str, *, note: str = "") -> dict[str, Any]:
@@ -42,7 +74,7 @@ def snapshot_of(store: Any, instance_id: str, timeline_id: str, *, note: str = "
     return {
         "note": str(note or ""),
         "world": int(clock.get("processed_world") or 0),
-        "rate": int(clock.get("rate") or 1),
+        "rate": recorded_rate(store, timeline_id),
         # 语义元数据（§5.1）：确定性复算要用的规则版本、数据格式与锁定种子，与抽样同源
         "rules_version": str(RULES_VERSION),
         "data_format": str(DATA_FORMAT_VERSION),

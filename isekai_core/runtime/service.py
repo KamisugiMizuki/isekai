@@ -534,7 +534,8 @@ class RuntimeService:
         self, instance_id: str, timeline_id: str, *, kind: str = "manual", note: str = ""
     ) -> dict[str, Any]:
         """在一致边界取快照（§5.1）：提交是回滚点与分叉点。"""
-        row = self.clock_row(timeline_id)
+        # 写快照前先结算已到期的倍率命令：否则快照把「上一段」的陈旧倍率当成有效倍率固化（§2.3.4）
+        row = self._settled_row(timeline_id, time.time())
         snapshot = versioning.snapshot_of(self.store, instance_id, timeline_id, note=note)
         commit_id = f"cm-{secrets.token_hex(6)}"
         record = versioning.make_commit_row(
@@ -1666,6 +1667,8 @@ class RuntimeService:
                 **row,
                 "base_real": float(now_real),
                 "base_world": int(world),
+                # 倍率取结算后的状态：`row` 是结算前的行，照它写回会把刚生效的新倍率丢掉
+                "rate": int(state.rate),
                 "high_water_real": max(float(row["high_water_real"]), float(now_real)),
                 "anchor_real": float(now_real),
                 "processed_world": max(int(row["processed_world"]), int(world)),
@@ -1722,6 +1725,17 @@ class RuntimeService:
             )
         return state, ids
 
+    def _settled_row(self, timeline_id: str, now_real: float) -> dict[str, Any]:
+        """结算已到期的倍率命令并把结果落回 clock 行，返回落库后的行（§2.3.4）。
+
+        `clock.rate` 是**当前倍率段**的流速，只在结算时前进：要拿行值当真值用（取快照、
+        冻结、调整倍率）就得先结算，别直接读行 —— 读到的可能是上一段的陈旧倍率。
+        """
+        row = self.clock_row(timeline_id)
+        _, consumed = self._settle_due(timeline_id, row, now_real)
+        self.store.rate_apply(consumed)
+        return self.clock_row(timeline_id)
+
     # ---------- 倍率 ----------
 
     def set_rate(self, instance_id: str, timeline_id: str, *, rate: int, now_real: float) -> dict[str, Any]:
@@ -1733,6 +1747,8 @@ class RuntimeService:
         row = self.clock_row(timeline_id)
         state, consumed = self._settle_due(timeline_id, row, now_real)
         self.store.rate_apply(consumed)
+        # 结算可能刚把当前倍率写进库里：给下面的「没变就不必再改」判断用结算后的行
+        row = self.clock_row(timeline_id)
         if int(row["rate"]) == rate and not self.store.rate_pending(timeline_id):
             return {"changed": False, "rate": rate, "effective_real": None, "command_id": None}
         effective = natural_second(now_real)

@@ -50,9 +50,12 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
     for item in timelines:
         clock = store.clock_get(item["id"])
         watermark = int(clock["processed_world"]) if clock else int(row["moment"])
+        from ..runtime import versioning  # 局部导入：版本层在 runtime 层，顶层导入会成环
+
         runtime_state[item["id"]] = {
             "watermark": watermark,
-            "rate": int(clock["rate"]) if clock else 1,
+            # 有效倍率取「待生效命令折进后」的值：只读 clock 行会把陈旧倍率带进导出件（§7.1）
+            "rate": versioning.recorded_rate(store, item["id"]),
             **store.runtime_dump(instance_id, item["id"], watermark=watermark),
         }
     payload = {
