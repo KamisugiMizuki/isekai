@@ -514,7 +514,8 @@ async def boot_shell(root: Path, port: int, env_extra: dict | None = None, *,
 # ================================================================== static
 
 def section_static() -> None:
-    spec = (REPO / "docs" / "DESKTOP_SPEC.md").read_text(encoding="utf-8")
+    # 规范文件按名字找：docs/ 下分过目录，硬编码路径会在搬目录时断（2026-09-21 搬过一次）
+    spec = next((REPO / "docs").rglob("DESKTOP_SPEC.md")).read_text(encoding="utf-8")
     src = (REPO / "desktop" / "src" / "main.ts").read_text(encoding="utf-8")
     rust = (REPO / "desktop" / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
     cargo = (REPO / "desktop" / "src-tauri" / "Cargo.toml").read_text(encoding="utf-8")

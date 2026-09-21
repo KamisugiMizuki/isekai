@@ -6,7 +6,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from isekai_core import config, session, store, ump, version  # noqa: E402
-DOC = (REPO / "docs" / "CHANNEL_PROTOCOL_APPENDIX.md").read_text(encoding="utf-8")
+DOC = next((REPO / "docs").rglob("CHANNEL_PROTOCOL_APPENDIX.md")).read_text(encoding="utf-8")
 SRC = {n: (REPO / "isekai_core" / n).read_text(encoding="utf-8") for n in ("channel.py", "llm.py", "log.py")}
 LOG = tuple(int(x) for x in re.search(r"maxBytes=(\d+) \* (\d+) \* (\d+), backupCount=(\d+)", SRC["log.py"]).groups())
 LIMITS = {k: getattr(version, k) for k in ("MAX_FRAME_BYTES", "HANDSHAKE_TIMEOUT_S", "PROTOCOL_ERROR_LIMIT", "DEFAULT_MAX_TEXT_LEN", "DEFAULT_MAX_PARTS")} | {  # ⑤ 常量名 → 代码取值

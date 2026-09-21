@@ -220,7 +220,7 @@ def c_plugin_compat(case: Case) -> tuple[str, str]:
 
 @item("§7.1-05 插件文档｜提供接口文档与参考实现")
 def c_plugin_docs(case: Case) -> tuple[str, str]:
-    spec = (ROOT / "docs" / "CHANNEL_PLUGIN_SPEC.md").exists()
+    spec = next((ROOT / "docs").rglob("CHANNEL_PLUGIN_SPEC.md")).exists()
     refs = [
         p.relative_to(ROOT).as_posix()
         for p in ROOT.rglob("*plugin*")
