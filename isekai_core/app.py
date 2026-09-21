@@ -343,6 +343,10 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
                 await runtime.world.extract_memories(
                     instance_id, timeline_id, llm=runtime.llm, now_real=time.time(), limit=6
                 )
+                # 积压汇总：世界时间跑得比现实预算快，没有这一步积压只会越长越大（§4.1）
+                await runtime.world.compact_backlog(
+                    instance_id, timeline_id, llm=runtime.llm, now_real=time.time(), batch=40, limit=1
+                )
                 await runtime.world.embed_memories(instance_id, timeline_id, now_real=time.time(), limit=8)
         except Exception:
             log.exception("memory extraction pass failed")

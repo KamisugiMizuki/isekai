@@ -850,9 +850,16 @@ class RuntimeService:
             if not character_id:
                 continue
             rows: list[tuple[str, str, int]] = []
-            for row in self.store.experience_window(
+            experiences = self.store.experience_window(
                 instance_id, timeline_id, character_id, until=10**15, limit=200
-            ):
+            )
+            # 日程切片（life）按世界日采样：一天 20 条窗口切片里留一条做锚点（§4.1）
+            kept, skipped = memory_mod.select_experience_sources(
+                experiences, day_seconds=self.calendar(self.store.instance_get(instance_id) or {}).day_seconds
+            )
+            for row in experiences:
+                if str(row["id"]) not in kept:
+                    continue
                 rows.append(("experience", str(row["id"]), int(row["world_seconds"])))
             for row in self.store.knowledge_window(
                 instance_id, timeline_id, character_id, until=10**15, limit=200
@@ -906,8 +913,11 @@ class RuntimeService:
             )
             if row is None:
                 return None
+            text = str(row.get("summary") or row.get("activity") or "")
+            if not text:
+                return None  # 空材料不值得花一次调用：当来源不可达处理
             return {
-                "text": str(row.get("activity") or ""),
+                "text": text,
                 "source": "经历",
                 "when": self.describe_world(instance_id, int(row["world_seconds"])),
                 "sources": [{"kind": "experience", "ref": ref}],
@@ -1245,6 +1255,122 @@ class RuntimeService:
         if reservation:
             self.settle_call(reservation, reply=str(text))
         return vectors[0] if vectors else None
+
+    async def compact_backlog(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        llm: Any,
+        now_real: float,
+        batch: int = 40,
+        limit: int = 1,
+    ) -> dict[str, int]:
+        """积压汇总（§4.1）：把堆久了的**流水账类**来源批量归一，成本 O(批数) 而不是 O(条数)。
+
+        与 `extract_memories` 的分工：那条路一条来源一次精提（对话、转述、打算不能粗），
+        这条路只吃 `experience` / `claim` 的旧账，一次调用吃一批、产出少量概括条目。
+        世界时间跑得比现实预算快（追赶一段就是几百个世界日），没有这条，积压只会越长越大。
+        """
+        from ..log import get_logger
+
+        log = get_logger("isekai.memory")
+        if not self.compatible(instance_id):
+            return {"materials": 0, "calls": 0, "written": 0, "pending": 0, "batches": 0}
+        cap = max(2, min(int(batch), 120))
+        all_tasks = [
+            task for task in self.store.memory_tasks(instance_id, timeline_id)
+            if str(task["source_kind"]) in ("experience", "claim")
+        ]
+        if len(all_tasks) < cap // 2:
+            return {"materials": 0, "calls": 0, "written": 0, "pending": len(all_tasks), "batches": 0}
+        row = self.clock_row(timeline_id)
+        watermark = int(row["processed_world"])
+        generation = int(row["generation"])
+        day_seconds = self.calendar(self.store.instance_get(instance_id)).day_seconds
+        written = calls = batches = materials_total = 0
+        by_character: dict[str, list[dict[str, Any]]] = {}
+        for task in all_tasks:
+            by_character.setdefault(str(task["character_id"]), []).append(task)
+        for character_id, items in by_character.items():
+            if batches >= max(1, int(limit)):
+                break
+            materials: list[dict[str, Any]] = []
+            for task in items[:cap]:
+                material = self._source_material(task)
+                if material is None:
+                    self.store.memory_task_set(str(task["id"]), state="dropped", note="来源不可达")
+                    continue
+                materials.append({**material, "ref": str(task["id"]), "task": task})
+            if len(materials) < 2:
+                continue
+            materials_total += len(materials)
+            prompt = memory_mod.compaction_prompt(
+                name=self._display_name(instance_id, timeline_id, character_id),
+                from_label=str(materials[0].get("when") or ""),
+                to_label=str(materials[-1].get("when") or ""),
+                items=materials,
+            )
+            prompt_text = "\n".join(str(item.get("content") or "") for item in prompt)
+            reservation = self.reserve_call(
+                instance_id, timeline_id, "memory_compact", prompt_text=prompt_text, now_real=now_real
+            )
+            if not reservation.get("ok"):
+                break
+            calls += 1
+            batches += 1
+            try:
+                text = await llm.chat(prompt, temperature=0.3, timeout=90.0)
+            except Exception:
+                log.exception("memory compaction failed character=%s", character_id)
+                self.settle_call(reservation, prompt_text=prompt_text, outcome="error")
+                continue
+            self.settle_call(reservation, prompt_text=prompt_text, reply=str(text or ""))
+            entries = memory_mod.parse_extraction(str(text or ""), {str(item["ref"]) for item in materials})
+            if int(self.clock_row(timeline_id)["generation"]) != generation:
+                # 迟到结果不许写回；这批保持待处理，留给下次
+                continue
+            by_ref = {str(item["ref"]): item for item in materials}
+            for entry in entries:
+                material = by_ref[entry["ref"]]
+                task = material["task"]
+                saved = self.store.memory_add({
+                    "id": f"mm-{events.stable_key(instance_id, timeline_id, character_id, entry['text'])[:12]}",
+                    "instance_id": instance_id,
+                    "timeline_id": timeline_id,
+                    "character_id": character_id,
+                    "text": entry["text"],
+                    "kind": entry["kind"],
+                    "sources": material["sources"],
+                    "happened_world": material["world"],
+                    "learned_world": int(task["source_world"]),
+                    "recorded_world": watermark,
+                    "semantic_watermark": watermark,
+                    "strength": memory_mod.decayed_strength(
+                        entry["strength"], from_world=int(task["source_world"]), to_world=watermark,
+                        day_seconds=day_seconds, per_day=self.memory_decay_per_day,
+                    ),
+                    "confidence": entry["confidence"],
+                    "source_key": f"compact:{task['id']}#{events.stable_key(entry['text'])[:12]}",
+                    "decay_world": watermark,
+                })
+                if saved is not None:
+                    written += 1
+            # 这一批无论有没有被提到都合上账：汇总就是把这段流水账收尾
+            parseable = "[" in str(text or "") and "]" in str(text or "")
+            for material in materials:
+                self.store.memory_task_set(
+                    str(material["task"]["id"]),
+                    state="done" if parseable else "pending",
+                    note="已汇总" if parseable else "汇总结果不可解析",
+                )
+        return {
+            "materials": materials_total,
+            "calls": calls,
+            "written": written,
+            "pending": len(all_tasks),
+            "batches": batches,
+        }
 
     async def organize_memories(
         self,

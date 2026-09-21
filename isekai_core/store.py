@@ -996,6 +996,10 @@ def new_binding_token() -> str:
     return f"bt-{secrets.token_urlsafe(18)}"
 
 
+#: 待提取队列的每角色上限（MEMORY_SPEC §4.1「有界重试队列」）：超出按价值淘汰最旧的
+MEMORY_PENDING_CAP = 200
+
+
 class Store:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -3827,8 +3831,13 @@ class Store:
         with self._lock, self._conn:
             self._conn.execute(f"UPDATE memory SET {columns} WHERE {where}", args)
 
-    def memory_task_add(self, row: dict[str, Any]) -> bool:
-        """登记一条待提取来源（同角色同来源幂等，§4.1）。"""
+    def memory_task_add(self, row: dict[str, Any], *, pending_cap: int = MEMORY_PENDING_CAP) -> bool:
+        """登记一条待提取来源（同角色同来源幂等，§4.1）。
+
+        队列**有界**（§4.1「有界重试队列」）：某角色待处理数超过 `pending_cap` 时，
+        同一次事务里淘汰最旧的低价值项——淘汰顺序 经历 < 说法 < 打算 < 转述 < 对话，
+        即流水账先走、对话与转述最后走。被淘汰的标 `dropped` 并写明原因，不是静默删除。
+        """
         with self._lock, self._conn:
             cur = self._conn.execute(
                 """INSERT OR IGNORE INTO memory_task(id, instance_id, timeline_id, character_id, source_kind,
@@ -3841,6 +3850,29 @@ class Store:
                     str(row.get("text") or ""),
                 ),
             )
+            if cur.rowcount and int(pending_cap) > 0:
+                pending = int(
+                    self._conn.execute(
+                        """SELECT COUNT(*) FROM memory_task
+                           WHERE instance_id=? AND timeline_id=? AND character_id=? AND state='pending'""",
+                        (row["instance_id"], row["timeline_id"], row["character_id"]),
+                    ).fetchone()[0]
+                )
+                over = pending - int(pending_cap)
+                if over > 0:
+                    self._conn.execute(
+                        """UPDATE memory_task SET state='dropped', note='队列有界淘汰（§4.1）'
+                           WHERE id IN (
+                             SELECT id FROM memory_task
+                             WHERE instance_id=? AND timeline_id=? AND character_id=? AND state='pending'
+                             ORDER BY CASE source_kind
+                                        WHEN 'experience' THEN 0 WHEN 'claim' THEN 1
+                                        WHEN 'intent' THEN 2 WHEN 'disclosed' THEN 3
+                                        WHEN 'dialog' THEN 4
+                                        ELSE 5 END ASC, source_world ASC, id ASC
+                             LIMIT ?)""",
+                        (row["instance_id"], row["timeline_id"], row["character_id"], int(over)),
+                    )
         return bool(cur.rowcount)
 
     def memory_tasks(self, instance_id: str, timeline_id: str, *, state: str = "pending") -> list[dict[str, Any]]:

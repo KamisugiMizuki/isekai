@@ -164,6 +164,77 @@ def pack_brief(
     return {"lines": lines, "ids": used, "text": "\n".join(lines)}
 
 
+#: 日程切片（`kind=life`）的入队上限：每角色每世界日最多几条（MEMORY_SPEC §4.1）
+#: 实测一个角色一天产 20 条窗口切片（「sleep（…）」「滩口值守与水位尺读数（…）」），
+#: 逐条当记忆候选必然积压——它们也是**流水账**，不是「值得记的事」。睡眠直接不算候选。
+LIFE_SOURCE_PER_DAY = 1
+
+
+def is_life_candidate(summary: str) -> bool:
+    """日程切片里哪条还算「经历」候选：睡眠不算（§4.1）。"""
+    return not str(summary or "").strip().startswith("sleep")
+
+
+def select_experience_sources(
+    rows: list[dict[str, Any]], *, day_seconds: int, life_per_day: int = LIFE_SOURCE_PER_DAY
+) -> tuple[set[str], int]:
+    """世界侧经历来源筛选（§4.1）：返回（该入队的 id 集合，被跳过的条数）。
+
+    - 非 `life`（真实行动等）：照登；
+    - `life`：按世界日分组，每天最多 `life_per_day` 条且睡眠不算——一天 20 条窗口切片里
+      留一条做「那阵子她在做什么」的锚点就够，剩下的逐条提取是纯浪费。
+    """
+    keep: set[str] = set()
+    seen: dict[int, int] = {}
+    skipped = 0
+    per_day = max(1, int(life_per_day))
+    days = max(1, int(day_seconds or 1))
+    for row in sorted(rows, key=lambda item: int(item.get("world_seconds") or 0)):
+        if str(row.get("kind") or "") != "life":
+            keep.add(str(row["id"]))
+            continue
+        if not is_life_candidate(str(row.get("summary") or "")):
+            skipped += 1
+            continue
+        day = int(row["world_seconds"]) // days
+        if seen.get(day, 0) >= per_day:
+            skipped += 1
+            continue
+        seen[day] = seen.get(day, 0) + 1
+        keep.add(str(row["id"]))
+    return keep, skipped
+
+
+#: 积压汇总的规则块：进 system，与角色 / 时间 / 材料无关（缓存前缀）
+COMPACTION_RULES = [
+    "把一段时间的流水账压成她真正记得住的事，输出 JSON 数组，每项：",
+    '{"text":"一到两句话","kind":"fragment|fact|impression","ref":"材料编号",'
+    '"strength":0.0-1.0,"confidence":0.0-1.0}',
+    "规则：",
+    "1) 一条概括覆盖一段时间，不要逐条复述；最多三条，宁少不滥；",
+    "2) 保留时间跨度（哪阵子）、地点，以及她还记得的关键变化；",
+    "3) ref 取这条概括主要依据的那条材料编号；不得新增来源、不得编造细节；",
+    "4) 例行公事（值守、吃饭、睡觉）不必单独成条；没有值得留的就输出 []。",
+]
+
+
+def compaction_prompt(
+    *, name: str, from_label: str, to_label: str, items: list[dict[str, Any]]
+) -> list[dict[str, str]]:
+    """积压汇总提示（§4.1）：一次调用吃一批旧材料，产出少量概括条目。
+
+    与 `extraction_prompt` 同形状：规则进 system（可缓存前缀），会变的进 user。
+    """
+    ask = [f"角色：{name}", f"这段时间：{from_label} → {to_label}", "材料："]
+    for item in items:
+        when = item.get("when") or ""
+        ask.append(f"[{item['ref']}]（{item.get('source') or ''}{('，' + when) if when else ''}）{item.get('text') or ''}")
+    return [
+        {"role": "system", "content": "\n".join(COMPACTION_RULES)},
+        {"role": "user", "content": "\n".join(ask)},
+    ]
+
+
 def extraction_prompt(
     *,
     name: str,
