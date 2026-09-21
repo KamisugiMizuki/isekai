@@ -21,7 +21,7 @@ from ..log import get_logger
 from ..store import Store
 from ..ump import Err, UmpError
 from .cards import template_card, validate_assembly, validate_card
-from .generator import fill_section, generate_card, generate_package, revise_package
+from .generator import fill_card, fill_section, generate_card, generate_package, revise_package
 from . import converters
 from .instances import (
     InstanceError,
@@ -1727,9 +1727,28 @@ async def dispatch_async(
                 **kwargs,
             )
         elif op == "world.card.generate":
-            package, errors, usage = await generate_card(
-                llm, _package_arg(args, cfg), str(args.get("brief") or ""), **kwargs
-            )
+            card_package = _package_arg(args, cfg)
+            sections = str(args.get("sections") or "").strip()
+            if sections:
+                # 字段级重跑（§4.2）：只改点名的字段，其余由核心强制取原卡
+                package, errors, usage = await fill_card(
+                    llm,
+                    card_package,
+                    _card_arg(args, cfg),
+                    sections,
+                    brief=str(args.get("brief") or ""),
+                    locked_fields=args.get("locked_fields"),
+                    **kwargs,
+                )
+            else:
+                package, errors, usage = await generate_card(
+                    llm,
+                    card_package,
+                    str(args.get("brief") or ""),
+                    locked_fields=args.get("locked_fields"),
+                    base=args.get("base"),
+                    **kwargs,
+                )
         else:
             raise UmpError(Err.UNSUPPORTED_TYPE, f"未知管理操作 {op}", retryable=False)
     except LLMError as exc:

@@ -87,6 +87,53 @@ def parse_locks(raw: Any) -> dict[str, list[str]]:
     return locks
 
 
+def parse_field_locks(raw: Any) -> list[str]:
+    """字段锁定的信任边界（角色卡工作区 §4.2）：`[卡内点分路径]`，粒度是「这个字段」。
+
+    与条目锁定（`parse_locks`，按 id）分开：卡的字段是一个值，不是一个可认领的条目。
+    """
+    if raw in (None, "", []):
+        return []
+    items = [raw] if isinstance(raw, str) else raw
+    if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+        raise PackageError("locked_fields: 必须是字段路径列表")
+    cleaned = []
+    for item in items:
+        path = item.strip()
+        if not path or path.startswith(".") or path.endswith("."):
+            raise PackageError(f"locked_fields: 字段路径必须是点分路径（收到 {item!r}）")
+        cleaned.append(path)
+    return sorted(set(cleaned))
+
+
+def apply_field_locks(candidate: dict[str, Any], current: dict[str, Any], paths: list[str]) -> dict[str, Any]:
+    """把锁定字段从 `current` 原样写回候选（整卡重跑与字段级重跑都走这里）。"""
+    if not paths:
+        return candidate
+    out = clone_package(candidate)
+    for path in paths:
+        value = _path_value(current, path)
+        if value is None:
+            continue
+        _path_set(out, path, clone_package(value) if isinstance(value, (dict, list)) else value)
+    return out
+
+
+def field_locks_note(card: dict[str, Any], paths: list[str]) -> str:
+    """提示词里的「已定稿字段」段：字段值原样带进去，并要求模型不要改动。"""
+    blocks: list[str] = []
+    for path in paths:
+        value = _path_value(card, path)
+        if value is None:
+            continue
+        blocks.append(f"- {path}: {json.dumps(value, ensure_ascii=False)}")
+    if not blocks:
+        return ""
+    return (
+        "以下字段已定稿（用户锁定）：重跑后必须原样保留，不得改动、不得换写法。\n" + "\n".join(blocks) + "\n"
+    )
+
+
 def _path_value(node: Any, path: str) -> Any:
     for part in path.split("."):
         if not isinstance(node, dict) or part not in node:
@@ -492,19 +539,26 @@ async def fill_section(
 
 
 async def generate_card(
-    llm: LLMClient, package: dict[str, Any], brief: str, *, max_calls: int = DEFAULT_CARD_CALLS
+    llm: LLMClient,
+    package: dict[str, Any],
+    brief: str,
+    *,
+    max_calls: int = DEFAULT_CARD_CALLS,
+    locked_fields: list[str] | None = None,
+    base: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
-    """AI 生成角色卡候选：创作校验可用实情层，但候选仍需用户确认后才进入实例。"""
+    """AI 生成角色卡候选：创作校验可用实情层，但候选仍需用户确认后才进入实例。
+
+    `locked_fields` = 字段路径列表（§4.2 字段级锁定）；`base` = 这些字段的出处（整卡重跑时传当前卡）。
+    """
     from .cards import template_card
     from .example import example_card
 
+    locks = parse_field_locks(locked_fields)
+    source = clone_package(base) if isinstance(base, dict) else {}
+
     skeleton = template_card(package)
-    moment = int(package.get("calendar", {}).get("initial_moment") or 0)
-    calendar = package.get("calendar") or {}
-    day = int(calendar.get("day_seconds") or 86400)
-    months = calendar.get("months") or []
-    year_days = sum(int(item.get("days") or 0) for item in months if isinstance(item, dict)) or len(months) * 30 or 360
-    year_seconds = year_days * day
+    moment, day, year_days, year_seconds = _card_context(package)
     system = (
         "你是角色卡生成器。按用户描述生成一张角色卡：身份、职业、背景与世界公理相容，"
         "信息渠道只能用世界包已定义的来源，初始知识必须有合法来源与获知时间（不晚于初始时刻，"
@@ -524,8 +578,11 @@ async def generate_card(
         f"{json.dumps(example_card(EXAMPLE), ensure_ascii=False)}"
     )
 
+    if locks:
+        system += field_locks_note(source, locks)
+
     def check(candidate: dict[str, Any]) -> list[str]:
-        card = _merge_structure(candidate, skeleton)
+        card = apply_field_locks(_merge_structure(candidate, skeleton), source, locks)
         return validate_card(card, package, moment=moment)
 
     budget = {"calls": 0, "limit": max(1, int(max_calls))}
@@ -535,7 +592,83 @@ async def generate_card(
         )
     except BudgetExhausted as exc:
         return {**skeleton}, [str(exc)], _usage(budget, paused=True)
-    return _unconfirmed(candidate), errors, _usage(budget, paused=False)
+    return _unconfirmed(apply_field_locks(candidate, source, locks)), errors, _usage(budget, paused=False)
+
+
+def _card_context(package: dict[str, Any]) -> tuple[int, int, int, int]:
+    """角色卡生成共用的历法上下文：(初始时刻, 日长, 一年几日, 一年几秒)。"""
+    moment = int(package.get("calendar", {}).get("initial_moment") or 0)
+    calendar = package.get("calendar") or {}
+    day = int(calendar.get("day_seconds") or 86400)
+    months = calendar.get("months") or []
+    year_days = sum(int(item.get("days") or 0) for item in months if isinstance(item, dict)) or len(months) * 30 or 360
+    return moment, day, year_days, year_days * day
+
+
+async def fill_card(
+    llm: LLMClient,
+    package: dict[str, Any],
+    card: dict[str, Any],
+    sections: str,
+    *,
+    brief: str = "",
+    max_calls: int = DEFAULT_CARD_CALLS,
+    locked_fields: list[str] | None = None,
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    """字段级重跑（生成工作区 §4.2）：只改指定的卡字段，其余字段由核心强制取原卡。
+
+    `sections` = 逗号分隔的卡顶层键（identity / background / channels / initial_knowledge / first_contact /
+    initial_units / comms / life_template / appearance …）；`locked_fields` = 字段路径（可到子字段）。
+    """
+    from .example import example_card
+
+    keys = tuple(part.strip() for part in str(sections).split(",") if part.strip())
+    if not keys:
+        raise PackageError("未知字段：空")
+    unknown = [key for key in keys if key not in card]
+    if unknown:
+        raise PackageError(f"未知字段：{'、'.join(unknown)}")
+    locks = parse_field_locks(locked_fields)
+    source = clone_package(card)
+    moment, day, year_days, year_seconds = _card_context(package)
+    system = (
+        "你是角色卡的字段补全器。只重写用户点名的那些字段，其余字段原样保留（由核心强制，不靠你自觉）。"
+        "身份、职业、背景与世界公理相容；渠道只能用世界包已定义的来源；初始知识必须有合法来源与获知时间"
+        "（不晚于初始时刻，史料不得早于成书，scope 只能取该传本 entries 里的标识）；"
+        "初始性格单元至少一个锚点（置信度 0.75–0.99）；生活线模板的活动必须来自世界包对应模板。" + STRUCTURE_HINT
+    )
+    if brief:
+        system += f"\n用户原先的角色描述（保持一致，不要另起一个人）：\n{brief}\n"
+    system += field_locks_note(source, locks)
+    user = (
+        f"本次要重写的字段：{','.join(keys)}\n"
+        f"当前卡（其余字段作为上下文，请原样返回）：{json.dumps(card, ensure_ascii=False)}\n\n"
+        f"世界历法：日长 {day} 世界秒；一年 {year_days} 日 = {year_seconds} 世界秒；实例初始时刻 {moment} 世界秒。\n"
+        f"身份用「种族 + 出生时刻（世界秒整数）」表达；出生时刻 = {moment} − N×{year_seconds}，纪元前为负数。\n\n"
+        f"形状参考（字段类型与粒度照此填写；内容按当前卡替换）：\n"
+        f"{json.dumps(example_card(package), ensure_ascii=False)}"
+    )
+
+    def restrict(value: dict[str, Any]) -> dict[str, Any]:
+        merged = {**card, **{key: value.get(key, card[key]) for key in keys}}
+        return apply_field_locks(merged, source, locks)
+
+    def check(value: dict[str, Any]) -> list[str]:
+        restricted = restrict(value)
+        return [
+            item
+            for item in validate_card(restricted, package, moment=moment)
+            if item.split(":")[0].split(".")[0].split("[")[0] in keys
+        ]
+
+    budget = {"calls": 0, "limit": max(1, int(max_calls))}
+    try:
+        candidate, errors = await _generate_with_retry(
+            llm, system, user, card, check, label=f"角色卡字段 {','.join(keys)}", budget=budget
+        )
+    except BudgetExhausted as exc:
+        return {**card}, [str(exc)], _usage(budget, paused=True)
+    return _unconfirmed(restrict(candidate)), errors, _usage(budget, paused=False)
 
 
 def _unconfirmed(candidate: dict[str, Any]) -> dict[str, Any]:

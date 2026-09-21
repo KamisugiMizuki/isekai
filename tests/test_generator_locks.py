@@ -114,6 +114,51 @@ async def test_fill_section_can_rerun_a_whole_segment() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fill_card_only_rewrites_named_fields_and_keeps_locks() -> None:
+    """卡的字段级重跑（§4.2）：点名的字段收下模型结果，其余字段由核心强制取原卡；锁定字段原样保留。"""
+    from isekai_core.world.cards import template_card
+    from isekai_core.world.example import example_card
+
+    package = sample_package()
+    card = example_card(package)
+    sections = "background,first_contact"
+    rewritten = clone_package(card)
+    rewritten["background"] = {"creator": "模型另写的身世", "self_knowledge": "模型另写的自述"}
+    rewritten["first_contact"] = {"stance": "模型写的初见态度", "intent": "模型写的意图"}
+    rewritten["identity"]["occupation"] = "模型顺手改的职业"  # 没点名：不该被收下
+    llm = FakeLLM([json.dumps(rewritten, ensure_ascii=False)])
+    out, errors, _usage = await generator.fill_card(
+        llm, package, card, sections, locked_fields=["background.self_knowledge"]
+    )
+    assert errors == [], errors
+    assert out["first_contact"]["stance"] == "模型写的初见态度", "点名的字段要收下新内容"
+    assert out["background"]["creator"] == "模型另写的身世"
+    assert out["background"]["self_knowledge"] == card["background"]["self_knowledge"], "锁定字段原样保留"
+    assert out["identity"] == card["identity"], "没点名的字段逐字段不变"
+    prompt = "\n".join(str(message.get("content") or "") for call in llm.calls for message in call)
+    assert "已定稿" in prompt and "background,first_contact" in prompt
+
+    with pytest.raises(PackageError):
+        await generator.fill_card(llm, package, card, "background,不存在的字段")
+
+
+@pytest.mark.asyncio
+async def test_generate_card_keeps_locked_fields() -> None:
+    from isekai_core.world.example import example_card
+
+    package = sample_package()
+    card = example_card(package)
+    rewritten = clone_package(card)
+    rewritten["identity"]["occupation"] = "模型重写的职业"
+    llm = FakeLLM([json.dumps(rewritten, ensure_ascii=False)])
+    out, errors, _usage = await generator.generate_card(
+        llm, package, "随便描述", locked_fields=["identity.occupation"], base=card
+    )
+    assert errors == [], errors
+    assert out["identity"]["occupation"] == card["identity"]["occupation"], "整卡重跑也不覆盖锁定字段"
+
+
+@pytest.mark.asyncio
 async def test_revise_package_keeps_locked_entries() -> None:
     package = sample_package()
     ident = str(package["narratives"][0]["id"])
