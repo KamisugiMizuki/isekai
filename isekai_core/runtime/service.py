@@ -536,6 +536,9 @@ class RuntimeService:
         """在一致边界取快照（§5.1）：提交是回滚点与分叉点。"""
         # 写快照前先结算已到期的倍率命令：否则快照把「上一段」的陈旧倍率当成有效倍率固化（§2.3.4）
         row = self._settled_row(timeline_id, time.time())
+        # 已结算账本行到此无读者：提交快照已把有效倍率记进 commit.rate，回滚照它跑（§七），
+        # 待生效行才算控制状态 —— 故提交点是清账本的安全时点，不这样清就会随每次变更无界积行。
+        self.store.rate_clear_settled(timeline_id)
         snapshot = versioning.snapshot_of(self.store, instance_id, timeline_id, note=note)
         commit_id = f"cm-{secrets.token_hex(6)}"
         record = versioning.make_commit_row(
@@ -707,6 +710,7 @@ class RuntimeService:
             **self.clock_row(timeline_id),
             "base_real": now,
             "base_world": int(snapshot.get("world") or 0),
+            # 回滚后按**提交那一刻**的倍率跑（选定口径）：照快照值重锚，不重放历史倍率命令（§七）
             "rate": int(snapshot.get("rate") or 1),
             "high_water_real": now,
             "anchor_real": now,

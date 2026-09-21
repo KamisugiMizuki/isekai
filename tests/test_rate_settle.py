@@ -170,3 +170,40 @@ def test_rollback_keeps_world_from_running_away(store, world) -> None:
     view = world.view(info["id"], timeline_id, now_real=T + 460)
     assert view["rate"] == 1
     assert view["world_seconds"] == snapshot["world"] + 60, "60 秒现实 = 60 秒世界（旧倍率会飙到上亿）"
+
+
+def _ledger(store, timeline_id: str, state: str) -> int:
+    """该线账本里某种状态的行数（applied / cancelled / pending）。"""
+    with sqlite3.connect(store.path) as conn:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM rate_command WHERE timeline_id=? AND state=?", (timeline_id, state)
+            ).fetchone()[0]
+        )
+
+
+def test_commit_clears_settled_rate_ledger(store, world) -> None:
+    """① 账本清理：提交清掉已结算 / 已取消行（不随历史无界积行），待生效行一动不动。"""
+    info, timeline_id = make_instance(store, world)
+    for step in range(5):
+        at = T + 10 * step
+        world.set_rate(info["id"], timeline_id, rate=2 + step, now_real=at)
+        world.advance(info["id"], timeline_id, now_real=at + 2)
+        assert _ledger(store, timeline_id, "applied") == 1, "推进结算后账本先记一笔"
+        world.commit(info["id"], timeline_id, kind="manual", note=f"第 {step} 次")
+        assert _ledger(store, timeline_id, "applied") == 0, "提交点清掉已结算行（否则 5 次变更积 5 行）"
+        assert _ledger(store, timeline_id, "pending") == 0
+
+    # 待生效行是控制状态，提交不许动它：提交按真实 now 结算，碰不到还没生效的整秒
+    later = time.time() + 1000.0
+    world.set_rate(info["id"], timeline_id, rate=9, now_real=later)
+    world.commit(info["id"], timeline_id, kind="manual", note="有待生效命令")
+    assert [item["rate"] for item in store.rate_pending(timeline_id)] == [9], "pending 行不受清理影响"
+    assert versioning.recorded_rate(store, timeline_id) == 9, "快照仍按折进口径记新倍率"
+
+    # 已取消行同理：冻结在生效整秒之前取消待生效请求 → 下一次提交清掉
+    world.freeze(info["id"], timeline_id, now_real=int(later) + 1 - 120)
+    assert _ledger(store, timeline_id, "cancelled") == 1, "冻结取消待生效请求（账本记一笔）"
+    world.commit(info["id"], timeline_id, kind="manual", note="冻结之后")
+    assert _ledger(store, timeline_id, "cancelled") == 0
+    assert _ledger(store, timeline_id, "pending") == 0

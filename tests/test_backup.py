@@ -145,3 +145,47 @@ def test_backup_covers_packages_and_drafts(store, tmp_path) -> None:
     assert restored, "配对包存在时要真的放回去"
     assert (packages / "keep.draft.json").exists()
     assert not (packages / "rev-after.draft.json").exists(), "恢复后备份时点之后的草稿不该还在"
+
+
+def test_backup_folds_pending_rate_so_restore_keeps_effective_rate(store, tmp_path) -> None:
+    """② 备份前把待生效倍率折进 clock 行：恢复 + 激活后不得按折进前的陈旧高倍率狂跑（§3.3）。"""
+    from isekai_core.config import load_config
+    from isekai_core.world import ops as world_ops
+
+    cfg = load_config(tmp_path)
+    world_service = RuntimeService(store)
+    info, timeline_id, _character_id = make_instance(store, world_service)
+    T = 1_700_000_000.0  # 固定现实时基（与 test_rate_settle 同口径）：生效整秒 T+1 / T+4
+    world_service.activate(info["id"], timeline_id, now_real=T)
+
+    world_service.set_rate(info["id"], timeline_id, rate=3600, now_real=T)
+    world_service.advance(info["id"], timeline_id, now_real=T + 2, max_batches=1)
+    assert store.clock_get(timeline_id)["rate"] == 3600, "高倍率已结算落库"
+
+    # 用户调回 1：生效整秒 T+4 还没到，行值仍是 3600（界面看的是投影）
+    world_service.set_rate(info["id"], timeline_id, rate=1, now_real=T + 3)
+    assert store.clock_get(timeline_id)["rate"] == 3600
+
+    result = world_ops.backup_once(cfg, store, note="折进未生效倍率")
+    assert result["ok"]
+    row = store.clock_get(timeline_id)
+    assert row["rate"] == 1, "备份前折进：行值就是备份时刻的有效倍率，不是折进前的 3600"
+    assert (row["base_real"], row["base_world"]) == (T + 4, DAY * 1500 + 1 + 3 * 3600), "旧段 3 秒 ×3600"
+    assert store.rate_pending(timeline_id) == [], "折进后不再有待生效命令"
+
+    copy = sqlite3.connect(str(result["file"]))
+    try:
+        stored = copy.execute("SELECT rate FROM timeline_clock WHERE timeline_id=?", (timeline_id,)).fetchone()
+    finally:
+        copy.close()
+    assert int(stored[0]) == 1, "备份文件里记的是有效倍率"
+
+    store.backup_restore(Path(str(result["file"])))
+    assert store.clock_get(timeline_id)["rate"] == 1, "恢复后不得残留折进前的陈旧高倍率"
+    assert store.rate_pending(timeline_id) == [], "恢复清空待生效命令（现有行为不变）"
+
+    # 恢复后是冻结线：激活后按 1 走，不是 3600（旧行为 60 秒现实 = 216000 世界秒）
+    world_service.activate(info["id"], timeline_id, now_real=T + 100)
+    view = world_service.view(info["id"], timeline_id, now_real=T + 160)
+    assert view["rate"] == 1
+    assert view["world_seconds"] == DAY * 1500 + 10801 + 60, "60 秒现实 = 60 秒世界"

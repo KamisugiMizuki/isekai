@@ -4066,6 +4066,19 @@ class Store:
         with self._lock, self._conn:
             self._conn.executemany("UPDATE rate_command SET state='applied' WHERE id=?", [(i,) for i in ids])
 
+    def rate_clear_settled(self, timeline_id: str) -> int:
+        """清掉该线已结算（applied）与已取消（cancelled）的账本行；pending 一律不动。
+
+        这两种状态没有读者：真值在 clock 行（当前倍率段）与提交快照（§5.1 / §七）里，
+        账本只用来回答「还有哪些待生效」。留着只会随每次倍率变更无界积行。
+        """
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM rate_command WHERE timeline_id=? AND state IN ('applied','cancelled')",
+                (timeline_id,),
+            )
+            return int(cursor.rowcount)
+
     def rate_cancel_pending(self, timeline_id: str) -> int:
         with self._lock, self._conn:
             cursor = self._conn.execute(

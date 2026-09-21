@@ -18,6 +18,38 @@ class VersionError(ValueError):
     """版本操作的前置条件不满足（提交不存在、线不存在等）。"""
 
 
+def _state_of(store: Any, timeline_id: str) -> ClockState:
+    """clock 行 → 状态机状态（行值可能落后于状态机，见 recorded_rate）。"""
+    clock = store.clock_get(timeline_id) or {}
+    return ClockState(
+        base_real=float(clock.get("base_real") or 0.0),
+        base_world=int(clock.get("base_world") or 0),
+        rate=int(clock.get("rate") or 1),
+        high_water_real=float(clock.get("high_water_real") or 0.0),
+    )
+
+
+def _commands_of(pending: list[dict[str, Any]]) -> list[RateCommand]:
+    return [
+        RateCommand(
+            input_real=float(item["input_real"]),
+            effective_real=int(item["effective_real"]),
+            rate=int(item["rate"]),
+            seq=int(item["seq"]),
+        )
+        for item in pending
+    ]
+
+
+def _folded_state(store: Any, timeline_id: str, pending: list[dict[str, Any]]) -> ClockState:
+    """把待生效命令折进时钟状态：结算到最后一条待生效命令的生效整秒（§2.2）。"""
+    return settle(
+        _state_of(store, timeline_id),
+        max(float(item["effective_real"]) for item in pending),
+        _commands_of(pending),
+    )[0]
+
+
 def recorded_rate(store: Any, timeline_id: str) -> int:
     """快照 / 导出要记的「有效倍率」：把待生效命令一并折进结果（§2.2 / §5.1）。
 
@@ -26,26 +58,41 @@ def recorded_rate(store: Any, timeline_id: str) -> int:
     就会把已经改掉的陈旧倍率固化下来，回滚 / 导入后照它狂跑。这里按状态机结算到最后一条
     待生效命令的生效整秒：快照记的是这条线接下来按什么速度走。
     """
-    clock = store.clock_get(timeline_id) or {}
-    state = ClockState(
-        base_real=float(clock.get("base_real") or 0.0),
-        base_world=int(clock.get("base_world") or 0),
-        rate=int(clock.get("rate") or 1),
-        high_water_real=float(clock.get("high_water_real") or 0.0),
-    )
-    pending = [
-        RateCommand(
-            input_real=float(item["input_real"]),
-            effective_real=int(item["effective_real"]),
-            rate=int(item["rate"]),
-            seq=int(item["seq"]),
-        )
-        for item in store.rate_pending(timeline_id)
-    ]
+    pending = store.rate_pending(timeline_id)
     if not pending:
-        return int(state.rate)
-    settled, _ = settle(state, max(float(item.effective_real) for item in pending), pending)
-    return int(settled.rate)
+        return int(_state_of(store, timeline_id).rate)
+    return int(_folded_state(store, timeline_id, pending).rate)
+
+
+def fold_pending_rates(store: Any) -> int:
+    """备份前的「一致水位」一步：把各线待生效的倍率命令折进 clock 行（§2.3.4 / §3.3）。
+
+    备份里的 `clock.rate` 必须是备份时刻的**有效倍率**：恢复清空 rate_command（§七 不回放
+    控制命令），备份若只记着折进前的行值，用户刚调低的陈旧高倍率会在恢复 + 激活后继续生效，
+    再推进就按它狂跑。口径与 recorded_rate 相同（结算到最后一条待生效命令的生效整秒），
+    折完把这些命令标 applied —— 同一条命令重复结算幂等（基准已落在它的生效点），不会二次生效。
+    返回折进过倍率的线数。
+    """
+    folded = 0
+    for instance in store.instance_list():
+        for timeline in store.timeline_list(str(instance["id"])):
+            line = str(timeline["id"])
+            pending = store.rate_pending(line)
+            if not pending:  # 冻结线的待生效命令已被取消（§2.3.6），这里天然只动有变更的线
+                continue
+            state = _folded_state(store, line, pending)
+            store.clock_put(
+                {
+                    **(store.clock_get(line) or {}),
+                    "base_real": state.base_real,
+                    "base_world": state.base_world,
+                    "rate": state.rate,
+                    "high_water_real": state.high_water_real,
+                }
+            )
+            store.rate_apply([int(item["id"]) for item in pending])
+            folded += 1
+    return folded
 
 
 def snapshot_of(store: Any, instance_id: str, timeline_id: str, *, note: str = "") -> dict[str, Any]:

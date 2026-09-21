@@ -1219,6 +1219,11 @@ def backup_once(cfg: Any, store: Any, *, note: str = "") -> dict[str, Any]:
     """
     folder = _backup_folder(cfg, store)
     folder.mkdir(parents=True, exist_ok=True)  # 首次到期补做时目录还不存在
+    # 备份前先把待生效倍率折进 clock 行：备份里的 rate 必须是**备份时刻的有效倍率**，
+    # 否则恢复清空 rate_command 之后，折进前的陈旧高倍率会继续生效（§3.3 一致水位）。
+    from ..runtime import versioning  # 局部导入：world → runtime 不在导入期成环
+
+    versioning.fold_pending_rates(store)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     result = store.backup_create(folder / f"isekai-{stamp}.db", note=note)
     if result["ok"]:
