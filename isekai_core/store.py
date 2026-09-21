@@ -480,6 +480,30 @@ CREATE TABLE IF NOT EXISTS reaction(
 );
 CREATE INDEX IF NOT EXISTS ix_reaction_stage ON reaction(instance_id, timeline_id, stage, started_world);
 
+-- 叙事中介层（NARRATIVE_LAYER_SPEC §7）：派生记录——已固化消息引用的叙事单元 / 暂缓标记 / 审计结果。
+-- 候选与排序是可重建的中间产物，不落库；落库的只有「她讲过什么、没讲出口什么」这件事。
+CREATE TABLE IF NOT EXISTS narrative_unit(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  id TEXT NOT NULL,                        -- 由主材引用派生：同一材料复用同一个单元
+  primary_ref TEXT NOT NULL,
+  refs TEXT NOT NULL DEFAULT '[]',         -- 单元内引用的材料（消费记账按这些引用去重）
+  entry TEXT NOT NULL DEFAULT '',          -- experience | knowledge
+  relation TEXT NOT NULL DEFAULT '',       -- 补充 | 连续 | 并列
+  topic TEXT NOT NULL DEFAULT '',
+  stage TEXT NOT NULL DEFAULT 'spoken',    -- spoken 已固化 | deferred 没讲出口（暂缓）
+  message_id TEXT NOT NULL DEFAULT '',
+  world_day INTEGER NOT NULL DEFAULT 0,
+  audit TEXT NOT NULL DEFAULT '[]',        -- 后验检查结果（空列表 = 本次没有发现越界）
+  note TEXT NOT NULL DEFAULT '',
+  created_world INTEGER NOT NULL,
+  updated_world INTEGER NOT NULL,
+  PRIMARY KEY(instance_id, timeline_id, character_id, id)
+);
+CREATE INDEX IF NOT EXISTS ix_narrative_unit_stage
+  ON narrative_unit(instance_id, timeline_id, character_id, stage, world_day);
+
 -- 惰性展开的覆盖状态（EVENT_ENGINE_SPEC §3.4 / 附录B#10）：
 -- 没有行 = 尚未生成；state=absent 只表示「这条记载没写下」，不是「历史被删改」的证据。
 CREATE TABLE IF NOT EXISTS claim_coverage(
@@ -729,6 +753,17 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+def _json_list(value: Any) -> list[str]:
+    """JSON 数组列 → 字符串列表（叙事单元的 refs 走这一套，读侧统一在这里解）。"""
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    try:
+        parsed = json.loads(str(value or "[]"))
+    except json.JSONDecodeError:
+        return []
+    return [str(item) for item in parsed] if isinstance(parsed, list) else []
+
+
 def hash_credential(credential: str) -> str:
     return hashlib.sha256(credential.encode("utf-8")).hexdigest()
 
@@ -869,6 +904,68 @@ class Store:
             (instance_id, timeline_id),
         ).fetchall()
         return [_row_to_dict(item) for item in rows]
+
+    # ---------- 叙事中介层（NARRATIVE_LAYER_SPEC §7） ----------
+
+    def narrative_unit_put(self, row: dict[str, Any]) -> None:
+        """落一条叙事单元记录：同一单元从「暂缓」到「讲出来」是同一行的推进。"""
+        payload = {"refs": "[]", "audit": "[]", "note": "", "message_id": "", "world_day": 0, **row}
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO narrative_unit(instance_id, timeline_id, character_id, id, primary_ref, refs,
+                                              entry, relation, topic, stage, message_id, world_day, audit, note,
+                                              created_world, updated_world)
+                   VALUES(:instance_id, :timeline_id, :character_id, :id, :primary_ref, :refs,
+                          :entry, :relation, :topic, :stage, :message_id, :world_day, :audit, :note,
+                          :created_world, :updated_world)
+                   ON CONFLICT(instance_id, timeline_id, character_id, id) DO UPDATE SET
+                     refs=excluded.refs, entry=excluded.entry, relation=excluded.relation, topic=excluded.topic,
+                     stage=excluded.stage, message_id=excluded.message_id, world_day=excluded.world_day,
+                     audit=excluded.audit, note=excluded.note, updated_world=excluded.updated_world""",
+                payload,
+            )
+
+    def narrative_unit_list(
+        self, instance_id: str, timeline_id: str, *, character_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        if character_id:
+            rows = self._conn.execute(
+                """SELECT * FROM narrative_unit WHERE instance_id=? AND timeline_id=? AND character_id=?
+                   ORDER BY created_world, id""",
+                (instance_id, timeline_id, character_id),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM narrative_unit WHERE instance_id=? AND timeline_id=? ORDER BY created_world, id",
+                (instance_id, timeline_id),
+            ).fetchall()
+        return [_row_to_dict(item) for item in rows]
+
+    def narrative_consumed_refs(self, instance_id: str, timeline_id: str, character_id: str) -> set[str]:
+        """已固化消息引用的叙事单元里的材料：这些素材算消费过（§7.1 消费记账）。"""
+        rows = self._conn.execute(
+            """SELECT refs FROM narrative_unit
+               WHERE instance_id=? AND timeline_id=? AND character_id=? AND stage='spoken' AND message_id<>''""",
+            (instance_id, timeline_id, character_id),
+        ).fetchall()
+        out: set[str] = set()
+        for item in rows:
+            out |= set(_json_list(item[0]))
+        return out
+
+    def narrative_deferred_refs(
+        self, instance_id: str, timeline_id: str, character_id: str, *, world_day: int
+    ) -> set[str]:
+        """同一世界日内没讲出口的单元：降级但不禁用——新依据或她改主意都合法（§5.2）。"""
+        rows = self._conn.execute(
+            """SELECT refs FROM narrative_unit
+               WHERE instance_id=? AND timeline_id=? AND character_id=? AND stage='deferred' AND world_day=?""",
+            (instance_id, timeline_id, character_id, int(world_day)),
+        ).fetchall()
+        out: set[str] = set()
+        for item in rows:
+            out |= set(_json_list(item[0]))
+        return out
 
     # ---------- 整库备份 / 恢复（DESKTOP_SPEC §3.3） ----------
 
@@ -1857,6 +1954,7 @@ class Store:
                 "proactive_log",
                 "first_contact",
                 "session_notice",
+                "narrative_unit",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute(
@@ -2278,6 +2376,7 @@ class Store:
             "pending_event",    # 回滚撤销待执行状态及其后果（§八 末条）
             "disclosure",       # 回滚同时撤销授权与依赖它的派生（§7.2）
             "reaction",         # 短期反应随线版本化：回滚撤销派生状态（§11.1 / 附录B#17）
+            "narrative_unit",   # 叙事单元 / 暂缓标记 / 审计结果同样是派生状态（NARRATIVE_LAYER §7.2）
         ):
             self._conn.execute(f"DELETE FROM {table} WHERE timeline_id=?", (timeline_id,))
         # 向量表两种形态都清：按线（新）与按 memory 归属（兼容早期没有 timeline_id 的行）
@@ -2688,6 +2787,13 @@ class Store:
                 timeline_id,
                 watermark,
             ),
+            "narrative": rows(
+                """SELECT * FROM narrative_unit WHERE instance_id=? AND timeline_id=? AND created_world<=?
+                   ORDER BY created_world, id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
             "effects": rows(
                 """SELECT * FROM effect_state WHERE instance_id=? AND timeline_id=? AND from_world<=?
                    ORDER BY from_world, seq, id""",
@@ -2935,6 +3041,20 @@ class Store:
                               :kind, :summary, :source_ref, :confidence)""",
                     item,
                 )
+            for item in payload.get("narrative") or []:
+                # 对照 dump 的键一一对应：少一处就是「导出有、导入后没」（§7.2）
+                row = {"refs": "[]", "audit": "[]", "note": "", "message_id": "", "world_day": 0, **item}
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO narrative_unit(instance_id, timeline_id, character_id, id,
+                                                             primary_ref, refs, entry, relation, topic, stage,
+                                                             message_id, world_day, audit, note,
+                                                             created_world, updated_world)
+                       VALUES(:instance_id, :timeline_id, :character_id, :id,
+                              :primary_ref, :refs, :entry, :relation, :topic, :stage,
+                              :message_id, :world_day, :audit, :note,
+                              :created_world, :updated_world)""",
+                    row,
+                )
         return sum(
             len(payload.get(key) or [])
             for key in (
@@ -2949,6 +3069,7 @@ class Store:
                 "intents",
                 "environment",
                 "citations",
+                "narrative",
             )
         )
 

@@ -1509,10 +1509,16 @@ async def ws_core_checks() -> None:
                 now_real = time.time()
                 reactivated = await mgmt.call("runtime.activate", instance_id=new_id, timeline_id=new_tl)
                 gap = await mgmt.call("runtime.clock", instance_id=new_id, timeline_id=new_tl)
+                # 判据按**现实时间**折算：倍率 1e5 时，激活到读时钟这零点几毫秒本就等于几十世界秒，
+                # 「世界时刻严格相等」在这条线上不可能成立。要验的是没把「导出日至今」补进来——
+                # 那至少是分钟级的现实间隔，折算后远大于 1 秒；读数间隔则远小于 1 秒。
+                new_rate = max(1, int(gap["clock"].get("rate") or 1))
+                drift_real = (int(gap["clock"].get("world_seconds") or 0) - int(source_watermark)) / new_rate
                 check("§2.6 条8 导入后激活：从备份内世界时刻重新锚定、不补算备份日至今的间隔",
-                      "激活后世界时刻 = 导出水位（不随现实间隔增长）",
-                      f"激活 world={gap['clock'].get('world_seconds')}，导出水位={source_watermark}",
-                      "PASS" if int(gap["clock"].get("world_seconds") or -1) == int(source_watermark) else "FAIL",
+                      "激活后世界时刻 ≈ 导出水位（差额折算成现实时间 < 1 秒，即没有补算导出日至今）",
+                      f"激活 world={gap['clock'].get('world_seconds')}，导出水位={source_watermark}，"
+                      f"倍率={new_rate}，折算现实偏差={drift_real:.4f}s",
+                      "PASS" if 0 <= drift_real < 1.0 else "FAIL",
                       code_ref="isekai_core/runtime/service.py:1399-1443")
             finally:
                 await client.close()

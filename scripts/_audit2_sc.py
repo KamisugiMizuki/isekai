@@ -274,12 +274,13 @@ def advance_world(core: Core, instance_id: str, timeline_id: str, *, world_secon
     return int(core.world.clock_row(timeline_id)["processed_world"])
 
 
-def add_material(core: Core, instance_id: str, timeline_id: str, character_id: str, *, key: str, text: str) -> int:
+def add_material(core: Core, instance_id: str, timeline_id: str, character_id: str, *, key: str, text: str,
+                 source: str = "src-1") -> int:
     world = int(core.world.clock_row(timeline_id)["processed_world"])
     core.store.knowledge_put({
         "instance_id": instance_id, "timeline_id": timeline_id, "character_id": character_id,
         "id": f"kn-{character_id}-{key}", "world_seconds": world, "kind": "claim",
-        "target": f"cl-{key}", "source": "src-1", "stance": "recorded", "text": text,
+        "target": f"cl-{key}", "source": source, "stance": "recorded", "text": text,
     })
     return world
 
@@ -1099,13 +1100,15 @@ async def c21(tmp: Path) -> dict[str, Any]:
                 int(core.world.clock_row(tl)["processed_world"]))))
         mine = second.get("skipped", {}).get(chars[0])
         others = [item for item in second.get("messages") or [] if item["character_id"] == chars[0]]
-        ok = spoken_self == 0 and day == 0 and mine == "没有可用素材" and not others and other_day == 1             and len(core.fake.calls) == 1
+        # 生成类调用单独数：后验检查是同一轮的第二个调用，不是「又生成了一次」（NARRATIVE_LAYER §6.2）
+        generated = len(prompts_with(core.fake, "告诉联络者"))
+        ok = spoken_self == 0 and day == 0 and mine == "没有可用素材" and not others and other_day == 1             and generated == 1
         return R(
             "PASS" if ok else "FAIL", "§5.1 无素材不生成 / 附录B16",
             "无已获知素材时不生成；只有别人的素材时本角色仍不生成、不借用他人素材",
             f"自身素材为空={knowledge_before == []}；第一次 spoken={spoken_self}（{first.get('skipped')}）；"
             f"只给他人素材后本角色原因={mine}、本角色配额计数={day}、本角色消息={len(others)} 条"
-            f"（另一角色计数={other_day}）；LLM 调用={len(core.fake.calls)}",
+            f"（另一角色计数={other_day}）；生成类调用={generated}",
             f"复现：{REPRO}C21 ",
             "isekai_core/runtime/proactive.py:19 candidates / service.py:1977 proactive_tick",
         )
@@ -1120,9 +1123,11 @@ async def c22(tmp: Path) -> dict[str, Any]:
     try:
         info, tl, chars, _ = make_instance(core)
         activate(core, info["id"], tl)
-        add_material(core, info["id"], tl, chars[0], key="m1", text="北堤的通行牌这三天都停发了")
-        add_material(core, info["id"], tl, chars[0], key="m2", text="驿站新到一份灾年编年的补页")
-        add_material(core, info["id"], tl, chars[0], key="m3", text="滩口的盐堆被潮水泡了")
+        # 三条**不同来源**的素材：同源的多条会被编进同一个叙事单元（见 tests/test_narrative.py），
+        # 这里要验的是配额上限，所以让它们各自成单元。
+        add_material(core, info["id"], tl, chars[0], key="m1", text="北堤的通行牌这三天都停发了", source="src-1")
+        add_material(core, info["id"], tl, chars[0], key="m2", text="驿站新到一份灾年编年的补页", source="src-2")
+        add_material(core, info["id"], tl, chars[0], key="m3", text="滩口的盐堆被潮水泡了", source="src-3")
         r1 = await tick(core, info["id"], tl, per_day=2)
         r2 = await tick(core, info["id"], tl, per_day=2)
         r3 = await tick(core, info["id"], tl, per_day=2)
@@ -1130,13 +1135,14 @@ async def c22(tmp: Path) -> dict[str, Any]:
             int(core.world.clock_row(tl)["processed_world"])))
         day_count = core.store.proactive_day_count(info["id"], tl, chars[0], world_day=world_day)
         consumed = core.store.proactive_consumed(info["id"], tl, chars[0])
+        generated = len(prompts_with(core.fake, "告诉联络者"))  # 两条消息 = 两次生成（后验检查另算）
         ok = (r1["spoken"], r2["spoken"], r3["spoken"]) == (1, 1, 0) and day_count == 2 \
-            and r3["skipped"].get(chars[0]) == "今日额度用完" and len(core.fake.calls) == 2
+            and r3["skipped"].get(chars[0]) == "今日额度用完" and generated == 2
         return R(
             "PASS" if ok else "FAIL", "§5.2 配额与素材消费",
             "每角色 / 每线 / 每世界日最多 2 条；第三条不生成；素材按固化条数计数、不重复消费",
             f"三次 tick spoken={r1['spoken']},{r2['spoken']},{r3['spoken']}（第三次原因={r3['skipped']}）；"
-            f"当日计数={day_count}；已消费素材={sorted(consumed)}；LLM 调用={len(core.fake.calls)}",
+            f"当日计数={day_count}；已消费素材={sorted(consumed)}；生成类调用={generated}",
             f"复现：{REPRO}C22 ",
             "isekai_core/runtime/service.py:1983-1996 proactive_tick / store.py:724 proactive_day_count",
         )

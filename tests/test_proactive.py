@@ -14,10 +14,19 @@ class ScriptedLLM:
     def __init__(self, text: str = "堤上风转了，我想起你上次问过的那件事。") -> None:
         self.text = text
         self.calls = 0
+        self.prompts: list[str] = []
 
     async def chat(self, prompt, **kwargs):  # noqa: ANN001, ANN003
         self.calls += 1
+        import json as _json
+
+        self.prompts.append(_json.dumps(prompt, ensure_ascii=False))
         return self.text
+
+    @property
+    def generations(self) -> int:
+        """真正生成消息的次数（后验检查是另一类调用，不算第二次生成）。"""
+        return sum(1 for item in self.prompts if "告诉联络者" in item)
 
 
 def _ready(store, world) -> tuple[str, str, str]:
@@ -77,7 +86,10 @@ def test_material_quota_and_no_duplicate_consumption(store, world) -> None:
         first = asyncio.run(service.proactive_tick(instance_id, timeline_id, llm=llm, per_day=2))
     finally:
         life_mod.activity_label = original  # type: ignore[assignment]
-    assert first["spoken"] == 1 and llm.calls == 1, first
+    assert first["spoken"] == 1, first
+    # 生成一次 + 后验检查一次（正文里没有可核对的数字，走语义那道，NARRATIVE_LAYER §6.2）
+    assert llm.generations == 1, "同一素材不重复生成"
+    assert llm.calls == 2, llm.prompts
     life_mod.activity_label = lambda window: "日间活动"  # type: ignore[assignment]
     try:
         second = asyncio.run(service.proactive_tick(instance_id, timeline_id, llm=llm, per_day=2))

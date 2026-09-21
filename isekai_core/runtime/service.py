@@ -31,6 +31,7 @@ from . import (
     events,
     institutions,
     intents,
+    narrative,
     proactive,
     life,
 )
@@ -2112,12 +2113,38 @@ class RuntimeService:
         world = int(self.clock_row(timeline_id)["processed_world"])
         card = self.card_of(instance, character_id, timeline_id=timeline_id, world_seconds=world)
         snapshot = self.character_snapshot(instance_id, timeline_id, character_id, world_seconds=world)
+        calendar = self.calendar(instance)
+        day = calendar.day_index(world)
+        unit = narrative.weave(
+            narrative.rank(
+                narrative.materials(
+                    experiences=snapshot.get("experiences") or [],
+                    knowledge=snapshot.get("knowledge") or [],
+                    world_seconds=world,
+                    day_seconds=calendar.day_seconds,
+                )
+            ),
+            day_seconds=calendar.day_seconds,
+        )
         text = ""
         if llm is not None:
-            try:
-                text = await llm.chat(self._first_contact_prompt(card, snapshot), temperature=0.7, timeout=45.0)
-            except Exception:
-                text = ""
+            if unit is None:
+                # 手边没有可讲的近况：只打招呼，不补造趣事（§5.6 / SPEC §4.5）
+                try:
+                    text = await llm.chat(
+                        self._first_contact_prompt(card, snapshot), temperature=0.7, timeout=45.0
+                    )
+                except Exception:
+                    text = ""
+            else:
+                text, _findings = await self._speak_unit(
+                    card,
+                    unit,
+                    activity=str(snapshot.get("current_activity") or ""),
+                    llm=llm,
+                    temperature=0.7,
+                    opener=True,
+                )
         if not proactive.proactive_text_allowed(text):
             return {"spoken": False, "reason": "开场没生成出来"}
 
@@ -2147,6 +2174,17 @@ class RuntimeService:
                 "created_real": now,
             }
         )
+        if unit is not None:
+            self._record_narrative(
+                unit,
+                instance_id=instance_id,
+                timeline_id=timeline_id,
+                character_id=character_id,
+                world=world,
+                world_day=day,
+                stage="spoken",
+                message_id=message_id,
+            )
         return {"spoken": True, "message_id": message_id, "world": world}
 
     def _first_contact_prompt(self, card: dict[str, Any], snapshot: dict[str, Any]) -> list[dict[str, str]]:
@@ -2225,11 +2263,24 @@ class RuntimeService:
             knowledge = self.store.knowledge_window(
                 instance_id, timeline_id, character_id, until=world, limit=40
             )
-            materials = proactive.candidates(
-                knowledge,
-                world_seconds=world,
-                day_seconds=calendar.day_seconds,
-                consumed=self.store.proactive_consumed(instance_id, timeline_id, character_id),
+            experiences = self.store.experience_window(
+                instance_id, timeline_id, character_id, until=world, limit=12
+            )
+            consumed = self.store.proactive_consumed(
+                instance_id, timeline_id, character_id
+            ) | self.store.narrative_consumed_refs(instance_id, timeline_id, character_id)
+            deferred_refs = self.store.narrative_deferred_refs(
+                instance_id, timeline_id, character_id, world_day=day
+            )
+            ranked = narrative.rank(
+                narrative.materials(
+                    experiences=experiences,
+                    knowledge=knowledge,
+                    consumed=consumed,
+                    world_seconds=world,
+                    day_seconds=calendar.day_seconds,
+                ),
+                deferred_refs=deferred_refs,
             )
             ok, why = proactive.should_speak(
                 archived=False,
@@ -2240,21 +2291,42 @@ class RuntimeService:
                     ),
                     per_day,
                 ),
-                materials=materials,
+                materials=ranked,
             )
             if not ok:
                 skipped[character_id] = why
                 continue
-            material = materials[0]
-            text = ""
-            if llm is not None:
-                prompt = self._proactive_prompt(card, material, activity)
-                try:
-                    text = await llm.chat(prompt, temperature=0.6, timeout=45.0)
-                except Exception:
-                    text = ""
-            if not proactive.proactive_text_allowed(text):
-                skipped[character_id] = "素材在但没想好怎么说" if text else "生成失败"
+            unit = narrative.weave(ranked, day_seconds=calendar.day_seconds)
+            if unit is None:
+                skipped[character_id] = "没有可用素材"
+                continue
+            was_deferred = bool(deferred_refs & set(unit["refs"]))
+            if llm is None:
+                # 没有可用的生成器：不算她「没讲出口」，也不记暂缓
+                skipped[character_id] = "生成失败"
+                continue
+            generation = self._generation(timeline_id)
+            text, findings = await self._speak_unit(
+                card, unit, activity=activity, llm=llm, deferred=was_deferred
+            )
+            if not text:
+                # 没讲出口也算一次取舍：记下来，本日内降级但不封死（§5.2）
+                self._record_narrative(
+                    unit,
+                    instance_id=instance_id,
+                    timeline_id=timeline_id,
+                    character_id=character_id,
+                    world=world,
+                    world_day=day,
+                    stage="deferred",
+                    audit=findings,
+                    note=str((findings[0] or {}).get("detail") or "") if findings else "",
+                )
+                skipped[character_id] = "素材在但没想好怎么说"
+                continue
+            if self._generation(timeline_id) != generation:
+                # 生成期间回滚 / 重新激活：迟到的文本不写回去（NARRATIVE_LAYER §7.2）
+                skipped[character_id] = "线已换代，迟到结果作废"
                 continue
             message_id = f"m-{__import__('secrets').token_hex(6)}"
             target_channel = str((target or {}).get("channel_id") or "")
@@ -2278,31 +2350,163 @@ class RuntimeService:
                     "timeline_id": timeline_id,
                     "character_id": character_id,
                     "world_day": int(day),
-                    "material_ref": str(material["ref"]),
+                    "material_ref": str(unit["primary"]),
                     "message_id": message_id,
                     "created_world": world,
                     "created_real": now,
                     "state": "fixed",
                 }
             )
-            spoken.append({"character_id": character_id, "message_id": message_id, "material": material["ref"]})
+            self._record_narrative(
+                unit,
+                instance_id=instance_id,
+                timeline_id=timeline_id,
+                character_id=character_id,
+                world=world,
+                world_day=day,
+                stage="spoken",
+                message_id=message_id,
+            )
+            spoken.append({"character_id": character_id, "message_id": message_id, "material": unit["primary"]})
         return {"spoken": len(spoken), "messages": spoken, "skipped": skipped, "world": world}
 
-    def _proactive_prompt(self, card: dict[str, Any], material: dict[str, Any], activity: str) -> list[dict[str, str]]:
-        """一句话主动消息：素材来自她已获知的东西，不送秘密原文，也不许喊口号。"""
+    def _proactive_prompt(
+        self,
+        card: dict[str, Any],
+        unit: dict[str, Any],
+        activity: str,
+        *,
+        strict: bool = False,
+        deferred: bool = False,
+        opener: bool = False,
+    ) -> list[dict[str, str]]:
+        """一句话主动消息：素材来自她已获知 / 亲历的东西，不送秘密原文，也不许喊口号。
+
+        结构性边界（只说这些 / 可以只讲一部分 / 不许把听来的说成亲历）随约束行一起进上下文
+        （NARRATIVE_LAYER §6.1）；`strict` 是后验检查不过后的第二次尝试，只加提醒、不扩范围。
+        """
         name = str((card.get("identity") or {}).get("name") or "她")
-        where = f"；她此刻在做：{activity}" if activity else ""
+        who = f"这是你第一次主动跟联络者开口。你是{name}。" if opener else f"你是{name}。"
+        head = (
+            f"{who}用一句口语化的消息把下面的事告诉联络者，只写这一句，"
+            "不要解释、不要加引号、不要列点、不要提设定或来源标签。"
+        )
+        if strict:
+            head += "上一版说过了头：只说她确实知道的部分，没把握的就含糊过去。"
+        lines = narrative.constraint_lines(unit, activity=activity, deferred=deferred)
         return [
-            {
-                "role": "system",
-                "content": (
-                    f"你是{name}。用一句口语化的消息把下面这件事告诉联络者，只写这一句，"
-                    "不要解释、不要加引号、不要列点、不要提设定或来源标签。"
-                    f"{where}"
-                ),
-            },
-            {"role": "user", "content": f"你想说的事：{material['text'][:200]}"},
+            {"role": "system", "content": head},
+            {"role": "user", "content": "\n".join(lines)},
         ]
+
+    async def _narrative_check(
+        self, llm: Any, unit: dict[str, Any], text: str, *, activity: str = ""
+    ) -> tuple[bool, str]:
+        """后验一致性检查（NARRATIVE_LAYER §6.2）：结构检查先行，语义交给一次便宜判断。
+
+        - 数字越界 / 空文本是确定性检查；
+        - 来源、时间、范围、关系、处境要看语义：正文里没有可核对数字时再花一次调用问，
+          问不出来（超时 / 解析失败）按通过，不误杀合法叙述（关键词从来不是唯一判据）。
+        """
+        findings = narrative.audit(text, unit, activity=activity)
+        if findings:
+            return False, str(findings[0].get("detail") or findings[0].get("kind") or "")
+        if llm is None or narrative.has_checkable_numbers(text):
+            return True, ""
+        try:
+            raw = await llm.chat(
+                narrative.audit_request(unit, text, activity=activity), temperature=0.0, timeout=12.0
+            )
+        except Exception:
+            return True, ""
+        parsed = narrative.parse_audit(str(raw))
+        if parsed is None:
+            return True, ""
+        ok, why = parsed
+        return ok, why
+
+    async def _speak_unit(
+        self,
+        card: dict[str, Any],
+        unit: dict[str, Any],
+        *,
+        activity: str,
+        llm: Any,
+        deferred: bool = False,
+        temperature: float = 0.6,
+        opener: bool = False,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """按叙事单元生成一句话，并跑后验检查（有界重试，不扩大可见材料范围）。
+
+        返回 (可用文本, 最后一次的检查结果)；文本为空表示两次都没过——调用方按「没讲出口」处理。
+        """
+        findings: list[dict[str, Any]] = []
+        why = ""
+        for attempt in range(2):
+            text = ""
+            if llm is not None:
+                try:
+                    text = await llm.chat(
+                        self._proactive_prompt(
+                            card, unit, activity, strict=attempt > 0, deferred=deferred, opener=opener
+                        ),
+                        temperature=temperature,
+                        timeout=45.0,
+                    )
+                except Exception:
+                    text = ""
+            if not proactive.proactive_text_allowed(text):
+                why = "生成失败" if not text else "素材在但没想好怎么说"
+                continue
+            ok, detail = await self._narrative_check(llm, unit, text, activity=activity)
+            if ok:
+                return str(text).strip(), []
+            why = detail or "没讲出口"
+            findings = [{"kind": "audit", "detail": detail}]
+        return "", (findings or [{"kind": "audit", "detail": why}])
+
+    def _generation(self, timeline_id: str) -> int:
+        """运行世代：生成期间回滚 / 重新激活会让迟到的候选与文本作废（NARRATIVE_LAYER §7.2）。"""
+        try:
+            return int(self.clock_row(timeline_id).get("generation") or 0)
+        except Exception:
+            return -1
+
+    def _record_narrative(
+        self,
+        unit: dict[str, Any],
+        *,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str,
+        world: int,
+        world_day: int,
+        stage: str,
+        message_id: str = "",
+        audit: list[dict[str, Any]] | None = None,
+        note: str = "",
+    ) -> None:
+        """落一条叙事单元记录：讲出来的算消费，没讲出口的只降级（NARRATIVE_LAYER §7.1）。"""
+        self.store.narrative_unit_put(
+            {
+                "instance_id": instance_id,
+                "timeline_id": timeline_id,
+                "character_id": character_id,
+                "id": str(unit["id"]),
+                "primary_ref": str(unit["primary"]),
+                "refs": json.dumps([str(item) for item in unit["refs"]], ensure_ascii=False),
+                "entry": str(unit.get("entry") or ""),
+                "relation": str(unit.get("relation") or ""),
+                "topic": str(unit.get("topic") or ""),
+                "stage": str(stage),
+                "message_id": str(message_id),
+                "world_day": int(world_day),
+                "audit": json.dumps(list(audit or []), ensure_ascii=False),
+                "note": str(note),
+                "created_world": int(unit.get("at_world") or world),
+                "updated_world": int(world),
+            }
+        )
 
     def _channel_batches(
         self, text: str, *, channel_id: str, max_text_len: int = 0, max_parts: int = 0
@@ -3439,4 +3643,37 @@ class RuntimeService:
             intents=snapshot["intents"],
             observations=snapshot["observations"],
         )
-        return cognition.render_prompt(context)
+        prompt = cognition.render_prompt(context)
+        block = self._opening_block(snapshot, calendar=calendar, world=world, topic=topic)
+        if block:
+            prompt = prompt + chr(10) + chr(10) + block
+        return prompt
+
+    def _opening_block(
+        self, snapshot: dict[str, Any], *, calendar: Calendar, world: int, topic: str | None
+    ) -> str:
+        """自然开场素材（SESSION_CORE §5.4 / NARRATIVE_LAYER §5）：给她「最近能提起的事」。
+
+        只在没有明确查询主题的开场里给；材料全部来自她**已经历 / 已获知**的东西，
+        没有素材就什么都不加（不补造趣事，也不因为多问几遍就多给）。
+        """
+        if not narrative.is_open_turn(str(topic or "")):
+            return ""
+        unit = narrative.weave(
+            narrative.rank(
+                narrative.materials(
+                    experiences=snapshot.get("experiences") or [],
+                    knowledge=snapshot.get("knowledge") or [],
+                    world_seconds=int(world),
+                    day_seconds=calendar.day_seconds,
+                    limit=6,
+                )
+            ),
+            day_seconds=calendar.day_seconds,
+            limit_extra=1,
+        )
+        if unit is None:
+            return ""
+        return "\n".join(
+            narrative.constraint_lines(unit, activity=str(snapshot.get("current_activity") or ""))
+        )
