@@ -54,6 +54,20 @@ html {
   display: none;
 }
 
+/* 只给读屏的播报节点（§四）：1×1 裁剪。不能用 display:none / visibility:hidden——
+   那会把播报一起关掉；也不能把 role=status 挂到可点控件上（会盖掉 button 语义）。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 html,
 body {
   margin: 0;
@@ -381,6 +395,13 @@ nav {
   flex-direction: column;
   gap: 10px;
   max-width: 520px;
+}
+
+/* 散文段落的行宽上限（§四）：宽窗下设置面那条说明曾排到 ~139 字符/行（眼睛要横跨一米找换行）。
+   72ch ≈ 40 个汉字/行；只管说明段落（p.muted），表单另有自己的 520px，互不干涉。 */
+#pane-manage p.muted,
+#pane-settings p.muted {
+  max-width: 72ch;
 }
 
 #pane-settings form label {

@@ -1436,6 +1436,12 @@ function renderDegrade(): void {
   const fullTextOnly = Boolean(state.facts) && !recallReady();
   chip.classList.toggle("hidden", !fullTextOnly);
   chip.textContent = fullTextOnly ? "召回：全文（默认；点此启用语义召回）" : "";
+  // 播报走单独的 sr-only 节点：role=status 挂在可点按钮上会盖掉 button 语义（AX 实测 role=status），
+  // 读屏把它当状态播报、键盘用户也拿不到「按钮」；chip 上因此不留 role / aria-live。
+  // 只在文案真的变了时写一次，避免重复播报。
+  const live = $("degrade-live");
+  const spoken = fullTextOnly ? "记忆召回：当前用全文（默认），可在设置面启用语义召回" : "";
+  if (live.textContent !== spoken) live.textContent = spoken;
 }
 
 /// 只读设置事实（记忆 / 提交 / 世界·会话 组）：核心 settings 契约不含这些键，
@@ -1836,6 +1842,16 @@ function setGenerateGate(kind: "package" | "card", busy: boolean): void {
       ($(id) as HTMLButtonElement | HTMLInputElement).disabled = blocked;
     }
   }
+  setLiveGate(blocked);
+}
+
+/// 进度槽的播报闸门（§四）：进度行每秒改写一次，槽又是 aria-live=polite——一次 10 分钟生成会被重复
+/// 播报几百句「同一句话只差几秒」。生成期间两个进度槽置 aria-live=off（文本照写、界面照看），
+/// 结束 / 失败后回 polite，只有结果那一句才播报。闸门跟 generateBusy 同一处开关：两条生成路径都走这里。
+function setLiveGate(quiet: boolean): void {
+  for (const slotId of ["pkg-note", "card-note"]) {
+    $(slotId).setAttribute("aria-live", quiet ? "off" : "polite");
+  }
 }
 
 /// 发起前的互斥闸门：本组在跑（连点）静默拦下；另一组在跑就在本组行内槽说清楚（§3.1 就近反馈）
@@ -1849,7 +1865,9 @@ function generateBlocked(kind: "package" | "card", slotId: string): boolean {
 }
 
 /// 确认框前的预算事实（harden：付费预算不再写死在壳里）：
-/// 拉一次 `runtime.budget` 写「今日已用 n 次 / 上限 N」，上限取核心三层 token 限额的单任务档；
+/// 拉一次 `runtime.budget` 写「今日已用 n 次调用（全部任务） / 单任务上限 N token；本次最多 k 次调用」：
+/// n = 本实例今日账本（call_ledger）里所有任务、所有线的 calls 逐行求和——不是单条任务、也不是本组的次数；
+/// N = 核心三层 token 限额的单任务档（本实例 / 单线两档一并写在同一条括号里）；
 /// 核心没有「生成调用次数上限」这一字段，次数上限仍是壳侧 GENERATE_LIMIT（= 核心 generator 默认值），
 /// 完成后再以核心回的 usage.limit 为准。
 /// ponytail: 读不到预算就退回壳常量并在文案里标明「本地常量」——确认框照弹，不因为读不到预算就卡住生成；
@@ -1863,13 +1881,14 @@ async function budgetLine(kind: "package" | "card"): Promise<string> {
     const rows = (budget.rows ?? []) as Array<{ calls?: number }>;
     const used = rows.reduce((sum, row) => sum + Number(row.calls ?? 0), 0);
     return (
-      `今日已用 ${used} 次 / 上限 ${limits.task_tokens_per_day ?? "?"} token（单任务档；` +
-      `本实例 ${limits.instance_tokens_per_day ?? "?"}、单线 ${limits.timeline_tokens_per_day ?? "?"}），` +
-      `本次调用上限 ${GENERATE_LIMIT[kind]} 次`
+      `今日已用 ${used} 次调用（全部任务） / 单任务上限 ${limits.task_tokens_per_day ?? "?"} token（本实例 ` +
+      `${limits.instance_tokens_per_day ?? "?"}、单线 ${limits.timeline_tokens_per_day ?? "?"}）；` +
+      `本次最多 ${GENERATE_LIMIT[kind]} 次调用`
     );
   } catch (error) {
     // 唯一的降级路径：上限回落到壳常量，并在文案里如实说明是本地常量（不冒充核心值）
-    return `今日已用 ? 次 / 上限 ${GENERATE_LIMIT[kind]} 次（本地常量：读不到核心预算 ${String(error)}）`;
+    return `今日已用 ? 次调用（全部任务；读不到核心预算 ${String(error)}） / 单任务上限 ? token；` +
+      `本次最多 ${GENERATE_LIMIT[kind]} 次调用（本地常量）`;
   }
 }
 
@@ -1881,10 +1900,8 @@ function elapsedLabel(ms: number): string {
 function startProgress(kind: "package" | "card", slotId: string): void {
   stopProgress(kind);
   const started = Date.now();
-  // 进度行落在 role="status"（aria-live=polite）的槽里——10 分钟等待里读屏要有反馈（§四）。
-  // ponytail: 这一行每秒改写一次，读屏会把「同一句话只差秒数」重复播报；没做节流，
-  //           因为一次播报只差一个数字、多数读屏会合并相邻更新。真嫌吵就再拆一个只在
-  //           开始 / 结束时写一次的 live 节点，等有真用户反馈再动。
+  // 进度行落在 role="status" 的槽里——10 分钟等待里读屏要有反馈（§四）。槽的 aria-live 由
+  // setGenerateGate → setLiveGate 压在 off：进度逐秒写、只有结果那一句真播报。
   const tick = (): void =>
     groupNote(
       slotId,

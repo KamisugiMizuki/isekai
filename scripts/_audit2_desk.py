@@ -692,8 +692,9 @@ def section_static() -> None:
         "管理面重建（核心重启后一次性令牌重新 auth）": "function rebuildMgmt" in src,
         "管理面 op 记账（探针观察点）": "function traceOps" in src and "__opLog" in src,
         # ---- 2026-09-21 复审四条（②–⑥）的源码落点。这些只是存在性；行为级断言在 main / notify 段：
-        # M41（预算从核心读 + 两组互斥）、M42（降级 chip + role=status）、M43（字号阶梯）、
-        # M44（侧栏筛选）、M45（Ctrl+1/2/3）、M46（.row.hidden 计算样式）、M47（设置面无开发者键控件）。
+        # M41（预算从核心读 + 两组互斥）、M42（降级 chip 的 AX 角色 + sr-only 播报节点）、M43（字号阶梯）、
+        # M44（侧栏筛选）、M45（Ctrl+1/2/3）、M46（.row.hidden 计算样式）、M47（设置面无开发者键控件）、
+        # M48（进度槽在途 aria-live=off）、M49（散文段落行宽 ≤ 72ch）、M50（确认框预算句口径）。
         "生成预算从核心读（runtime.budget → 确认框）":
             'mgmt!.call("runtime.budget"' in src and "async function budgetLine" in src
             and "今日已用" in src,
@@ -716,6 +717,16 @@ def section_static() -> None:
         "删除提示带实例标识尾段（校验仍比显示名）":
             "function deleteHint" in src and "id.slice(-6)" in src
             and "typed !== name" in src,
+        # ---- 2026-09-21 第三轮复审四条：进度槽播报闸门 / chip 的 AX 语义 / 散文 measure / 预算口径。
+        # 这里只是存在性；行为级断言在 main 段 M42（AX 角色 = button + sr-only 播报节点）、
+        # M48（在途 aria-live=off）、M49（段落行宽实测）、M50（确认框预算句口径）。
+        "进度槽播报闸门（在途 aria-live=off，结束回 polite）":
+            "function setLiveGate" in src and 'setAttribute("aria-live", quiet ? "off" : "polite")' in src
+            and "setLiveGate(blocked);" in src,
+        "降级播报写进独立 sr-only 节点（chip 自身不再带 live）":
+            '$("degrade-live")' in src and "记忆召回：当前用全文" in src,
+        "预算口径：今日已用 = 全部任务 calls 之和 + 本次最多 k 次调用":
+            "今日已用 ${used} 次调用（全部任务）" in src and "本次最多 ${GENERATE_LIMIT[kind]} 次调用" in src,
     }
     missing_wired = [key for key, present in wired.items() if not present]
     css_tokens = {
@@ -737,13 +748,27 @@ def section_static() -> None:
             set(re.findall(r"font-size:\s*(\d+)px", css)) == {"12", "14", "24"}
             and bool(re.search(r"font:\s*14px/1\.6", css)),
         "筛选框样式（不与正文抢字号档）": "#side-filter" in css,
+        # 复审 ③（行为级见 M42 / M49）：sr-only 播报节点 + 散文段落行宽上限
+        "sr-only 播报节点（1×1 裁剪，不是 display:none）":
+            bool(re.search(r"^\.sr-only \{", css, re.M))
+            and bool(re.search(r"\.sr-only \{[^}]*clip-path: inset\(50%\);", css))
+            and "display: none" not in (re.search(r"\.sr-only \{[^}]*\}", css) or re.match("", "")).group(0),
+        "散文段落 72ch 行宽上限（只管 p.muted，表单另有 520px）":
+            bool(re.search(r"#pane-manage p\.muted,\n#pane-settings p\.muted \{\n  max-width: 72ch;\n\}", css))
+            and bool(re.search(r"#pane-settings form \{[^}]*max-width: 520px;", css)),
     }
     missing_css = [key for key, present in css_tokens.items() if not present]
+    # 复审 ③（行为级见 M42）：role=status 挂在可点 button 上会盖掉 button 语义（AX 实测角色变 status）——
+    # 播报改走独立 sr-only 节点，button 上不再留 role / aria-live。
+    degrade_tag = re.search(r'<button[^>]*id="degrade"[^>]*>', html)
+    degrade_tag_s = degrade_tag.group(0) if degrade_tag else ""
     html_tokens = {
         # 复审 ②（行为级见 M42）：状态节点要被读屏播报；降级 chip 是可点的真 button
         "状态条 role=status": 'id="status" class="chip pending" role="status"' in html,
-        "降级 chip 是 button 且 role=status":
-            'id="degrade" class="chip hidden" role="status"' in html and "<button type=\"button\" id=\"degrade\"" in html,
+        "降级 chip：可点 button 且不在 button 上挂 role / aria-live":
+            bool(degrade_tag) and "role=" not in degrade_tag_s and "aria-live" not in degrade_tag_s,
+        "降级播报另起视觉隐藏的 role=status 节点（sr-only）":
+            bool(re.search(r'<span id="degrade-live" class="sr-only" role="status" aria-live="polite"></span>', html)),
         "生成进度槽 role=status（世界包 / 角色卡两个槽）":
             all(f'id="{item}" class="muted note" role="status"' in html for item in ("pkg-note", "card-note")),
         # 复审 ④：侧栏筛选框（行为级见 M44）
@@ -754,16 +779,17 @@ def section_static() -> None:
                if re.search(r"rate_max|max_active|catch_up|render_calls|per_day|quota", item)]
     # 【静态检查，不是行为级】本项只核对源码 / 静态 HTML 里的文本与属性存在性——
     # 上一批的失效模式（源码改了但行为没改）在这里防不住，所以逐条的行为级等价断言放在 main 段的
-    # M34 / M41 / M42 / M43 / M44 / M45 / M46 / M47（真点真读）与 notify 段；本条保留是因为它一次
+    # M34 / M41 / M42 / M43 / M44 / M45 / M46 / M47 / M48 / M49 / M50（真点真读）与 notify 段；本条保留是因为它一次
     # 覆盖 30 条落点的清单，比行为探针更不容易漏项。
-    check("S8（静态检查：源码 / HTML 文本存在性；行为级见 M34·M41–M47）2026-09-21 critique 既定顺序修复项在界面 / 渲染层 / 样式里的落点",
+    check("S8（静态检查：源码 / HTML 文本存在性；行为级见 M34·M41–M50）2026-09-21 critique 既定顺序修复项在界面 / 渲染层 / 样式里的落点",
           "PASS" if not (missing_ids or missing_wired or missing_css or missing_html) else "FAIL",
           f"界面控件缺={missing_ids or '无'}；渲染层接线缺={missing_wired or '无'}；"
           f"样式缺={missing_css or '无'}；HTML 属性缺={missing_html or '无'}。"
           "**本项口径 = 静态源码文本存在性断言（不驱动界面）**：判据是 main.ts / styles.css / index.html 里"
           "出现对应文本；真正“点了会发生什么”由 M34（生成闸门与连点）、M41（预算从核心读 + 两组互斥）、"
-          "M42（降级 chip 跳转聚焦 + role=status）、M43（字号实测集合）、M44（筛选真筛）、M45（快捷键真切 pane）、"
-          "M46（.row.hidden 计算样式）、M47（设置面无开发者键控件）逐条取证",
+          "M42（降级 chip 的 AX 角色 = button + sr-only 播报节点 + 跳转聚焦）、M43（字号实测集合）、"
+          "M44（筛选真筛）、M45（快捷键真切 pane）、M46（.row.hidden 计算样式）、M47（设置面无开发者键控件）、"
+          "M48（进度槽在途 aria-live=off / 结束回 polite）、M49（散文段落渲染宽 ≤ 72ch）、M50（确认框预算句口径）逐条取证",
           clause="DESKTOP_SPEC §3.1 附近反馈 / 顶栏世界时钟 · §3.3 设置面 · §四 视觉与可访问性",
           code="desktop/index.html · desktop/src/main.ts · desktop/src/styles.css")
     # 【静态检查，不是行为级】S9 同样只看静态 HTML / 源码文本；行为级等价断言 = M47
@@ -1172,6 +1198,12 @@ async def section_main() -> None:
     await cdp.js(
         "(()=>{window.__gateLog=[];window.__reentry={tried:false,disabledAtClick:null};"
         "window.__mutex={cardDisabled:null,cardDisabledAtClick:null,cardNote:null};"
+        # M48 同一现场（不另起一次付费生成）：进度槽的 aria-live 突变时间线 + 在途文本写入落点计数。
+        # armed[id] = 该槽当前是否处在自己的 off 窗口里（看见 aria-live=off 起、回到 polite 止）。
+        "window.__live={log:[],writesOff:0,leaks:0,armed:{},inflight:null,"
+        "onAttr:function(id,live){this.log.push({id:id,ev:'attr',live:live});this.armed[id]=(live==='off');},"
+        "onText:function(id,live){if(live==='off'){this.writesOff++;}else if(this.armed[id]){this.leaks++;}}};"
+        "const liveOf=id=>document.getElementById(id).getAttribute('aria-live');"
         "const b=document.getElementById('pkg-generate');"
         "const c=document.getElementById('card-generate');"
         "if(window.__gateObs)window.__gateObs.disconnect();"
@@ -1183,15 +1215,27 @@ async def section_main() -> None:
         "window.__mutex.cardDisabled=c.disabled;"
         "c.click();c.dispatchEvent(new MouseEvent('click',{bubbles:true}));"
         "window.__mutex.cardDisabledAtClick=c.disabled;"
-        "window.__mutex.cardNote=document.getElementById('card-note').textContent;}});"
-        "window.__gateObs.observe(b,{attributes:true,attributeFilter:['disabled']});})()")
+        "window.__mutex.cardNote=document.getElementById('card-note').textContent;"
+        "window.__live.inflight={pkg:liveOf('pkg-note'),card:liveOf('card-note')};}});"
+        "window.__gateObs.observe(b,{attributes:true,attributeFilter:['disabled']});"
+        "if(window.__liveObs)window.__liveObs.disconnect();"
+        "window.__liveObs=new MutationObserver(ms=>{for(const m of ms){const el=m.target;const live=liveOf(el.id);"
+        "if(m.attributeName==='aria-live'){window.__live.onAttr(el.id,live);continue;}"
+        "window.__live.onText(el.id,live);"
+        "if(window.__live.log.length<40){window.__live.log.push({id:el.id,ev:'text',live:live,"
+        "text:(el.textContent||'').slice(0,20)});}}});"
+        "for(const id of ['pkg-note','card-note']){window.__liveObs.observe(document.getElementById(id),"
+        "{attributes:true,attributeFilter:['aria-live'],childList:true,characterData:true,subtree:true});}})()")
     await cdp.js("document.getElementById('pkg-brief').value='审计闸门用世界描述';"
                  "document.getElementById('pkg-file').value='a2gate.json';"
                  "document.getElementById('pkg-generate').click()")
     gen_final = await wait_note(cdp, ("pkg-note", "world-note"), "草稿", 150)
     gate = await cdp.js("({log:(window.__gateLog||[]).slice(),reentry:window.__reentry||null,"
-                        "mutex:window.__mutex||null})")
-    await cdp.js("if(window.__gateObs)window.__gateObs.disconnect()")
+                        "mutex:window.__mutex||null,live:window.__live?{log:window.__live.log.slice(),"
+                        "writesOff:window.__live.writesOff,leaks:window.__live.leaks,"
+                        "inflight:window.__live.inflight}:null})")
+    await cdp.js("if(window.__gateObs)window.__gateObs.disconnect();"
+                 "if(window.__liveObs)window.__liveObs.disconnect()")
     gen_after = (await ops_log(cdp)).count("world.package.generate")
     card_ops_after = (await ops_log(cdp)).count("world.card.generate")
     confirm_gate = await cdp.js("window.__confirmArgs.slice(-1)[0] || ''")
@@ -1247,12 +1291,79 @@ async def section_main() -> None:
           expected="确认框里的「今日已用 n 次 / 上限 N」两处数字与核心 runtime.budget 一致（含只有核心知道的实例上限）；"
                    "一组在跑时另一组控件禁用、点击不产生管理面调用、本组槽里给出互斥说明")
 
-    # ---- M42 复审②：降级 chip 的口径 / 可点（跳设置面记忆组 + 聚焦首控件）/ 三个状态节点 role=status
-    chip_roles = await cdp.js(
+    # ---- M48 复审④（P1）：生成进度不落进 atomic live region
+    # 病根：进度行每秒改写一次，槽却是 role="status" + aria-live=polite —— 一次 10 分钟生成会被重复播报数百句。
+    # 判据全部来自页面侧 MutationObserver（就是上面 M34 那个生成现场，不另起一次付费调用）：
+    # ① 闸门合上那一刻两槽都是 off；② 在途落到槽里的文本写入全部发生在 off 期间（落进 polite 的 = 0）；
+    # ③ 结束后两槽回 polite（只有结果那一句才播报）。
+    live_pkg = await cdp.js("document.getElementById('pkg-note').getAttribute('aria-live')")
+    live_card = await cdp.js("document.getElementById('card-note').getAttribute('aria-live')")
+    live = gate.get("live") or {}
+    inflight_live = live.get("inflight") or {}
+    attr_line = [e for e in (live.get("log") or []) if e.get("ev") == "attr"]
+    text_line = [e for e in (live.get("log") or []) if e.get("ev") == "text"]
+    check("M48 复审④ 生成进度不落进 atomic live region（在途 aria-live=off，结束回 polite）",
+          "PASS" if (inflight_live.get("pkg") == "off" and inflight_live.get("card") == "off"
+                     and int(live.get("writesOff") or 0) >= 1 and int(live.get("leaks") or 0) == 0
+                     and live_pkg == "polite" and live_card == "polite") else "FAIL",
+          f"闸门合上那一刻（disabled 突变回调里读）两槽 aria-live：pkg-note={inflight_live.get('pkg')!r}、"
+          f"card-note={inflight_live.get('card')!r}；生成在途落到槽里的文本写入：落进 off 槽 "
+          f"{live.get('writesOff')} 条记录、落进 polite 槽（off 窗口内）{live.get('leaks')} 条"
+          f"（后者就是「重复播报数百次」的现场，必须为 0）；结束后两槽 aria-live：pkg-note={live_pkg!r}、"
+          f"card-note={live_card!r}；aria-live 突变时间线={attr_line}；在途头几条文本写入={text_line[:3]}",
+          clause="§四 可访问性：live region 只播「该说的那一句」，逐秒进度不逐条播报",
+          code="desktop/src/main.ts setGenerateGate → setLiveGate / startProgress / groupNote",
+          expected="生成在途 pkg-note 与 card-note 的 aria-live=off（文本照写、界面照看）；在途没有任何文本写进 "
+                   "polite 的槽；结束 / 失败后两槽回到 polite，只有结果那一句被播报")
+
+    # ---- M50 复审④（P2）：预算句的口径（数字与口径都要对得上）
+    # 旧句「今日已用 N 次 / 上限 M token」把两件事混在一句里：N 是当日**全部任务**的 calls 之和，
+    # 却被读成「本次任务的次数」。新口径把两类上限分开写，并逐项对核心本轮读数。
+    desktop_src = (REPO / "desktop" / "src" / "main.ts").read_text(encoding="utf-8")
+    gen_k = re.search(r"GENERATE_LIMIT = \{ package: (\d+), card: (\d+) \}", desktop_src)
+    budget_re = re.search(
+        r"今日已用 (\d+) 次调用（全部任务） / 单任务上限 (\d+) token（本实例 (\d+)、单线 (\d+)）；"
+        r"本次最多 (\d+) 次调用", str(confirm_gate))
+    printed = [int(x) for x in budget_re.groups()] if budget_re else []
+    used_ok2 = bool(printed) and budget_used <= printed[0] <= budget_used_after
+    limits_ok = bool(printed) and (str(printed[1]) == str(budget_limits.get("task_tokens_per_day"))
+                                  and str(printed[2]) == str(budget_limits.get("instance_tokens_per_day"))
+                                  and str(printed[3]) == str(budget_limits.get("timeline_tokens_per_day")))
+    k_ok = bool(printed) and bool(gen_k) and printed[4] == int(gen_k.group(1))
+    check("M50 复审④ 确认框的预算句按新口径（今日已用 n 次调用（全部任务） / 单任务上限 M token；本次最多 k 次调用）",
+          "PASS" if (used_ok2 and limits_ok and k_ok and "次 / 上限" not in str(confirm_gate)) else "FAIL",
+          f"确认框原文={str(confirm_gate)[:300]!r}；正则抓到=（今日已用 {printed[0] if printed else '∅'} 次调用（全部任务）、"
+          f"单任务上限 {printed[1] if printed else '∅'} token、本实例 {printed[2] if printed else '∅'}、"
+          f"单线 {printed[3] if printed else '∅'}、本次最多 {printed[4] if printed else '∅'} 次调用）；"
+          f"核心 runtime.budget 本轮真实读数：探针先读 {budget_used} → 确认框写 {printed[0] if printed else '∅'} → "
+          f"生成后再读 {budget_used_after}（n = 本实例今日 call_ledger 全任务 calls 之和，落在区间内={used_ok2}）；"
+          f"核心三层 token 限额={budget_limits}，句子里三个数字与之一致={limits_ok}；"
+          f"k 与壳侧 GENERATE_LIMIT.package={gen_k.group(1) if gen_k else '∅'} 一致={k_ok}；"
+          f"旧「次 / 上限 N」混排已消失={'次 / 上限' not in str(confirm_gate)}",
+          clause="§十.11 生成前给出调用预估与上限（次数与 token 两类上限不混在一句话里）",
+          code="desktop/src/main.ts budgetLine",
+          expected="确认框写「今日已用 n 次调用（全部任务） / 单任务上限 M token（本实例 / 单线）；本次最多 k 次调用」；"
+                   "n 与核心账本当轮读数（全部任务 calls 之和）一致、M 与核心限额一致、k 与壳侧常量一致")
+
+    # ---- M42 复审③（P1）：降级 chip 的 AX 语义 / 口径 / 可点（跳设置面记忆组 + 聚焦首控件）；
+    # 播报改走独立 sr-only 节点——上一版把 role=status 挂在 button 上，AX 实测角色变成 status（button 语义被盖掉）。
+    # 判据认 AX 树 + HTML 属性两侧：AX role=button 且 focusable、可点（跳转 + 聚焦），播报节点 role=status 且不可聚焦、
+    # 视觉上 1×1 裁剪（不是 display:none，那会把播报一起关掉）；#status 与两个进度槽仍保持 role=status。
+    deg_ax = await ax_view(cdp, "document.getElementById('degrade')")
+    live_ax = await ax_view(cdp, "document.getElementById('degrade-live')")
+    chip_state = await cdp.js(
         "(()=>{const r=id=>{const el=document.getElementById(id);"
-        "return el?{role:el.getAttribute('role'),live:el.getAttribute('aria-live'),tag:el.tagName,"
-        "text:(el.textContent||'').trim().slice(0,60)}:null};"
-        "return {degrade:r('degrade'),status:r('status'),pkg:r('pkg-note'),card:r('card-note')};})()")
+        "return el?{role:el.getAttribute('role'),live:el.getAttribute('aria-live')}:null};"
+        "const c=document.getElementById('degrade');const l=document.getElementById('degrade-live');"
+        "const cl=getComputedStyle(l);const box=l.getBoundingClientRect();"
+        "return {chipRole:c.getAttribute('role'),chipLive:c.getAttribute('aria-live'),"
+        " chipText:(c.textContent||'').trim(),chipTitle:c.getAttribute('title')||'',"
+        " chipHidden:c.classList.contains('hidden'),"
+        " liveRole:l.getAttribute('role'),liveLive:l.getAttribute('aria-live'),"
+        " liveText:(l.textContent||'').trim(),"
+        " liveBox:[Math.round(box.width),Math.round(box.height)],liveDisplay:cl.display,"
+        " liveVisibility:cl.visibility,liveClip:cl.clipPath||cl.webkitClipPath||'',"
+        " status:r('status'),pkg:r('pkg-note'),card:r('card-note')};})()")
     await cdp.js("document.getElementById('degrade').click()")
     await asyncio.sleep(1.5)
     jumped = await cdp.js(
@@ -1260,24 +1371,36 @@ async def section_main() -> None:
         " chat: !document.getElementById('pane-chat').classList.contains('hidden'),"
         " active: (document.activeElement&&document.activeElement.id)||'',"
         " chipHidden: document.getElementById('degrade').classList.contains('hidden')})")
-    check("M42 复审② 降级口径不再像故障 + chip 可点（切设置面记忆组并聚焦首个可编辑控件）+ 状态节点 role=status",
-          "PASS" if (chip_roles["degrade"] and chip_roles["degrade"]["role"] == "status"
-                     and chip_roles["status"] and chip_roles["status"]["role"] == "status"
-                     and chip_roles["pkg"] and chip_roles["pkg"]["role"] == "status"
-                     and chip_roles["card"] and chip_roles["card"]["role"] == "status"
-                     and "语义召回" in str(chip_roles["degrade"]["text"])
-                     and "不可用" not in str(chip_roles["degrade"]["text"])
+    ax_ok = (deg_ax["found"] and deg_ax["role"] == "button" and deg_ax["ignored"] is False
+             and deg_ax["props"].get("focusable") is True)
+    live_ok = (live_ax["found"] and live_ax["role"] == "status"
+               and live_ax["props"].get("focusable") is not True
+               and any("全文" in t and "语义召回" in t for t in live_ax["texts"]))
+    chip_ok = (chip_state["chipRole"] is None and chip_state["chipLive"] is None
+               and "语义召回" in chip_state["chipText"] and "不可用" not in chip_state["chipText"]
+               and chip_state["chipTitle"] != "")
+    live_css_ok = (chip_state["liveDisplay"] != "none" and chip_state["liveVisibility"] != "hidden"
+                   and max(chip_state["liveBox"]) <= 2 and bool(chip_state["liveClip"]))
+    slots_ok = all(chip_state[k] and chip_state[k]["role"] == "status" for k in ("status", "pkg", "card"))
+    check("M42 复审③ 降级 chip 在 AX 上是 button（不再被 role=status 盖掉）+ 仍可聚焦可点 + 播报走独立 sr-only 节点",
+          "PASS" if (ax_ok and live_ok and chip_ok and live_css_ok and slots_ok
                      and jumped["settings"] and not jumped["chat"]
                      and jumped["active"] == "set-mem-mode") else "FAIL",
-          f"chip 文本={chip_roles['degrade']['text']!r}（口径=在说「现在用哪种召回」，不再写「不可用」）；"
-          f"状态节点：degrade={chip_roles['degrade']}、status={chip_roles['status']}、"
-          f"生成进度槽 pkg-note={chip_roles['pkg']}、card-note={chip_roles['card']}；"
-          f"点 chip → 设置面可见={jumped['settings']}、聊天面仍可见={jumped['chat']}（应 False）、"
-          f"document.activeElement={jumped['active']!r}",
-          clause="§3.1 界面状态可见（状态 / 进度 / 降级对读屏可用）／§六 降级是常态不是故障",
-          code="desktop/index.html #degrade/#status/#pkg-note/#card-note · main.ts renderDegrade / openMemoryGroup",
-          expected="三个状态节点都有 role=status；chip 文案说明「正在用全文召回（默认）」；"
-                   "点击后切到设置面记忆组并聚焦它的第一个可编辑控件")
+          f"AX 实测 #degrade：role={deg_ax['role']!r}（子树角色={deg_ax['roles'][:4]}）、"
+          f"focusable={deg_ax['props'].get('focusable')}、ignored={deg_ax['ignored']}；"
+          f"HTML 侧：#degrade role={chip_state['chipRole']!r}、aria-live={chip_state['chipLive']!r}、"
+          f"title={chip_state['chipTitle']!r}、文本={chip_state['chipText']!r}；"
+          f"播报节点 #degrade-live：AX role={live_ax['role']!r}、focusable={live_ax['props'].get('focusable')}、"
+          f"AX 子树文本={live_ax['texts'][:4]}；视觉：display={chip_state['liveDisplay']!r}、"
+          f"visibility={chip_state['liveVisibility']!r}、clip-path={chip_state['liveClip']!r}、盒={chip_state['liveBox']}px；"
+          f"仍带 role=status 的槽：#status={chip_state['status']}、pkg-note={chip_state['pkg']}、"
+          f"card-note={chip_state['card']}；点 chip → 设置面可见={jumped['settings']}、"
+          f"聊天面仍可见={jumped['chat']}（应 False）、document.activeElement={jumped['active']!r}",
+          clause="§3.1 界面状态可见（状态 / 进度 / 降级对读屏可用）／§四 可访问性（可点控件保持 button 语义）／§六 降级是常态不是故障",
+          code="desktop/index.html #degrade / #degrade-live · styles.css .sr-only · main.ts renderDegrade / openMemoryGroup",
+          expected="AX 上 #degrade 的 role=button、focusable=true、ignored=false（HTML 上不带 role / aria-live）；"
+                   "存在 sr-only 的 role=status 节点，AX 子树文本说明「当前用全文（默认）」、不可聚焦、视觉 1×1 裁剪且不是 display:none；"
+                   "#status / pkg-note / card-note 仍是 role=status；点击后切到设置面记忆组并聚焦它的第一个可编辑控件")
 
     # ---- M47 复审⑥：S9 的渲染态等价（设置面有没有能改开发者键的控件）
     dev_live = await cdp.js(
@@ -1415,6 +1538,72 @@ async def section_main() -> None:
           expected="带 .hidden 时计算样式 display=none；摘掉时 display=flex")
     await cdp.pane("manage")
     await asyncio.sleep(0.5)
+
+    # ---- M49 复审④（P2）：散文段落的行宽上限（宽窗下不再排满整屏）
+    # 判据是渲染态实测：1ch = 该段字体下「0」的宽度（不是字数）；宽窗用 CDP 设备度量覆盖模拟，
+    # 同时要求「约束确实在生效」——容器宽 > 72ch，否则窄窗下这条断言等于白给。
+    prose_expr = ("(()=>{const sec=document.getElementById('pane-__PANE__');"
+                  "const chOf=el=>{const cs=getComputedStyle(el);const s=document.createElement('span');"
+                  "s.textContent='0';s.style.position='absolute';s.style.left='-9999px';s.style.whiteSpace='pre';"
+                  "s.style.fontSize=cs.fontSize;s.style.fontFamily=cs.fontFamily;s.style.fontWeight=cs.fontWeight;"
+                  "document.body.appendChild(s);const w=s.getBoundingClientRect().width;s.remove();return w;};"
+                  "const rows=[];for(const p of sec.querySelectorAll('p.muted')){const t=(p.textContent||'').trim();"
+                  "if(t.length<40)continue;const cs=getComputedStyle(p);const ch=chOf(p);"
+                  "const w=p.getBoundingClientRect().width;"
+                  "rows.push({pane:'__PANE__',chars:t.length,width:+w.toFixed(1),maxWidth:cs.maxWidth,ch:+ch.toFixed(2),"
+                  "chPerLine:+(w/ch).toFixed(1),cjkPerLine:+(w/parseFloat(cs.fontSize)).toFixed(1),"
+                  "paneWidth:+sec.getBoundingClientRect().width.toFixed(1)});}"
+                  "const offenders=[];"
+                  "for(const el of document.querySelectorAll('p,li,span,div,td,th,a,label')){"
+                  "const dt=[...el.childNodes].some(n=>n.nodeType===3&&(n.textContent||'').trim());"
+                  # 与 impeccable 检测器同一道闸（hasDirectText）：只算「自己直接持有文本」的元素，容器不算
+                  "if(!dt)continue;"
+                  "const t=(el.textContent||'').trim();if(t.length<=80)continue;"
+                  "const r=el.getBoundingClientRect();if(r.width<=0)continue;const cs=getComputedStyle(el);"
+                  "if(cs.display==='none'||cs.visibility==='hidden')continue;"
+                  "const cpl=r.width/(parseFloat(cs.fontSize)*0.5);"
+                  "if(cpl>85)offenders.push({tag:el.tagName,id:el.id||'',cls:String(el.className).slice(0,24),"
+                  "pane:(el.closest('.pane')||{}).id||'',cpl:Math.round(cpl)});}"
+                  "return {viewport:innerWidth,paneWidth:+sec.getBoundingClientRect().width.toFixed(1),"
+                  "rows:rows,offenders:offenders.slice(0,6)"
+                  "};})()")
+    await cdp.pane("settings")
+    await cdp.call("Emulation.setDeviceMetricsOverride", width=1800, height=1000,
+                   deviceScaleFactor=1, mobile=False)
+    await asyncio.sleep(0.9)
+    prose_settings = await cdp.js(prose_expr.replace("__PANE__", "settings"))
+    prose_settings["formWidth"] = await cdp.js(
+        "+document.getElementById('settings-form').getBoundingClientRect().width.toFixed(1)")
+    await cdp.pane("manage")
+    await asyncio.sleep(0.6)
+    prose_manage = await cdp.js(prose_expr.replace("__PANE__", "manage"))
+    await cdp.call("Emulation.clearDeviceMetricsOverride")
+    await asyncio.sleep(0.6)
+    prose_rows = list(prose_settings["rows"]) + list(prose_manage["rows"])
+    worst = max(prose_rows, key=lambda r: r["chPerLine"]) if prose_rows else {}
+    cap_binds = [r for r in prose_rows if r["paneWidth"] > 72 * r["ch"]]
+    cap_ok = all(re.search(r"[\d.]+", str(r["maxWidth"]))
+                 and float(re.search(r"[\d.]+", str(r["maxWidth"])).group(0)) <= 72 * r["ch"] + 1.5
+                 and r["chPerLine"] <= 72.5 for r in prose_rows)
+    check("M49 复审④ 散文段落有行宽上限（渲染态实测 ≤ 72ch，且宽窗下确实在生效）",
+          "PASS" if (prose_settings["rows"] and prose_manage["rows"] and prose_rows and cap_ok and cap_binds
+                     and 500 <= prose_settings["formWidth"] <= 522) else "FAIL",
+          f"模拟宽窗 {prose_settings['viewport']}px 视口（设置面内容宽 {prose_settings['paneWidth']}px、"
+          f"管理面 {prose_manage['paneWidth']}px）下实测 {len(prose_rows)} 段（设置面 {len(prose_settings['rows'])} / "
+          f"管理面 {len(prose_manage['rows'])}）；最宽一行 {worst.get('chPerLine')} ch"
+          f"（= {worst.get('cjkPerLine')} 个汉字/行，段长 {worst.get('chars')} 字，实宽 {worst.get('width')}px，"
+          f"计算样式 max-width={worst.get('maxWidth')!r}，1ch={worst.get('ch')}px，容器 {worst.get('paneWidth')}px）；"
+          f"逐段 ch/行={[r['chPerLine'] for r in prose_rows]}；"
+          f"「约束在生效」的证据（容器宽 > 72ch，窄窗下这条断言才不会白给）="
+          f"{[{'pane': r['pane'], 'paneWidth': r['paneWidth'], 'cap': round(72 * r['ch'])} for r in cap_binds]}；"
+          f"表单没被压窄：settings-form 宽 {prose_settings['formWidth']}px（它自己的 520px 上限，未受新规则影响）；"
+          f"镜像 impeccable 的 line-length 规则（文本 >80 字且 宽/(字号×0.5) >85）在宽窗下列出的残余元素="
+          f"{prose_settings['offenders'] or '无'}"
+          f"（设置面 / 管理面的 p.muted 已全部落在这条线以下；若仍有残余，看这里的 tag/id 落在哪个面）",
+          clause="§四 视觉：散文段落有可读行宽上限（宽窗下不排满整屏）",
+          code="desktop/src/styles.css（#pane-manage p.muted / #pane-settings p.muted → max-width: 72ch）",
+          expected="设置面 / 管理面的说明段落渲染宽 ≤ ~72ch（1ch = 该字体下「0」的宽度，实测给出 px 与汉字数）；"
+                   "宽窗下是这条上限在起作用（容器宽 > 72ch）；设置表单仍按自己的 520px，没被压窄")
 
     # ---- M35 harden：删除实例的闸门（离开实例行 + 键入实例名 + 写清保留什么）
     gate_inst = (await mgmt_call(cdp, "instance.create",
@@ -2926,6 +3115,28 @@ async def wait_note(cdp: Cdp, ids: tuple, want: str, timeout: float = 45.0) -> s
             return value
         await asyncio.sleep(0.4)
     return value
+
+
+async def ax_view(cdp: Cdp, expr: str) -> dict:
+    """AX 树上某个节点的真实角色 / 属性 / 子树文本（CDP Accessibility.queryAXTree）。
+
+    HTML 属性不是读屏看到的东西：`role="status"` 挂在 <button> 上时 AX 角色就会变成 status（button 语义被盖掉），
+    「这控件到底是按钮还是状态区」只认这里。返回 found / role / roles / ignored / props（含 focusable）/ texts。
+    """
+    await cdp.call("Accessibility.enable")
+    obj = (await cdp.call("Runtime.evaluate", expression=expr, returnByValue=False)).get("result") or {}
+    object_id = obj.get("objectId")
+    if not object_id:
+        return {"found": False, "role": "", "roles": [], "ignored": True, "props": {}, "texts": []}
+    nodes = (await cdp.call("Accessibility.queryAXTree", objectId=object_id)).get("nodes", [])
+    if not nodes:
+        return {"found": False, "role": "", "roles": [], "ignored": True, "props": {}, "texts": []}
+    head = nodes[0]
+    props = {p.get("name"): (p.get("value") or {}).get("value") for p in (head.get("properties") or [])}
+    return {"found": True, "role": (head.get("role") or {}).get("value") or "",
+            "roles": [(n.get("role") or {}).get("value") or "" for n in nodes],
+            "ignored": bool(head.get("ignored")), "props": props,
+            "texts": [(n.get("name") or {}).get("value") or "" for n in nodes]}
 
 
 async def clear_notes(cdp: Cdp, *ids: str) -> None:
