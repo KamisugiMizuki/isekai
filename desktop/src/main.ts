@@ -1322,7 +1322,7 @@ async function restoreBackup(): Promise<void> {
   $("backup-note").textContent = "等待选择备份文件…";
   let picked: string | null = null;
   try {
-    picked = await invoke<string | null>("pick_backup_file", { dir: state.backupDir });
+    picked = await invoke<string | null>("pick_file", { dir: state.backupDir });
   } catch (error) {
     $("backup-note").textContent = `打开文件对话框失败：${error}`;
     return;
@@ -1580,7 +1580,7 @@ async function loadWorld(): Promise<void> {
   ]);
   const instanceOptions = world.instances.map((item) => [
     item.id,
-    `${item.name}｜${item.timelines} 线 / ${item.sessions} 会话｜时刻 ${item.moment}`,
+    `${item.name}｜${item.timelines} 线 / ${item.sessions} 会话｜时刻 ${item.moment}${compatibilityMark(item.compatibility)}`,
   ]);
   fillSelect($<HTMLSelectElement>("pkg-select"), packageOptions as Array<[string, string]>);
   fillSelect($<HTMLSelectElement>("card-select"), cardOptions as Array<[string, string]>);
@@ -1920,10 +1920,27 @@ async function addCharacter(): Promise<string> {
 
 /* ---------- 导入（世界包 / 角色卡）与不兼容实例转换：入口在壳，校验与落盘在核心 ---------- */
 
-/// 原生文件对话框：复用壳的 pick_backup_file（Tauri 命令，跑在阻塞线程池上），只换标题与过滤器。
+/// 创作目录（对话框初始目录）：世界包与角色卡都放在这里，核心的列表 op 顺手带回来。
+async function creationDir(): Promise<string> {
+  if (!mgmt) return "";
+  try {
+    return String((await mgmt.call("world.package.list"))?.dir ?? "");
+  } catch {
+    return "";
+  }
+}
+
+/// 实例下拉里的兼容性标记：列表层就能看出哪条开不了，不用先选中（§7.6）。
+function compatibilityMark(state: unknown): string {
+  if (state === "blocked") return "｜⚠ 不兼容（需转换或缺转换器）";
+  if (state === "convertible") return "｜⚠ 需转换";
+  return "";
+}
+
+/// 原生文件对话框：复用壳的 pick_file（Tauri 命令，跑在阻塞线程池上），只换标题与初始目录与过滤器。
 /// 核心只认绝对路径，所以路径授权交给系统对话框，壳不自己拼路径（§3.2）。
 async function pickImportFile(title: string, filter: string): Promise<string | null> {
-  return await invoke<string | null>("pick_backup_file", { dir: "", title, filter });
+  return await invoke<string | null>("pick_file", { dir: await creationDir(), title, filter });
 }
 
 /// 一次导入：核心拒绝同名覆盖，除非用户显式确认（force）。

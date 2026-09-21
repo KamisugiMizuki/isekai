@@ -420,17 +420,17 @@ fn config_facts(state: State<AppState>) -> ConfigFacts {
 /// OpenFileDialog，标题与过滤器由调用方给（不引新依赖）。对话框会一直阻塞到用户选择（或挂起不选）：
 /// 跑在阻塞线程池上，壳主线程保持可用，托盘退出 / 关窗不会被它挂住（DESKTOP_SPEC §3.2）。
 #[tauri::command]
-async fn pick_backup_file(
+async fn pick_file(
     dir: Option<String>,
     title: Option<String>,
     filter: Option<String>,
 ) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || pick_backup_file_blocking(dir, title, filter))
+    tauri::async_runtime::spawn_blocking(move || pick_file_blocking(dir, title, filter))
         .await
         .map_err(|error| format!("文件对话框任务失败：{error}"))?
 }
 
-fn pick_backup_file_blocking(
+fn pick_file_blocking(
     dir: Option<String>,
     title: Option<String>,
     filter: Option<String>,
@@ -443,12 +443,12 @@ fn pick_backup_file_blocking(
         "if(-not $d.Title){$d.Title='选择文件'};",
         "if($env:ISEKAI_PICK_FILTER){$d.Filter=$env:ISEKAI_PICK_FILTER};",
         "if(-not $d.Filter){$d.Filter='所有文件 (*.*)|*.*'};",
-        "if($env:ISEKAI_BACKUP_DIR -and (Test-Path $env:ISEKAI_BACKUP_DIR)){$d.InitialDirectory=$env:ISEKAI_BACKUP_DIR};",
+        "if($env:ISEKAI_PICK_DIR -and (Test-Path $env:ISEKAI_PICK_DIR)){$d.InitialDirectory=$env:ISEKAI_PICK_DIR};",
         "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($d.FileName)}"
     );
     let output = Command::new("powershell")
         .args(["-NoProfile", "-STA", "-Command", script])
-        .env("ISEKAI_BACKUP_DIR", dir.unwrap_or_default())
+        .env("ISEKAI_PICK_DIR", dir.unwrap_or_default())
         .env(
             "ISEKAI_PICK_TITLE",
             title.unwrap_or_else(|| "选择要恢复的备份".to_string()),
@@ -574,7 +574,7 @@ fn main() {
             log_dir,
             open_dir,
             config_facts,
-            pick_backup_file,
+            pick_file,
             exit_ready,
             quit_app
         ])

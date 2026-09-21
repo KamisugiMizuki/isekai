@@ -388,9 +388,14 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
         if op == "world.package.validate":
             return {"errors": validate_package(_package_arg(args, cfg))}
         if op == "world.package.list":
-            return {"packages": _list_files(cfg, "package"), "containers": _list_files(cfg, "container")}
+            # dir 给界面用：导入对话框的初始目录就是创作目录（与 backup.list 的 dir 同一口径）
+            return {
+                "packages": _list_files(cfg, "package"),
+                "containers": _list_files(cfg, "container"),
+                "dir": str(cfg.paths.packages),
+            }
         if op == "world.card.list":
-            return {"cards": _list_files(cfg, "card")}
+            return {"cards": _list_files(cfg, "card"), "dir": str(cfg.paths.packages)}
         if op == "world.package.import":
             # 从外部文件带一个世界包进创作目录（§7.5）：读取前字节限额 → 结构校验 → 不过不落盘
             source = resolve_path(cfg, args.get("source_path") or args.get("path"))

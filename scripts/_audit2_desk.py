@@ -321,7 +321,7 @@ def dialog_pid(hwnd: int) -> int:
 def drive_open_dialog(path: str, title_needle: str, timeout: float = 30.0) -> tuple[int, str]:
     """真驱动原生「打开」文件对话框，返回 (hwnd, 观察文本)。
 
-    壳的 pick_backup_file 是原生对话框，装不了 stub（`__TAURI_INTERNALS__.invoke` 是
+    壳的 pick_file 是原生对话框，装不了 stub（`__TAURI_INTERNALS__.invoke` 是
     writable:false，赋值静默失败；2026-09 实测），所以只能真驱动：
     等对话框出现 → 给文件名框 WM_SETTEXT 绝对路径 → 真鼠标点「打开」按钮。
     Shell 风格对话框不认 PostMessage(WM_COMMAND/IDOK)，必须真点按钮。
@@ -458,7 +458,7 @@ class Cdp:
 STUB = ("window.__confirmArgs=[]; window.confirm=(m)=>{window.__confirmArgs.push(String(m)); return true;};"
         "window.alert=()=>undefined;"
         "if(!window.__origInvoke){window.__origInvoke=window.__TAURI_INTERNALS__.invoke;"
-        "window.__TAURI_INTERNALS__.invoke=(c,a,o)=>{if(c==='pick_backup_file')"
+        "window.__TAURI_INTERNALS__.invoke=(c,a,o)=>{if(c==='pick_file')"
         "{return Promise.resolve(window.__wantBackup||null);}return window.__origInvoke(c,a,o);};}")
 
 
@@ -1683,7 +1683,7 @@ async def section_recon() -> None:
                         "return d?{writable:d.writable, configurable:d.configurable,"
                         " kind:typeof d.value, hasGet: !!d.get}:null;})()")
     await cdp.js(STUB)
-    live = await cdp.js("window.__TAURI_INTERNALS__.invoke.toString().includes('pick_backup_file')")
+    live = await cdp.js("window.__TAURI_INTERNALS__.invoke.toString().includes('pick_file')")
     check("R0 渲染层 invoke 可包装（探针能力自检）",
           # 能力自检：包装不成功不是产品缺陷，是探针这条路走不通（Tauri 把 invoke 定义成 writable/configurable=false）。
           # 原生文件对话框因此只能走真窗口点击（R4-R7 用的就是那条），本项如实记 DEFERRED 而不是 FAIL。
