@@ -237,6 +237,76 @@ def save_llm_settings(cfg: Config, updates: dict[str, Any]) -> Config:
     return load_config(cfg.paths.root)
 
 
+# DESKTOP_SPEC §3.3：日常用户可调项的白名单（开发者专用键一律不开放）
+SETTABLE_SECTIONS: dict[str, tuple[str, dict[str, str]]] = {
+    "memory": (
+        "runtime",
+        {
+            "base_url": "memory_embedding_base_url",
+            "model": "memory_embedding_model",
+            "api_key": "memory_embedding_api_key",
+        },
+    ),
+    "commit": (
+        "runtime",
+        {
+            "auto_enabled": "autocommit_enabled",
+            "minutes": "autocommit_minutes",
+            "events": "autocommit_events",
+        },
+    ),
+    "backup": ("backup", {"dir": "dir", "interval_hours": "interval_hours", "keep": "keep"}),
+}
+
+_NUMERIC_SECTION_KEYS = {"minutes", "events", "interval_hours", "keep"}
+
+
+def validate_section_updates(section: str, updates: dict[str, Any]) -> dict[str, Any]:
+    """段内可写键白名单 + 类型校验：不在白名单里的键直接拒绝并点名（§3.3 之外不开放）。"""
+    if section not in SETTABLE_SECTIONS:
+        raise SettingsError(f"不开放的设置段：{section}")
+    _, mapping = SETTABLE_SECTIONS[section]
+    cleaned: dict[str, Any] = {}
+    for key, value in updates.items():
+        if key not in mapping:
+            raise SettingsError(f"{section} 段不开放这个键：{key}")
+        if key == "auto_enabled":
+            cleaned[mapping[key]] = bool(value)
+        elif key in _NUMERIC_SECTION_KEYS:
+            number = int(value)
+            if number < 0:
+                raise SettingsError(f"{section}.{key} 不能为负")
+            cleaned[mapping[key]] = number
+        elif isinstance(value, bool):
+            raise SettingsError(f"{section}.{key} 不是布尔项")
+        else:
+            text = str(value or "").strip()
+            if text:  # 空串 = 不改（与 llm.api_key 同一口径）
+                cleaned[mapping[key]] = text
+    return cleaned
+
+
+def save_section_settings(cfg: Config, section: str, updates: dict[str, Any]) -> Config:
+    """把某个可写段的修改写回 config.yaml（保留其它段与未知键），返回重新加载后的配置。"""
+    cleaned = validate_section_updates(section, updates)
+    if not cleaned:
+        return load_config(cfg.paths.root)
+    raw: dict[str, Any] = {}
+    if cfg.paths.config_file.exists():
+        loaded = yaml.safe_load(cfg.paths.config_file.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            raw = loaded
+    yaml_section, _ = SETTABLE_SECTIONS[section]
+    target = _section(raw, yaml_section)
+    target.update(cleaned)
+    raw[yaml_section] = target
+    cfg.paths.config_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg.paths.config_file.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    return load_config(cfg.paths.root)
+
+
 def load_config(root: str | os.PathLike[str] | None = None) -> Config:
     paths = paths_for(resolve_root(root))
     raw: dict[str, Any] = {}

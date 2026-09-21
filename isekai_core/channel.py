@@ -18,7 +18,7 @@ from websockets.asyncio.server import Server, serve
 from websockets.exceptions import ConnectionClosed
 
 from . import ump
-from .config import Config, SettingsError, mask_api_key, save_llm_settings
+from .config import Config, SettingsError, mask_api_key, save_llm_settings, SETTABLE_SECTIONS, save_section_settings
 from .log import get_logger
 from .session import SessionService
 from .store import Store
@@ -461,6 +461,24 @@ class CoreServer:
                 "max_tokens": cfg.llm.max_tokens,
                 "temperature": cfg.llm.temperature,
             },
+            "memory": {
+                "mode": "separate" if cfg.runtime.memory_embedding_model else "chat",
+                "base_url": cfg.runtime.memory_embedding_base_url,
+                "model": cfg.runtime.memory_embedding_model,
+                "api_key": mask_api_key(cfg.runtime.memory_embedding_api_key),
+                "api_key_set": bool(cfg.runtime.memory_embedding_api_key),
+                "ready": bool(cfg.runtime.memory_embedding_model and cfg.runtime.memory_embedding_base_url),
+            },
+            "commit": {
+                "auto_enabled": bool(cfg.runtime.autocommit_enabled),
+                "minutes": int(cfg.runtime.autocommit_minutes),
+                "events": int(cfg.runtime.autocommit_events),
+            },
+            "backup": {
+                "dir": cfg.backup.dir,
+                "interval_hours": int(cfg.backup.interval_hours),
+                "keep": int(cfg.backup.keep),
+            },
             "core": {
                 "host": cfg.host,
                 "max_text_len": cfg.max_text_len,
@@ -471,19 +489,51 @@ class CoreServer:
         }
 
     async def _settings_set(self, args: dict[str, Any]) -> dict[str, Any]:
-        """写入本地配置并即时生效；校验失败保留原值、错误不回显 Key。"""
-        updates = args.get("llm")
-        if not isinstance(updates, dict):
-            raise UmpError(Err.PROTOCOL, "settings.set 需要 llm 段", retryable=False)
+        """写入本地配置并即时生效；校验失败保留原值、错误不回显 Key（§3.3 白名单见 config.SETTABLE_SECTIONS）。"""
+        llm_updates = args.get("llm")
+        sections = {
+            name: args.get(name) for name in SETTABLE_SECTIONS if isinstance(args.get(name), dict)
+        }
+        # 认得的段之外一律点名拒绝（含开发者专用段，如 runtime）
+        unknown = [
+            name
+            for name, value in args.items()
+            if name != "llm" and isinstance(value, dict) and name not in SETTABLE_SECTIONS
+        ]
+        if unknown:
+            raise UmpError(Err.PROTOCOL, f"不开放的设置段：{unknown[0]}", retryable=False)
+        if not isinstance(llm_updates, dict) and not sections:
+            raise UmpError(
+                Err.PROTOCOL, "settings.set 需要 llm 或 memory / commit / backup 段", retryable=False
+            )
+        reloaded = self.cfg
         try:
-            reloaded = save_llm_settings(self.cfg, updates)
+            if isinstance(llm_updates, dict):
+                reloaded = save_llm_settings(self.cfg, llm_updates)
+                self.cfg.llm = reloaded.llm  # 与 session 共用同一个 Config 对象
+                await self.service.llm.aclose()  # base_url / key 可能变化，丢弃缓存的连接
+                self.service.llm.cfg = reloaded.llm
+                log.info(
+                    "settings updated: model=%s base_url=%s key=%s",
+                    reloaded.llm.model,
+                    reloaded.llm.base_url,
+                    bool(reloaded.llm.api_key),
+                )
+            for name in sections:
+                reloaded = save_section_settings(reloaded, name, sections[name])
         except SettingsError as exc:
             raise UmpError(Err.PROTOCOL, str(exc), retryable=False) from exc
-        self.cfg.llm = reloaded.llm  # 与 session 共用同一个 Config 对象
-        await self.service.llm.aclose()  # base_url / key 可能变化，丢弃缓存的连接
-        self.service.llm.cfg = reloaded.llm
-        log.info("settings updated: model=%s base_url=%s key=%s",
-                 reloaded.llm.model, reloaded.llm.base_url, bool(reloaded.llm.api_key))
+        if sections:
+            # 运行层服务持有自己的运行时副本（RuntimeService 与 SessionService 都可能有）：一并写回，
+            # 否则配置改了不生效（设计探针口径：runtime 键同时落在 RuntimeConfig 与实例属性上）
+            targets = [self.service, getattr(self.service, "runtime", None)]
+            for field_name, value in vars(reloaded.runtime).items():
+                for target in targets:
+                    if target is not None and hasattr(target, field_name):
+                        setattr(target, field_name, value)
+            self.cfg.runtime = reloaded.runtime
+            self.cfg.backup = reloaded.backup
+            log.info("settings updated: sections=%s", ",".join(sorted(sections)))
         return self._settings_get()
 
     def _mgmt_call(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
