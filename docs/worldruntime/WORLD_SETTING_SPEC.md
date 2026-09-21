@@ -284,8 +284,12 @@
 
 ## 十、待模块设计项（残余）
 
-- 实现级 JSON schema、稳定标识编码、容器布局；**加载限额已落地**（读取前按字节数拦：世界包 / 卡 / 草稿 1 MiB、
+- 实现级 JSON schema、稳定标识编码、容器布局：**2026-09-22 落地**——[`WORLD_PACKAGE_APPENDIX.md`](WORLD_PACKAGE_APPENDIX.md)
+  （文件形态与落盘位置、导出容器四段与指纹、标识编码（代码强制的只有「非空 + 集合内唯一」+ 生成器前缀表 + 名称规范化）、
+  顶层 15 键与强制项对照表、枚举与取值域、六项加载限额）。**加载限额另已落地**（读取前按字节数拦：世界包 / 卡 / 草稿 1 MiB、
   容器件 256 MiB，`world/package.py:MAX_PACKAGE_BYTES` · `read_json_file` · `world/ops.py::_read_user_json`）。
+  机器对拍 `scripts/_audit2_pkg_doc.py`（键集 / 枚举 / 数值 / 前缀共 20 项，全绿）；顺带删除死常量
+  `package.NAME_MAX_LEN`（定义后从未被引用，名称长度目前不设上限）。
 - 生成器提示词、有限字段表单及对话式修订交互。
 - **转换器注册格式已落地**（`world/converters.py`：注册表 + 未确认不动数据 + 副本转换 + 完整校验 + 原子发布）；
   **名称规范化细则与元数据物理存放位置 2026-09-22 落地**——格式标识走 `converters.normalize_format`

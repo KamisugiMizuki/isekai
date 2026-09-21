@@ -1,6 +1,6 @@
 # 设计文档地图
 
-isekai 的根目标是完整、持续运行的异世界模拟。四个目录按产品边界组织文档；它们不是四套世界真值。
+isekai 的根目标是完整、持续运行的异世界模拟。文档按产品边界组织；它们不是多套世界真值。
 
 ## WorldRuntime
 
@@ -17,6 +17,7 @@ isekai 的根目标是完整、持续运行的异世界模拟。四个目录按�
 - [角色记忆](worldruntime/MEMORY_SPEC.md)
 - [通道与 UMP](worldruntime/CHANNEL_PLUGIN_SPEC.md)
 - [协议附录](worldruntime/CHANNEL_PROTOCOL_APPENDIX.md)
+- [世界包附录](worldruntime/WORLD_PACKAGE_APPENDIX.md)
 - [安卓一致性](worldruntime/ANDROID_SPEC.md)
 - [历史存档](worldruntime/archive/)
 
@@ -34,9 +35,13 @@ isekai 的根目标是完整、持续运行的异世界模拟。四个目录按�
 - [桌面壳](core%20debugging/DESKTOP_SPEC.md)
 - [生成工作区](core%20debugging/DESKTOP_GENERATION_WORKSPACE_SPEC.md)
 
-## TRPG 规则
+## TRPG 客户端
 
-具体规则系统、规则程序和主持人视角需求。规则程序不拥有 WorldRuntime 的世界真值。
+玩家与 GM 的战役游玩、行动确认、场景视角和结果表达。客户端消费 TRPG Campaign Runtime、规则插件和 WorldRuntime 的稳定投影，不拥有规则或世界真值。
+
+- [TRPG 客户端规范](trpg-client/TRPG_CLIENT_SPEC.md)
+
+## TRPG 规则
 
 - [规则插件协议](trpg-rules/TRPG_RULE_PLUGIN_SPEC.md)
 - [TRPG GM 用户评价草案](trpg-rules/TRPG_GM_USER_EVALUATION_DRAFT.md)
@@ -54,6 +59,6 @@ isekai 的根目标是完整、持续运行的异世界模拟。四个目录按�
 
 1. 先读 WorldRuntime 总纲、会话核心和叙事中介，确认世界真值、会话与表达边界。
 2. 再读 Core Debugging 外壳，确认桌面壳和生成工作区如何消费核心接口。
-3. 最后读 TRPG 规则插件协议、TRPG 战役运行层和规则共用模块，再读 OC 故事评价或 TRPG 规则层，确认具体产品方案不反向拥有世界状态。
+3. 先读 TRPG 客户端规范，确认玩家 / GM 的产品流程与视角边界；再读规则插件协议、TRPG 战役运行层和规则共用模块，确认客户端消费的运行时契约；最后读 TRPG 规则层与 OC 故事评价，确认具体产品方案不反向拥有世界状态。
 
 状态说明：评价草案用于判断产品需求，不代表其中提出的功能已经实现；SPEC 的实现状态以当前代码和行为测试为准。

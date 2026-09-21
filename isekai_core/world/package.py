@@ -16,7 +16,6 @@ from typing import Any, Iterable
 
 PACKAGE_SCHEMA_VERSION = "1.0"
 DENSITIES = ("sparse", "normal", "rich")
-NAME_MAX_LEN = 64
 
 
 class PackageError(ValueError):
