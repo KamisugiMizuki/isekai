@@ -1833,7 +1833,7 @@ const generateBusy = { package: false, card: false };
 const GENERATE_LIMIT = { package: 6, card: 2 };
 const GENERATE_CONTROLS = {
   package: ["pkg-open-workspace", "gw-generate", "gw-brief", "gw-name", "gw-file"],
-  card: ["card-generate", "card-brief", "card-name-input"],
+  card: ["card-open-workspace", "cw-generate", "cw-brief", "cw-name", "cw-file"],
 };
 /// 每个组各一个进度计时器：同组重入时先清掉上一只，绝不让计时器泄漏着一直改写结果槽
 const progressTimers: Record<"package" | "card", number | null> = { package: null, card: null };
@@ -1854,7 +1854,7 @@ function setGenerateGate(kind: "package" | "card", busy: boolean): void {
 /// 播报几百句「同一句话只差几秒」。生成期间两个进度槽置 aria-live=off（文本照写、界面照看），
 /// 结束 / 失败后回 polite，只有结果那一句才播报。闸门跟 generateBusy 同一处开关：两条生成路径都走这里。
 function setLiveGate(quiet: boolean): void {
-  for (const slotId of ["pkg-note", "gw-generate-note", "card-note"]) {
+  for (const slotId of ["pkg-note", "gw-generate-note", "card-note", "cw-generate-note"]) {
     $(slotId).setAttribute("aria-live", quiet ? "off" : "polite");
   }
 }
@@ -3477,6 +3477,352 @@ async function genwsSaveDraft(): Promise<string> {
   return `已存为草稿（管理页「草稿」组可继续）`;
 }
 
+/* ---------- 角色卡生成工作区（DESKTOP_GENERATION_WORKSPACE_SPEC §4，P2 卡侧） ---------- */
+
+/// 字段分组（§4.1 六个字段）：显示名 · 卡顶层键（重跑与锁定的粒度）· [改] 编辑的叶子路径
+const CW_FIELDS: Array<[string, string[], string]> = [
+  ["身份与职业", ["identity"], "identity.occupation"],
+  ["性格与说话方式", ["initial_units", "appearance"], "appearance"],
+  ["初始处境", ["region", "background"], "background.self_knowledge"],
+  ["渠道与联络", ["channels", "comms"], "channels"],
+  ["初始知识与认知", ["initial_knowledge", "cognition"], "cognition.mode"],
+  ["初见与生活线", ["first_contact", "life_template"], "life_template.routine_note"],
+];
+
+interface CardwsState {
+  candidate: Record<string, unknown> | null;
+  errors: string[];
+  usage: { calls?: number; limit?: number } | null;
+  model: string;
+  dirty: boolean;
+  savedAt: number | null;
+  locks: string[];
+  edited: Record<string, string>;
+}
+
+const cardws: CardwsState = {
+  candidate: null,
+  errors: [],
+  usage: null,
+  model: "",
+  dirty: false,
+  savedAt: null,
+  locks: [],
+  edited: {},
+};
+
+function cwValue(path: string): unknown {
+  let node: unknown = cardws.candidate;
+  for (const part of path.split(".")) {
+    if (!node || typeof node !== "object") return undefined;
+    node = (node as Record<string, unknown>)[part];
+  }
+  return node;
+}
+
+function cwSet(path: string, value: unknown): void {
+  const parts = path.split(".");
+  let node = cardws.candidate as Record<string, unknown> | null;
+  if (!node) return;
+  for (const part of parts.slice(0, -1)) {
+    const next = node[part];
+    if (!next || typeof next !== "object") return;
+    node = next as Record<string, unknown>;
+  }
+  node[parts[parts.length - 1]] = value;
+}
+
+/// 字段现值摘要：优先把对象里的**文字字段**摊出来（截断 JSON 会把关键值藏掉），数组只报条数
+function cwTextLeaves(value: unknown, limit = 4): string[] {
+  if (typeof value === "string") return value.trim() ? [value.trim()] : [];
+  if (Array.isArray(value)) return [`${value.length} 条`];
+  if (value && typeof value === "object") {
+    const out: string[] = [];
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      out.push(...cwTextLeaves(item, limit));
+      if (out.length >= limit) break;
+    }
+    return out.slice(0, limit);
+  }
+  return [];
+}
+
+function cwFieldValue(keys: string[]): string {
+  const card = cardws.candidate;
+  if (!card) return "—";
+  const parts = keys.flatMap((key) => cwTextLeaves(card[key]));
+  return parts.filter(Boolean).slice(0, 5).join(" / ") || "（空）";
+}
+
+function cwRenderStatus(): void {
+  const parts = [`模型 ${cardws.model || "未读取"}`];
+  parts.push(`调用 ${cardws.usage?.calls ?? 0}/${cardws.usage?.limit ?? GENERATE_LIMIT.card}`);
+  parts.push(`锁定 ${cardws.locks.length} 个字段`);
+  if (cardws.errors.length) parts.push(`校验未过 ${cardws.errors.length} 条`);
+  else if (cardws.candidate) parts.push("校验通过");
+  else parts.push("尚未生成");
+  if (cardws.savedAt) parts.push(`已保存 ${stamp(cardws.savedAt)}`);
+  else if (cardws.dirty) parts.push("有未保存的改动");
+  $("cw-status").textContent = parts.join(" · ");
+}
+
+/// 字段表（§4.1 ②）：一行一个字段：显示名 · 现值 · [改][锁] + 来源（AI 给的 / 你改的）
+function cwRenderFields(): void {
+  const box = $("cw-fields");
+  box.innerHTML = "";
+  if (!cardws.candidate) {
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = "还没有卡：先生成一份候选（或从管理页选一张已确认的卡载进来）";
+    box.append(item);
+    return;
+  }
+  for (const [label, keys, leaf] of CW_FIELDS) {
+    const row = document.createElement("li");
+    row.className = "entry-row";
+    const wrap = document.createElement("label");
+    const tick = document.createElement("input");
+    tick.type = "checkbox";
+    tick.className = "cw-lock";
+    tick.dataset.field = keys[0];
+    tick.checked = keys.every((key) => cardws.locks.includes(key));
+    tick.addEventListener("change", () => cwToggleLock(keys, tick.checked));
+    const text = document.createElement("span");
+    const source = cardws.edited[leaf] ? "你改的" : "AI 给的";
+    text.textContent = `${label} · ${cwFieldValue(keys)} · ${source}`;
+    const edit = document.createElement("button");
+    edit.className = "cw-edit";
+    edit.dataset.leaf = leaf;
+    edit.textContent = "改";
+    edit.addEventListener("click", () => cwEditField(leaf));
+    wrap.append(tick, text, edit);
+    row.append(wrap);
+    box.append(row);
+  }
+}
+
+function cwToggleLock(keys: string[], on: boolean): void {
+  const set = new Set(cardws.locks);
+  for (const key of keys) {
+    if (on) set.add(key);
+    else set.delete(key);
+  }
+  cardws.locks = [...set].sort();
+  cardws.dirty = true;
+  cwRenderStatus();
+  cwRenderFields();
+}
+
+function cwEditField(leaf: string): void {
+  const current = cwValue(leaf);
+  const shown = current && typeof current === "object" ? JSON.stringify(current, null, 0) : String(current ?? "");
+  const next = window.prompt(`改「${leaf}」（对象/数组填 JSON）：`, shown);
+  if (next === null) return;
+  const trimmed = next.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      cwSet(leaf, JSON.parse(trimmed));
+    } catch {
+      window.alert("这段 JSON 没解析成功，没有改动。");
+      return;
+    }
+  } else {
+    cwSet(leaf, next);
+  }
+  cardws.edited[leaf] = "你改的";
+  cardws.dirty = true;
+  cwRenderFields();
+  cwRenderSummary();
+  cwRenderStatus();
+}
+
+function cwRenderSummary(): void {
+  const target = $("cw-summary");
+  const card = cardws.candidate;
+  if (!card) {
+    renderFacts(target, []);
+    return;
+  }
+  const count = (value: unknown): number => (Array.isArray(value) ? value.length : 0);
+  const identity = (card.identity ?? {}) as Record<string, unknown>;
+  const meta = (card.meta ?? {}) as Record<string, unknown>;
+  renderFacts(target, [
+    ["角色名", String(identity.name ?? "—")],
+    ["种族 / 出生", `${String(identity.race_id ?? "—")} / ${String(identity.born ?? "—")} 世界秒`],
+    ["职业", String(identity.occupation ?? "—")],
+    ["区域", String(card.region ?? "—")],
+    ["渠道 / 联络", `${count(card.channels)} / ${count(card.comms)}`],
+    ["初始知识", String(count(card.initial_knowledge))],
+    ["性格单元", String(count(card.initial_units))],
+    ["打算", String(count(card.intents))],
+    ["是否已确认", meta.confirmed === true ? "已确认" : "未确认"],
+  ]);
+}
+
+function cwAbsorb(result: Record<string, unknown>, what: string): string {
+  cardws.candidate = (result.candidate ?? null) as Record<string, unknown> | null;
+  cardws.errors = (result.errors ?? []) as string[];
+  cardws.usage = (result.usage ?? null) as { calls?: number; limit?: number } | null;
+  cardws.dirty = true;
+  cardws.savedAt = null;
+  showErrors("cw-errors", cardws.errors);
+  cwRenderFields();
+  cwRenderSummary();
+  cwRenderStatus();
+  const locked = cardws.locks.length;
+  return cardws.errors.length
+    ? `${what}未通过校验：③ 里是错误清单（锁定 ${locked} 个字段原样保留）`
+    : `${what}完成：校验通过（锁定 ${locked} 个字段原样保留）`;
+}
+
+function cwFieldKeys(): string[] {
+  const want = $<HTMLSelectElement>("cw-field").value;
+  return CW_FIELDS.find(([label]) => label === want)?.[1] ?? [];
+}
+
+async function cwGenerate(): Promise<string> {
+  if (generateBlocked("card", "cw-generate-note")) return "";
+  const brief = $<HTMLTextAreaElement>("cw-brief").value.trim();
+  const file = $<HTMLInputElement>("cw-file").value.trim() || "card.json";
+  const pkgPath = $<HTMLSelectElement>("cw-package").value;
+  if (!pkgPath) throw new Error("先在管理页选一个归属世界包（工作区 ① 里也能选）");
+  if (!brief && !cardws.candidate) throw new Error("先写一段角色描述");
+  const settings = (await mgmt!.call("settings.get")) as unknown as SettingsPayload;
+  if (apiKeyBlocked(settings, "cw-generate-note")) return "";
+  cardws.model = String(settings.llm.model ?? "");
+  const ok = window.confirm(
+    `将向 ${settings.llm.model}（${settings.llm.base_url}）发送角色描述与目标世界包，` +
+      `预计调用 1–2 次（上限 ${GENERATE_LIMIT.card} 次），最长等 ${GENERATE_TIMEOUT_MS / 60000} 分钟；` +
+      `预算：${await budgetLine("card")}；继续？`,
+  );
+  if (!ok) return "已取消，未发送任何内容";
+  const started = Date.now();
+  setGenerateGate("card", true);
+  startProgress("card", "cw-generate-note");
+  const payload: Record<string, unknown> = { package_path: pkgPath, brief };
+  if (cardws.candidate) {
+    payload.base = cardws.candidate; // 整卡重跑：锁定字段原样带进提示词并写回
+    payload.locked_fields = cardws.locks;
+  }
+  let result: Record<string, unknown>;
+  try {
+    result = await mgmt!.call("world.card.generate", payload, GENERATE_TIMEOUT_MS);
+  } finally {
+    stopProgress("card");
+    setGenerateGate("card", false);
+  }
+  const message = cwAbsorb(result, cardws.locks.length ? "整卡重跑" : "生成");
+  const cost = `调用 ${cardws.usage?.calls ?? "?"}/${cardws.usage?.limit ?? GENERATE_LIMIT.card} 次 · 用时 ${elapsedLabel(Date.now() - started)}`;
+  if (!cardws.errors.length) {
+    return `${message}（${cost}）：可以 [确认卡片]`;
+  }
+  await saveDraft(file, "card", { card: cardws.candidate, locks: cardws.locks }, cardws.errors);
+  cardws.dirty = false;
+  cwRenderStatus();
+  return `生成未通过校验，已存为草稿（${cost}）`;
+}
+
+async function cwRerun(): Promise<string> {
+  if (generateBlocked("card", "cw-rerun-note")) return "";
+  if (!cardws.candidate) throw new Error("先生成一份候选");
+  const keys = cwFieldKeys();
+  if (!keys.length) throw new Error("先选要重跑的字段");
+  const pkgPath = $<HTMLSelectElement>("cw-package").value;
+  if (!pkgPath) throw new Error("先选归属世界包");
+  setGenerateGate("card", true);
+  startProgress("card", "cw-rerun-note");
+  let result: Record<string, unknown>;
+  try {
+    result = await mgmt!.call(
+      "world.card.generate",
+      {
+        package_path: pkgPath,
+        card: cardws.candidate,
+        sections: keys.join(","),
+        brief: $<HTMLTextAreaElement>("cw-brief").value.trim(),
+        locked_fields: cardws.locks,
+      },
+      GENERATE_TIMEOUT_MS,
+    );
+  } finally {
+    stopProgress("card");
+    setGenerateGate("card", false);
+  }
+  return cwAbsorb(result, `重跑「${$<HTMLSelectElement>("cw-field").value}」`);
+}
+
+async function cwValidate(): Promise<string> {
+  if (!cardws.candidate) throw new Error("先生成一份候选");
+  const pkgPath = $<HTMLSelectElement>("cw-package").value;
+  if (!pkgPath) throw new Error("先选归属世界包");
+  const result = await mgmt!.call("world.card.validate", { package_path: pkgPath, card: cardws.candidate });
+  const errors = (result.errors ?? []) as string[];
+  showErrors("cw-errors", errors);
+  cardws.errors = errors;
+  cwRenderStatus();
+  return errors.length ? `联合校验未通过：${errors.length} 条（见 ③ 清单）` : "联合校验通过：对包与对时刻都没问题";
+}
+
+async function cwConfirm(): Promise<string> {
+  if (!cardws.candidate) throw new Error("先生成一份候选");
+  const file = $<HTMLInputElement>("cw-file").value.trim() || "card.json";
+  const pkgPath = $<HTMLSelectElement>("cw-package").value;
+  if (!pkgPath) throw new Error("先选归属世界包");
+  const result = await mgmt!.call("world.card.confirm", { package_path: pkgPath, card_path: file, card: cardws.candidate });
+  cardws.candidate = (result.card ?? cardws.candidate) as Record<string, unknown>;
+  cardws.errors = [];
+  cardws.dirty = false;
+  cardws.savedAt = Date.now() / 1000;
+  showErrors("cw-errors", []);
+  cwRenderFields();
+  cwRenderSummary();
+  cwRenderStatus();
+  return `已确认并写回 ${file}（未确认的卡进不了实例，现在它可以了）`;
+}
+
+async function cwSaveDraft(): Promise<string> {
+  if (!cardws.candidate) throw new Error("先生成一份候选");
+  const file = $<HTMLInputElement>("cw-file").value.trim() || "card.json";
+  await saveDraft(file, "card", { card: cardws.candidate, locks: cardws.locks }, cardws.errors);
+  cardws.dirty = false;
+  cardws.savedAt = Date.now() / 1000;
+  cwRenderStatus();
+  return "已存为草稿（管理页「草稿」组可继续）";
+}
+
+function cwOpen(): void {
+  for (const pane of Array.from(document.querySelectorAll<HTMLElement>(".pane"))) {
+    pane.classList.toggle("hidden", pane.id !== "pane-cardws");
+  }
+  for (const button of Array.from(document.querySelectorAll<HTMLButtonElement>("nav .nav"))) {
+    button.classList.toggle("active", button.dataset.pane === "manage");
+  }
+  fillSelect(
+    $<HTMLSelectElement>("cw-field"),
+    CW_FIELDS.map(([label]) => [label, label]),
+  );
+  fillSelect(
+    $<HTMLSelectElement>("cw-package"),
+    world.packages.map((item) => [item.file, `${item.file}｜${item.name ?? "未命名"}`]),
+  );
+  const picked = $<HTMLSelectElement>("pkg-select").value;
+  if (picked && world.packages.some((item) => item.file === picked)) {
+    $<HTMLSelectElement>("cw-package").value = picked;
+  }
+  if (!$<HTMLInputElement>("cw-file").value.trim()) $<HTMLInputElement>("cw-file").value = "card.json";
+  if (!$<HTMLInputElement>("cw-name").value.trim()) $<HTMLInputElement>("cw-name").value = $<HTMLInputElement>("card-name-input").value.trim();
+  cwRenderFields();
+  cwRenderSummary();
+  cwRenderStatus();
+}
+
+function cwClose(): void {
+  if (cardws.dirty && !window.confirm("这张卡还没确认或存草稿。仍要返回管理页？未保存的内容留在工作区里，不会丢。")) {
+    return;
+  }
+  document.querySelector<HTMLButtonElement>('nav .nav[data-pane="manage"]')?.click();
+}
+
 function bindWorld(): void {
   $("world-refresh").addEventListener("click", () => void loadWorld());
   $("world-note-jump").addEventListener("click", () => jumpToWorldGroup());
@@ -3486,6 +3832,13 @@ function bindWorld(): void {
   $("gw-save").addEventListener("click", () => void worldAction(genwsSave, "gw-generate-note"));
   $("gw-save-draft").addEventListener("click", () => void worldAction(genwsSaveDraft, "gw-generate-note"));
   $("gw-rerun").addEventListener("click", () => void worldAction(genwsRerun, "gw-rerun-note"));
+  $("card-open-workspace").addEventListener("click", () => cwOpen());
+  $("cw-back").addEventListener("click", () => cwClose());
+  $("cw-generate").addEventListener("click", () => void worldAction(cwGenerate, "cw-generate-note"));
+  $("cw-rerun").addEventListener("click", () => void worldAction(cwRerun, "cw-rerun-note"));
+  $("cw-validate").addEventListener("click", () => void worldAction(cwValidate, "cw-validate-note"));
+  $("cw-confirm").addEventListener("click", () => void worldAction(cwConfirm, "cw-generate-note"));
+  $("cw-save-draft").addEventListener("click", () => void worldAction(cwSaveDraft, "cw-generate-note"));
   $("gw-revise").addEventListener("click", () => void worldAction(genwsRevise, "gw-rerun-note"));
   genwsRenderKnobs();
   $("pkg-import").addEventListener("click", () => void worldAction(importPackage, "pkg-note"));
@@ -3586,52 +3939,6 @@ function bindWorld(): void {
     }, "card-select-note"),
   );
 
-  $("card-generate").addEventListener("click", () =>
-    void worldAction(async () => {
-      if (generateBlocked("card", "card-note")) return ""; // 两组互斥：本组连点 / 另一组在跑都拦下
-      const pkg = $<HTMLSelectElement>("pkg-select").value;
-      const brief = $<HTMLInputElement>("card-brief").value.trim();
-      const file = $<HTMLInputElement>("card-file").value.trim() || "card.json";
-      if (!pkg) throw new Error("先选一个世界包");
-      if (!brief) throw new Error("先写一段角色描述");
-      const settings = (await mgmt!.call("settings.get")) as unknown as SettingsPayload;
-      if (apiKeyBlocked(settings, "card-note")) return ""; // 没配 Key：不弹确认框，也不发起调用（与世界包共用同一道闸）
-      const ok = window.confirm(
-        `将向 ${settings.llm.model}（${settings.llm.base_url}）发送角色描述与目标世界包，` +
-          `预计调用 1–2 次（上限 ${GENERATE_LIMIT.card} 次），最长等 ${GENERATE_TIMEOUT_MS / 60000} 分钟；` +
-          `预算：${await budgetLine("card")}；` +
-          "过程中无法取消（核心没有取消 op，只能等它结束或失败）。继续？",
-      );
-      if (!ok) return "已取消，未发送任何内容";
-      const started = Date.now();
-      setGenerateGate("card", true);
-      startProgress("card", "card-note");
-      let result: Record<string, unknown>;
-      try {
-        result = await mgmt!.call(
-          "world.card.generate",
-          { package_path: pkg, brief },
-          GENERATE_TIMEOUT_MS,
-        );
-      } finally {
-        stopProgress("card");
-        setGenerateGate("card", false);
-      }
-      const errors = (result.errors ?? []) as string[];
-      const usage = result.usage as { calls?: number; limit?: number } | undefined;
-      const cost =
-        `调用 ${usage?.calls ?? "?"}/${usage?.limit ?? GENERATE_LIMIT.card} 次 · ` +
-        `用时 ${elapsedLabel(Date.now() - started)} / 上限 ${elapsedLabel(GENERATE_TIMEOUT_MS)}`;
-      if (errors.length) {
-        showErrors("card-errors", errors);
-        await saveDraft(file, "card", result.candidate, errors);
-        return `生成未通过校验，已存为草稿（${cost}）`;
-      }
-      await mgmt!.call("world.card.save", { card_path: file, card: result.candidate });
-      showErrors("card-errors", []);
-      return `已生成并写入 ${file}（仍需确认；${cost}）`;
-    }, "card-note"),
-  );
 
   $("card-confirm").addEventListener("click", () =>
     void worldAction(async () => {

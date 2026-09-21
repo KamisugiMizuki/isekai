@@ -124,9 +124,8 @@
             <span id="card-import-note" class="muted note"></span>
           </div>
           <div class="row">
-            <input id="card-brief" placeholder="角色描述，如：盐滩上记水位尺的年轻堤务吏" />
             <input id="card-name-input" placeholder="角色名（可留空）" />
-            <button id="card-generate" class="primary">AI 生成</button>
+            <button id="card-open-workspace" class="primary">AI 生成角色卡</button>
             <span id="card-note" class="muted note" role="status" aria-live="polite"></span>
           </div>
           <pre id="card-errors" class="muted"></pre>
@@ -238,6 +237,52 @@
                 <button id="gw-save-draft">存为草稿</button>
               </div>
               <pre id="gw-errors" class="muted"></pre>
+            </section>
+          </div>
+        </section>
+
+        <section id="pane-cardws" class="pane hidden">
+          <div class="row genws-topbar">
+            <strong id="cw-crumb">管理 ▸ 角色卡 ▸ 生成</strong>
+            <button id="cw-back">返回</button>
+            <span id="cw-status" class="muted note" role="status" aria-live="polite"></span>
+          </div>
+          <div class="genws-grid">
+            <section class="genws-col">
+              <h3>① 卡的设定</h3>
+              <label>归属世界包<select id="cw-package" aria-label="归属世界包"></select></label>
+              <label>角色名<input id="cw-name" placeholder="可留空" /></label>
+              <label>角色描述<textarea id="cw-brief" rows="4" placeholder="一段话：身份、处境、想让她是什么样"></textarea></label>
+              <label>文件名<input id="cw-file" placeholder="如 tihe.card.json" /></label>
+              <p id="cw-resume" class="muted note"></p>
+            </section>
+            <section class="genws-col">
+              <h3>② 生成与校对</h3>
+              <div class="row">
+                <button id="cw-generate" class="primary">生成</button>
+                <span id="cw-generate-note" class="muted note" role="status" aria-live="polite"></span>
+              </div>
+              <div class="row">
+                <select id="cw-field" aria-label="要重跑的字段"></select>
+                <button id="cw-rerun">重跑字段</button>
+                <span id="cw-rerun-note" class="muted note" role="status" aria-live="polite"></span>
+              </div>
+              <ol id="cw-fields" class="genws-entries"></ol>
+              <p class="muted">勾选 = 锁定该字段：重跑字段与整卡重跑都不覆盖它；行尾标出这一版是谁给的。</p>
+            </section>
+            <section class="genws-col">
+              <h3>③ 预览与确认</h3>
+              <dl id="cw-summary" class="facts"></dl>
+              <div class="row">
+                <button id="cw-validate">联合校验</button>
+                <span id="cw-validate-note" class="muted note"></span>
+              </div>
+              <div class="row">
+                <button id="cw-save-draft">存为草稿</button>
+                <button id="cw-confirm" class="primary">确认卡片</button>
+              </div>
+              <pre id="cw-errors" class="muted"></pre>
+              <p id="cw-gate" class="muted">未确认的卡进不了实例：确认通过后才写回文件。</p>
             </section>
           </div>
         </section>

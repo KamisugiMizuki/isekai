@@ -78,6 +78,12 @@ def section_static() -> None:
           f"入口按钮={'pkg-open-workspace' in INDEX}；工作区 pane={'pane-genws' in INDEX}；残留内联框={leftovers}",
           clause="§二 入口改造：[AI 生成世界包] 只负责进工作区",
           code="desktop/index.html #pkg-open-workspace / #pane-genws")
+    card_leftovers = [item for item in ("card-brief", "card-generate") if f'id="{item}"' in INDEX]
+    check("G0d §二 角色卡组同样改成入口按钮（管理页不再有内联角色描述 / 生成按钮）",
+          "PASS" if ("card-open-workspace" in INDEX and "pane-cardws" in INDEX and not card_leftovers) else "FAIL",
+          f"入口按钮={'card-open-workspace' in INDEX}；工作区 pane={'pane-cardws' in INDEX}；残留内联控件={card_leftovers}",
+          clause="§二 入口改造：两组都只留「AI 生成 …」按钮；§四 卡工作区",
+          code="desktop/index.html #card-open-workspace / #pane-cardws")
     check("G0c §3.1 分段与核心 PACKAGE_SEGMENTS 同源（段名 → 顶层键）",
           "PASS" if ts_segment_keys() == [(label, tuple(keys)) for label, keys in PACKAGE_SEGMENTS] else "FAIL",
           f"TS 段={[(label, list(keys)) for label, keys in ts_segment_keys()]}；"
@@ -289,6 +295,110 @@ async def section_broken() -> None:
         dump("genws")
 
 
+async def section_card() -> None:
+    """卡工作区（§4，P2 卡侧）：字段表 / 字段级重跑 / 锁定 / 联合校验 / 确认硬闸。"""
+    from isekai_core.world.example import example_card
+
+    root = make_root("cardws")
+    package = example_package()
+    (root / "packages" / "w-cw.json").write_text(json.dumps(package, ensure_ascii=False), encoding="utf-8")
+    card_reply = json.dumps(example_card(package), ensure_ascii=False)
+    proc, cdp, _targets = await boot_shell(
+        root, 9933, {"ISEKAI_LLM_FAKE": "1", "ISEKAI_LLM_FAKE_REPLY": card_reply}
+    )
+    try:
+        await cdp.wait("document.getElementById('status').textContent", "已就绪", 120)
+        await cdp.js(STUB)
+        await mgmt_call(cdp, "settings.set", llm={"api_key": FAKE_KEY, "model": "audit-fake"})
+        await cdp.pane("manage")
+        await cdp.js("document.getElementById('card-open-workspace').click()")
+        await asyncio.sleep(1.5)
+        opened = await cdp.js(
+            "({open: !document.getElementById('pane-cardws').classList.contains('hidden'),"
+            " manage_hidden: document.getElementById('pane-manage').classList.contains('hidden'),"
+            " crumb: document.getElementById('cw-crumb').textContent,"
+            " placeholder: document.getElementById('cw-fields').textContent,"
+            " fields: [...document.getElementById('cw-field').options].map(o=>o.value),"
+            " packages: [...document.getElementById('cw-package').options].map(o=>o.value)})")
+        check("C1 §4.1 卡工作区：入口按钮进三列工作区 + 字段下拉 + 归属包下拉（无候选时给引导）",
+              "PASS" if (opened["open"] and opened["manage_hidden"] and opened["crumb"].startswith("管理 ▸ 角色卡 ▸ 生成")
+                         and len(opened["fields"]) == 6 and "w-cw.json" in opened["packages"]
+                         and "先生成一份候选" in str(opened["placeholder"])) else "FAIL",
+              f"工作区可见={opened['open']}／管理页隐藏={opened['manage_hidden']}；面包屑={opened['crumb']!r}；"
+              f"字段下拉={opened['fields']}；归属包下拉={opened['packages']}；无候选提示={str(opened['placeholder'])[:60]!r}",
+              clause="§4.1 布局：① 卡的设定 / ② 生成与校对（字段级）/ ③ 预览与确认；§4.2 必须先有包",
+              code="desktop/index.html #pane-cardws · desktop/src/main.ts cwOpen / cwRenderFields")
+
+        await cdp.select("cw-package", "w-cw.json")
+        await cdp.js("document.getElementById('cw-file').value='a2cw.json';"
+                     "document.getElementById('cw-brief').value='盐滩上记水位尺的年轻堤务吏';"
+                     "document.getElementById('cw-name').value='审计卡';"
+                     "window.__confirmArgs=[];"
+                     "document.getElementById('cw-generate').click()")
+        await asyncio.sleep(6.0)
+        generated = await cdp.js(
+            "({note: document.getElementById('cw-generate-note').textContent,"
+            " status: document.getElementById('cw-status').textContent,"
+            " rows: document.querySelectorAll('#cw-summary dt').length,"
+            " fields: [...document.querySelectorAll('#cw-fields .entry-row')].map(e=>e.textContent),"
+            " errors: document.getElementById('cw-errors').textContent})")
+        check("C2 §4.1 填表 → 生成（FakeLLM 合法卡）→ 字段表与摘要出现、校验通过",
+              "PASS" if (int(generated["rows"]) >= 8 and not str(generated["errors"]).strip()
+                         and "校验通过" in str(generated["status"]) and len(generated["fields"]) == 6) else "FAIL",
+              f"生成提示={str(generated['note'])[:90]!r}；状态条={str(generated['status'])[:80]!r}；摘要行={generated['rows']}；"
+              f"字段表={[t[:46] for t in generated['fields']]}；错误清单={str(generated['errors'])[:80]!r}",
+              clause="§4.1 ①→②→③：填设定 → 生成 → 校对；§4.2 字段级而非段级",
+              code="desktop/src/main.ts cwGenerate / cwRenderFields / cwRenderSummary")
+
+        # 锁定「身份与职业」→ 改它的 occupation → 重跑该字段组（模型返回示例卡原文）→ 用户改的那版必须留下
+        await cdp.js(
+            "window.prompt=()=> '审计改过的职业';"
+            "document.querySelector('#cw-fields .cw-lock[data-field=\"identity\"]').click();"
+            "document.querySelector('#cw-fields .cw-edit[data-leaf=\"identity.occupation\"]').click()")
+        before = await cdp.js(
+            "({row: [...document.querySelectorAll('#cw-fields .entry-row')].map(e=>e.textContent).find(t=>t.includes('身份与职业')) || '',"
+            " status: document.getElementById('cw-status').textContent})")
+        await cdp.select("cw-field", "身份与职业")
+        await cdp.js("document.getElementById('cw-rerun').click()")
+        rerun = await wait_note(cdp, ("cw-rerun-note",), "重跑", 90)
+        after = await cdp.js(
+            "({row: [...document.querySelectorAll('#cw-fields .entry-row')].map(e=>e.textContent).find(t=>t.includes('身份与职业')) || '',"
+            " status: document.getElementById('cw-status').textContent,"
+            " errors: document.getElementById('cw-errors').textContent})")
+        check("C3 §4.2 字段级重跑 + 锁定：用户改过并锁定的字段不被模型覆盖，其他字段不动",
+              "PASS" if ("审计改过的职业" in str(before["row"]) and "审计改过的职业" in str(after["row"])
+                         and "锁定 1 个字段" in str(after["status"]) and not str(after["errors"]).strip()) else "FAIL",
+              f"改后该行={str(before['row'])[:80]!r}；重跑提示={str(rerun)[:70]!r}；"
+              f"重跑后该行={str(after['row'])[:80]!r}（模型给的是示例卡原文——锁定字段没被覆盖）；"
+              f"状态条={str(after['status'])[:80]!r}",
+              clause="§4.2 字段可 [锁定]（重跑不覆盖），粒度是「这个字段」；§七 P2 卡侧验收：字段级重跑、锁定与联合校验",
+              code="desktop/src/main.ts cwRerun / cwToggleLock · isekai_core/world/generator.py fill_card/apply_field_locks")
+
+        # 联合校验 + 确认硬闸（确认才写回文件）
+        await cdp.js("document.getElementById('cw-validate').click()")
+        validated = await wait_note(cdp, ("cw-validate-note",), "联合校验", 30)
+        await cdp.js("window.__confirmArgs=[]; document.getElementById('cw-confirm').click()")
+        confirmed = await wait_note(cdp, ("cw-generate-note",), "已确认", 45)
+        saved_file = root / "packages" / "a2cw.json"
+        saved = json.loads(saved_file.read_text(encoding="utf-8")) if saved_file.exists() else {}
+        check("C4 §4.2/§七 联合校验 + 确认硬闸：确认后才写回，且写回的卡是已确认状态",
+              "PASS" if ("联合校验通过" in str(validated) and "已确认" in str(confirmed)
+                         and bool(saved) and (saved.get("meta") or {}).get("confirmed") is True
+                         and ((saved.get("identity") or {}).get("occupation") == "审计改过的职业")) else "FAIL",
+              f"联合校验提示={str(validated)[:70]!r}；确认提示={str(confirmed)[:70]!r}；"
+              f"磁盘上有该卡={saved_file.exists()}；meta.confirmed={((saved.get('meta') or {}).get('confirmed'))}；"
+              f"落盘的职业={((saved.get('identity') or {}).get('occupation'))!r}",
+              clause="§4.2 确认是硬闸：world.card.confirm 才是最终版，未确认的卡进不了实例",
+              code="desktop/src/main.ts cwValidate / cwConfirm · isekai_core/world/ops.py world.card.validate/confirm")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+        dump("cardws")
+
+
 async def amain() -> None:
     which = sys.argv[1] if len(sys.argv) > 1 else "static"
     started = time.time()
@@ -304,6 +414,11 @@ async def amain() -> None:
             check("broken", "SKIP", f"没有可执行件 {EXE}（先构建桌壳）")
         else:
             await section_broken()
+    if which in ("card", "all"):
+        if not EXE.exists():
+            check("card", "SKIP", f"没有可执行件 {EXE}（先构建桌壳）")
+        else:
+            await section_card()
     print(f"[genws] 用时 {time.time() - started:.1f}s", flush=True)
 
 

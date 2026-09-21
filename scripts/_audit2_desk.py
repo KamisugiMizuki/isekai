@@ -665,7 +665,7 @@ def section_static() -> None:
         "生成前 API Key 闸门（世界包 / 角色卡共用一处）":
             "function apiKeyBlocked" in src and "function openApiKeyField" in src
             and "还没配 API Key" in src and 'apiKeyBlocked(settings, "gw-generate-note")' in src
-            and 'apiKeyBlocked(settings, "card-note")' in src,
+            and 'apiKeyBlocked(settings, "cw-generate-note")' in src,
         "设置面 API Key 事实行（已配置 / 未配置）": '"API Key", settings.llm.api_key_set' in src,
         "删除闸门（离开实例行 + 键入实例名）": "function renderDeleteGate" in src and "将保留：世界包 / 角色卡 / 导出件" in src,
         "组内结果槽": "function groupNote" in src and "function reportNote" in src,
@@ -703,7 +703,7 @@ def section_static() -> None:
         "两组生成互斥（全局在途闸门 + 发起前拦下）":
             "function generateBlocked" in src and "generateBusy.package || generateBusy.card" in src
             and 'generateBlocked("package", "gw-generate-note")' in src
-            and 'generateBlocked("card", "card-note")' in src,
+            and 'generateBlocked("card", "cw-generate-note")' in src,
         "降级 chip 可点（落点是设置面记忆组首个可编辑控件）":
             "function openMemoryGroup" in src and "openMemoryGroup()" in src
             and '$("degrade").addEventListener("click"' in src,
@@ -1182,7 +1182,7 @@ async def section_main() -> None:
     # ---- M34 harden：10 分钟付费生成的在途仪表（已用 / 上限）与重入闸门
     gen_controls = await cdp.js(
         "({pkg: ['pkg-open-workspace','gw-generate','gw-brief','gw-name','gw-file'].every(i=>!!document.getElementById(i)),"
-        " card: ['card-generate','card-brief','card-name-input'].every(i=>!!document.getElementById(i))})")
+        " card: ['card-open-workspace','cw-generate','cw-brief','cw-name','cw-file'].every(i=>!!document.getElementById(i))})")
     await clear_notes(cdp, "gw-generate-note", "world-note")
     gen_before = (await ops_log(cdp)).count("world.package.generate")
     # ---- M41 准备：把实例级预算上限改成一个只有核心知道的数字（654321），再用确认框里的数字
@@ -1208,7 +1208,7 @@ async def section_main() -> None:
         "onText:function(id,live){if(live==='off'){this.writesOff++;}else if(this.armed[id]){this.leaks++;}}};"
         "const liveOf=id=>document.getElementById(id).getAttribute('aria-live');"
         "const b=document.getElementById('gw-generate');"
-        "const c=document.getElementById('card-generate');"
+        "const c=document.getElementById('cw-generate');"
         "if(window.__gateObs)window.__gateObs.disconnect();"
         "window.__gateObs=new MutationObserver(()=>{const d=b.disabled;"
         "window.__gateLog.push({d:d,note:document.getElementById('gw-generate-note').textContent});"
@@ -1218,8 +1218,8 @@ async def section_main() -> None:
         "window.__mutex.cardDisabled=c.disabled;"
         "c.click();c.dispatchEvent(new MouseEvent('click',{bubbles:true}));"
         "window.__mutex.cardDisabledAtClick=c.disabled;"
-        "window.__mutex.cardNote=document.getElementById('card-note').textContent;"
-        "window.__live.inflight={pkg:liveOf('gw-generate-note'),card:liveOf('card-note')};}});"
+        "window.__mutex.cardNote=document.getElementById('cw-generate-note').textContent;"
+        "window.__live.inflight={pkg:liveOf('gw-generate-note'),card:liveOf('cw-generate-note')};}});"
         "window.__gateObs.observe(b,{attributes:true,attributeFilter:['disabled']});"
         "if(window.__liveObs)window.__liveObs.disconnect();"
         "window.__liveObs=new MutationObserver(ms=>{for(const m of ms){const el=m.target;const live=liveOf(el.id);"
@@ -1227,7 +1227,7 @@ async def section_main() -> None:
         "window.__live.onText(el.id,live);"
         "if(window.__live.log.length<40){window.__live.log.push({id:el.id,ev:'text',live:live,"
         "text:(el.textContent||'').slice(0,20)});}}});"
-        "for(const id of ['gw-generate-note','card-note']){window.__liveObs.observe(document.getElementById(id),"
+        "for(const id of ['gw-generate-note','cw-generate-note']){window.__liveObs.observe(document.getElementById(id),"
         "{attributes:true,attributeFilter:['aria-live'],childList:true,characterData:true,subtree:true});}})()")
     await cdp.js("document.getElementById('gw-brief').value='审计闸门用世界描述';"
                  "document.getElementById('gw-file').value='a2gate.json';"
@@ -2149,12 +2149,15 @@ async def section_main() -> None:
     # 角色卡生成走同一道闸（共用一处）：也只在行内槽给跳转，不弹确认框
     await cdp.pane("manage")
     await cdp.select("pkg-select", "w0.json")
-    await clear_notes(cdp, "card-note", "world-note")
-    await cdp.js("document.getElementById('card-brief').value='审计 I6 未配 Key 的角色描述';"
+    await clear_notes(cdp, "cw-generate-note", "world-note")
+    await cdp.js("document.getElementById('card-open-workspace').click()")
+    await asyncio.sleep(1.2)
+    await cdp.select("cw-package", "w0.json")
+    await cdp.js("document.getElementById('cw-brief').value='审计 I6 未配 Key 的角色描述';"
                  "window.__confirmArgs=[]; window.__opLog.length=0;"
-                 "document.getElementById('card-generate').click()")
-    card_gate = await cdp.wait("document.getElementById('card-note').textContent", "还没配 API Key", 25)
-    card_gate_state = await cdp.js("({link: !!document.querySelector('#card-note button.api-key-jump'),"
+                 "document.getElementById('cw-generate').click()")
+    card_gate = await cdp.wait("document.getElementById('cw-generate-note').textContent", "还没配 API Key", 25)
+    card_gate_state = await cdp.js("({link: !!document.querySelector('#cw-generate-note button.api-key-jump'),"
                                    " confirms: window.__confirmArgs.length,"
                                    " called: (window.__opLog||[]).includes('world.card.generate')})")
     # 把 Key 配回去：正常路径必须恢复（再点一次 → 确认框回来 → 取消）
