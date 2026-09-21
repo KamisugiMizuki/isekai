@@ -461,14 +461,48 @@ class RuntimeService:
             raise RuntimeStateError("注入被拒（世代已变）")
         return {"scheduled": False, "event": ident, "effects": len(rows["effects"]), "claims": len(rows["claims"])}
 
+    def apply_external_event(
+        self, instance_id: str, timeline_id: str, payload: dict[str, Any], *, source: str, action_id: str,
+        resolution: dict[str, Any], now_real: float | None = None,
+    ) -> dict[str, Any]:
+        """Apply a rule-plugin result on the current line; the rule engine stays external."""
+        instance = self.store.instance_get(instance_id)
+        if instance is None:
+            raise RuntimeStateError(f"实例不存在：{instance_id}")
+        clock = self.clock_row(timeline_id)
+        world = int(clock["processed_world"])
+        ident = f"ev-{events.stable_key(instance_id, timeline_id, source, action_id)[:12]}"
+        rows = self._user_event_rows(
+            instance_id, timeline_id, payload, ident=ident, world=world,
+            source=source, template="trpg.action",
+        )
+        rows["event"]["detail"] = json.dumps({"resolution": resolution}, ensure_ascii=False)
+        institution_rows = self._institution_rows(
+            instance, instance_id, timeline_id, rows["effects"], deaths=[], from_world=world, to_world=world
+        )
+        environment_rows = self._environment_rows(
+            instance, instance_id, timeline_id, self.calendar(instance), rows["effects"],
+            from_world=world, to_world=world,
+        )
+        applied = self.store.apply_runtime_batch(
+            timeline_id=timeline_id, generation=int(clock["generation"]), processed_world=world,
+            catching_up=False, events=[rows["event"]], claims=rows["claims"], knowledge=rows["knowledge"],
+            effects=rows["effects"], environment=environment_rows,
+            institution=institution_rows["institution"], customs=institution_rows["customs"],
+        )
+        if not applied:
+            raise RuntimeStateError("规则结果写入被拒（世代已变）")
+        return {"event": ident, "world": world, "effects": len(rows["effects"]), "claims": len(rows["claims"])}
+
     def _user_event_rows(
-        self, instance_id: str, timeline_id: str, payload: dict[str, Any], *, ident: str, world: int
+        self, instance_id: str, timeline_id: str, payload: dict[str, Any], *, ident: str, world: int,
+        source: str = "user", template: str = "user.introduced",
     ) -> dict[str, list[dict[str, Any]]]:
-        """用户事件的登记行：与引擎事件同形（效果 + 说法），获知交给常规传播链（§五）。"""
+        """外部输入事件的登记行：与引擎事件同形，获知交给常规传播链。"""
         event_row = {
             "instance_id": instance_id, "timeline_id": timeline_id, "id": ident, "world_seconds": world,
-            "seq": 0, "kind": "world", "family": "政治", "template": "user.introduced",
-            "source": "user", "summary": str(payload["intent"])[:200], "detail": str(payload["intent"]),
+            "seq": 0, "kind": "world", "family": "政治", "template": template,
+            "source": source, "summary": str(payload["intent"])[:200], "detail": str(payload["intent"]),
             "text_source": "template", "effects": json.dumps(payload["effects"], ensure_ascii=False),
             "share_value": 0.7, "importance": 0.8, "created_real": time.time(),
         }

@@ -114,6 +114,7 @@ ASYNC_OPS = frozenset(
         "runtime.propose",
         "runtime.extract",
         "event.draft",
+        "trpg.action.resolve",
         "world.package.generate",
         "world.package.revise",
         "world.package.fill",
@@ -921,6 +922,55 @@ async def _draft_user_event(cfg: Config, llm: Any, store: Store | None, args: di
     )
 
 
+async def _resolve_trpg_action(cfg: Config, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
+    """Call an external rules process, then apply only its structured world result."""
+    if store is None:
+        raise UmpError(Err.STATE_BLOCKED, "缺少存储上下文", retryable=False)
+    instance_id = str(args.get("instance_id") or "")
+    timeline_id = str(args.get("timeline_id") or "")
+    plugin = str(args.get("plugin_manifest") or "")
+    action_id = str(args.get("action_id") or "")
+    intent = str(args.get("intent") or "").strip()
+    if not instance_id or not timeline_id or not plugin or not action_id or not intent:
+        raise UmpError(Err.INVALID, "TRPG 调用需要实例、时间线、插件清单、行动标识与意图", retryable=False)
+    from ..runtime import drafts, rules
+
+    world = _world_service(cfg, store)
+    try:
+        resolution = await rules.resolve(
+            plugin,
+            {
+                "type": "resolve_action",
+                "action_id": action_id,
+                "intent": intent,
+                "actor_id": str(args.get("actor_id") or ""),
+                "context": args.get("context") if isinstance(args.get("context"), dict) else {},
+            },
+        )
+        payload = {
+            "intent": intent,
+            "effects": resolution["effects"],
+            "claims": resolution.get("claims") or [],
+            "participants": resolution.get("participants") or [],
+        }
+        instance = store.instance_get(instance_id) or {}
+        watermark = world.world_moment(instance_id, timeline_id)
+        targets, channels = world._known_targets(instance, timeline_id, world_seconds=watermark)
+        normalized = drafts.normalize_draft(
+            world.setting(instance)["world_package"], payload,
+            known_targets=targets, world_seconds=watermark, default_channels=channels,
+        )
+        result = world.apply_external_event(
+            instance_id, timeline_id, normalized, source="player_action", action_id=action_id,
+            resolution=resolution["resolution"],
+        )
+    except rules.RulePluginError as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+    except ValueError as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+    return {"accepted": True, "resolution": resolution["resolution"], **result}
+
+
 async def _extract_memories(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
     """触发一次记忆提取（写侧；不回传任何记忆内容——界面不提供浏览入口，MEMORY_SPEC §一）。"""
     if store is None:
@@ -1210,6 +1260,8 @@ async def dispatch_async(
             return await _extract_memories(cfg, llm, store, args)
         if op == "event.draft":
             return await _draft_user_event(cfg, llm, store, args)
+        if op == "trpg.action.resolve":
+            return await _resolve_trpg_action(cfg, store, args)
         if op == "world.package.generate":
             package, errors, usage = await generate_package(
                 llm, str(args.get("brief") or ""), name=str(args.get("name") or "未命名世界"), **kwargs

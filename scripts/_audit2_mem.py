@@ -1214,11 +1214,21 @@ def spec_no_memory_browse() -> str:
         text = re.sub(r"memory_embedding[a-z_]*", "", path.read_text(encoding="utf-8", errors="ignore"))
         if any(marker in text for marker in browse_markers):
             desktop_hits.append(str(path.relative_to(ROOT)))
-    assert memory_ops == ["disclose.confirm", "disclose.list"], f"管理面出现了记忆明文入口：{memory_ops}"
+    assert memory_ops == ["disclose.confirm", "disclose.list", "disclose.suggest"], \
+        f"管理面出现了记忆明文入口：{memory_ops}"
     assert desktop_hits == [], f"界面出现了记忆相关入口：{desktop_hits}"
     extract = ROOT.joinpath("isekai_core/world/ops.py").read_text(encoding="utf-8")
     assert "不回传任何记忆内容" in extract, "提取入口的返回约定不见了"
-    return f"管理面记忆相关操作={memory_ops}（仅为披露授权）；桌面端无记忆字样；提取入口按约定不回传内容"
+    # 名字带 disclose 的第三条是 NARRATIVE_LAYER §9.4 的**披露候选**：它只挑出「对方讲过、用户已看过」
+    # 的会话原文摆给人选，授权仍走 disclose.confirm。既然按名字它算披露族，就按实现核一遍：
+    # 候选构造不许读记忆表、世界实情或认知切片（否则「候选」就成了旁路的浏览入口）。
+    service_text = ROOT.joinpath("isekai_core/runtime/service.py").read_text(encoding="utf-8")
+    body = service_text.split("def disclosure_candidates", 1)[1].split("\n    def ", 1)[0]
+    forbidden = [name for name in ("memory_", "knowledge_", "claim_", "truth", "cognition")
+                 if name in body]
+    assert forbidden == [], f"披露候选读了不该读的表：{forbidden}"
+    return (f"管理面记忆相关操作={memory_ops}（两条披露授权 + 一条候选挑选，候选只读已固化原文）；"
+            f"桌面端无记忆字样；提取入口按约定不回传内容")
 
 
 def spec_frozen_dialog_not_blocked() -> str:

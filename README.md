@@ -10,6 +10,7 @@ isekai——一个持续运行的异世界。用户通过与世界内角色的�
 - 总设计（总纲，粗颗粒度）：[`docs/DESIGN.md`](docs/DESIGN.md)
 - 模块设计（SPEC）：
   - [`docs/CHANNEL_PLUGIN_SPEC.md`](docs/CHANNEL_PLUGIN_SPEC.md) — 通道插件层
+  - [`docs/TRPG_RULE_PLUGIN_SPEC.md`](docs/TRPG_RULE_PLUGIN_SPEC.md) — TRPG 规则插件桥接
   - [`docs/DESKTOP_SPEC.md`](docs/DESKTOP_SPEC.md) — 桌面壳
   - [`docs/SESSION_CORE_SPEC.md`](docs/SESSION_CORE_SPEC.md) — 会话核心层
   - [`docs/MEMORY_SPEC.md`](docs/MEMORY_SPEC.md) — 角色记忆
@@ -39,6 +40,10 @@ cp config/config.example.yaml config/config.yaml                  # 填 llm.api_
 - 核心启动时向 stdout 输出**一行 JSON 就绪握手**（端点 + 一次性引导凭据 + 管理凭据）；壳 / 客户端按字节（UTF-8）读这一行取得连接材料，不猜端口。
 - 数据与日志：`data/isekai.db`（SQLite，WAL）、`data/clients/*.json`（通道持久凭据）、`logs/core.log`；均在 `.gitignore` 内。
 - 配置项与环境变量见 [`config/README.md`](config/README.md)。
+
+## 官方参考外壳
+
+当前 UMP、Tauri 壳与桌面管理台共同构成 WorldRuntime 的官方参考外壳：UMP 提供本地受信管理调用与通道承载，Tauri 负责核心进程监督和窗口生命周期，桌面管理台负责世界创作与运行管理。它们消费核心接口，但不定义世界规则或 TRPG 规则；其他客户端可以复用同一管理面语义。
 
 ## 桌面壳（阶段 0）
 

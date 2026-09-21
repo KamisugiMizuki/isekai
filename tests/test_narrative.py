@@ -521,3 +521,33 @@ async def test_question_turn_runs_the_same_audit(tmp_path):
         rows = h.store.narrative_unit_list(instance_id, timeline_id, character_id=character_id)
         assert rows and rows[0]["stage"] == "spoken"
         assert rows[0]["message_id"] == reply.payload["message_id"], "讲过的线索挂在真正固化那条回复上"
+
+
+async def test_management_plane_reaches_map_and_suggest(tmp_path):
+    """两个新入口经**真管理面**可达（CLI 与桌面壳都走它）：narrative.map / disclose.suggest。"""
+    async with running_core(tmp_path, replies=["盐滩的秤被收走了，我听说的。"]) as h:
+        mgmt = await open_mgmt(h)
+        package = sample_package(moment=DAY * 1500 + 30000)
+        first = sample_card(package, name="堤禾")
+        second = sample_card(package, name="潮生")
+        info = create_instance(h.store, package, [first, second])
+        timeline_id = h.store.timeline_list(info["id"])[0]["id"]
+        mine, other = str(first["meta"]["card_id"]), str(second["meta"]["card_id"])
+        h.runtime.world.ensure_instance(info["id"], now_real=time.time())
+        h.runtime.world.activate(info["id"], timeline_id, now_real=time.time())
+        world = int(h.runtime.world.clock_row(timeline_id)["processed_world"])
+        _know(store=h.store, instance_id=info["id"], timeline_id=timeline_id, character_id=mine,
+              at=world, ref="cl-op", text="盐滩的秤被收走了")
+        with daytime():
+            await h.runtime.world.proactive_tick(info["id"], timeline_id, llm=h.fake, per_day=2)
+
+        mapping = await mgmt.call("narrative.map", instance_id=info["id"], timeline_id=timeline_id)
+        assert mapping["map"]["counts"]["spoken"] == 1, mapping
+        assert mapping["map"]["nodes"][0]["message_id"]
+
+        suggest = await mgmt.call(
+            "disclose.suggest", instance_id=info["id"], timeline_id=timeline_id,
+            from_character=mine, to_character=other,
+        )
+        assert suggest["candidates"] and suggest["candidates"][0]["ref"]
+        assert h.store.disclosure_list(info["id"], timeline_id) == [], "只是候选，不落授权"
