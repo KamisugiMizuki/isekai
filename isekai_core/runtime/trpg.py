@@ -20,6 +20,18 @@ from typing import Any
 
 from ..log import get_logger
 from . import campaign as campaign_mod
+
+#: 因果来源细分（TRPG_CAMPAIGN_RUNTIME_SPEC §二十一 残余第 1 条 + TRPG_RULE_COMMON_MODULE_SPEC §105
+#: 的 source 轴：规则裁定 / GM 宣告 / 世界过程）。`action` 只由行动路径内部使用，
+#: 其余可直接由 `trpg.gm.change(source=…)` 指定；事件落库用右边的来源标识。
+SOURCE_EVENT: dict[str, str] = {
+    "action": "trpg_action",                 # 角色行动（经插件裁定）
+    "gm_declaration": "gm_declaration",      # GM 直接裁定
+    "world_process": "trpg_world_process",   # 世界自身的 NPC / 环境推进（与玩家行动分开记账）
+    "npc_script": "trpg_npc_script",         # 剧本 / NPC 自动行为（不经骰点插件）
+}
+#: 直声明路径（`trpg.gm.change`）可指定的来源；`action` 不在此列（行动走行动路径）
+DIRECT_SOURCES: tuple[str, ...] = ("gm_declaration", "world_process", "npc_script")
 from . import drafts, rules
 
 log = get_logger("isekai.trpg")
@@ -229,9 +241,13 @@ class CampaignRuntime:
         return {**scene, "world_snapshot": _loads(scene["world_snapshot"], {})}
 
     def view(
-        self, instance_id: str, timeline_id: str, campaign_id: str, *, audience: str = "public_party"
+        self, instance_id: str, timeline_id: str, campaign_id: str, *, audience: Any = "public_party"
     ) -> dict[str, Any]:
-        """可行动局面投影：战役 + 当前场景 + 未结行动 + 开放待选择 + 规则状态版本（不含内容）。"""
+        """可行动局面投影：战役 + 当前场景 + 未结行动 + 开放待选择 + 规则状态版本（不含内容）。
+
+        `audience` 可以是单个受众，也可以是上层为「同一用户的多个角色」显式传进来的一串（取并集）——
+        核心不把 `user:` 猜成角色（§十五 / §二十一 残余第 2 条）。
+        """
         campaign_row = self._campaign_row(instance_id, timeline_id, campaign_id)
         scene_id = str(campaign_row.get("current_scene_id") or "")
         scene = (
@@ -243,7 +259,10 @@ class CampaignRuntime:
             else None
         )
         if not campaign_mod.audience_ok(audience):
-            raise CampaignRuntimeError(f"未知受众：{audience}（§十五 闭集）")
+            raise CampaignRuntimeError(
+                f"未知受众：{audience}（§十五 闭集：public_party / gm_only / player: / character: / npc:；"
+                "同一用户的多个角色要并就显式传一串，核心不做用户级归并）"
+            )
         keys = {"instance_id": instance_id, "timeline_id": timeline_id, "campaign_id": campaign_id}
         all_actions = [
             row for row in self.store.trpg_list("action", **keys)
@@ -555,6 +574,7 @@ class CampaignRuntime:
         idempotency_key: str,
         audience: str = "public_party",
         now_real: float | None = None,
+        source: str = "gm_declaration",
     ) -> dict[str, Any]:
         """GM 直接变化（§十五）：不过行动、不过插件，直接提交后果。
 
@@ -569,6 +589,12 @@ class CampaignRuntime:
                 raise CampaignRuntimeError(f"changes.{key} 必须是数组")
         if not str(idempotency_key or "").strip():
             raise CampaignRuntimeError("联合提交必须带幂等键")
+        if source not in DIRECT_SOURCES:
+            # §二十一 残余第 1 条：直声明的来源要能细分（GM 裁定 / 世界过程 / 剧本推进），
+            # 角色行动不在这里——它有自己的行动路径与规则裁定。
+            raise CampaignRuntimeError(
+                f"未知来源：{source}（直声明只接受 {' / '.join(DIRECT_SOURCES)}；角色行动请走行动路径）"
+            )
         existing = self.store.trpg_commit_by_key(instance_id, timeline_id, idempotency_key)
         if existing is not None:
             return {**_loads(existing["result"], {}), "status": "duplicate",
@@ -579,7 +605,7 @@ class CampaignRuntime:
         return self._joint_apply(
             campaign_row, payload,
             instance_id=instance_id, timeline_id=timeline_id, campaign_id=campaign_id,
-            action_row=None, action_id="", source_mode="gm_declaration",
+            action_row=None, action_id="", source_mode=source,
             idempotency_key=idempotency_key, audience=audience, now_real=now_real,
         )
 
@@ -603,8 +629,10 @@ class CampaignRuntime:
         `action_row=None` 表示这次没有行动在背后（GM 直接变化）：不做行动状态迁移，
         场景取战役当前场景，其余（规则状态、世界后果、时间消耗、幂等账本）完全一致。
         """
-        if source_mode not in ("action", "gm_declaration"):
-            raise CampaignRuntimeError(f"未知来源：{source_mode}（只接受 action / gm_declaration）")
+        if source_mode not in SOURCE_EVENT:
+            raise CampaignRuntimeError(
+                f"未知来源：{source_mode}（只接受 {' / '.join(SOURCE_EVENT)}）"
+            )
         if not campaign_mod.audience_ok(audience):
             raise CampaignRuntimeError(f"未知受众：{audience}（§十五 闭集）")
         status = str(action_row["status"]) if action_row is not None else ""
@@ -620,13 +648,25 @@ class CampaignRuntime:
         if patch_errors:
             return self._review(action_row, patch_errors)
         new_state = None
+        patch_paths: list[str] = []
+        merged_from: list[int] = []
         if patch:
             if str(patch.get("ruleset_id")) != ruleset_id:
                 return self._review(action_row, ["rule_state_patch.ruleset_id 与战役不一致"])
             base = int(patch.get("base_state_revision", -1))
             current = int(state["state_revision"]) if state else 0
             if base != current:
-                return self._conflict(action_row, current_revision=current, requested=base)
+                # §二十一 残余第 4 条：分片合并——base 落后但**触及路径与中间提交不相交**时并入当前 revision；
+                # 有交集 / 中间记录缺失一律照旧冲突（不确定就别猜）。
+                merged_from = self._mergeable_revisions(
+                    instance_id, timeline_id, campaign_id, ruleset_id, base=base, current=current, patch=patch
+                )
+                if merged_from is None:
+                    return self._conflict(action_row, current_revision=current, requested=base)
+                patch = {**patch, "base_state_revision": current}
+            patch_paths = sorted(
+                {str(item.get("path") or "") for item in patch.get("operations") or [] if isinstance(item, dict)}
+            )
             try:
                 new_state = campaign_mod.apply_patch(
                     _loads(state["opaque_state"], {}) if state else {}, list(patch.get("operations") or [])
@@ -662,7 +702,7 @@ class CampaignRuntime:
         ident = f"ev-trpg-{campaign_mod.new_id('x').split('-')[1]}"
         event_rows = self.runtime._user_event_rows(
             instance_id, timeline_id, normalized, ident=ident, world=world,
-            source=("trpg_action" if source_mode == "action" else "gm_declaration"),
+            source=SOURCE_EVENT[source_mode],
             template="trpg.action",
         )
         event_rows["event"]["detail"] = _dumps({"campaign_id": campaign_id, "action_id": action_id,
@@ -798,6 +838,8 @@ class CampaignRuntime:
             "world_time_request": time_request,
             "world_time_applied": bool(shift_seconds),
             "world_time_source": time_source,
+            "patch_paths": patch_paths,
+            "merged_from": merged_from,
         }
         commit_row = {
             "joint_commit_id": joint_id,
@@ -1246,6 +1288,47 @@ class CampaignRuntime:
     def _needs_review(self, action_row: dict[str, Any], errors: list[str]) -> dict[str, Any]:
         self._fail(action_row, "awaiting_gm_review", code="needs_review")
         return {"status": "needs_review", "action_id": str(action_row["action_id"]), "errors": errors}
+
+    def _mergeable_revisions(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        campaign_id: str,
+        ruleset_id: str,
+        *,
+        base: int,
+        current: int,
+        patch: dict[str, Any],
+    ) -> list[int] | None:
+        """分片合并判定（§二十一 残余第 4 条）：能并就返回被并进来的 revision 列表，不能并返回 None。
+
+        判据只有一条：本次 patch 触及的路径（JSON 指针）与 `base..current` 之间**每一次**提交记下的
+        `patch_paths` 完全不相交。中间任何一次提交没留下路径记录（更早版本的数据、或状态被直接改过）
+        就不并——把不确定的情况留给冲突，比猜错安全。
+        """
+        if base < 0 or base >= current:
+            return None
+        incoming = {
+            str(item.get("path") or "") for item in patch.get("operations") or [] if isinstance(item, dict)
+        }
+        if not incoming:
+            return None
+        seen: dict[int, set[str] | None] = {}
+        for row in self.store.trpg_list(
+            "commit", instance_id=instance_id, timeline_id=timeline_id, campaign_id=campaign_id
+        ):
+            revisions = _loads(row.get("state_revisions"), {}) or {}
+            revision = int(revisions.get(ruleset_id) or 0)
+            if not (base < revision <= current):
+                continue
+            recorded = (_loads(row.get("result"), {}) or {}).get("patch_paths")
+            seen[revision] = {str(item) for item in recorded} if isinstance(recorded, list) else None
+        if len(seen) != current - base:
+            return None
+        for paths in seen.values():
+            if paths is None or paths & incoming:
+                return None
+        return sorted(seen)
 
     def _conflict(
         self, action_row: dict[str, Any] | None, *, current_revision: int, requested: int

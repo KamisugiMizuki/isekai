@@ -222,30 +222,40 @@ GM_ONLY = "gm_only"
 _AUDIENCE_PREFIXES = ("player:", "character:", "npc:")
 
 
+def audience_set(value: Any) -> list[str]:
+    """把受众参数摊成一组：单个受众，或上层为「同一用户的多个角色」**显式**传的一串受众。
+
+    §十五 拍板：核心不做用户级归并（不把 `user:<id>` 猜成它控制的角色）。要并，
+    就由上层把 `["character:pc-1", "character:pc-2"]` 这样显式传进来，核心只做并集。
+    """
+    items = [value] if isinstance(value, str) else list(value or [])
+    cleaned = [str(item) for item in items if str(item or "").strip()]
+    return cleaned or [PUBLIC_PARTY]
+
+
 def audience_ok(value: Any) -> bool:
-    """受众标识是否合法：闭集，别让「谁看得见」变成自由文本。"""
-    text = str(value or "")
-    if text in (PUBLIC_PARTY, GM_ONLY):
-        return True
-    return any(text.startswith(prefix) and len(text) > len(prefix) for prefix in _AUDIENCE_PREFIXES)
+    """受众标识是否合法：闭集，别让「谁看得见」变成自由文本（一串受众则逐个校验）。"""
+    for one in audience_set(value):
+        if one in (PUBLIC_PARTY, GM_ONLY):
+            continue
+        if not any(one.startswith(prefix) and len(one) > len(prefix) for prefix in _AUDIENCE_PREFIXES):
+            return False
+    return True
 
 
-def audience_visible(material: str, viewer: str) -> bool:
-    """材料对这位观看者可见吗：GM 全见，公开全见，其余只认精确匹配。
+def audience_visible(material: str, viewer: Any) -> bool:
+    """材料对这位观看者可见吗：GM 全见，公开全见，其余只认精确匹配；观看者是多个受众时取并集。
 
-    同一用户控制多个角色**不自动合并** `character:<id>`（§十五）——这里刻意不做
-    用户级归并，宁可让调用方显式再传一个受众。
+    同一用户控制多个角色**不自动合并** `character:<id>`（§十五）——`user:` 不是合法受众，
+    这里也不推断「这个用户是谁」；上层要并就显式传一串（`audience_set`）。
     """
     material = str(material or PUBLIC_PARTY)
-    viewer = str(viewer or PUBLIC_PARTY)
-    if viewer == GM_ONLY:
-        return True
     if material == PUBLIC_PARTY:
         return True
-    return material == viewer
+    return any(one == GM_ONLY or material == one for one in audience_set(viewer))
 
 
-def scene_view(scene: dict[str, Any], *, audience: str = PUBLIC_PARTY) -> dict[str, Any]:
+def scene_view(scene: dict[str, Any], *, audience: Any = PUBLIC_PARTY) -> dict[str, Any]:
     """场景投影（§十五）：公共材料人人可见，私密材料只给对应受众。
 
     - `public_facts` / `active_risks` / `available_actions`：逐项按 `audience` 字段裁剪
@@ -266,13 +276,13 @@ def scene_view(scene: dict[str, Any], *, audience: str = PUBLIC_PARTY) -> dict[s
             if not isinstance(item, dict) or audience_visible(str(item.get("audience") or PUBLIC_PARTY), audience)
         ]
     views = _loads(scene.get("private_views"), {})
-    out["private_views"] = views if audience == GM_ONLY else {
+    out["private_views"] = views if GM_ONLY in audience_set(audience) else {
         key: value for key, value in views.items() if audience_visible(str(key), audience)
     }
     return out
 
 
-def action_view(row: dict[str, Any], *, audience: str = "public_party") -> dict[str, Any]:
+def action_view(row: dict[str, Any], *, audience: Any = "public_party") -> dict[str, Any]:
     """行动投影：GM 私有材料（原始 resolution）只有 gm_only 受众拿得到。"""
     out: dict[str, Any] = {
         "action_id": str(row.get("action_id") or ""),
@@ -288,6 +298,6 @@ def action_view(row: dict[str, Any], *, audience: str = "public_party") -> dict[
         "joint_commit_id": str(row.get("joint_commit_id") or ""),
         "audience": str(row.get("audience") or PUBLIC_PARTY),
     }
-    if audience == "gm_only":
+    if GM_ONLY in audience_set(audience):
         out["resolution"] = row.get("resolution") or "{}"
     return out

@@ -575,7 +575,7 @@ created_at / updated_at
 
 ## 二十一、实施状态
 
-**已实现并通过行为验证**（`tests/test_trpg_campaign.py` 20 项 + `tests/test_time_consume.py` 3 项：真 WebSocket + 真 SQLite + 真插件子进程；CLI 端到端 `scripts/_probe_trpg_cli.py` 走完战役 → 行动 → 裁定 → 联合提交 → 时间消耗 → GM 直接变化 → 规则版本迁移）：
+**已实现并通过行为验证**（`tests/test_trpg_campaign.py` 23 项 + `tests/test_time_consume.py` 3 项：真 WebSocket + 真 SQLite + 真插件子进程；CLI 端到端 `scripts/_probe_trpg_cli.py` 走完战役 → 行动 → 裁定 → 联合提交 → 时间消耗 → GM 直接变化 → 规则版本迁移）：
 
 - 战役 / 场景 / 行动 / 待选择的持久化与状态机（非法迁移给出合法去向，不静默纠正）；
 - 战役状态闸门：`blocked` / `paused` / `archived` 拒绝一切改变状态的调用；**`waiting` 只接受对应的输入**（有待选择未处理时不许再声明 / 确认 / 裁定 / 提交；选择完回 `active`，还有别的待选择就继续停在 `waiting`）；
@@ -583,9 +583,18 @@ created_at / updated_at
 - 规则版本闸（§十六 第 2 层）：比对「状态写入时的版本」与「当前插件声明的版本（清单 `ruleset_version`，缺省退回 `version`）」，不一致→战役 `blocked` + 明确原因；
 - 规则版本**转换器**（§十六）：清单 `converters` 声明的转换器由插件执行、核心只搬运与记账；失败 / 输出非法 / 有信息损失（未显式接受）一律停在 `needs_review` 且**原状态可恢复**；记录（old_state_revision / old_ruleset_version / converter_id / converter_version / new_state_revision / losses）写进 `trpg_commit` 账本（`status=converted`），幂等键 `converter|from>to`；无转换器时的人工出口是 `trpg.campaign.status(accept_ruleset_version=…)`（同批重铸状态版本 + 留记录）；
 - 联合提交 `trpg.commit`：规则状态 patch + 世界后果 + 场景转换在**同一个 `apply_runtime_batch` 事务**里落地，任一步非法则三处都不落盘；**行动路径与 GM 直接变化共用同一条管线**（`_joint_apply`）；
-- **GM 直接变化**（§十五）：`trpg.gm.change` 不过行动、不过插件，直接提交后果；来源落 `gm_declaration`，不制造行动行，规则状态与世界后果照旧同批；角色行动落 `trpg_action`；非法来源直接拒；
+- **GM 直接变化**（§十五）：`trpg.gm.change` 不过行动、不过插件，直接提交后果；不制造行动行，规则状态与世界后果照旧同批；非法来源直接拒；
 - 场景内时间消耗（§十四）：`transition.world_time_request = {seconds, cause}` 校验通过后，**与世界后果、规则状态同批前移时钟锚点**（`clock_shift_seconds`），随后按正常批次结算这段时间；`runtime.time.consume` 是同一原语的通用入口（`cause` 必填、只许前进、留下 `time_consume` 提交点、回滚会把世界时间一起拉回）；非法请求进待审且不动时钟；
-- 受众与信息隔离（§十五）：受众闭集（`public_party` / `gm_only` / `player:` / `character:` / `npc:`）校验；`trpg.scene.view(audience=…)` 按受众裁剪场景材料（`private_views` 只给对应受众，GM 拿全份）与行动（行动材料带自己的受众列）；插件原始 `resolution` 默认 `gm_only`，玩家面拿不到；
+- **来源细分**（§二十一 残余第 1 条，2026-09-22）：来源不再是两种——`source_mode` / 事件 `source` 现为
+  `action→trpg_action` / `gm_declaration→gm_declaration` / `world_process→trpg_world_process`（世界自身的 NPC 与环境推进）/
+  `npc_script→trpg_npc_script`（剧本推进）；`trpg.gm.change` 收 `source`（CLI `--source`），非法来源拒并列出合法集；
+  世界过程与玩家行动从此在事件流里分得开（RULE_COMMON §200 的要求）；
+- **规则状态 patch 分片合并**（§二十一 残余第 4 条，2026-09-22）：`base_state_revision` 落后但**触及路径（JSON 指针）**
+  与 `base..current` 之间每一次提交记下的 `patch_paths` 完全不相交时，patch 并入当前 revision（记 `merged_from`）；
+  有交集、或中间任何一次提交没留路径记录（老数据 / 直改状态）→ 照旧 `conflict` 且不落半条（不确定就别猜）；
+- 受众与信息隔离（§十五）：受众闭集（`public_party` / `gm_only` / `player:` / `character:` / `npc:`）校验；
+  **上层可显式传一串受众**（`audience=["character:pc-1","character:pc-2"]`）取并集——这就是「用户级归并」的位置：
+  核心不把 `user:` 猜成角色（§十五 拍板），`user:` 仍非法；`trpg.scene.view(audience=…)` 按受众裁剪场景材料（`private_views` 只给对应受众，GM 拿全份）与行动（行动材料带自己的受众列）；插件原始 `resolution` 默认 `gm_only`，玩家面拿不到；
 - 幂等重放（`trpg_commit` 账本，同键返回原 `joint_commit_id`）、版本冲突（`base_state_revision` 不符→`conflict`）、世代失效（→`stale`）；
 - 回滚 / 分叉 / 导出导入随件：六张 `trpg_*` 表进 `runtime_dump` / `runtime_load` / `timeline_clear_state` / `instance_delete` / `portable`，回滚按提交快照精确恢复规则状态；
 - 重启恢复 `trpg.recover`：在途 `snapshotting`/`resolving` → `interrupted`，`committing` 按幂等账本判定，不重跑随机裁定；
@@ -595,7 +604,5 @@ created_at / updated_at
 
 **尚未实现（记为设计义务，不充数）**：
 
-- `source_mode` 之外的**多来源细分**：目前只有 `trpg_action` / `gm_declaration` 两种来源标注；
-- 受众的**用户级归并**：设计明确「同一用户控制多个角色不自动合并 `character:<id>`」，核心不做 `user:` 映射（需要的话由上层显式传受众）；
 - 常驻插件的**跨核心复用**：会话属于核心进程，核心重启后重开；
-- 规则状态 patch 的**分片合并**（多个来源同时对同一战役提交 patch 的合并策略）——当前按 revision 冲突处理。
+

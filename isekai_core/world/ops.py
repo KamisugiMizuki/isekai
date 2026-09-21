@@ -1135,7 +1135,8 @@ def _trpg_scene_view(cfg: Config, store: Store, runtime: Any, args: dict[str, An
     instance_id, timeline_id, campaign_id = _campaign_ref(args)
     return _campaign_call(
         _campaign_service(runtime).view, instance_id, timeline_id, campaign_id,
-        audience=str(args.get("audience") or "public_party"),
+        # 受众可以是单个标识，也可以是上层显式给的一串（同一用户的多个角色取并集）——别 str() 掉列表
+        audience=args.get("audience") or "public_party",
     )
 
 
@@ -1303,7 +1304,11 @@ def _iface_call(fn: Any, instance_id: str, timeline_id: str, **kwargs: Any) -> d
 
 
 def _trpg_gm_change(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
-    """GM 直接变化（§十五）：没有行动、没有插件的联合提交，来源落 gm_declaration。"""
+    """GM 直接变化（§十五）：没有行动、没有插件的联合提交。
+
+    来源可按 §二十一 残余第 1 条细分：`gm_declaration`（缺省）/ `world_process`（世界自身的 NPC 与环境推进）/
+    `npc_script`（剧本推进）；角色行动不走这里。
+    """
     instance_id, timeline_id, campaign_id = _campaign_ref(args)
     raw = args.get("changes")
     if isinstance(raw, str) and raw.strip() and not raw.lstrip().startswith("{"):
@@ -1314,6 +1319,7 @@ def _trpg_gm_change(cfg: Config, store: Store, runtime: Any, args: dict[str, Any
         changes=changes if isinstance(changes, dict) else {},
         idempotency_key=str(args.get("idempotency_key") or ""),
         audience=str(args.get("audience") or "public_party"),
+        source=str(args.get("source") or "gm_declaration"),
     )
 
 

@@ -223,6 +223,8 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
         if cmd == "gm-change":
             args["changes"] = ns.changes or ""
             args["idempotency_key"] = ns.idempotency or ""
+            if getattr(ns, "source", None):
+                args["source"] = ns.source
         if cmd in ("commit", "gm-change", "scene"):
             if ns.audience:
                 args["audience"] = ns.audience
@@ -493,6 +495,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="TRPG：人工确认规则状态改用新规则版本解释（§十六）")
     parser.add_argument("--audience", default=None,
                         help="TRPG：受众（public_party / gm_only / player:… / character:… / npc:…）")
+    parser.add_argument("--source", default=None,
+                        help="TRPG：GM 直接变化的来源（gm_declaration / world_process / npc_script）")
     parser.add_argument("--converter", default=None, help="TRPG：状态转换器标识（规则版本迁移）")
     parser.add_argument("--accept-losses", dest="accept_losses", action="store_true",
                         help="TRPG：显式接受有信息损失的规则状态转换")

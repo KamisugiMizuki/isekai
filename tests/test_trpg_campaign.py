@@ -99,6 +99,31 @@ print(json.dumps({
 '''
 
 
+MERGE_PLUGIN_SOURCE = '''
+import json, sys
+
+req = json.loads(sys.stdin.readline())
+state = req.get("rule_state") or {}
+base = int(state.get("state_revision") or 0)
+which = str(req.get("intent") or "pc-1")
+print(json.dumps({
+    "resolution": {"system": "fake-rules", "outcome": "success"},
+    "rule_state_patch": {
+        "ruleset_id": state.get("ruleset_id"),
+        "base_state_revision": base,
+        "operations": [{"path": "/actors/" + which + "/hp", "op": "add", "value": 1}],
+    },
+    "consequences": [{
+        "kind": "institution_state", "target": "off-1", "value": "vacant",
+        "expiry": "until_cleared", "certainty": "confirmed",
+    }],
+    "scene_transition": {"status": "advanced"},
+    "claims": [],
+    "participants": [which],
+}, ensure_ascii=False))
+'''
+
+
 RESIDENT_SOURCE = '''
 import json, os, sys
 
@@ -156,10 +181,10 @@ def make_resident_plugin(tmp_path) -> str:
     return str(manifest)
 
 
-def make_plugin(tmp_path) -> str:
+def make_plugin(tmp_path, *, source: str = PLUGIN_SOURCE) -> str:
     folder = tmp_path / "rules"
     folder.mkdir(exist_ok=True)
-    (folder / "main.py").write_text(PLUGIN_SOURCE, encoding="utf-8")
+    (folder / "main.py").write_text(source, encoding="utf-8")
     manifest = folder / "manifest.json"
     (folder / "convert.py").write_text(CONVERT_SOURCE, encoding="utf-8")
     manifest.write_text(
@@ -1013,5 +1038,128 @@ async def test_resident_plugin_recovers_after_crash(tmp_path) -> None:
                                     campaign_id=campaign_id))["state_revision"] == 2
             # 常驻进程是核心的子进程：测试自己收了它，别留给已经关掉的循环（否则 Event loop is closed）
             assert await harness.runtime.service.runtime.campaign.close_rule_sessions() == 1
+        finally:
+            await mgmt.close()
+
+
+async def test_source_axis_is_fine_grained(tmp_path) -> None:
+    """§二十一 残余第 1 条：直声明可按来源细分（GM 裁定 / 世界过程 / 剧本推进），非法来源直接拒。"""
+    plugin = make_plugin(tmp_path)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, _card = make_instance(harness.store, harness.runtime.service.runtime, moment=DAY * 1500)
+            campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
+            changes = {
+                "consequences": [{
+                    "kind": "institution_state", "target": "off-1", "value": "vacant",
+                    "expiry": "until_cleared", "certainty": "confirmed",
+                }],
+            }
+            with pytest.raises(UmpError) as err:
+                await mgmt.call(
+                    "trpg.gm.change", instance_id=info["id"], timeline_id=timeline_id, campaign_id=campaign_id,
+                    changes=changes, idempotency_key="src-bad", source="whatever",
+                )
+            assert "来源" in str(err.value), err.value
+
+            for key, source, expect in (
+                ("src-world", "world_process", "trpg_world_process"),
+                ("src-npc", "npc_script", "trpg_npc_script"),
+                ("src-gm", "gm_declaration", "gm_declaration"),
+            ):
+                committed = await mgmt.call(
+                    "trpg.gm.change", instance_id=info["id"], timeline_id=timeline_id,
+                    campaign_id=campaign_id, changes=changes, idempotency_key=key, source=source,
+                )
+                assert committed["status"] == "committed", committed
+                events = [
+                    row for row in harness.store.event_window(info["id"], timeline_id, until=10**15)
+                    if row["source"] == expect
+                ]
+                assert events, f"{source} 要落成自己的来源标识 {expect}"
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_disjoint_patches_merge_instead_of_conflicting(tmp_path) -> None:
+    """§二十一 残余第 4 条：base 落后但触及路径互不相交 → 并入；有交集 → 照旧冲突且不落半条。"""
+    plugin = make_plugin(tmp_path, source=MERGE_PLUGIN_SOURCE)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, _card = make_instance(harness.store, harness.runtime.service.runtime, moment=DAY * 1500)
+            campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
+            # 两次行动都在 revision 0 上做版本（各自声明 base=0）
+            first, _ = await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin, intent="pc-1")
+            second, _ = await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin, intent="pc-2")
+            await mgmt.call("trpg.commit", instance_id=info["id"], timeline_id=timeline_id,
+                            campaign_id=campaign_id, action_id=first, idempotency_key="m-a")
+            merged = await mgmt.call("trpg.commit", instance_id=info["id"], timeline_id=timeline_id,
+                                     campaign_id=campaign_id, action_id=second, idempotency_key="m-b")
+            assert merged["status"] == "committed", merged
+            assert merged["merged_from"] == [1], merged
+            state = await mgmt.call("trpg.rule_state.read", instance_id=info["id"],
+                                    timeline_id=timeline_id, campaign_id=campaign_id)
+            actors = (state.get("opaque_state") or {}).get("actors") or {}
+            assert set(actors) == {"pc-1", "pc-2"}, actors
+            assert state["state_revision"] == 2
+
+            # 同一条路径上的两次提交：后一个的 base 落后，且与中间那次**相交** → 冲突，且不推进状态
+            third, _ = await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin, intent="pc-1")
+            fourth, _ = await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin, intent="pc-1")
+            await mgmt.call("trpg.commit", instance_id=info["id"], timeline_id=timeline_id,
+                            campaign_id=campaign_id, action_id=third, idempotency_key="m-c")
+            conflict = await mgmt.call("trpg.commit", instance_id=info["id"], timeline_id=timeline_id,
+                                       campaign_id=campaign_id, action_id=fourth, idempotency_key="m-d")
+            assert conflict["status"] == "conflict", conflict
+            after = await mgmt.call("trpg.rule_state.read", instance_id=info["id"],
+                                    timeline_id=timeline_id, campaign_id=campaign_id)
+            assert after["state_revision"] == 3, "冲突不推进规则状态（仍停在 m-c 之后的 3）"
+            ledger = harness.store.trpg_list("commit", instance_id=info["id"], timeline_id=timeline_id,
+                                             campaign_id=campaign_id)
+            recorded = {row["idempotency_key"]: json.loads(row["result"]).get("patch_paths") for row in ledger}
+            assert recorded["m-a"] == ["/actors/pc-1/hp"], recorded
+            assert recorded["m-b"] == ["/actors/pc-2/hp"], recorded
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_multi_audience_view_is_an_explicit_union(tmp_path) -> None:
+    """§二十一 残余第 2 条：核心不做用户级归并，但上层显式传一串受众时取并集；`user:` 仍非法。"""
+    plugin = make_plugin(tmp_path)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, _card = make_instance(harness.store, harness.runtime.service.runtime, moment=DAY * 1500)
+            campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
+            await mgmt.call(
+                "trpg.scene.open", instance_id=info["id"], timeline_id=timeline_id, campaign_id=campaign_id,
+                kind="exploration", location_refs=["pl-1"], participants=["pc-1", "pc-2"],
+                public_facts=[{"fact": "潮线在退"}],
+                private_views={
+                    "character:pc-1": {"note": "甲看得到的东西"},
+                    "character:pc-2": {"note": "乙看得到的东西"},
+                },
+            )
+            one = await mgmt.call("trpg.scene.view", instance_id=info["id"], timeline_id=timeline_id,
+                                  campaign_id=campaign_id, audience="character:pc-1")
+            assert set(one["scene"]["private_views"]) == {"character:pc-1"}, one["scene"]
+
+            both = await mgmt.call("trpg.scene.view", instance_id=info["id"], timeline_id=timeline_id,
+                                   campaign_id=campaign_id,
+                                   audience=["character:pc-1", "character:pc-2"])
+            assert set(both["scene"]["private_views"]) == {"character:pc-1", "character:pc-2"}, both["scene"]
+
+            gm = await mgmt.call("trpg.scene.view", instance_id=info["id"], timeline_id=timeline_id,
+                                 campaign_id=campaign_id, audience="gm_only")
+            assert set(gm["scene"]["private_views"]) == {"character:pc-1", "character:pc-2"}
+
+            with pytest.raises(UmpError) as err:
+                await mgmt.call("trpg.scene.view", instance_id=info["id"], timeline_id=timeline_id,
+                                campaign_id=campaign_id, audience="user:alice")
+            assert "未知受众" in str(err.value) or "audience" in str(err.value).lower(), err.value
         finally:
             await mgmt.close()
