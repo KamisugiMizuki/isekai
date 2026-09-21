@@ -273,7 +273,7 @@ blocked -> archived
 
 - `preparing`：角色、规则版本或首场景尚未准备完毕。
 - `active`：允许创建和确认行动。
-- `waiting`：等待玩家选择、补充输入或 GM 审批；只允许处理对应的输入。
+- `waiting`：等待玩家选择、补充输入或 GM 审批；只允许处理对应的输入（实现上由战役状态闸门拦下声明 / 确认 / 裁定 / 提交，`choice.select` 是放行的那一条；还有别的待选择未处理就继续停在 `waiting`）。
 - `paused`：主持人暂停；不接受会改变状态的行动。
 - `blocked`：规则版本、状态恢复、WorldRuntime 或持久化不可用；只读并显示原因。
 - `archived`：终态；只能读取和导出。
@@ -464,7 +464,13 @@ npc:<character_id>
 2. 规则版本：插件能否解释 `opaque_state`；
 3. 战役协议版本：Campaign Runtime 能否解释场景、行动和提交记录。
 
-规则版本不兼容时战役进入 `blocked`，不静默清空、降级或替换状态。若插件声明转换器，转换必须是独立、可审计、幂等的：
+规则版本不兼容时战役进入 `blocked`，不静默清空、降级或替换状态。
+
+第 2 层的比对基准是**插件声明的规则版本**（清单 `ruleset_version`；没声明就退回插件 `version`，只有 `opaque_state` 格式变化才该改它），比的是它和**规则状态写入时记录的版本**（`trpg_rule_state.ruleset_version`）。触发点是插件升级后继续拿旧状态裁定——这是最危险的一种，因为插件看不懂的状态会被它当成合法输入。
+
+没有转换器时的合法出口只有人工确认：`trpg.campaign.status(status="active", accept_ruleset_version="…")`，同一批把状态行的版本重铸到新值并把这次接受写进战役记录（`note`）。它是"人工接受"，不是"自动迁移"；转换器存在时才允许自动改写状态正文。
+
+若插件声明转换器，转换必须是独立、可审计、幂等的：
 
 ```text
 old_state_revision
@@ -559,11 +565,14 @@ created_at / updated_at
 
 ## 二十一、实施状态
 
-**已实现并通过行为验证**（`tests/test_trpg_campaign.py` 9 项：真 WebSocket + 真 SQLite + 真插件子进程；CLI 端到端 `scripts/_probe_trpg_cli.py`）：
+**已实现并通过行为验证**（`tests/test_trpg_campaign.py` 12 项：真 WebSocket + 真 SQLite + 真插件子进程；CLI 端到端 `scripts/_probe_trpg_cli.py`）：
 
 - 战役 / 场景 / 行动 / 待选择的持久化与状态机（非法迁移给出合法去向，不静默纠正）；
-- 规则状态附件（`trpg_rule_state`）：字段不透明、只托管版本与并发；
+- 战役状态闸门：`blocked` / `paused` / `archived` 拒绝一切改变状态的调用；**`waiting` 只接受对应的输入**（有待选择未处理时不许再声明 / 确认 / 裁定 / 提交；选择完自动回 `active`，还有别的待选择就继续停在 `waiting`）；
+- 规则状态附件（`trpg_rule_state`）：字段不透明、只托管版本与并发；并记下**写这份状态时插件声明的规则版本**；
+- 规则版本闸（§十六 第 2 层）：裁定与提交入口比对「状态写入时的版本」与「当前插件声明的版本（清单 `ruleset_version`，缺省退回插件版本）」，不一致→战役 `blocked` + 明确原因，不静默替换；出口是人工确认 `trpg.campaign.status(accept_ruleset_version=…)`（同一批重铸状态版本并留下记录），转换器仍属未实现；
 - 联合提交 `trpg.commit`：规则状态 patch + 世界后果 + 场景转换在**同一个 `apply_runtime_batch` 事务**里落地，任一步非法则三处都不落盘；
+- 后果来源区分（§十五）：`source_mode=action`（落 `trpg_action`）/ `gm_declaration`（落 `gm_declaration`），非法来源直接拒；
 - 幂等重放（`trpg_commit` 账本，同键返回原 `joint_commit_id`）、版本冲突（`base_state_revision` 不符→`conflict`）、世代失效（→`stale`）；
 - 回滚 / 分叉 / 导出导入随件：六张 `trpg_*` 表进 `runtime_dump` / `runtime_load` / `timeline_clear_state` / `instance_delete` / `portable`，回滚按提交快照精确恢复规则状态；
 - 重启恢复 `trpg.recover`：在途 `snapshotting`/`resolving` → `interrupted`，`committing` 按幂等账本判定，不重跑随机裁定；
@@ -572,10 +581,10 @@ created_at / updated_at
 
 **尚未实现（记为设计义务，不充数）**：
 
-- 规则版本转换器（当前只在版本不兼容时阻断，无转换执行路径）；
-- `world_time_request` 的实际推进：当前只随提交结果回传并标 `world_time_applied=False`，世界时间仍只能走时钟通道；
-- 待选择之后的自动续接（当前 `select_choice` 只关闭选择并恢复战役状态，不自动派生新行动）；
-- `source=gm_declaration` 的 GM 直接变化专用入口（现走既有 `event.draft` / `event.confirm`）；
-- 多玩家受众的完整校验（受众字段已落库，但队伍 / 私密频道的界面规则未实现）；
-- 规则插件常驻进程形态（当前每次裁定仍是一次调用一个进程，状态经快照传递）。
+- 规则版本**转换器**：闸门与人工确认出口已具备，但转换器执行路径没写——它按设计是**插件声明才启用**的能力（清单 `converters`），当前没有任何插件声明，写了没有调用方；
+- `world_time_request` 的实际推进：当前只随提交结果回传并标 `world_time_applied=False`。**缺的不是代码而是语义**：核心现在没有「消耗 N 秒世界时间」的原始操作（时钟是水位/速率驱动的），跳跃水位会牵动到期待处理事件与世代，设计里「允许请求局部时间消耗的场景」也还没定义。要落地得先定这条语义；
+- `source=gm_declaration` 的**独立管理面入口**：来源标注已能打，但 GM 直接变化目前仍复用 `trpg.commit` / `event.draft` 的入口，没有专门的 op；
+- 多玩家受众的完整校验（受众字段已落库，但队伍 / 私密频道的界面规则未实现——§2 明确写它不属于首版前提）；
+- 规则插件常驻进程形态（当前每次裁定仍是一次调用一个进程；**状态生命周期已实现**，快照进快照出，驻留与否只是传输层优化）。
+
 

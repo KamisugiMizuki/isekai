@@ -1039,6 +1039,7 @@ def _trpg_campaign_status(cfg: Config, store: Store, runtime: Any, args: dict[st
     return _campaign_call(
         _campaign_service(runtime).status, instance_id, timeline_id, campaign_id,
         status=str(args.get("status") or ""), reason=str(args.get("reason") or args.get("note") or ""),
+        accept_ruleset_version=str(args.get("accept_ruleset_version") or ""),
     )
 
 
@@ -1127,6 +1128,7 @@ def _trpg_commit(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) 
         instance_id, timeline_id, campaign_id, str(args.get("action_id") or ""),
         idempotency_key=str(args.get("idempotency_key") or ""),
         audience=str(args.get("audience") or "public_party"),
+        source_mode=str(args.get("source_mode") or "action"),
     )
 
 

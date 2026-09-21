@@ -16,6 +16,24 @@ class RulePluginError(ValueError):
     """The external rule plugin did not produce a usable result."""
 
 
+def manifest_identity(manifest_path: str | Path) -> dict[str, Any]:
+    """读规则清单的标识（§十六 兼容性比对用）。
+
+    `ruleset_version` 只在 opaque_state 的格式变化时才该变；清单没声明就退回插件版本。
+    清单读不动 / 缺字段一律返回空字典：比对失败不该让裁定先炸。
+    """
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(manifest, dict):
+        return {}
+    return {
+        "ruleset_id": str(manifest.get("ruleset_id") or manifest.get("id") or ""),
+        "ruleset_version": str(manifest.get("ruleset_version") or manifest.get("version") or ""),
+    }
+
+
 async def resolve(manifest_path: str | Path, request: dict[str, Any], *, timeout: float = 30.0) -> dict[str, Any]:
     path = Path(manifest_path)
     try:

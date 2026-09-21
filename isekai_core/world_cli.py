@@ -179,7 +179,11 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             if ns.kind:
                 args["scene"] = {"kind": ns.kind, "location_refs": [ns.ref] if ns.ref else []}
         if cmd == "campaign-status":
-            args.update({"status": ns.status or "", "reason": ns.reason or ""})
+            args.update({
+                "status": ns.status or "",
+                "reason": ns.reason or "",
+                "accept_ruleset_version": ns.accept_ruleset_version or "",
+            })
         if cmd == "scene-open":
             args["kind"] = ns.kind or "exploration"
         if cmd == "declare":
@@ -195,6 +199,7 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args["action_id"] = ns.action or ""
         if cmd == "commit":
             args["idempotency_key"] = ns.idempotency or ""
+            args["source_mode"] = ns.source_mode or "action"
         if cmd == "resolve":
             args.update({
                 "action_id": ns.action or "",
@@ -396,6 +401,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--status", default=None, help="TRPG：战役状态")
     parser.add_argument("--reason", default=None, help="TRPG：状态变更原因")
     parser.add_argument("--auto-confirm", dest="auto_confirm", action="store_true", help="TRPG：低风险行动直接确认")
+    parser.add_argument("--accept-ruleset-version", dest="accept_ruleset_version", default=None,
+                        help="TRPG：人工确认规则状态改用新规则版本解释（§十六）")
+    parser.add_argument("--source-mode", dest="source_mode", default=None,
+                        help="TRPG：后果来源 action（角色行动）/ gm_declaration（GM 直接裁定）")
     ns = parser.parse_args(argv)
     if (ns.group, ns.command) not in OP_BY_COMMAND:
         parser.error(f"未知命令 {ns.group} {ns.command}")

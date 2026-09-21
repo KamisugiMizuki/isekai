@@ -741,6 +741,7 @@ CREATE TABLE IF NOT EXISTS trpg_rule_state(
   timeline_id TEXT NOT NULL,
   campaign_id TEXT NOT NULL,
   ruleset_id TEXT NOT NULL,
+  ruleset_version TEXT NOT NULL DEFAULT '',   -- 写这份状态时插件声明的规则版本（§十六 兼容性检查的比对基准）
   state_revision INTEGER NOT NULL DEFAULT 1,
   opaque_state TEXT NOT NULL DEFAULT '{}',
   created_world INTEGER NOT NULL DEFAULT 0,
@@ -826,8 +827,8 @@ TRPG_COLUMNS: dict[str, tuple[str, ...]] = {
         "selection", "created_real", "updated_real", "created_world",
     ),
     "rule_state": (
-        "instance_id", "timeline_id", "campaign_id", "ruleset_id", "state_revision",
-        "opaque_state", "created_world", "updated_world", "updated_real",
+        "instance_id", "timeline_id", "campaign_id", "ruleset_id", "ruleset_version",
+        "state_revision", "opaque_state", "created_world", "updated_world", "updated_real",
     ),
     "commit": (
         "joint_commit_id", "instance_id", "timeline_id", "campaign_id", "action_id",
@@ -1511,6 +1512,12 @@ class Store:
         if message_columns and "wait_until" not in message_columns:
             log.info("message 增列 wait_until（睡眠期合并批的截止点，§4.5）")
             self._conn.execute("ALTER TABLE message ADD COLUMN wait_until REAL NOT NULL DEFAULT 0")
+        # TRPG 规则状态兼容性比对需要的规则版本列（早先建的表没有）
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(trpg_rule_state)")}
+        if columns and "ruleset_version" not in columns:
+            self._conn.execute(
+                "ALTER TABLE trpg_rule_state ADD COLUMN ruleset_version TEXT NOT NULL DEFAULT ''"
+            )
         join_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(character_join)")}
         for name, ddl in (
             ("commit_id", "TEXT NOT NULL DEFAULT ''"),

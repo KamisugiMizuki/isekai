@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -375,5 +376,142 @@ async def test_recover_reports_inflight_without_guessing(tmp_path) -> None:
                                    timeline_id=timeline_id, campaign_id=campaign_id)
             assert view["actions"][0]["status"] == "interrupted"
             assert view["rule_state"]["state_revision"] == 0, "中断不猜结果、不扣资源"
+        finally:
+            await mgmt.close()
+
+@pytest.mark.asyncio
+async def test_ruleset_version_change_blocks_then_manual_accept_unblocks(tmp_path) -> None:
+    """§十六：插件声明的规则版本变了 → 战役 blocked；人工确认接受是唯一出口。"""
+    plugin = make_plugin(tmp_path)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, _card = make_instance(harness.store, harness.runtime.service.runtime, moment=DAY * 1500)
+            campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
+            action_id, _resolved = await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin)
+            committed = await mgmt.call(
+                "trpg.commit", instance_id=info["id"], timeline_id=timeline_id, campaign_id=campaign_id,
+                action_id=action_id, idempotency_key="ver-1",
+            )
+            assert committed["status"] == "committed", committed
+            state = await mgmt.call("trpg.rule_state.read", instance_id=info["id"],
+                                    timeline_id=timeline_id, campaign_id=campaign_id)
+            assert state["state_ruleset_version"] == "1.0", "状态要记下写它时插件声明的规则版本"
+
+            # 插件升级：清单里声明的规则版本变了（只有 opaque_state 格式变化才该这么干）
+            manifest_path = Path(plugin)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["ruleset_version"] = "2.0"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            # 闸门在裁定入口就生效：拿旧状态去问新插件 = 最危险的情形（§十六）
+            with pytest.raises(UmpError) as err:
+                await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin)
+            assert "规则版本不兼容" in str(err.value)
+
+            row = await mgmt.call("trpg.campaign.info", instance_id=info["id"],
+                                  timeline_id=timeline_id, campaign_id=campaign_id)
+            assert row["status"] == "blocked", "版本不兼容要阻断，不静默替换状态"
+            assert "规则版本不兼容" in row["note"]
+
+            # 出口：人工确认接受新版本（同一批把状态版本重铸，并留下记录）
+            accepted = await mgmt.call(
+                "trpg.campaign.status", instance_id=info["id"], timeline_id=timeline_id,
+                campaign_id=campaign_id, status="active", accept_ruleset_version="2.0",
+            )
+            assert accepted["status"] == "active"
+            assert "人工确认" in accepted["note"]
+            state = await mgmt.call("trpg.rule_state.read", instance_id=info["id"],
+                                    timeline_id=timeline_id, campaign_id=campaign_id)
+            assert state["state_ruleset_version"] == "2.0"
+            assert state["state_revision"] == 1, "接受版本不改写状态本身"
+            assert state["opaque_state"] == {"actors": {"pc-1": {"hp": 2}}}
+
+            action_id2, _ = await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin)
+            committed2 = await mgmt.call(
+                "trpg.commit", instance_id=info["id"], timeline_id=timeline_id, campaign_id=campaign_id,
+                action_id=action_id2, idempotency_key="ver-2",
+            )
+            assert committed2["status"] == "committed", committed2
+            state = await mgmt.call("trpg.rule_state.read", instance_id=info["id"],
+                                    timeline_id=timeline_id, campaign_id=campaign_id)
+            assert state["state_revision"] == 2 and state["opaque_state"]["actors"]["pc-1"]["hp"] == 4
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_waiting_campaign_takes_only_the_choice(tmp_path) -> None:
+    """§11.1：有待选择时战役进 waiting，只接受对应的输入；选完就能继续声明行动。"""
+    plugin = make_plugin(tmp_path)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, _card = make_instance(harness.store, harness.runtime.service.runtime, moment=DAY * 1500)
+            campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
+            action_id, _ = await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin, intent="waiting")
+            committed = await mgmt.call(
+                "trpg.commit", instance_id=info["id"], timeline_id=timeline_id, campaign_id=campaign_id,
+                action_id=action_id, idempotency_key="wait-1",
+            )
+            assert committed["status"] == "committed", committed
+            choice_id = committed["open_choices"][0]
+            row = await mgmt.call("trpg.campaign.info", instance_id=info["id"],
+                                  timeline_id=timeline_id, campaign_id=campaign_id)
+            assert row["status"] == "waiting"
+
+            with pytest.raises(UmpError) as err:
+                await mgmt.call(
+                    "trpg.action.declare", instance_id=info["id"], timeline_id=timeline_id,
+                    campaign_id=campaign_id, actor_id="card-1", intent="硬来", raw_text="硬来",
+                )
+            assert "等待选择" in str(err.value)
+
+            picked = await mgmt.call(
+                "trpg.choice.select", instance_id=info["id"], timeline_id=timeline_id,
+                campaign_id=campaign_id, choice_id=choice_id, selection="追上去",
+            )
+            assert picked["status"] == "selected" and picked["duplicate"] is False
+            row = await mgmt.call("trpg.campaign.info", instance_id=info["id"],
+                                  timeline_id=timeline_id, campaign_id=campaign_id)
+            assert row["status"] == "active"
+
+            # 继续本来就靠「再声明一个行动」完成，不需要额外的自动续接机制
+            action_id2, _ = await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin)
+            after = await mgmt.call(
+                "trpg.commit", instance_id=info["id"], timeline_id=timeline_id, campaign_id=campaign_id,
+                action_id=action_id2, idempotency_key="wait-2",
+            )
+            assert after["status"] == "committed", after
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_gm_declaration_source_is_distinguishable(tmp_path) -> None:
+    """§十五：GM 直接裁定的后果与角色行动的后果不能混成同一个来源。"""
+    plugin = make_plugin(tmp_path)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, _card = make_instance(harness.store, harness.runtime.service.runtime, moment=DAY * 1500)
+            campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
+            action_id, _ = await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin)
+            with pytest.raises(UmpError) as err:
+                await mgmt.call(
+                    "trpg.commit", instance_id=info["id"], timeline_id=timeline_id, campaign_id=campaign_id,
+                    action_id=action_id, idempotency_key="gm-bad", source_mode="whatever",
+                )
+            assert "来源" in str(err.value)
+
+            committed = await mgmt.call(
+                "trpg.commit", instance_id=info["id"], timeline_id=timeline_id, campaign_id=campaign_id,
+                action_id=action_id, idempotency_key="gm-ok", source_mode="gm_declaration",
+            )
+            assert committed["status"] == "committed", committed
+            events = harness.store.event_window(info["id"], timeline_id, until=10**15)
+            sources = {str(row["source"]) for row in events}
+            assert "gm_declaration" in sources, "GM 直接裁定要落成自己的来源"
+            assert "trpg_action" not in sources
         finally:
             await mgmt.close()

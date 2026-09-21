@@ -27,8 +27,12 @@ log = get_logger("isekai.trpg")
 COMMIT_STATUSES = ("committed", "duplicate", "rejected", "conflict", "needs_review", "stale")
 
 
-class CampaignRuntimeError(ValueError):
-    """战役运行时的可预期错误（调用方翻成管理面错误码）。"""
+class CampaignRuntimeError(campaign_mod.CampaignError):
+    """战役运行时的可预期错误（调用方翻成管理面错误码）。
+
+    继承 `CampaignError` 是有意的：管理面只在一个地方把这一族翻成 `invalid_input`，
+    另起炉灶的兄弟异常会漏成 internal（§12 错误分类）。
+    """
 
 
 #: 失败态不可直达时走这条合法路径（§11.2 状态机：冲突 / 过期只能从 committing 出）
@@ -124,22 +128,47 @@ class CampaignRuntime:
         return campaign_mod.public_campaign(self._campaign_row(instance_id, timeline_id, campaign_id))
 
     def status(
-        self, instance_id: str, timeline_id: str, campaign_id: str, *, status: str, reason: str = ""
+        self,
+        instance_id: str,
+        timeline_id: str,
+        campaign_id: str,
+        *,
+        status: str,
+        reason: str = "",
+        accept_ruleset_version: str = "",
     ) -> dict[str, Any]:
-        """战役状态迁移：全部记录原因，不接受隐式跳转（§11.1）。"""
+        """战役状态迁移：全部记录原因，不接受隐式跳转（§11.1）。
+
+        `accept_ruleset_version`：人工确认规则状态改用新版本解释（§十六 没有转换器时的
+        唯一合法出口）。它会把规则状态行的版本重铸到新值，所以必须在同一批里写，
+        并把这次接受记进 note——不接受「改个字符串让闸门闭嘴」。
+        """
         row = self._campaign_row(instance_id, timeline_id, campaign_id)
         target = campaign_mod.transition("campaign", str(row["status"]), str(status), what="战役")
-        if target == str(row["status"]):
-            return campaign_mod.public_campaign(row)
+        accepted = str(accept_ruleset_version or "").strip()
         now = time.time()
+        rows: dict[str, Any] = {}
+        if accepted and accepted != str(row["ruleset_version"] or ""):
+            old = str(row["ruleset_version"] or "")
+            row["ruleset_version"] = accepted
+            row["note"] = f"接受规则版本 {old or '(未声明)'} → {accepted}（无转换器，人工确认）"
+            state = self.store.trpg_get(
+                "rule_state", instance_id=instance_id, timeline_id=timeline_id,
+                campaign_id=campaign_id, ruleset_id=str(row["ruleset_id"]),
+            )
+            if state is not None:
+                rows["rule_state"] = [{**state, "ruleset_version": accepted, "updated_real": now}]
+        elif target == str(row["status"]) and not rows:
+            return campaign_mod.public_campaign(row)
         row = {
             **row,
             "status": target,
-            "note": str(reason or row.get("note") or ""),
+            "note": str(row.get("note") or reason or ""),
             "updated_world": self._world(instance_id, timeline_id),
             "updated_real": now,
         }
-        self.store.trpg_upserts({"campaign": [row]})
+        rows["campaign"] = [row]
+        self.store.trpg_upserts(rows)
         return campaign_mod.public_campaign(row)
 
     # ------------------------------------------------------------ 场景
@@ -401,6 +430,13 @@ class CampaignRuntime:
             "rule_state", instance_id=instance_id, timeline_id=timeline_id,
             campaign_id=campaign_id, ruleset_id=ruleset_id,
         )
+        identity = rules.manifest_identity(plugin_manifest)
+        manifest_ruleset = str(identity.get("ruleset_id") or "")
+        if manifest_ruleset and manifest_ruleset != ruleset_id:
+            raise CampaignRuntimeError(
+                f"插件与战役规则系统不一致：插件 {manifest_ruleset}，战役 {ruleset_id}"
+            )
+        self._require_compatible(campaign_row, state, plugin_manifest)
         world = self._world(instance_id, timeline_id)
         request = {
             "type": "resolve_action",
@@ -417,7 +453,10 @@ class CampaignRuntime:
             },
             "rule_state": {
                 "ruleset_id": ruleset_id,
-                "ruleset_version": str(campaign_row["ruleset_version"] or ""),
+                # 告诉插件「你要解释的是哪个版本写的状态」，不是战役创建时随手写的字符串
+                "ruleset_version": str(
+                    (state.get("ruleset_version") if state else "") or campaign_row["ruleset_version"] or ""
+                ),
                 "state_revision": int(state["state_revision"]) if state else 0,
                 "opaque_state": _loads(state["opaque_state"], {}) if state else {},
             },
@@ -469,11 +508,18 @@ class CampaignRuntime:
         *,
         idempotency_key: str,
         audience: str = "public_party",
+        source_mode: str = "action",
         now_real: float | None = None,
     ) -> dict[str, Any]:
-        """联合提交（§十二）：规则状态 patch + 世界后果 + 场景转换，同批成功或同批失败。"""
+        """联合提交（§十二）：规则状态 patch + 世界后果 + 场景转换，同批成功或同批失败。
+
+        `source_mode`：`action` = 角色行动的因果后果；`gm_declaration` = GM 直接裁定
+        （§十五 来源标注，审计面要能区分这两种，别混成一个来源）。
+        """
         if not str(idempotency_key or "").strip():
             raise CampaignRuntimeError("联合提交必须带幂等键")
+        if source_mode not in ("action", "gm_declaration"):
+            raise CampaignRuntimeError(f"未知来源：{source_mode}（只接受 action / gm_declaration）")
         existing = self.store.trpg_commit_by_key(instance_id, timeline_id, idempotency_key)
         if existing is not None:
             return {**_loads(existing["result"], {}), "status": "duplicate",
@@ -496,6 +542,7 @@ class CampaignRuntime:
             "campaign_id": campaign_id, "ruleset_id": ruleset_id,
         }
         state = self.store.trpg_get("rule_state", **state_key)
+        self._require_compatible(campaign_row, state, str(campaign_row.get("plugin_manifest") or ""))
         patch = payload.get("rule_state_patch") or None
         patch_errors = campaign_mod.validate_patch(patch)
         if patch_errors:
@@ -543,7 +590,8 @@ class CampaignRuntime:
         ident = f"ev-trpg-{campaign_mod.new_id('x').split('-')[1]}"
         event_rows = self.runtime._user_event_rows(
             instance_id, timeline_id, normalized, ident=ident, world=world,
-            source="trpg_action", template="trpg.action",
+            source=("trpg_action" if source_mode == "action" else "gm_declaration"),
+            template="trpg.action",
         )
         event_rows["event"]["detail"] = _dumps({"campaign_id": campaign_id, "action_id": action_id,
                                                 "resolution": payload.get("resolution") or {}})
@@ -598,8 +646,14 @@ class CampaignRuntime:
             "updated_world": world,
             "updated_real": time.time(),
         }
+        next_campaign_status = str(campaign_row["status"])
+        if choice_rows and next_campaign_status != "waiting":
+            next_campaign_status = campaign_mod.transition(
+                "campaign", next_campaign_status, "waiting", what="战役"
+            )
         campaign_out = {
             **campaign_row,
+            "status": next_campaign_status,
             "state_revision": int(campaign_row["state_revision"]) + 1,
             "current_scene_id": str(scene["scene_id"]) if scene else campaign_row["current_scene_id"],
             "updated_world": world,
@@ -609,6 +663,14 @@ class CampaignRuntime:
         if patch and new_state is not None:
             state_out = {
                 **state_key,
+                # 记「写这份状态的插件声明的规则版本」：版本闸比对的基准（§十六 第 2 层）
+                "ruleset_version": str(
+                    rules.manifest_identity(str(campaign_row.get("plugin_manifest") or "")).get(
+                        "ruleset_version"
+                    )
+                    or campaign_row["ruleset_version"]
+                    or ""
+                ),
                 "state_revision": (int(state["state_revision"]) if state else 0) + 1,
                 "opaque_state": _dumps(new_state),
                 "created_world": int(state["created_world"]) if state else world,
@@ -692,7 +754,7 @@ class CampaignRuntime:
     ) -> dict[str, Any]:
         """选择（§11.3）：过期或已选的重试返回原结果，不重新裁定。"""
         campaign_row = self._campaign_row(instance_id, timeline_id, campaign_id)
-        self._require_live(campaign_row, what="作出选择")
+        self._require_live(campaign_row, what="作出选择", allow_waiting=True)
         row = self.store.trpg_get(
             "choice", instance_id=instance_id, timeline_id=timeline_id,
             campaign_id=campaign_id, choice_id=choice_id,
@@ -707,10 +769,17 @@ class CampaignRuntime:
         if options and selection not in [str(item) if not isinstance(item, dict) else str(item.get("id") or item.get("value") or "") for item in options]:
             raise CampaignRuntimeError(f"选择不在候选项内：{selection}")
         row = {**row, "status": "selected", "selection": str(selection), "updated_real": time.time()}
+        others = [
+            item for item in self.store.trpg_list(
+                "choice", instance_id=instance_id, timeline_id=timeline_id, campaign_id=campaign_id
+            )
+            if str(item["choice_id"]) != choice_id and str(item["status"]) == "open"
+        ]
         campaign_out = {
             **campaign_row,
+            # 还有别的待选择就继续 waiting，别让战役提前回到可行动（§11.1）
             "status": campaign_mod.transition("campaign", str(campaign_row["status"]), "active", what="战役")
-            if str(campaign_row["status"]) == "waiting"
+            if str(campaign_row["status"]) == "waiting" and not others
             else str(campaign_row["status"]),
             "state_revision": int(campaign_row["state_revision"]) + 1,
             "updated_world": self._world(instance_id, timeline_id),
@@ -732,6 +801,8 @@ class CampaignRuntime:
             "campaign_id": campaign_id,
             "ruleset_id": str(campaign_row["ruleset_id"]),
             "ruleset_version": str(campaign_row["ruleset_version"] or ""),
+            # 写这份状态时插件声明的规则版本：与上面不一致 = 需要版本闸或人工确认（§十六）
+            "state_ruleset_version": str(row["ruleset_version"] or "") if row else "",
             "state_revision": int(row["state_revision"]) if row else 0,
             "opaque_state": _loads(row["opaque_state"], {}) if row else {},
         }
@@ -789,10 +860,42 @@ class CampaignRuntime:
         return row
 
     @staticmethod
-    def _require_live(campaign_row: dict[str, Any], *, what: str) -> None:
+    def _require_live(campaign_row: dict[str, Any], *, what: str, allow_waiting: bool = False) -> None:
+        """战役状态闸（§11.1）：blocked/paused/archived 一律拒；waiting 只放行对应的输入。"""
         status = str(campaign_row["status"])
+        if status == "waiting" and not allow_waiting:
+            raise CampaignRuntimeError(f"战役在等待选择（waiting），先处理待选择再做{what}（§11.1）")
         if status in ("archived", "blocked", "paused"):
             raise CampaignRuntimeError(f"战役当前状态（{status}）不接受{what}")
+
+    def _require_compatible(
+        self, campaign_row: dict[str, Any], state_row: dict[str, Any] | None, manifest_path: str
+    ) -> None:
+        """规则版本闸（§十六 第 2 层）：插件解释不了这份 opaque_state → blocked，不静默降级或替换。
+
+        比对基准是**插件声明的规则版本**（清单 `ruleset_version`，缺省退回插件版本），
+        不是战役创建时写的字符串——真正危险的场景是插件升级后继续拿旧状态跑。
+        出口只有两条：插件声明转换器（未实现），或在 `status(accept_ruleset_version=…)`
+        里人工确认接受（会留下记录）。
+        """
+        if not state_row:
+            return
+        written = str(state_row.get("ruleset_version") or "")
+        identity = rules.manifest_identity(manifest_path)
+        declared = str(identity.get("ruleset_version") or "")
+        if not written or not declared or written == declared:
+            return
+        reason = f"规则版本不兼容：规则状态由 {written} 写入，当前插件声明 {declared}（§十六）"
+        self._block_campaign(campaign_row, reason)
+        raise CampaignRuntimeError(reason)
+
+    def _block_campaign(self, campaign_row: dict[str, Any], reason: str) -> None:
+        row = {**campaign_row, "note": reason, "updated_real": time.time()}
+        try:
+            row["status"] = campaign_mod.transition("campaign", str(campaign_row["status"]), "blocked", what="战役")
+        except campaign_mod.CampaignError:
+            pass  # preparing/paused 等没有直达 blocked 的边：只记原因，靠 status() 人工恢复
+        self.store.trpg_upserts({"campaign": [row]})
 
     def _set_action_status(self, row: dict[str, Any], status: str, *, failure_code: str = "") -> dict[str, Any]:
         """按状态机迁一步并落库，返回新行（连续推进时不用回读）。"""
