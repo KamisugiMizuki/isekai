@@ -46,6 +46,7 @@ SYNC_OPS = frozenset(
         "world.package.validate",
         "world.package.list",
         "world.package.import",
+        "world.generate.snapshot",
         "world.draft.list",
         "world.draft.save",
         "world.draft.load",
@@ -547,6 +548,12 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 "replaced": replaced,
                 "source": str(source),
             }
+        if op == "world.generate.snapshot":
+            # P3「进度可见」+ §3.4「看这次给模型的提示词」：核心单进程，生成在 await 模型时事件循环仍空闲，
+            # 这里读的是即时快照；提示词是最近一次实际发出去的原文（没发起过就是空串）。
+            from .generator import last_prompt, progress_snapshot
+
+            return {"progress": progress_snapshot(), "prompt": last_prompt()}
         if op == "world.draft.list":
             return {"drafts": _list_files(cfg, "draft")}
         if op == "world.draft.save":

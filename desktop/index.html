@@ -71,6 +71,7 @@
             <button id="pkg-check">校验</button>
             <input id="pkg-file" placeholder="文件名，如 greytide.json" />
             <button id="pkg-template">新建骨架</button>
+            <button id="pkg-open-in-ws">丢进工作区</button>
             <button id="pkg-import">导入世界包…</button>
           </div>
           <div class="row">
@@ -236,6 +237,15 @@
                 <button id="gw-save" class="primary">保存为世界包</button>
                 <button id="gw-save-draft">存为草稿</button>
               </div>
+              <details id="gw-compare-box" class="hidden">
+                <summary>与上一份对比（[生成] 再跑一次会留下上一份）</summary>
+                <div id="gw-compare" class="muted"></div>
+                <div class="row"><button id="gw-adopt-previous">采用上一份</button></div>
+              </details>
+              <details id="gw-prompt-box">
+                <summary>看这次给模型的提示词 ▾</summary>
+                <pre id="gw-prompt" class="muted"></pre>
+              </details>
               <pre id="gw-errors" class="muted"></pre>
             </section>
           </div>

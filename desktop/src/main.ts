@@ -1907,12 +1907,33 @@ function startProgress(kind: "package" | "card", slotId: string): void {
   const started = Date.now();
   // 进度行落在 role="status" 的槽里——10 分钟等待里读屏要有反馈（§四）。槽的 aria-live 由
   // setGenerateGate → setLiveGate 压在 off：进度逐秒写、只有结果那一句真播报。
-  const tick = (): void =>
+  const tick = (): void => {
+    // P3「进度可见」：核心侧快照（第 n/总段 · 已调用 m 次），每秒拉一次；拉不到就退回计时口径
+    void (async () => {
+      try {
+        const snap = await mgmt?.call("world.generate.snapshot");
+        const progress = ((snap?.progress ?? {}) as Record<string, unknown>) || {};
+        genProgress = progress.running
+          ? {
+              label: String(progress.label ?? ""),
+              step: Number(progress.step ?? 0),
+              total: Number(progress.total ?? 0),
+              calls: Number(progress.calls ?? 0),
+            }
+          : {};
+      } catch {
+        genProgress = {};
+      }
+    })();
+    const where = genProgress.label
+      ? `　正在：${genProgress.label}${genProgress.total ? `（第 ${genProgress.step}/${genProgress.total} 步）` : ""}`
+      : "";
     groupNote(
       slotId,
       `${kind === "package" ? "世界包" : "角色卡"}生成中：已用 ${elapsedLabel(Date.now() - started)}` +
-        ` / 上限 ${elapsedLabel(GENERATE_TIMEOUT_MS)}　调用上限 ${GENERATE_LIMIT[kind]} 次（过程中无法取消）`,
+        ` / 上限 ${elapsedLabel(GENERATE_TIMEOUT_MS)}　调用上限 ${GENERATE_LIMIT[kind]} 次（过程中无法取消）${where}`,
     );
+  };
   tick();
   progressTimers[kind] = window.setInterval(tick, 1000);
 }
@@ -2954,6 +2975,7 @@ const GENWS_ENTRY_PATHS: Record<string, string[]> = {
 
 interface GenwsState {
   candidate: Record<string, unknown> | null;
+  previous: Record<string, unknown> | null;
   errors: string[];
   usage: { calls?: number; limit?: number } | null;
   model: string;
@@ -2962,8 +2984,12 @@ interface GenwsState {
   locks: Record<string, string[]>;
 }
 
+/// 核心侧即时进度（P3「进度可见」）：生成在途时每秒拉一次
+let genProgress: { label?: string; step?: number; total?: number; calls?: number } = {};
+
 const genws: GenwsState = {
   candidate: null,
+  previous: null,
   errors: [],
   usage: null,
   model: "",
@@ -3152,6 +3178,87 @@ function genwsRenderEntries(): void {
   }
 }
 
+/// 逐段条目数（粗略口径：该段各顶层键的列表长度之和）——对比两份候选用
+function genwsSegmentCount(pkg: Record<string, unknown>, keys: string[]): number {
+  let total = 0;
+  for (const key of keys) {
+    const value = pkg[key];
+    if (Array.isArray(value)) total += value.length;
+    else if (value && typeof value === "object") total += Object.keys(value as Record<string, unknown>).length;
+  }
+  return total;
+}
+
+function genwsRenderCompare(): void {
+  const box = $<HTMLDetailsElement>("gw-compare-box");
+  const target = $("gw-compare");
+  if (!genws.previous || !genws.candidate) {
+    box.classList.add("hidden");
+    target.textContent = "";
+    return;
+  }
+  box.classList.remove("hidden");
+  const rows = GENWS_SEGMENT_KEYS.map(([label, keys]) => {
+    const now = genwsSegmentCount(genws.candidate as Record<string, unknown>, keys);
+    const before = genwsSegmentCount(genws.previous as Record<string, unknown>, keys);
+    return `${label}：这一份 ${now} 条 / 上一份 ${before} 条${now === before ? "" : " ← 有差异"}`;
+  });
+  target.textContent = rows.join("；");
+}
+
+function genwsAdoptPrevious(): void {
+  if (!genws.previous) return;
+  const current = genws.candidate;
+  genws.candidate = genws.previous;
+  genws.previous = current;
+  genws.dirty = true;
+  genws.savedAt = null;
+  genwsRenderEntries();
+  genwsRenderCompare();
+  genwsRenderSummary();
+  genwsRenderStatus();
+}
+
+/// §3.4：把最近一次真正发给模型的提示词摊开（旋钮 / 锁定条目变成了哪句话，一眼可见）
+async function genwsLoadPrompt(): Promise<void> {
+  if (!mgmt) return;
+  try {
+    const snap = await mgmt.call("world.generate.snapshot");
+    const prompt = (snap.prompt ?? {}) as { label?: string; system?: string; user?: string };
+    $("gw-prompt").textContent = prompt.system
+      ? `【最近一次调用：${prompt.label ?? ""}】\n\n== system ==\n${prompt.system}\n\n== user ==\n${prompt.user ?? ""}`
+      : "还没有发起过生成调用（先 [生成] 一次）。";
+  } catch (error) {
+    $("gw-prompt").textContent = String(error);
+  }
+}
+
+/// §六「从骨架长」：把管理页选中的包（骨架 / 已确认版本）直接载进工作区，再逐段 [重跑这段]
+async function openPackageInWorkspace(): Promise<string> {
+  const file = $<HTMLSelectElement>("pkg-select").value;
+  if (!file) throw new Error("先在列表里选一个世界包");
+  const loaded = await mgmt!.call("world.package.load", { path: file });
+  const pkg = (loaded.package ?? null) as Record<string, unknown> | null;
+  if (!pkg) throw new Error(`读不到 ${file}`);
+  genws.candidate = pkg;
+  genws.errors = (loaded.errors ?? []) as string[];
+  genws.previous = null;
+  genws.locks = {};
+  genws.dirty = true;
+  genws.savedAt = null;
+  $<HTMLInputElement>("gw-file").value = file;
+  $<HTMLInputElement>("gw-name").value = String(((pkg.meta ?? {}) as Record<string, unknown>).display_name ?? "");
+  genwsOpen();
+  showErrors("gw-errors", genws.errors);
+  genwsRenderSegments();
+  genwsRenderSummary();
+  genwsRenderEntries();
+  genwsRenderCompare();
+  genwsRenderStatus();
+  $("gw-generate-note").textContent = `已载入 ${file}（${genws.errors.length ? `未过校验 ${genws.errors.length} 条` : "校验通过"}）：逐段 [重跑这段] 即可长内容`;
+  return "";
+}
+
 function genwsSegmentKeys(): string[] {
   const want = $<HTMLSelectElement>("gw-segment").value;
   return GENWS_SEGMENT_KEYS.find(([label]) => label === want)?.[1] ?? [];
@@ -3168,6 +3275,7 @@ function genwsAbsorb(result: Record<string, unknown>, what: string): string {
   genwsRenderSegments();
   genwsRenderSummary();
   genwsRenderEntries();
+  genwsRenderCompare();
   genwsRenderStatus();
   const locked = genwsLockCount();
   return genws.errors.length
@@ -3443,7 +3551,12 @@ async function genwsGenerate(): Promise<string> {
     stopProgress("package");
     setGenerateGate("package", false);
   }
+  const kept = genws.candidate;
   const message = genwsAbsorb(result, genwsLockCount() ? "整包重跑" : "生成");
+  if (kept && genws.candidate) {
+    genws.previous = kept; // 「再生成一份 → 取其一」：上一份留着做对比
+  }
+  genwsRenderCompare();
   const cost =
     `调用 ${genws.usage?.calls ?? "?"}/${genws.usage?.limit ?? GENERATE_LIMIT.package} 次 · ` +
     `用时 ${elapsedLabel(Date.now() - started)} / 上限 ${elapsedLabel(GENERATE_TIMEOUT_MS)}`;
@@ -3832,6 +3945,11 @@ function bindWorld(): void {
   $("gw-save").addEventListener("click", () => void worldAction(genwsSave, "gw-generate-note"));
   $("gw-save-draft").addEventListener("click", () => void worldAction(genwsSaveDraft, "gw-generate-note"));
   $("gw-rerun").addEventListener("click", () => void worldAction(genwsRerun, "gw-rerun-note"));
+  $("gw-adopt-previous").addEventListener("click", () => genwsAdoptPrevious());
+  $<HTMLDetailsElement>("gw-prompt-box").addEventListener("toggle", (event) => {
+    if ((event.target as HTMLDetailsElement).open) void genwsLoadPrompt();
+  });
+  $("pkg-open-in-ws").addEventListener("click", () => void worldAction(openPackageInWorkspace, "pkg-note"));
   $("card-open-workspace").addEventListener("click", () => cwOpen());
   $("cw-back").addEventListener("click", () => cwClose());
   $("cw-generate").addEventListener("click", () => void worldAction(cwGenerate, "cw-generate-note"));

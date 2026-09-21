@@ -733,7 +733,9 @@ def section_static() -> None:
     css_tokens = {
         "基础 button 规则": bool(re.search(r"^button \{", css, re.M)),
         ".primary 主操作": "button.primary" in css,
-        "h3 分组分隔线": "border-top: 1px solid var(--border)" in css and re.search(r"#pane-manage h3,\s*\n#pane-settings h3", css),
+        # 2026-09-22：选择器按 pane 写会在新 pane 上漏（UA 1.17em 撑破三档字号，M43 抓过两次），
+        # 改成 `.pane h3` 兜全；判据跟着改成「全局兜底 + 分隔线」。
+        "h3 分组分隔线": "border-top: 1px solid var(--border)" in css and re.search(r"\.pane h3 \{", css),
         ".row 换行 + 按钮不压缩": "flex-wrap: wrap" in css and "flex-shrink: 0" in css,
         "错误色用已有 --bad": "color: var(--bad)" in css and "--danger" not in css,
         "长串换行 overflow-wrap": "overflow-wrap: anywhere" in css and "word-break: break-all" not in css,

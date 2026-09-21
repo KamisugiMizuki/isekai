@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
 
 from ..llm import LLMClient, LLMError
@@ -364,13 +365,41 @@ class BudgetExhausted(Exception):
     """调用预算用尽：暂停并保留已完成的段落，不继续重试扩支。"""
 
 
+#: 生成进度快照（P3「进度可见」，DESKTOP_GENERATION_WORKSPACE_SPEC §六）：
+#: 核心是单进程，生成在 await 模型时事件循环仍然空闲，管理面就能读到这一份即时状态。
+#: 只记「做到哪一步」，不记提示词内容（提示词另走 opt-in 的 `want_prompt`）。
+_PROGRESS: dict[str, Any] = {"running": False}
+
+
+#: 最近一次送给模型的提示词（读侧按需取；不随每次回执推送，避免把回执撑大）
+_LAST_PROMPT: dict[str, Any] = {"label": "", "system": "", "user": ""}
+
+
+def progress_snapshot() -> dict[str, Any]:
+    """读当前（或最近一次）生成的进度：`{running, label, step, total, calls, limit, started_at}`。"""
+    return dict(_PROGRESS)
+
+
+def last_prompt() -> dict[str, Any]:
+    """读最近一次实际发给模型的提示词（§3.4「看这次给模型的提示词」）；空串 = 还没发起过。"""
+    return dict(_LAST_PROMPT)
+
+
+def _progress(**fields: Any) -> None:
+    _PROGRESS.update(fields)
+
+
 def _spend(budget: dict[str, int], label: str) -> None:
     if budget["calls"] >= budget["limit"]:
         raise BudgetExhausted(f"{label}：已达确认的调用上限")
     budget["calls"] += 1
+    if _PROGRESS.get("running"):
+        _PROGRESS["calls"] = budget["calls"]
 
 
 def _usage(budget: dict[str, int], *, paused: bool) -> dict[str, Any]:
+    """用量回执；顺手把进度快照收尾——所有生成流程的每条返回路径都过这里（含预算耗尽）。"""
+    _PROGRESS["running"] = False
     return {"calls": budget["calls"], "limit": budget["limit"], "paused": paused}
 
 
@@ -397,7 +426,10 @@ async def generate_package(
     source = clone_package(base) if isinstance(base, dict) else package
     kwargs_knobs = knob_brief(knobs) + locks_note(source, locks)
     budget = {"calls": 0, "limit": max(1, int(max_calls))}
-    for label, keys in PACKAGE_SEGMENTS:
+    _progress(running=True, label="世界包", step=0, total=len(PACKAGE_SEGMENTS),
+              calls=0, limit=budget["limit"], started_at=time.time(), error="")
+    for index, (label, keys) in enumerate(PACKAGE_SEGMENTS, start=1):
+        _progress(label=f"世界包·{label}", step=index, calls=budget["calls"])
         sub_skeleton = {key: skeleton[key] for key in keys}
         system = (
             "你是世界设定层的世界包生成器。按用户描述生成一份完整、自洽、内部不矛盾的世界包。"
@@ -455,6 +487,8 @@ async def revise_package(
     """在现有世界包上按指令修订：产出完整新版本，不就地改文件。锁定条目（§3.3）修订后原样写回。"""
     locks = parse_locks(locked)
     source = clone_package(package)
+    _progress(running=True, label="修订整包", step=1, total=1, calls=0,
+              limit=max(1, int(max_calls)), started_at=time.time(), error="")
     system = (
         "你是世界设定层的世界包修订器。按用户指令修改给定世界包，只改与指令相关的部分，其余保持原样。"
         + STRUCTURE_HINT
@@ -495,6 +529,8 @@ async def fill_section(
     keys = tuple(part.strip() for part in str(section).split(",") if part.strip())
     if not keys:
         raise PackageError("未知段落：空")
+    _progress(running=True, label=f"重跑段落 {','.join(keys)}", step=1, total=1, calls=0,
+              limit=max(1, int(max_calls)), started_at=time.time(), error="")
     unknown = [key for key in keys if key not in package]
     if unknown:
         raise PackageError(f"未知段落：{'、'.join(unknown)}")
@@ -556,6 +592,8 @@ async def generate_card(
 
     locks = parse_field_locks(locked_fields)
     source = clone_package(base) if isinstance(base, dict) else {}
+    _progress(running=True, label="角色卡", step=1, total=1, calls=0,
+              limit=max(1, int(max_calls)), started_at=time.time(), error="")
 
     skeleton = template_card(package)
     moment, day, year_days, year_seconds = _card_context(package)
@@ -630,6 +668,8 @@ async def fill_card(
         raise PackageError(f"未知字段：{'、'.join(unknown)}")
     locks = parse_field_locks(locked_fields)
     source = clone_package(card)
+    _progress(running=True, label=f"重跑字段 {','.join(keys)}", step=1, total=1, calls=0,
+              limit=max(1, int(max_calls)), started_at=time.time(), error="")
     moment, day, year_days, year_seconds = _card_context(package)
     system = (
         "你是角色卡的字段补全器。只重写用户点名的那些字段，其余字段原样保留（由核心强制，不靠你自觉）。"
@@ -698,6 +738,7 @@ async def _generate_with_retry(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    _LAST_PROMPT.update(label=label, system=system, user=user)
     candidate: dict[str, Any] | None = None
     errors: list[str] = []
     for attempt in (0, 1):

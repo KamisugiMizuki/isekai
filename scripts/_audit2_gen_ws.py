@@ -399,6 +399,104 @@ async def section_card() -> None:
         dump("cardws")
 
 
+async def section_p3() -> None:
+    """P3（§六）：进度可见 / 并排对比 / 从骨架长 + §3.4 提示词预览。"""
+    root = make_root("genws-p3")
+    reply = json.dumps(example_package(), ensure_ascii=False)
+    skeleton = json.loads(json.dumps(example_package(), ensure_ascii=False))
+    skeleton["canon"] = []  # 搞一份「未过校验的骨架」当从骨架长的起点
+    (root / "packages" / "skel.json").write_text(json.dumps(skeleton, ensure_ascii=False), encoding="utf-8")
+    proc, cdp, _targets = await boot_shell(
+        root, 9934, {"ISEKAI_LLM_FAKE": "1", "ISEKAI_LLM_FAKE_REPLY": reply}
+    )
+    try:
+        await cdp.wait("document.getElementById('status').textContent", "已就绪", 120)
+        await cdp.js(STUB)
+        await mgmt_call(cdp, "settings.set", llm={"api_key": FAKE_KEY, "model": "audit-fake"})
+        await cdp.pane("manage")
+        await asyncio.sleep(1.0)
+        await cdp.select("pkg-select", "skel.json")
+        await cdp.js("document.getElementById('pkg-open-in-ws').click()")
+        await asyncio.sleep(2.0)
+        loaded = await cdp.js(
+            "({open: !document.getElementById('pane-genws').classList.contains('hidden'),"
+            " file: document.getElementById('gw-file').value,"
+            " rows: document.querySelectorAll('#gw-entries .entry-row').length,"
+            " note: document.getElementById('gw-generate-note').textContent,"
+            " status: document.getElementById('gw-status').textContent})")
+        check("P3-① §六「从骨架长」：把选中的包（未过校验的骨架）丢进工作区，条目表随之出来",
+              "PASS" if (loaded["open"] and loaded["file"] == "skel.json" and int(loaded["rows"]) > 0
+                         and "已载入 skel.json" in str(loaded["note"])) else "FAIL",
+              f"工作区可见={loaded['open']}；文件名={loaded['file']!r}；条目行={loaded['rows']}；"
+              f"提示={str(loaded['note'])[:90]!r}；状态条={str(loaded['status'])[:80]!r}",
+              clause="§六 从骨架长：新建骨架的产物直接丢进工作区，再逐段 [重跑这段]",
+              code="desktop/src/main.ts openPackageInWorkspace")
+
+        # 生成① → 生成②（再生成一份）→ 上一份留作对比 → [采用上一份] 换回来
+        await cdp.js("document.getElementById('gw-file').value='p3.json';"
+                     "document.getElementById('gw-brief').value='一片灰潮沿岸的三城邦';"
+                     "document.getElementById('gw-knob-genre').value='低魔海国';"
+                     "window.__confirmArgs=[];"
+                     "document.getElementById('gw-generate').click()")
+        await asyncio.sleep(6.0)
+        first = await cdp.js(
+            "({status: document.getElementById('gw-status').textContent,"
+            " rows: document.querySelectorAll('#gw-entries .entry-row').length})")
+        # 第二份要能与第一份分辨：先改一条（不锁）→ 第二份会把没锁的改动覆盖掉 → 采用上一份能找回来
+        await cdp.js("window.prompt=()=> '审计改过的公理';"
+                     "document.querySelector('#gw-entries .entry-edit[data-ident=\"ax-1\"]').click();"
+                     "document.getElementById('gw-generate').click()")
+        await asyncio.sleep(6.0)
+        second = await cdp.js(
+            "({compare_visible: !document.getElementById('gw-compare-box').classList.contains('hidden'),"
+            " compare: document.getElementById('gw-compare').textContent,"
+            " ax: [...document.querySelectorAll('#gw-entries .entry-row')].map(e=>e.textContent).find(t=>t.includes('ax-1')) || '',"
+            " status: document.getElementById('gw-status').textContent})")
+        await cdp.js("document.getElementById('gw-adopt-previous').click()")
+        await asyncio.sleep(0.6)
+        adopted = await cdp.js(
+            "({compare: document.getElementById('gw-compare').textContent,"
+            " ax: [...document.querySelectorAll('#gw-entries .entry-row')].map(e=>e.textContent).find(t=>t.includes('ax-1')) || '',"
+            " rows: document.querySelectorAll('#gw-entries .entry-row').length})")
+        check("P3-② §六「并排对比」：[生成] 再跑一次留上一份 → 逐段条数对比 → [采用上一份] 换回第一份",
+              "PASS" if (second["compare_visible"] and "这一份" in str(second["compare"])
+                         and "上一份" in str(second["compare"])
+                         and "审计改过的公理" not in str(second["ax"])       # 第二份：没锁的改动被模型覆盖
+                         and "审计改过的公理" in str(adopted["ax"])) else "FAIL",       # 采用上一份：改动回来了
+              f"第一次生成后条目行={first['rows']}；再生成后对比块可见={second['compare_visible']}：{str(second['compare'])[:150]!r}；"
+              f"第二份里 ax-1={str(second['ax'])[:70]!r}（没锁的改动被模型覆盖）；"
+              f"采用上一份后 ax-1={str(adopted['ax'])[:70]!r}（回到第一份，改动找回来了）、条目行={adopted['rows']}、"
+              f"对比块={str(adopted['compare'])[:100]!r}",
+              clause="§六 并排对比：同一 brief 生成两份取其一",
+              code="desktop/src/main.ts genwsRenderCompare / genwsAdoptPrevious")
+
+        # §3.4 提示词预览 + 核心进度快照
+        await cdp.js("document.getElementById('gw-prompt-box').open=true;"
+                     "document.getElementById('gw-prompt-box').dispatchEvent(new Event('toggle'))")
+        await asyncio.sleep(2.0)
+        prompt_ui = await cdp.js("document.getElementById('gw-prompt').textContent")
+        snap = await mgmt_call(cdp, "world.generate.snapshot")
+        progress = (snap.get("progress") or {})
+        prompt_core = (snap.get("prompt") or {})
+        check("P3-③ §3.4/§六 提示词预览：界面摊开的正是最近一次调用原文（旋钮句在其中）+ 核心进度快照可读",
+              "PASS" if ("只输出一个 JSON 对象" in str(prompt_ui) and "体裁 低魔海国" in str(prompt_ui)
+                         and "用户旋钮" in str(prompt_ui)
+                         and progress.get("running") is False and str(prompt_core.get("label") or "")
+                         and "体裁 低魔海国" in str(prompt_core.get("system"))) else "FAIL",
+              f"界面提示词长度={len(str(prompt_ui))}（含旋钮句={'体裁 低魔海国' in str(prompt_ui)}、"
+              f"含结构提示={'只输出一个 JSON 对象' in str(prompt_ui)}）；"
+              f"核心快照 progress={progress}；prompt.label={str(prompt_core.get('label'))[:40]!r}",
+              clause="§3.4 看这次给模型的提示词（只读）／§六 进度可见：生成期间显示正在生成第几段",
+              code="desktop/src/main.ts genwsLoadPrompt · isekai_core/world/generator.py last_prompt/progress_snapshot · ops world.generate.snapshot")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+        dump("genws-p3")
+
+
 async def amain() -> None:
     which = sys.argv[1] if len(sys.argv) > 1 else "static"
     started = time.time()
@@ -419,6 +517,11 @@ async def amain() -> None:
             check("card", "SKIP", f"没有可执行件 {EXE}（先构建桌壳）")
         else:
             await section_card()
+    if which in ("p3", "all"):
+        if not EXE.exists():
+            check("p3", "SKIP", f"没有可执行件 {EXE}（先构建桌壳）")
+        else:
+            await section_p3()
     print(f"[genws] 用时 {time.time() - started:.1f}s", flush=True)
 
 

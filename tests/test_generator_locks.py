@@ -159,6 +159,31 @@ async def test_generate_card_keeps_locked_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_progress_snapshot_tracks_a_running_generation() -> None:
+    """P3 进度可见：生成期间能读到「第 n/总段 · 已调用 m 次」，结束后 running 落回 False。"""
+    import asyncio
+
+    package = sample_package()
+    llm = FakeLLM([json.dumps(package, ensure_ascii=False)])
+    llm.delay_s = 0.25
+    task = asyncio.create_task(generator.generate_package(llm, "灰潮沿岸", name="灰潮纪"))
+    await asyncio.sleep(0.35)
+    mid = generator.progress_snapshot()
+    assert mid["running"] is True, mid
+    assert mid["step"] >= 1 and mid["total"] == len(generator.PACKAGE_SEGMENTS), mid
+    assert "世界包" in str(mid["label"]) and int(mid["calls"]) >= 1, mid
+    await task
+    assert generator.progress_snapshot()["running"] is False, "生成结束（含失败路径）要把进度收尾"
+
+
+@pytest.mark.asyncio
+async def test_progress_snapshot_closes_on_budget_exhaustion() -> None:
+    llm = FakeLLM([json.dumps(sample_package(), ensure_ascii=False)])
+    await generator.generate_package(llm, "灰潮沿岸", name="灰潮纪", max_calls=1)
+    assert generator.progress_snapshot()["running"] is False
+
+
+@pytest.mark.asyncio
 async def test_revise_package_keeps_locked_entries() -> None:
     package = sample_package()
     ident = str(package["narratives"][0]["id"])

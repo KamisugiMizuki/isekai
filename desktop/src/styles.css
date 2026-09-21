@@ -514,10 +514,10 @@ h2 {
   font-size: 24px;
 }
 
-/* 分组标题：14px（正文档）/600 + 上方 1px 分隔线——层级不靠灰度承载（§四） */
-#pane-manage h3,
-#pane-settings h3,
-#pane-genws h3 {
+/* 分组标题：14px（正文档）/600 + 上方 1px 分隔线——层级不靠灰度承载（§四）。
+   选择器按 pane 写会漏：每加一个 pane（生成工作区、卡工作区）就冒一次 UA 的 1.17em=16.4px，
+   把三档字号（12/14/24）撑破（审计 M43 抓过两次）。所以这里按 `.pane h3` 兜全，新 pane 不用再改。 */
+.pane h3 {
   margin: 18px 0 6px;
   padding-top: 14px;
   border-top: 1px solid var(--border);
