@@ -451,6 +451,38 @@ def backfill_rows(
 
 BACKFILL_VOLUME_YEARS = 10  # 暂按十年一卷（§3.6 条 3，起步口径，不冻结）
 BACKFILL_BATCH_MIN, BACKFILL_BATCH_MAX = 10, 20  # 10–20 条一批
+BACKFILL_MAX_VOLUMES = 24  # 超长时代的折半阈值：卷数超它即折半抽样（跨度不能线性放大，DESIGN.md 回填一节）
+BACKFILL_KEY_FIGURE_LIMIT = 12  # 回填期「确定生死与活动区间」的要点人物上限（种子定序取前 N，其余留白）
+BACKFILL_ENTITY_LIMIT = 32  # 回填期具名对象的登记体量上限（名册生成预算）
+
+
+def backfill_sample_volumes(volume_count: int, *, limit: int = BACKFILL_MAX_VOLUMES) -> tuple[list[int], int]:
+    """超长时代：卷数超阈值就按折半抽样（逐轮步长 ×2 的等距抽样），未列卷 = 跨时代留白。
+
+    返回 (保留的卷下标, 步长)。折半只改**抽样密度**、不改事实，所以与种子无关；留白不是缺载。
+    """
+    count = max(0, int(volume_count))
+    step = 1
+    while count // step > max(1, int(limit)):
+        step *= 2
+    return [index for index in range(count) if index % step == 0], step
+
+
+def backfill_key_figures(
+    package: dict[str, Any], *, seed: str, rules_version: str, limit: int = BACKFILL_KEY_FIGURE_LIMIT
+) -> list[str]:
+    """要点人物挑选：登记人物按种子定序取前 N（同种子同人选），其余保留在册但不铺生死。
+
+    只挑人物（`kind=person`）：组织 / 地点 / 物件没有寿命推演可言。
+    """
+    persons = [
+        str(item.get("id"))
+        for item in package.get("entities") or []
+        if isinstance(item, dict) and str(item.get("kind") or "") == "person" and item.get("id")
+    ]
+    persons.sort()
+    persons.sort(key=lambda ident: stable_key(seed, rules_version, ident))
+    return persons[: max(1, int(limit))]
 
 
 def backfill_volume_index(calendar: Any, at: int) -> int:
@@ -540,6 +572,22 @@ def backfill_plan(
                 }
             )
         selection.setdefault(source_id, []).extend(idents)
+    total_volumes = max((int(v["volume"]) for v in volumes), default=-1) + 1
+    keep, step = backfill_sample_volumes(total_volumes)
+    keep_set = set(keep)
+    listed_idents = {ident for volume in volumes if int(volume["volume"]) in keep_set for ident in volume["entries"]}
+    if step > 1:
+        volumes = [volume for volume in volumes if int(volume["volume"]) in keep_set]
+        batches = [batch for batch in batches if int(batch["volume"]) in keep_set]
+        selection = {
+            source_id: [ident for ident in idents if ident in listed_idents]
+            for source_id, idents in selection.items()
+        }
+    persons = [
+        str(item.get("id"))
+        for item in package.get("entities") or []
+        if isinstance(item, dict) and str(item.get("kind") or "") == "person" and item.get("id")
+    ]
     return {
         "volumes": volumes,
         "batches": batches,
@@ -547,7 +595,20 @@ def backfill_plan(
         "volume_years": BACKFILL_VOLUME_YEARS,
         "batch_bounds": [BACKFILL_BATCH_MIN, BACKFILL_BATCH_MAX],
         "total": len(entries),
+        "listed": len(listed_idents),
         "with_text": sum(1 for row in entries if not row["need_text"]),
+        "sampling": {
+            "volumes": total_volumes,
+            "kept": len(keep),
+            "step": step,
+            "blanked": len(entries) - len(listed_idents),
+        },
+        "key_figures": backfill_key_figures(package, seed=seed, rules_version=rules_version),
+        "roster_budget": {
+            "limit": BACKFILL_ENTITY_LIMIT,
+            "registered": len(persons),
+            "room": max(0, BACKFILL_ENTITY_LIMIT - len(persons)),
+        },
     }
 
 

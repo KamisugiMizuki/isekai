@@ -295,7 +295,13 @@
 - 历史回填的实现参数：**分卷（十年一卷）与批量（10–20 条均衡分批）、传本选载范围已落地**
   （`runtime/events.py::backfill_plan` + 创建期联合校验 `backfill_product_errors`）；**「已确认缺载」的表示方式已落地**
   （`claim_coverage` 表：`pending` 尚未生成 / `absent` 已确认缺载 / `done` 已展开，`claim.coverage` 可读）；
-  超长时代的折半阈值、要点人物挑选与名册生成的体量仍余。
+  **超长时代的折半阈值、要点人物挑选与名册生成的体量：2026-09-22 落地**——
+  卷数超 `BACKFILL_MAX_VOLUMES`（24）即**折半抽样**（逐轮步长 ×2，`backfill_sample_volumes`），未列卷 = 跨时代留白
+  （计划里 `sampling{volumes,kept,step,blanked}` 与 `listed` 明示，留白不是缺载）；
+  要点人物 = 登记人物按种子定序取前 `BACKFILL_KEY_FIGURE_LIMIT`（12，`backfill_key_figures`），
+  回填期只为这些人推算并固化生死与死讯（`service.backfill`），没挑中的保留在册、不补造生死；
+  名册体量 = `BACKFILL_ENTITY_LIMIT`（32）与计划里的 `roster_budget{limit,registered,room}`。
+  行为验收 `tests/test_backfill_plan.py`（折半抽样 / 要点挑选 / 回填期生死只到要点人物 三项）。
 - 种族与寿命 schema：**2026-09-22 落地**——两种形态共用 `world/validate.py::lifespan_errors`（`{mode: long|unbounded}`
   或 `{min_years, max_years}`，正整数年且 min ≤ max），**混写即拒**；历法换算走 `calendar.year_seconds`
   （`runtime/events.py::death_moment` 按出生 + 上限年推）；**个体覆盖优先级**：卡片 `identity.died`（固死）

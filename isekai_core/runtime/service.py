@@ -4060,14 +4060,38 @@ class RuntimeService:
         calendar = self.calendar(instance)
         package = self.setting(instance)["world_package"]
         moment = int(instance["moment"] or 0)
+        key_figures = set(
+            events.backfill_key_figures(package, seed=self.seed_of(instance), rules_version=self.rules_of(instance))
+        )
         for entity in package.get("entities") or []:
             if not isinstance(entity, dict) or str(entity.get("kind") or "") != "person":
                 continue
             died = entity.get("died")
-            if not isinstance(died, int) or isinstance(died, bool) or int(died) >= moment:
+            if isinstance(died, int) and not isinstance(died, bool):
+                if int(died) >= moment:
+                    continue
+            elif str(entity.get("id") or "") in key_figures:
+                # 要点人物：回填期一并确定寿终（§3.6 条 2 / EVENT_ENGINE §四）。没被挑中的
+                # 登记人物保留在册但不补造生死——缺寿命依据只留名，正是留白。
+                derived = events.death_moment(
+                    {
+                        "identity": {
+                            "race_id": entity.get("race_id"),
+                            "born": entity.get("born"),
+                            "died": None,
+                            "lifespan": entity.get("lifespan"),
+                        }
+                    },
+                    package,
+                    calendar,
+                )
+                if not isinstance(derived, int) or int(derived) >= moment:
+                    continue
+                entity = {**entity, "died": int(derived)}
+            else:
                 continue
             row = self._entity_death_row(
-                entity, instance_id=instance_id, timeline_id=timeline_id, world_seconds=int(died), calendar=calendar
+                entity, instance_id=instance_id, timeline_id=timeline_id, world_seconds=int(entity["died"]), calendar=calendar
             )
             if row is None:
                 continue
@@ -4080,7 +4104,7 @@ class RuntimeService:
                         instance_id=instance_id,
                         timeline_id=timeline_id,
                         event_ident=str(row["id"]),
-                        world_seconds=int(died),
+                        world_seconds=int(entity["died"]),
                         calendar=calendar,
                     )
                 )
