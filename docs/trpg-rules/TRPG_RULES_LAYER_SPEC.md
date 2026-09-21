@@ -1,8 +1,10 @@
 # TRPG 规则层模块设计
 
-> 状态：设计规范草案 v1.0，未实现声明。
-> 上游：[`../worldruntime/DESIGN.md`](../worldruntime/DESIGN.md)、[`TRPG_CAMPAIGN_RUNTIME_SPEC.md`](TRPG_CAMPAIGN_RUNTIME_SPEC.md)、[`TRPG_RULE_PLUGIN_SPEC.md`](TRPG_RULE_PLUGIN_SPEC.md)。
+> 状态：已定稿 v1.0（跨模块编排规范）；实现状态：底层 Campaign Runtime、规则插件协议和联合提交已落地，完整客户端仍属独立实现范围。
+> 上游：[`../worldruntime/DESIGN.md`](../worldruntime/DESIGN.md)、[`../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md`](../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md)、[`../trpg-client/TRPG_CLIENT_SPEC.md`](../trpg-client/TRPG_CLIENT_SPEC.md)、[`TRPG_CAMPAIGN_RUNTIME_SPEC.md`](TRPG_CAMPAIGN_RUNTIME_SPEC.md)、[`TRPG_RULE_PLUGIN_SPEC.md`](TRPG_RULE_PLUGIN_SPEC.md)、[`TRPG_RULE_COMMON_MODULE_SPEC.md`](TRPG_RULE_COMMON_MODULE_SPEC.md)。
 > 评价依据：[`TRPG_GM_USER_EVALUATION_DRAFT.md`](TRPG_GM_USER_EVALUATION_DRAFT.md)。
+>
+> 本文只拥有 TRPG 各模块之间的路由、边界和提交语义；玩家 / GM 的界面流程由 `TRPG_CLIENT_SPEC.md` 持有，战役状态机由 `TRPG_CAMPAIGN_RUNTIME_SPEC.md` 持有，规则到世界后果的规范化由 `TRPG_RULE_COMMON_MODULE_SPEC.md` 持有。
 
 ## 一、定位
 
@@ -37,19 +39,19 @@ TRPG 规则层是玩家模式与 GM 辅助模式的应用编排层。它不直�
 
 ## 三、模块边界
 
-### 3.1 规则层负责
+### 3.1 规则层的编排责任
 
-- 为一次战役维护当前场景和可行动局面；
-- 维护行动声明、确认、放弃、待选择和场景转换；
-- 绑定规则状态快照与版本，不解析规则字段；
-- 接收自然语言行动并形成待确认行动声明；
-- 展示行动者、目标、意图、方法、风险和可能代价；
-- 调用符合协议的独立规则插件；
-- 校验通用裁定结果和效果目标；
-- 将已确认结果提交给 WorldRuntime；
-- 保存行动、裁定、规则状态引用、效果、视角和新局面的因果链；
-- 把结果编排成玩家可理解的 GM 表达；
-- 管理辅助裁定、自动主持和共同主持三种介入模式。
+规则层是跨模块语义边界，不另建一份战役或世界状态。它负责：
+
+- 接收客户端已经明确其模式、作用域和用户意图的结构化命令；
+- 按当前战役与场景状态，选择 B0 无状态 resolver、完整战役裁定或 GM 直接变化路径；
+- 协调 WorldRuntime 快照、规则状态快照与插件请求的同一基准；
+- 把插件返回交给规则共用模块规范化，再交给 WorldRuntime preview / commit；
+- 协调规则状态、世界后果、场景转换的联合提交和幂等重放；
+- 透传来源、受众、规则版本、世界 revision 和运行世代，不在上层猜测或补齐；
+- 把底层结果翻译成客户端可消费的成功、失败、待审、待选择、冲突或过期状态。
+
+客户端拥有自然语言输入、确认卡和结果表达；Campaign Runtime 拥有战役 / 场景 / 行动状态机；规则插件拥有规则语义；公共模块拥有规范化边界；WorldRuntime 拥有世界事实。规则层不得把这些所有权重新集中到一个“GM 大模型”里。
 
 ### 3.2 规则独占转接插件
 
@@ -57,20 +59,19 @@ TRPG 规则层是玩家模式与 GM 辅助模式的应用编排层。它不直�
 
 ### 3.3 TRPG 规则共用模块
 
-公共模块位于转接插件与 WorldRuntime 之间，负责保存原始裁定、检查通用后果包、区分 confirmed / candidate / needs_review，并将合法变化提交给 WorldRuntime。它不解释骰点、属性、职业、牌面或规则私有 context。
+公共模块位于转接插件与 WorldRuntime 之间，负责规范化插件结果、检查通用后果包、区分 `confirmed` / `candidate` / `needs_review`，并产出可供联合提交的 WorldRuntime 变化意图。原始裁定由 Campaign Runtime 保存；实际提交由统一协调器执行。它不解释骰点、属性、职业、牌面或规则私有 context。
 
 ### 3.4 WorldRuntime 负责
 
-WorldRuntime 仍是唯一事实与效果写入者：
+WorldRuntime 仍是唯一事实与效果写入者，规则层只提交结构化意图：
 
-- 校验 action_id 在实例 / 时间线内幂等；
-- 校验效果类型、目标、有效期和说法引用；
+- 校验提交幂等键、变化目标、效果类型、有效期和说法引用；
 - 原子写入事件、效果、claims、认知传播和世界水位；
 - 按角色视角提供后续可见事实；
 - 处理回滚、分支、恢复、成员资格和运行世代；
 - 在插件失败、结果非法或提交失败时不落半条结果。
 
-规则层不能把插件响应中的自由文本直接当作世界事实。只有通过通用校验并提交的效果和说法，才可以进入后续世界与叙事链。
+Campaign Runtime 负责 `action_id`、`action_revision`、战役状态和场景状态；WorldRuntime 不把规则行动行当作自己的事实模型。规则层不能把插件响应中的自由文本直接当作世界事实。只有通过通用校验并提交的效果和说法，才可以进入后续世界与叙事链。
 
 ## 四、最小数据对象
 
@@ -173,6 +174,62 @@ GM 开场只能使用玩家角色应知的材料。无法形成可行动局面�
 ```
 
 规则插件返回成功不等于世界已经改变。只有提交成功，GM 才能把效果表达为已发生；提交失败时必须说明结果尚未落地。
+
+### 5.5 三条入口的固定语义
+
+规则层只能从三条入口之一开始一次处理，不在中途把一种输入改解释成另一种：
+
+| 入口 | 适用内容 | 插件 | 是否产生行动行 | 提交路径 |
+|---|---|---:|---:|---|
+| B0 resolver | 单次、无持续规则状态的兼容裁定 | 是 | 否 | `trpg.action.resolve` 的无 `campaign_id` 路径 |
+| 战役行动 | 已确认的玩家 / NPC 行动 | 是 | 是 | `declare → confirm → resolve → review → trpg.commit` |
+| GM 直接变化 | GM 已明确决定的结构化变化、世界过程或剧本推进 | 否 | 否 | `trpg.gm.change → 公共模块 → 联合提交` |
+
+B0 返回的成功只表示 B0 世界效果路径被接受；它不提供战役场景、持续规则状态、待选择恢复或完整 GM 产品体验。战役行动的 `resolve` 只保存裁定并停在 `reviewing` / 待审状态；只有 `trpg.commit` 成功后才更新世界、规则状态和场景。GM 直接变化不伪造骰点，也不创建一条虚假的玩家行动。
+
+### 5.6 联合提交的责任闭包
+
+一次战役提交以以下材料为一个不可拆分的闭包：
+
+```text
+scope = instance_id + timeline_id + campaign_id
+action_id? + action_revision?
+base_campaign_revision
+base_world_revision / snapshot_id
+base_state_revisions[]
+resolution_ref
+rule_state_patches[]
+world_changes[]
+knowledge_changes[]
+scene_transition?
+world_time_request?
+idempotency_key
+```
+
+规则层必须保持以下顺序：
+
+1. 读取并固定战役、世界和规则状态基准；
+2. 调插件或接收 GM 结构化变化；
+3. 经公共模块规范化并取得 `ready` / `needs_review`；
+4. 由 WorldRuntime 预览目标、效果、认知、时间和版本；
+5. 由同一协调器联合提交规则状态、世界后果和场景转换；
+6. 依据一个联合结果更新行动 / 战役状态并返回客户端。
+
+任一版本、目标、权限、规则 patch、时间或场景转换检查失败，规则状态、WorldRuntime 和 Campaign Runtime 都不能以“部分成功”落盘。已存在的失败 / 待审记录可以保存诊断，但不等于事实提交。
+
+### 5.7 来源、受众与版本
+
+- `source_mode` 的行动路径值为 `action`，落成事件来源 `trpg_action`；GM 直接变化可用 `gm_declaration`、`world_process` 或 `npc_script`，分别落成 `gm_declaration`、`trpg_world_process`、`trpg_npc_script`。
+- `source_mode` 是审计来源，不是绕过权限的凭据；GM 直接变化也必须经过结构化目标、受众、时间和版本校验。
+- 受众只使用闭集：`public_party`、`gm_only`、`player:<id>`、`character:<id>`、`npc:<id>`；多个角色的可见并集必须由上层显式传入，核心不推断 `user:<id>`。
+- 插件声明的 `ruleset_id` / `ruleset_version`、规则状态写入版本、WorldRuntime revision 和运行世代都必须在提交前比对；不兼容就阻断，不静默换规则。
+- `action_id` 标识一次规则行动；`action_revision` 标识该行动的确认版本；`idempotency_key` 标识一次联合提交。三者不能互相替代。
+
+### 5.8 插件错误与失败恢复
+
+结构化插件错误按 `needs_input`、`needs_choice`、`needs_review`、`plugin_failed`、`rejected` 处理。错误响应若携带 `rule_state_patch`、`consequences` 或 B0 `effects` 半成品，一律进入待审且不采信任何半成品。
+
+插件在尚未发出请求前死亡，可以按协议边界重新启动；请求已经发出后死亡、超时、返回非法 JSON 或协议不匹配，不重跑可能产生随机结果的裁定，行动进入 `plugin_failed` / `interrupted`。核心重启后：`reviewing` 重新等待提交，`committing` 查询幂等账本，`resolving` 只能显式重试，不自动重掷。
 
 ## 六、GM 辅助模式
 
@@ -302,15 +359,20 @@ TRPG 层复用 WorldRuntime 的认知、披露和回滚语义，不建立第二�
 
 ## 十五、行为验收
 
-- 用户用自然语言声明行动时，系统能复述行动者、目标、意图和风险。
-- 用户修改或放弃行动后，未确认版本不会进入裁定或世界提交。
-- 真实插件进程能通过现有 B0 协议返回 resolution、effects、claims 和 participants；
-- 设计中的战役协议能返回 resolution、rule_state_patch、consequences、scene_transition、claims 和 participants；
-- 规则状态 patch 与必要世界后果联合提交，任一失败都不落半条结果；
-- 插件崩溃、超时、非法 JSON、协议不兼容或结果校验失败时，不落世界效果。
-- 规则插件返回成功但 WorldRuntime 提交失败时，GM 不表达为已发生。
-- 失败结果能产生可理解代价、信息、待补充状态或新的行动局面。
-- 玩家视角不会看到 NPC 私密信息、未获知事件或 GM 实情。
-- 相同 action_id 重试不重复施加效果，重启后能恢复正确状态。
-- 回滚 / 分支不会把另一条线的行动结果带回当前线。
-- 评价标准中的行动确认、成功后果、失败后果、无法裁定、玩家自主权、认知隔离、回合边界、重复恢复、规则更换和失败后新局面均能通过真实插件 + 真实 WorldRuntime + 真实客户端链路验证。
+| 场景 | 必须观察到的结果 |
+|---|---|
+| B0 resolver | 无 `campaign_id` 时可走兼容单次裁定；不产生 Campaign action / 规则状态生命周期假象 |
+| 战役行动 | 未确认行动不能 resolve；修改增加 `action_revision`；旧版本不能提交 |
+| 裁定与提交 | `resolve` 只保存裁定；只有 `trpg.commit` 成功后才表达世界已改变 |
+| GM 直接变化 | 不调用骰点插件、不制造行动行；来源保留为 `gm_declaration` / `world_process` / `npc_script` |
+| 联合提交失败 | 规则状态、世界后果和场景转换都不落半条；行动进入真实 conflict / stale / needs_review |
+| 插件错误 | 结构化错误映射为待补充、待选择、待审、失败或拒绝；夹带半成品不采信 |
+| 插件死亡 / 超时 | 请求发出后不自动重跑随机裁定；核心重启可恢复为 interrupted 或查询提交账本 |
+| 规则版本变化 | 不兼容时战役 blocked；转换或人工接受有明确记录，不能静默换规则 |
+| 幂等重试 | 相同 `action_id` / `idempotency_key` 返回原结果，不重复扣资源或写世界 |
+| 受众隔离 | 玩家看不到 GM 私有 resolution、其他角色私密内容、未获知事实或 opaque state |
+| 待选择 | 未选择分支只存在 Campaign Runtime；战役 waiting 时锁住无关关键行动 |
+| 时间双轨 | 规则时间推进不自动推进世界时间；非法 `world_time_request` 不动世界时钟 |
+| 分支与回滚 | 场景、规则状态和行动派生不跨线回流；迟到结果按新世代失效 |
+
+以上场景必须使用真实 Campaign Runtime、真实规则插件进程、真实 SQLite / WebSocket 边界验证；客户端设计不等于客户端已实现。
