@@ -218,6 +218,22 @@ def logs(root: Path) -> str:
     return "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in folder.glob("*.log"))
 
 
+def impeccable_detector() -> Path | None:
+    """Impeccable 技能自带的渲染态检测器（清规扫描）：找到就用真检测器复跑，
+    找不到就退回「同一查询 / 同一四舍五入 / 同一阈值」的镜像判定（见 M43）。"""
+    candidates = []
+    if os.environ.get("IMPECCABLE_DETECTOR"):
+        candidates.append(Path(os.environ["IMPECCABLE_DETECTOR"]))
+    for base in (Path(os.environ.get("LOCALAPPDATA", "") or "."), Path.home() / "AppData" / "Local",
+                 Path.home() / ".local" / "share"):
+        candidates.append(base / "hermes" / "skills" / "frontend-design" / "impeccable"
+                          / "scripts" / "detector" / "detect-antipatterns-browser.js")
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
 # --------------------------------------------------- 原生窗口 / 键盘（点对话框）
 
 def dialog_hwnd(needle: str) -> int:
@@ -462,8 +478,9 @@ class Cdp:
         await self.js(f"(function(){{const s=document.getElementById({json.dumps(element_id)});"
                       f"s.value={json.dumps(value)}; s.dispatchEvent(new Event('change'));}})()")
 
-    async def keys(self, key: str, code: str, vk: int, *, shift: bool = False) -> None:
-        mods = 8 if shift else 0
+    async def keys(self, key: str, code: str, vk: int, *, shift: bool = False,
+                   ctrl: bool = False) -> None:
+        mods = (8 if shift else 0) | (2 if ctrl else 0)
         await self.call("Input.dispatchKeyEvent", type="keyDown", key=key, code=code,
                         windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk, modifiers=mods)
         await self.call("Input.dispatchKeyEvent", type="keyUp", key=key, code=code,
@@ -674,6 +691,31 @@ def section_static() -> None:
         "打开配置目录（复用 open_dir + 配置路径父目录）": "function openConfigDir" in src and '"open_dir"' in src,
         "管理面重建（核心重启后一次性令牌重新 auth）": "function rebuildMgmt" in src,
         "管理面 op 记账（探针观察点）": "function traceOps" in src and "__opLog" in src,
+        # ---- 2026-09-21 复审四条（②–⑥）的源码落点。这些只是存在性；行为级断言在 main / notify 段：
+        # M41（预算从核心读 + 两组互斥）、M42（降级 chip + role=status）、M43（字号阶梯）、
+        # M44（侧栏筛选）、M45（Ctrl+1/2/3）、M46（.row.hidden 计算样式）、M47（设置面无开发者键控件）。
+        "生成预算从核心读（runtime.budget → 确认框）":
+            'mgmt!.call("runtime.budget"' in src and "async function budgetLine" in src
+            and "今日已用" in src,
+        "读不到预算的降级有 ponytail 标注": "ponytail:" in src,
+        "两组生成互斥（全局在途闸门 + 发起前拦下）":
+            "function generateBlocked" in src and "generateBusy.package || generateBusy.card" in src
+            and 'generateBlocked("package", "pkg-note")' in src
+            and 'generateBlocked("card", "card-note")' in src,
+        "降级 chip 可点（落点是设置面记忆组首个可编辑控件）":
+            "function openMemoryGroup" in src and "openMemoryGroup()" in src
+            and '$("degrade").addEventListener("click"' in src,
+        "降级口径不再写成故障（全文 = 默认态）":
+            "召回：全文（默认；点此启用语义召回）" in src and "语义召回不可用" not in src
+            and "全文召回（默认：语义召回未启用）" in src,
+        "侧栏筛选（键入即筛 + 重渲染后仍生效）":
+            "function applySideFilter" in src and "applySideFilter();" in src,
+        "快捷键最小集（Ctrl+K / Ctrl+1-3）":
+            "function bindShortcuts" in src and 'event.key === "k"' in src
+            and 'panes: Record<string, string> = { "1": "chat", "2": "manage", "3": "settings" }' in src,
+        "删除提示带实例标识尾段（校验仍比显示名）":
+            "function deleteHint" in src and "id.slice(-6)" in src
+            and "typed !== name" in src,
     }
     missing_wired = [key for key, present in wired.items() if not present]
     css_tokens = {
@@ -687,22 +729,52 @@ def section_static() -> None:
         "浏览器外表面取主题色": "color-scheme: light dark" in css and "::selection" in css,
         "空槽不占位": ".note:empty" in css,
         "被禁用的输入看得出禁用": "input:disabled" in css and "background: transparent" in css,
-        ".row.hidden 真的收起": ".row.hidden" in css,
+        # 治症不治根（复审 ⑤）：.row.hidden 必须排在 .row 之后（后写者胜），不靠 !important
+        ".row.hidden 真的收起（且排在 .row 之后）":
+            ".row.hidden" in css and css.find("\n.row {") < css.rfind("\n.row.hidden {"),
+        # 字号三档（复审 ③）：CSS 里只剩 12 / 14 / 24（正文 14 走 body 的 font 简写）
+        "字号只有 12 / 14 / 24 三档":
+            set(re.findall(r"font-size:\s*(\d+)px", css)) == {"12", "14", "24"}
+            and bool(re.search(r"font:\s*14px/1\.6", css)),
+        "筛选框样式（不与正文抢字号档）": "#side-filter" in css,
     }
     missing_css = [key for key, present in css_tokens.items() if not present]
+    html_tokens = {
+        # 复审 ②（行为级见 M42）：状态节点要被读屏播报；降级 chip 是可点的真 button
+        "状态条 role=status": 'id="status" class="chip pending" role="status"' in html,
+        "降级 chip 是 button 且 role=status":
+            'id="degrade" class="chip hidden" role="status"' in html and "<button type=\"button\" id=\"degrade\"" in html,
+        "生成进度槽 role=status（世界包 / 角色卡两个槽）":
+            all(f'id="{item}" class="muted note" role="status"' in html for item in ("pkg-note", "card-note")),
+        # 复审 ④：侧栏筛选框（行为级见 M44）
+        "侧栏筛选框": 'id="side-filter"' in html,
+    }
+    missing_html = [key for key, present in html_tokens.items() if not present]
     dev_ids = [item for item in re.findall(r'id="(set-[a-z-]+)"', html)
                if re.search(r"rate_max|max_active|catch_up|render_calls|per_day|quota", item)]
-    check("S8 2026-09-21 critique 既定顺序修复项在界面 / 渲染层 / 样式里的落点",
-          "PASS" if not (missing_ids or missing_wired or missing_css) else "FAIL",
-          f"界面控件缺={missing_ids or '无'}；渲染层接线缺={missing_wired or '无'}；样式缺={missing_css or '无'}",
+    # 【静态检查，不是行为级】本项只核对源码 / 静态 HTML 里的文本与属性存在性——
+    # 上一批的失效模式（源码改了但行为没改）在这里防不住，所以逐条的行为级等价断言放在 main 段的
+    # M34 / M41 / M42 / M43 / M44 / M45 / M46 / M47（真点真读）与 notify 段；本条保留是因为它一次
+    # 覆盖 30 条落点的清单，比行为探针更不容易漏项。
+    check("S8（静态检查：源码 / HTML 文本存在性；行为级见 M34·M41–M47）2026-09-21 critique 既定顺序修复项在界面 / 渲染层 / 样式里的落点",
+          "PASS" if not (missing_ids or missing_wired or missing_css or missing_html) else "FAIL",
+          f"界面控件缺={missing_ids or '无'}；渲染层接线缺={missing_wired or '无'}；"
+          f"样式缺={missing_css or '无'}；HTML 属性缺={missing_html or '无'}。"
+          "**本项口径 = 静态源码文本存在性断言（不驱动界面）**：判据是 main.ts / styles.css / index.html 里"
+          "出现对应文本；真正“点了会发生什么”由 M34（生成闸门与连点）、M41（预算从核心读 + 两组互斥）、"
+          "M42（降级 chip 跳转聚焦 + role=status）、M43（字号实测集合）、M44（筛选真筛）、M45（快捷键真切 pane）、"
+          "M46（.row.hidden 计算样式）、M47（设置面无开发者键控件）逐条取证",
           clause="DESKTOP_SPEC §3.1 附近反馈 / 顶栏世界时钟 · §3.3 设置面 · §四 视觉与可访问性",
           code="desktop/index.html · desktop/src/main.ts · desktop/src/styles.css")
-    check("S9 开发者专用键不在设置表单里（只作只读事实）",
+    # 【静态检查，不是行为级】S9 同样只看静态 HTML / 源码文本；行为级等价断言 = M47
+    # （渲染态：设置面没有任何开发者键控件，worldset-facts 里只有只读的「倍率上限（仅开发者）」事实行）。
+    check("S9（静态检查：源码 / HTML 文本存在性；行为级见 M47）开发者专用键不在设置表单里（只作只读事实）",
           "PASS" if not dev_ids and "worldset-facts" in html and "倍率上限（仅开发者）" in src else "FAIL",
           f"设置表单里出现的开发者键={dev_ids or '无'}（rate_max / max_active_timelines / "
           f"catch_up_batches / render_calls_per_day / 各类 token 额度一律只读）；"
           f"只读事实节点=worldset-facts={'在' if 'worldset-facts' in html else '缺'}；"
-          f"「倍率上限（仅开发者）」文案={'在' if '倍率上限（仅开发者）' in src else '缺'}",
+          f"「倍率上限（仅开发者）」文案={'在' if '倍率上限（仅开发者）' in src else '缺'}。"
+          "**本项口径 = 静态源码文本存在性断言**；渲染态行为级复核见 M47",
           clause="§3.3 世界 / 会话组：倍率上限只读且仅开发者可配置",
           code="desktop/index.html（settings 面各表单） · desktop/src/main.ts renderLocalFacts")
 
@@ -1084,28 +1156,52 @@ async def section_main() -> None:
         " card: ['card-generate','card-brief','card-name-input'].every(i=>!!document.getElementById(i))})")
     await clear_notes(cdp, "pkg-note", "world-note")
     gen_before = (await ops_log(cdp)).count("world.package.generate")
+    # ---- M41 准备：把实例级预算上限改成一个只有核心知道的数字（654321），再用确认框里的数字
+    # 证明「上限从核心读」而不是壳里写死的常量；同时记下核心账本里今日的调用次数。
+    gen_instance = await cdp.js("document.getElementById('inst-select').value")
+    await mgmt_call(cdp, "runtime.budget.set", instance_id=gen_instance,
+                    instance_tokens_per_day=654321)
+    budget_head = await mgmt_call(cdp, "runtime.budget", instance_id=gen_instance)
+    budget_limits = dict(budget_head.get("limits") or {})
+    budget_used = sum(int(row.get("calls") or 0) for row in (budget_head.get("rows") or []))
+    card_ops_before = (await ops_log(cdp)).count("world.card.generate")
     # 页面侧观察点：① disabled 属性突变记录（不受探针采样节奏影响，能看见瞬时的在途窗口）；
     # ② 闸门刚合上的那个微任务里自动补一次「连点」（程序化 click + 派发 click）——
-    #    浏览器对 disabled 按钮两条路都不派发，这正是「连点不得发第二次」的现场。
+    #    浏览器对 disabled 按钮两条路都不派发，这正是「连点不得发第二次」的现场；
+    # ③ 同一时刻对另一组（角色卡）发起一次：两组互斥必须在这里挡住（M41 的证据）。
     await cdp.js(
         "(()=>{window.__gateLog=[];window.__reentry={tried:false,disabledAtClick:null};"
+        "window.__mutex={cardDisabled:null,cardDisabledAtClick:null,cardNote:null};"
         "const b=document.getElementById('pkg-generate');"
+        "const c=document.getElementById('card-generate');"
         "if(window.__gateObs)window.__gateObs.disconnect();"
         "window.__gateObs=new MutationObserver(()=>{const d=b.disabled;"
         "window.__gateLog.push({d:d,note:document.getElementById('pkg-note').textContent});"
         "if(d&&!window.__reentry.tried){window.__reentry.tried=true;"
         "b.click();b.dispatchEvent(new MouseEvent('click',{bubbles:true}));"
-        "window.__reentry.disabledAtClick=b.disabled;}});"
+        "window.__reentry.disabledAtClick=b.disabled;"
+        "window.__mutex.cardDisabled=c.disabled;"
+        "c.click();c.dispatchEvent(new MouseEvent('click',{bubbles:true}));"
+        "window.__mutex.cardDisabledAtClick=c.disabled;"
+        "window.__mutex.cardNote=document.getElementById('card-note').textContent;}});"
         "window.__gateObs.observe(b,{attributes:true,attributeFilter:['disabled']});})()")
     await cdp.js("document.getElementById('pkg-brief').value='审计闸门用世界描述';"
                  "document.getElementById('pkg-file').value='a2gate.json';"
                  "document.getElementById('pkg-generate').click()")
     gen_final = await wait_note(cdp, ("pkg-note", "world-note"), "草稿", 150)
-    gate = await cdp.js("({log:(window.__gateLog||[]).slice(),reentry:window.__reentry||null})")
+    gate = await cdp.js("({log:(window.__gateLog||[]).slice(),reentry:window.__reentry||null,"
+                        "mutex:window.__mutex||null})")
     await cdp.js("if(window.__gateObs)window.__gateObs.disconnect()")
     gen_after = (await ops_log(cdp)).count("world.package.generate")
+    card_ops_after = (await ops_log(cdp)).count("world.card.generate")
+    confirm_gate = await cdp.js("window.__confirmArgs.slice(-1)[0] || ''")
+    # 生成结束后再读一次核心账本：确认框里那个「今日已用 n 次」必须落在两次读数之间
+    # （账本是活的：跑着的激活线会在探针读数之后继续记账，所以判据是区间而不是相等）
+    budget_tail = await mgmt_call(cdp, "runtime.budget", instance_id=gen_instance)
+    budget_used_after = sum(int(row.get("calls") or 0) for row in (budget_tail.get("rows") or []))
     inflight = next((row for row in (gate["log"] or []) if row.get("d")), {})
     reentry = gate["reentry"] or {}
+    mutex = gate.get("mutex") or {}
     check("M34 §3.1/§十.11 生成在途有仪表（已用 / 上限）、相关控件禁用、连点不发起第二次调用",
           "PASS" if (gen_controls["pkg"] and gen_controls["card"]
                      and inflight and "生成中" in str(inflight.get("note"))
@@ -1122,6 +1218,203 @@ async def section_main() -> None:
           clause="§3.1 界面状态可见（生成过程有已用时长与上限，不用「一两分钟」糊）／§十.11 调用上限与用量回报",
           code="desktop/src/main.ts setGenerateGate / startProgress / GENERATE_LIMIT / window.__opLog",
           expected="在途时三控件禁用、进度行给已用与上限、连点只发一次调用、完成后回报实际用量与用时")
+
+    # ================= 2026-09-21 impeccable 复审：壳侧四条（①②③④⑤⑥）的行为级断言 =================
+
+    # ---- M41 复审①：付费预算从核心读 + 世界包 / 角色卡两组生成互斥（数据取自上面同一次生成）
+    printed_used = re.search(r"今日已用 (\d+) 次", str(confirm_gate))
+    printed_calls = int(printed_used.group(1)) if printed_used else -1
+    used_ok = bool(printed_used) and budget_used <= printed_calls <= budget_used_after
+    limit_expect = str(budget_limits.get("instance_tokens_per_day") or "")
+    task_expect = f"上限 {budget_limits.get('task_tokens_per_day')} token"
+    check("M41 复审① 生成预算从核心读（确认框写核心的今日调用数与上限）+ 两组生成互斥",
+          "PASS" if (used_ok and limit_expect and limit_expect in str(confirm_gate)
+                     and task_expect in str(confirm_gate)
+                     and mutex.get("cardDisabled") is True and mutex.get("cardDisabledAtClick") is True
+                     and "互斥" in str(mutex.get("cardNote"))
+                     and (card_ops_after - card_ops_before) == 0) else "FAIL",
+          f"确认框（真文案）={str(confirm_gate)[:300]!r}；探针先把实例上限改成 654321 再经壳读回："
+          f"核心 runtime.budget.limits={budget_limits} → 确认框里出现 {limit_expect!r}="
+          f"{bool(limit_expect) and limit_expect in str(confirm_gate)}（壳里写死的常量给不出这个数）；"
+          f"核心账本今日调用：探针读数 {budget_used} → 确认框写 {printed_calls} → 生成结束后再读 "
+          f"{budget_used_after}（区间内={used_ok}；账本是活的，判据是区间不是相等，但落在区间外就说明"
+          f"这个数不来自核心）；世界包在途时角色卡组：按钮 disabled="
+          f"{mutex.get('cardDisabled')}、点击时仍 disabled={mutex.get('cardDisabledAtClick')}、"
+          f"点后本组提示={str(mutex.get('cardNote'))!r}；角色卡生成实际调用数 "
+          f"{card_ops_before}→{card_ops_after}（互斥窗口内 0 次）",
+          clause="§十.11 生成前给出调用预估与上限（上限取核心预算，不写死在壳里）／§3.1 两组生成互斥",
+          code="desktop/src/main.ts budgetLine / setGenerateGate / generateBlocked",
+          expected="确认框里的「今日已用 n 次 / 上限 N」两处数字与核心 runtime.budget 一致（含只有核心知道的实例上限）；"
+                   "一组在跑时另一组控件禁用、点击不产生管理面调用、本组槽里给出互斥说明")
+
+    # ---- M42 复审②：降级 chip 的口径 / 可点（跳设置面记忆组 + 聚焦首控件）/ 三个状态节点 role=status
+    chip_roles = await cdp.js(
+        "(()=>{const r=id=>{const el=document.getElementById(id);"
+        "return el?{role:el.getAttribute('role'),live:el.getAttribute('aria-live'),tag:el.tagName,"
+        "text:(el.textContent||'').trim().slice(0,60)}:null};"
+        "return {degrade:r('degrade'),status:r('status'),pkg:r('pkg-note'),card:r('card-note')};})()")
+    await cdp.js("document.getElementById('degrade').click()")
+    await asyncio.sleep(1.5)
+    jumped = await cdp.js(
+        "({settings: !document.getElementById('pane-settings').classList.contains('hidden'),"
+        " chat: !document.getElementById('pane-chat').classList.contains('hidden'),"
+        " active: (document.activeElement&&document.activeElement.id)||'',"
+        " chipHidden: document.getElementById('degrade').classList.contains('hidden')})")
+    check("M42 复审② 降级口径不再像故障 + chip 可点（切设置面记忆组并聚焦首个可编辑控件）+ 状态节点 role=status",
+          "PASS" if (chip_roles["degrade"] and chip_roles["degrade"]["role"] == "status"
+                     and chip_roles["status"] and chip_roles["status"]["role"] == "status"
+                     and chip_roles["pkg"] and chip_roles["pkg"]["role"] == "status"
+                     and chip_roles["card"] and chip_roles["card"]["role"] == "status"
+                     and "语义召回" in str(chip_roles["degrade"]["text"])
+                     and "不可用" not in str(chip_roles["degrade"]["text"])
+                     and jumped["settings"] and not jumped["chat"]
+                     and jumped["active"] == "set-mem-mode") else "FAIL",
+          f"chip 文本={chip_roles['degrade']['text']!r}（口径=在说「现在用哪种召回」，不再写「不可用」）；"
+          f"状态节点：degrade={chip_roles['degrade']}、status={chip_roles['status']}、"
+          f"生成进度槽 pkg-note={chip_roles['pkg']}、card-note={chip_roles['card']}；"
+          f"点 chip → 设置面可见={jumped['settings']}、聊天面仍可见={jumped['chat']}（应 False）、"
+          f"document.activeElement={jumped['active']!r}",
+          clause="§3.1 界面状态可见（状态 / 进度 / 降级对读屏可用）／§六 降级是常态不是故障",
+          code="desktop/index.html #degrade/#status/#pkg-note/#card-note · main.ts renderDegrade / openMemoryGroup",
+          expected="三个状态节点都有 role=status；chip 文案说明「正在用全文召回（默认）」；"
+                   "点击后切到设置面记忆组并聚焦它的第一个可编辑控件")
+
+    # ---- M47 复审⑥：S9 的渲染态等价（设置面有没有能改开发者键的控件）
+    dev_live = await cdp.js(
+        "(()=>{const ids=[...document.querySelectorAll('#pane-settings input,#pane-settings select')]"
+        ".map(e=>e.id).filter(Boolean);"
+        "const bad=ids.filter(id=>/rate_max|max_active|catch_up|render_calls|per_day|quota/.test(id));"
+        "const facts=document.getElementById('worldset-facts').textContent||'';"
+        "return {controls:ids.length,bad:bad,fact:facts.includes('倍率上限（仅开发者）'),facts:facts.slice(0,180)};})()")
+    check("M47 复审⑥（S9 的行为级等价）设置面没有开发者键控件，倍率上限只作只读事实",
+          "PASS" if (not dev_live["bad"] and dev_live["fact"]) else "FAIL",
+          f"设置面活体控件 {dev_live['controls']} 个，命中开发者键的={dev_live['bad'] or '无'}"
+          f"（rate_max / max_active_timelines / catch_up_batches / render_calls_per_day / 各类 per_day 额度）；"
+          f"worldset-facts 含「倍率上限（仅开发者）」={dev_live['fact']}；事实文本={dev_live['facts']!r}",
+          clause="§3.3 世界 / 会话组：倍率上限只读且仅开发者可配置",
+          code="desktop/index.html（settings 面各表单） · main.ts renderLocalFacts",
+          expected="设置面没有任何改这些键的控件；它们只出现在只读事实里")
+
+    # ---- M43 复审③：字号阶梯实测（规则镜像 + 技能自带检测器复跑）
+    sizes = await cdp.js(
+        "(()=>{const s=new Set();"
+        "for(const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,span,a,li,td,th,label,button,div')){"
+        "const fs=parseFloat(getComputedStyle(el).fontSize);"
+        "if(fs>0&&fs<200)s.add(Math.round(fs*10)/10);}"
+        "const sorted=[...s].sort((a,b)=>a-b);"
+        "return {sizes:sorted, ratio: sorted.length? +(sorted[sorted.length-1]/sorted[0]).toFixed(2):0};})()")
+    detector_hits: list = []
+    detector_path = impeccable_detector()
+    if detector_path:
+        try:
+            await cdp.js("window.__IMPECCABLE_CONFIG__={autoScan:false};"
+                         + detector_path.read_text(encoding="utf-8"))
+            detector_hits = await cdp.js(
+                "(()=>{try{const out=[];const raw=window.impeccableDetect({serialize:false})||[];"
+                "for(const g of raw){const fs=(g&&g.findings)||[];"
+                "if(fs.length){for(const f of fs)out.push(f.type||f.id||'?');}"
+                "else if(g&&(g.type||g.id))out.push(g.type||g.id);}"
+                "return out;}catch(e){return ['@error:'+String(e)]}})()") or []
+            detector_note = (f"技能自带检测器（{detector_path.name}）渲染态复跑 → 全量 findings="
+                             f"{detector_hits or '无'}；flat-type-hierarchy "
+                             f"{'命中（不合格）' if 'flat-type-hierarchy' in detector_hits else '0 命中'}")
+        except Exception as exc:  # noqa: BLE001
+            detector_note = f"检测器注入失败（{str(exc)[:120]}）→ 只用下面的镜像判定"
+    else:
+        detector_note = "未找到技能自带检测器 → 只用镜像判定（同一查询 / 同一四舍五入 / 同一阈值）"
+    check("M43 复审③ 字号阶梯只剩三档（12 / 14 / 24），实测不再触发 flat-type-hierarchy",
+          "PASS" if (sizes["sizes"] and set(sizes["sizes"]) <= {12, 14, 24} and sizes["ratio"] >= 2.0
+                     and "flat-type-hierarchy" not in detector_hits) else "FAIL",
+          f"渲染态实测字号集合={sizes['sizes']}（max/min={sizes['ratio']}，规则是 <2.0 才报）；"
+          f"判据镜像自 detect-antipatterns-browser.js:4707-4717（同一 querySelectorAll 名单 / 同一 "
+          f"Math.round(fs*10)/10 / 同一 ratio<2.0 阈值）；{detector_note}",
+          clause="§四 视觉：字号阶梯有真层级（三档：正文 14 / 次级 12 / 标题 24）",
+          code="desktop/src/styles.css（.brand · h2 = 24、body = 14、次级与输入 = 12）",
+          expected="实测集合 ⊆ {12,14,24} 且 max/min ≥ 2.0；真检测器不再报 flat-type-hierarchy")
+
+    # ---- M44 复审④：侧栏过滤框（键入即筛 / 按内容匹配 / Esc 清空恢复 / Ctrl+K 聚焦）
+    rows_expr = ("(()=>{const all=[];for(const id of ['sessions','timelines']){"
+                 "for(const el of document.getElementById(id).children)all.push(el);}"
+                 "const vis=all.filter(e=>!e.classList.contains('hidden'));"
+                 "return {total:all.length,vis:vis.length,texts:vis.map(e=>e.textContent)};})()")
+    side_before = await cdp.js(rows_expr)
+    await cdp.keys("k", "KeyK", 75, ctrl=True)
+    await asyncio.sleep(0.5)
+    focus_after_ctrl_k = await cdp.js("(document.activeElement&&document.activeElement.id)||''")
+    await cdp.js("(()=>{const el=document.getElementById('side-filter');"
+                 "el.value='zzz-没有这一行';el.dispatchEvent(new Event('input'))})()")
+    await asyncio.sleep(0.4)
+    side_none = await cdp.js(rows_expr)
+    needle = str((side_before["texts"] or [""])[0])[:2]
+    await cdp.js("(()=>{const el=document.getElementById('side-filter');"
+                 f"el.value={json.dumps(needle)};el.dispatchEvent(new Event('input'))}})()")
+    await asyncio.sleep(0.4)
+    side_hit = await cdp.js(rows_expr)
+    await cdp.js("document.getElementById('side-filter').dispatchEvent("
+                 "new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))")
+    await asyncio.sleep(0.4)
+    side_back = await cdp.js(rows_expr)
+    filter_value_after_esc = await cdp.js("document.getElementById('side-filter').value")
+    hit_all_match = bool(side_hit["texts"]) and all(needle in str(text) for text in side_hit["texts"])
+    check("M44 复审④ 侧栏过滤框：键入即筛（可见行减少）、真按内容匹配、Esc 清空后恢复",
+          "PASS" if (focus_after_ctrl_k == "side-filter"
+                     and side_before["vis"] == side_before["total"] and side_before["total"] >= 2
+                     and side_none["vis"] == 0 and side_none["total"] == side_before["total"]
+                     and side_hit["vis"] >= 1 and hit_all_match
+                     and side_back["vis"] == side_before["total"]
+                     and filter_value_after_esc == "") else "FAIL",
+          f"Ctrl+K → 焦点={focus_after_ctrl_k!r}；筛前可见 {side_before['vis']}/{side_before['total']} 行；"
+          f"键入不存在的词 → 可见 {side_none['vis']} 行（对象仍是 {side_none['total']} 行，只是被收起）；"
+          f"键入首行前两字 {needle!r} → 可见 {side_hit['vis']} 行、全部含该词={hit_all_match}"
+          f"（{side_hit['texts']}）；Esc 清空后 → 输入框={filter_value_after_esc!r}、"
+          f"可见 {side_back['vis']}/{side_back['total']} 行（完全恢复）",
+          clause="§3.1 列表可用性（老手效率最小集：过滤，不做批量操作）",
+          code="desktop/index.html#side-filter · main.ts applySideFilter / bindShortcuts",
+          expected="键入即筛（可见行数减少且只留内容匹配的行），Esc 清空后完全恢复；Ctrl+K 聚焦过滤框")
+
+    # ---- M45 复审④：Ctrl+1/2/3 切三个 pane
+    pane_expr = ("({chat:!document.getElementById('pane-chat').classList.contains('hidden'),"
+                 "manage:!document.getElementById('pane-manage').classList.contains('hidden'),"
+                 "settings:!document.getElementById('pane-settings').classList.contains('hidden')})")
+    pane_start = await cdp.js(pane_expr)
+    await cdp.keys("1", "Digit1", 49, ctrl=True)
+    await asyncio.sleep(0.9)
+    pane_1 = await cdp.js(pane_expr)
+    await cdp.keys("3", "Digit3", 51, ctrl=True)
+    await asyncio.sleep(0.9)
+    pane_3 = await cdp.js(pane_expr)
+    await cdp.keys("2", "Digit2", 50, ctrl=True)
+    await asyncio.sleep(0.9)
+    pane_2 = await cdp.js(pane_expr)
+    check("M45 复审④ Ctrl+1/2/3 切聊天 / 管理 / 设置三个 pane",
+          "PASS" if (pane_1 == {"chat": True, "manage": False, "settings": False}
+                     and pane_3 == {"chat": False, "manage": False, "settings": True}
+                     and pane_2 == {"chat": False, "manage": True, "settings": False}) else "FAIL",
+          f"起点（刚点完 chip，在设置面）={pane_start}；Ctrl+1 → {pane_1}；Ctrl+3 → {pane_3}；"
+          f"Ctrl+2 → {pane_2}（每步只有一个 pane 可见）",
+          clause="§3.1 键盘效率最小集（不做全局命令面板）",
+          code="desktop/src/main.ts bindShortcuts",
+          expected="Ctrl+1/2/3 分别切到聊天 / 管理 / 设置，同一时刻只有一个 pane 可见")
+
+    # ---- M46 复审⑤：.row.hidden 的计算样式护栏（治根：规则排在 .row 之后）
+    hidden_guard = await cdp.js(
+        "(()=>{const row=document.getElementById('inst-convert-row');"
+        "const has=row.classList.contains('hidden');"
+        "const off=getComputedStyle(row).display;"
+        "row.classList.remove('hidden');const shown=getComputedStyle(row).display;"
+        "row.classList.add('hidden');const back=getComputedStyle(row).display;"
+        "return {has:has,hidden:off,shown:shown,back:back};})()")
+    check("M46 复审⑤ .row.hidden 的渲染态计算样式（护栏：隐藏规则必须压过 .row 的 display:flex）",
+          "PASS" if (hidden_guard["has"] and hidden_guard["hidden"] == "none"
+                     and hidden_guard["shown"] == "flex" and hidden_guard["back"] == "none") else "FAIL",
+          f"#inst-convert-row（.row.hidden）带 hidden 类={hidden_guard['has']}；计算样式：带 hidden → "
+          f"display={hidden_guard['hidden']!r}；临时摘掉 hidden → display={hidden_guard['shown']!r}"
+          f"（正对照：证明这条判据能区分两种情况，不是恒为 none）；再戴回 → {hidden_guard['back']!r}",
+          clause="§四 视觉：.row.hidden 真的收起（治根：规则排在 .row 之后，不靠 !important）",
+          code="desktop/src/styles.css 文件末尾 .row.hidden",
+          expected="带 .hidden 时计算样式 display=none；摘掉时 display=flex")
+    await cdp.pane("manage")
+    await asyncio.sleep(0.5)
 
     # ---- M35 harden：删除实例的闸门（离开实例行 + 键入实例名 + 写清保留什么）
     gate_inst = (await mgmt_call(cdp, "instance.create",
@@ -1154,21 +1447,26 @@ async def section_main() -> None:
     gone = one(root, "SELECT COUNT(*) FROM instance WHERE id=?", (gate_inst["id"],))
     del_note = await cdp.js("document.getElementById('inst-delete-note').textContent")
     del_confirm = await cdp.js("window.__confirmArgs.slice(-1)[0] || ''")
-    check("M35 §3.2 删除实例要键入实例名才放行；入口离开实例行，并写明保留什么",
+    inst_tail = f"#{str(gate_inst['id'])[-6:]}"   # 复审⑤：删除提示里的实例标识尾段
+    check("M35 §3.2 删除实例要键入实例名才放行；入口离开实例行，并写明保留什么 + 实例标识尾段",
           "PASS" if (gate0["disabled"] is True and gate0["row"] and not gate0["same_row"]
                      and "将保留：世界包 / 角色卡 / 导出件" in str(gate0["note"])
+                     and inst_tail in str(gate0["note"])
                      and gate_wrong is True and alive_after_wrong == 1
                      and gate_right is False and gone == 0
                      and "已删除" in str(del_note)
-                     and "不可撤销" in str(del_confirm) and "将保留" in str(del_confirm)) else "FAIL",
+                     and "不可撤销" in str(del_confirm) and "将保留" in str(del_confirm)
+                     and inst_tail in str(del_confirm)) else "FAIL",
           f"未输入名字时删除按钮 disabled={gate0['disabled']}（输入错名字后仍={gate_wrong}，"
           f"派发点击后实例仍在=实例表 {alive_after_wrong} 行）；入口在独立 .delete-row={gate0['row']}、"
-          f"与实例下拉同一行={gate0['same_row']}（应为 False）；行内保留清单={gate0['note']!r}；"
+          f"与实例下拉同一行={gate0['same_row']}（应为 False）；行内保留清单={gate0['note']!r}"
+          f"（含实例 id 尾段 {inst_tail!r}={inst_tail in str(gate0['note'])}）；"
           f"键入正确名字后可点={gate_right is False} → 删除后实例表 {gone} 行；结果提示={del_note!r}；"
-          f"确认框={str(del_confirm)[:120]!r}",
+          f"确认框={str(del_confirm)[:140]!r}（含尾段={inst_tail in str(del_confirm)}）",
           clause="§3.2 删除需二次确认，明确范围与失去的进展（破坏性操作不贴着它的目标）",
-          code="desktop/index.html#inst-delete-name · main.ts renderDeleteGate / inst-delete 处理器",
-          expected="未键入实例名时不可点、点击不生效；键入后删除并回报；保留清单与确认框都写清范围")
+          code="desktop/index.html#inst-delete-name · main.ts renderDeleteGate / deleteHint / inst-delete 处理器",
+          expected="未键入实例名时不可点、点击不生效；键入后删除并回报；保留清单与确认框都写清范围"
+                   "（同名实例靠 id 尾段区分；校验仍比显示名，不让用户输 id）")
 
     # ---- M36 polish：动作结果就近落在本组的行内槽，页顶不再承接组内结果
     await cdp.pane("manage")
@@ -1791,7 +2089,9 @@ async def section_main() -> None:
              and not str(create_slots["top"]).strip()
              and "已导入为" in str(import_slot) and "已导入为" not in str(import_slots["select_row"])
              and not str(import_slots["top"]).strip()
-             and del_hint.strip() == "将保留：世界包 / 角色卡 / 导出件" and armed is True
+             and del_hint.strip().startswith("将保留：世界包 / 角色卡 / 导出件")
+             and f"（实例 #{str(made_id)[-6:]}）" in str(del_hint)   # 复审⑤：提示带实例标识尾段
+             and armed is True
              and "实例不存在" in str(del_note) and "实例不存在" not in str(del_slots["select_row"])
              and not str(del_slots["top"]).strip())
     check("I7 polish 四处影子槽归位：槽只服务本行（补卡 / 创建实例 / 导入实例 / 删除失败）",

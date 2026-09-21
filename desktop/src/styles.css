@@ -1,4 +1,7 @@
-/* 黑白极简：无衬线、细描边、跟随系统明暗（DESKTOP_SPEC §4） */
+/* 黑白极简：无衬线、细描边、跟随系统明暗（DESKTOP_SPEC §4）。
+   字号阶梯只有三档（2026-09-21 复审）：正文 14 / 次级·标签·输入 12 / 标题 24（h2 与品牌）。
+   原来 11/12/13/14/16 五档之间差太小（max/min=1.45）等于没有层级；同档内靠字重与分隔线分级。
+   改字号前先想清楚落哪一档，别再添第四档。 */
 
 :root {
   --bg: #ffffff;
@@ -114,9 +117,20 @@ button.primary {
 }
 
 .brand {
-  font-size: 16px;
+  font-size: 24px;
   font-weight: 600;
   letter-spacing: 0.08em;
+}
+
+/* 侧栏筛选框（老手效率最小集）：只筛会话 / 时间线两条列表，键入即筛、Ctrl+K 聚焦、Esc 清空 */
+#side-filter {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
 }
 
 .section-title {
@@ -136,7 +150,7 @@ button.primary {
   padding: 6px 8px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  font-size: 13px;
+  font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -216,10 +230,6 @@ nav {
 .chip.bad {
   border-color: var(--bad);
   color: var(--bad);
-}
-
-.chip.small {
-  font-size: 11px;
 }
 
 .pane {
@@ -377,7 +387,7 @@ nav {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--muted);
 }
 
@@ -403,12 +413,6 @@ nav {
   gap: 10px;
 }
 
-/* .hidden 在文件靠前、.row 在后：同等特异度下 display:flex 会盖掉 display:none，
-   于是 .row.hidden（如 #inst-convert-row）在界面上仍然显示（2026-09-21 截图核对发现）。 */
-.row.hidden {
-  display: none;
-}
-
 /* 组内结果槽：空时不占位（就近反馈，但空着不吃 gap） */
 .note:empty {
   display: none;
@@ -419,7 +423,7 @@ nav {
   grid-template-columns: max-content 1fr;
   gap: 4px 16px;
   margin: 0;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .facts dt {
@@ -434,7 +438,7 @@ nav {
 /* 版本与计数：零实例时不占首屏（折叠一条摘要行） */
 #manage-facts-box > summary {
   color: var(--muted);
-  font-size: 13px;
+  font-size: 12px;
   cursor: pointer;
 }
 
@@ -444,16 +448,16 @@ nav {
 
 h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: 24px;
 }
 
-/* 分组标题：13px/600 + 上方 1px 分隔线——层级不靠灰度承载（§四） */
+/* 分组标题：14px（正文档）/600 + 上方 1px 分隔线——层级不靠灰度承载（§四） */
 #pane-manage h3,
 #pane-settings h3 {
   margin: 18px 0 6px;
   padding-top: 14px;
   border-top: 1px solid var(--border);
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
   color: var(--ink);
 }
@@ -466,7 +470,7 @@ h2 {
   background: var(--surface);
   color: var(--ink);
   font: inherit;
-  font-size: 13px;
+  font-size: 12px;
   min-width: 0;
 }
 
@@ -546,7 +550,7 @@ button.session {
   background: transparent;
   color: var(--ink);
   font: inherit;
-  font-size: 13px;
+  font-size: 12px;
   text-align: left;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -581,4 +585,12 @@ textarea:disabled,
   cursor: default;
   background: transparent;
   border-style: dashed; /* 白底上「不变灰就看不出来」：用虚线边框把「不可编辑」说清楚 */
+}
+
+/* 隐藏规则的最后一手（2026-09-21 复审：治症不治根）：`.hidden` 在文件靠前、`.row` 在后，
+   同等特异度下 `display: flex` 会盖掉 `display: none`，于是 `.row.hidden`（如 #inst-convert-row）
+   在界面上照样显示。解决办法是把这条规则放到文件最末尾——后写者胜，不靠 `!important` 记性。
+   行为护栏：渲染态断言 `.row.hidden` 的计算样式 display === 'none'（审计 M46）。 */
+.row.hidden {
+  display: none;
 }

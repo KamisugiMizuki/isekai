@@ -328,6 +328,15 @@ function openApiKeyField(): void {
   field.focus();
 }
 
+/// 设置面落点：切到设置页并把「记忆向量化（语义召回）」组的第一个可编辑控件顶到眼前
+/// （顶栏降级 chip 的落点；照 openApiKeyField 的写法——只导航与聚焦，不替用户改配置）
+function openMemoryGroup(): void {
+  document.querySelector<HTMLButtonElement>('nav .nav[data-pane="settings"]')?.click();
+  const field = $<HTMLSelectElement>("set-mem-mode");
+  field.scrollIntoView({ block: "center" });
+  field.focus();
+}
+
 /// 生成前的付费闸门（世界包与角色卡共用这一处）：没配 API Key 就不弹确认框 ——
 /// 否则第一次生成是一堵没有门的墙：用户付出等待，只拿回核心的原始错误。
 /// 这里直接在发起按钮旁的行内槽写「去设置面填 Key」+ 一个真跳转（照 openFirstWorld 的写法）。
@@ -349,7 +358,7 @@ function apiKeyBlocked(settings: SettingsPayload, slotId: string): boolean {
 
 function chip(text: string, kind: string): HTMLElement {
   const element = document.createElement("span");
-  element.className = `chip small ${kind}`;
+  element.className = `chip ${kind}`;
   element.textContent = text;
   return element;
 }
@@ -707,6 +716,46 @@ function renderSessionList(): void {
     item.appendChild(button);
     list.appendChild(item);
   }
+  applySideFilter(); // 筛选是常驻状态：重渲染后照旧生效
+}
+
+/// 侧栏筛选（老手效率最小集）：一个过滤框管两条列表，键入即筛（大小写不敏感的子串）；
+/// Ctrl+K 聚焦、Esc 清空。列表重渲染后要再筛一次，否则筛选状态会被 innerHTML 冲掉。
+function applySideFilter(): void {
+  const input = document.getElementById("side-filter") as HTMLInputElement | null;
+  const needle = input?.value.trim().toLowerCase() ?? "";
+  for (const listId of ["sessions", "timelines"]) {
+    for (const item of Array.from($(listId).children)) {
+      const hit = !needle || (item.textContent ?? "").toLowerCase().includes(needle);
+      item.classList.toggle("hidden", !hit);
+    }
+  }
+}
+
+/// 键盘最小集（老手效率）：Ctrl+K 聚焦侧栏筛选框，Ctrl+1/2/3 切聊天 / 管理 / 设置三个 pane。
+/// 只做这三条（不做批量操作、不做全局命令面板），键位与浏览器/系统不冲突。
+function bindShortcuts(): void {
+  $<HTMLInputElement>("side-filter").addEventListener("input", () => applySideFilter());
+  $<HTMLInputElement>("side-filter").addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    (event.target as HTMLInputElement).value = "";
+    applySideFilter();
+  });
+  const panes: Record<string, string> = { "1": "chat", "2": "manage", "3": "settings" };
+  document.addEventListener("keydown", (event) => {
+    if (!event.ctrlKey || event.altKey) return;
+    if (event.key === "k" || event.key === "K") {
+      event.preventDefault();
+      const filter = $<HTMLInputElement>("side-filter");
+      filter.focus();
+      filter.select();
+      return;
+    }
+    const pane = panes[event.key];
+    if (!pane) return;
+    event.preventDefault();
+    document.querySelector<HTMLButtonElement>(`nav .nav[data-pane="${pane}"]`)?.click();
+  });
 }
 
 /// 侧栏世界组：当前实例的时间线与公开状态（不做世界内容浏览，§一）
@@ -725,6 +774,7 @@ function renderTimelines(): void {
     item.textContent = `${line.name}（${line.state === "frozen" ? "冻结" : "激活"}）`;
     list.appendChild(item);
   }
+  applySideFilter(); // 筛选是常驻状态：重渲染后照旧生效
 }
 
 /* ---------- 会话：选会话 / 换会话（§3.1 切换角色、世界、时间线就是选择另一会话，不迁移历史） ---------- */
@@ -1269,7 +1319,7 @@ function fillMemorySegment(segment: Record<string, unknown> | undefined): void {
     ["服务地址", String(segment.base_url || "未配置")],
     ["模型", String(segment.model || "未配置")],
     ["API Key", segment.api_key_set ? "已配置（读取打码）" : "尚未配置"],
-    ["当前状态", segment.ready ? "可用：记忆检索走远程语义召回" : "不可用：已降级为全文召回"],
+    ["当前状态", segment.ready ? "可用：记忆检索走远程语义召回" : "全文召回（默认：语义召回未启用）"],
   ]);
 }
 
@@ -1378,12 +1428,14 @@ function recallReady(): boolean {
   return Boolean(facts && facts.memory_model && facts.memory_base_url && facts.memory_key_set);
 }
 
-/// 降级只在顶栏给一句标识，不带地址与凭据（§二.6 / §十.7）
+/// 降级只在顶栏给一句标识，不带地址与凭据（§二.6 / §十.7）。
+/// 口径（2026-09-21 复审）：全文召回是默认态，不是故障——chip 说的是「现在用哪种召回」，
+/// 不再写成「不可用」；chip 自身可点：切设置面「记忆向量化」组并聚焦第一个可编辑控件。
 function renderDegrade(): void {
-  const chip = $("degrade");
-  const degraded = Boolean(state.facts) && !recallReady();
-  chip.classList.toggle("hidden", !degraded);
-  chip.textContent = degraded ? "语义召回不可用（已降级为全文）" : "";
+  const chip = $<HTMLButtonElement>("degrade");
+  const fullTextOnly = Boolean(state.facts) && !recallReady();
+  chip.classList.toggle("hidden", !fullTextOnly);
+  chip.textContent = fullTextOnly ? "召回：全文（默认；点此启用语义召回）" : "";
 }
 
 /// 只读设置事实（记忆 / 提交 / 世界·会话 组）：核心 settings 契约不含这些键，
@@ -1409,7 +1461,7 @@ function renderLocalFacts(): void {
     ["服务地址", facts.memory_base_url || "未配置"],
     ["模型", facts.memory_model || "未配置"],
     ["API Key", facts.memory_key_set ? "已配置（读取打码）" : "尚未配置"],
-    ["当前状态", recallReady() ? "可用：记忆检索走远程语义召回" : "不可用：已降级为全文召回"],
+    ["当前状态", recallReady() ? "可用：记忆检索走远程语义召回" : "全文召回（默认：语义召回未启用）"],
     ["说明", "这组键由核心运行时配置管理，本界面只读"],
   ]);
   renderFacts($("commit-facts"), [
@@ -1762,10 +1814,11 @@ const world: WorldCache = {
 let disclosureSelection: DisclosureSelection | null = null;
 const GENERATE_TIMEOUT_MS = 600000;
 
-/// 生成（世界包 / 角色卡）闸门：进行中禁用该组三个控件，二次点击直接拦下（连点 = 第二次付费调用）。
+/// 生成（世界包 / 角色卡）闸门：两组共用一个**全局在途闸门**（互斥）——一个在跑时另一组也发不起；
+/// 进行中禁用两组控件，二次点击直接拦下（连点 = 第二次付费调用）。
 /// 过程没有进度事件，只有已用时长与上限——不装进度条、不写「一两分钟」（§3.1 诚实反馈）。
 const generateBusy = { package: false, card: false };
-/// 调用上限：与确认框里写的一致；完成后以核心回的 usage.limit 为准
+/// 调用上限：与核心 generator 的默认值一致（段数 × 2 / 卡片 2）；完成后以核心回的 usage.limit 为准
 const GENERATE_LIMIT = { package: 6, card: 2 };
 const GENERATE_CONTROLS = {
   package: ["pkg-generate", "pkg-brief", "pkg-name"],
@@ -1776,8 +1829,47 @@ const progressTimers: Record<"package" | "card", number | null> = { package: nul
 
 function setGenerateGate(kind: "package" | "card", busy: boolean): void {
   generateBusy[kind] = busy;
-  for (const id of GENERATE_CONTROLS[kind]) {
-    ($(id) as HTMLButtonElement | HTMLInputElement).disabled = busy;
+  // 全局互斥：任一组在跑，两组的控件都禁用（同一实例上叠两次付费调用没有意义）
+  const blocked = generateBusy.package || generateBusy.card;
+  for (const group of ["package", "card"] as const) {
+    for (const id of GENERATE_CONTROLS[group]) {
+      ($(id) as HTMLButtonElement | HTMLInputElement).disabled = blocked;
+    }
+  }
+}
+
+/// 发起前的互斥闸门：本组在跑（连点）静默拦下；另一组在跑就在本组行内槽说清楚（§3.1 就近反馈）
+function generateBlocked(kind: "package" | "card", slotId: string): boolean {
+  if (!generateBusy.package && !generateBusy.card) return false;
+  if (!generateBusy[kind]) {
+    const running = generateBusy.package ? "世界包" : "角色卡";
+    groupNote(slotId, `${running}生成在跑：两组生成互斥，等它结束再发起`, true);
+  }
+  return true;
+}
+
+/// 确认框前的预算事实（harden：付费预算不再写死在壳里）：
+/// 拉一次 `runtime.budget` 写「今日已用 n 次 / 上限 N」，上限取核心三层 token 限额的单任务档；
+/// 核心没有「生成调用次数上限」这一字段，次数上限仍是壳侧 GENERATE_LIMIT（= 核心 generator 默认值），
+/// 完成后再以核心回的 usage.limit 为准。
+/// ponytail: 读不到预算就退回壳常量并在文案里标明「本地常量」——确认框照弹，不因为读不到预算就卡住生成；
+///           要更强的一致性就把「读不到预算 → 不给生成」写进闸门，等核心的预算面稳定后再升级。
+async function budgetLine(kind: "package" | "card"): Promise<string> {
+  try {
+    const budget = await mgmt!.call("runtime.budget", {
+      instance_id: world.instanceId || state.instanceId,
+    });
+    const limits = (budget.limits ?? {}) as Record<string, number>;
+    const rows = (budget.rows ?? []) as Array<{ calls?: number }>;
+    const used = rows.reduce((sum, row) => sum + Number(row.calls ?? 0), 0);
+    return (
+      `今日已用 ${used} 次 / 上限 ${limits.task_tokens_per_day ?? "?"} token（单任务档；` +
+      `本实例 ${limits.instance_tokens_per_day ?? "?"}、单线 ${limits.timeline_tokens_per_day ?? "?"}），` +
+      `本次调用上限 ${GENERATE_LIMIT[kind]} 次`
+    );
+  } catch (error) {
+    // 唯一的降级路径：上限回落到壳常量，并在文案里如实说明是本地常量（不冒充核心值）
+    return `今日已用 ? 次 / 上限 ${GENERATE_LIMIT[kind]} 次（本地常量：读不到核心预算 ${String(error)}）`;
   }
 }
 
@@ -1789,6 +1881,10 @@ function elapsedLabel(ms: number): string {
 function startProgress(kind: "package" | "card", slotId: string): void {
   stopProgress(kind);
   const started = Date.now();
+  // 进度行落在 role="status"（aria-live=polite）的槽里——10 分钟等待里读屏要有反馈（§四）。
+  // ponytail: 这一行每秒改写一次，读屏会把「同一句话只差秒数」重复播报；没做节流，
+  //           因为一次播报只差一个数字、多数读屏会合并相邻更新。真嫌吵就再拆一个只在
+  //           开始 / 结束时写一次的 live 节点，等有真用户反馈再动。
   const tick = (): void =>
     groupNote(
       slotId,
@@ -1977,8 +2073,14 @@ async function showInstance(instanceId: string): Promise<void> {
 
 /* ---------- 删除闸门（§3.2）：离开实例选择行，要求键入实例名，同处写明保留什么 ---------- */
 
-/// 删除行的默认提示（保留清单）：换实例时复位；删除结果留在这一行自己的槽里（#inst-delete-note）
+/// 删除行的默认提示（保留清单 + 实例标识尾段）：换实例时复位；删除结果留在这一行自己的槽里（#inst-delete-note）
 const DELETE_HINT = "将保留：世界包 / 角色卡 / 导出件";
+
+/// 同名实例不再歧义：默认提示里带上实例标识尾段（照回滚点列表的 slice(-6) 口径）；
+/// 删除闸门仍然比显示名——不改成让用户输内部 id。
+function deleteHint(id: string): string {
+  return id ? `${DELETE_HINT}（实例 #${id.slice(-6)}）` : DELETE_HINT;
+}
 
 function instanceNameOf(id: string): string {
   return world.instances.find((item) => item.id === id)?.name ?? "";
@@ -1989,6 +2091,12 @@ function instanceNameOf(id: string): string {
 function renderDeleteGate(): void {
   const id = $<HTMLSelectElement>("inst-select").value;
   const name = instanceNameOf(id);
+  const note = $("inst-delete-note");
+  // 槽里是默认提示（不是动作结果）时跟着选中实例刷新标识尾段：同名实例不再靠猜是哪一个
+  if (!note.textContent || note.textContent.startsWith(DELETE_HINT)) {
+    note.className = "muted";
+    note.textContent = deleteHint(id);
+  }
   const typed = $<HTMLInputElement>("inst-delete-name").value.trim();
   $<HTMLButtonElement>("inst-delete").disabled = !name || typed !== name;
 }
@@ -2609,7 +2717,7 @@ function bindWorld(): void {
   $("draft-discard").addEventListener("click", () => void worldAction(discardDraft, "draft-note"));
   $("rollback").addEventListener("click", () => void worldAction(rollbackToCommit, "rollback-note"));
   $<HTMLSelectElement>("inst-select").addEventListener("change", (event) => {
-    $("inst-delete-note").textContent = DELETE_HINT; // 换实例：删除行的提示回到保留清单（结果不跨实例残留）
+    $("inst-delete-note").textContent = ""; // 换实例：删除行的提示复位（renderDeleteGate 会写回保留清单 + 标识尾段）
     commitsNote(""); // 回滚行的结果也不跨实例残留（commitsNote 不会盖掉正在显示的动作结果）
     void showInstance((event.target as HTMLSelectElement).value).then(() => renderDeleteGate());
   });
@@ -2682,7 +2790,7 @@ function bindWorld(): void {
 
   $("pkg-generate").addEventListener("click", () =>
     void worldAction(async () => {
-      if (generateBusy.package) return ""; // in-flight 守卫：连点不发第二次（第二次就是第二次付费调用）
+      if (generateBlocked("package", "pkg-note")) return ""; // 两组互斥：本组连点 / 另一组在跑都拦下
       const brief = $<HTMLInputElement>("pkg-brief").value.trim();
       if (!brief) throw new Error("先写一段世界描述");
       const file = $<HTMLInputElement>("pkg-file").value.trim() || "world.json";
@@ -2691,6 +2799,7 @@ function bindWorld(): void {
       const ok = window.confirm(
         `将向 ${settings.llm.model}（${settings.llm.base_url}）发送你填写的世界描述与生成上下文，` +
           `预计调用 3–6 次（含重试，上限 ${GENERATE_LIMIT.package} 次），最长等 ${GENERATE_TIMEOUT_MS / 60000} 分钟；` +
+          `预算：${await budgetLine("package")}；` +
           "过程中无法取消（核心没有取消 op，只能等它结束或失败）。用量在完成后显示，继续？",
       );
       if (!ok) return "已取消，未发送任何内容";
@@ -2740,7 +2849,7 @@ function bindWorld(): void {
 
   $("card-generate").addEventListener("click", () =>
     void worldAction(async () => {
-      if (generateBusy.card) return ""; // in-flight 守卫：连点不发第二次
+      if (generateBlocked("card", "card-note")) return ""; // 两组互斥：本组连点 / 另一组在跑都拦下
       const pkg = $<HTMLSelectElement>("pkg-select").value;
       const brief = $<HTMLInputElement>("card-brief").value.trim();
       const file = $<HTMLInputElement>("card-file").value.trim() || "card.json";
@@ -2751,6 +2860,7 @@ function bindWorld(): void {
       const ok = window.confirm(
         `将向 ${settings.llm.model}（${settings.llm.base_url}）发送角色描述与目标世界包，` +
           `预计调用 1–2 次（上限 ${GENERATE_LIMIT.card} 次），最长等 ${GENERATE_TIMEOUT_MS / 60000} 分钟；` +
+          `预算：${await budgetLine("card")}；` +
           "过程中无法取消（核心没有取消 op，只能等它结束或失败）。继续？",
       );
       if (!ok) return "已取消，未发送任何内容";
@@ -2858,7 +2968,7 @@ function bindWorld(): void {
       }
       if (
         !window.confirm(
-          `删除实例「${name}」及其对话？此操作不可撤销。\n` +
+          `删除实例「${name}」（#${id.slice(-6)}）及其对话？此操作不可撤销。\n` +
             "· 将保留：世界包 / 角色卡 / 导出件（都不受影响）\n" +
             "· 随实例删除：它的时间线、会话、记忆与预算账本",
         )
@@ -2910,6 +3020,7 @@ async function boot(): Promise<void> {
   await loadShellSettings(); // 壳侧偏好（内建聊天开关）先读出来，再决定要不要建聊天通道
   bindComposer();
   bindNav();
+  bindShortcuts();
   bindWorld();
   bindDisclosure();
   try {
@@ -2942,6 +3053,8 @@ async function boot(): Promise<void> {
     ? "已启用：对话走内建通道（builtin）"
     : "已停用：不登记 / 不连接聊天通道，管理面保留";
   $("restart").addEventListener("click", () => void restartCore());
+  // 顶栏降级 chip 的落点（§3.3）：全文召回是默认态，点它切到设置面「记忆向量化」组并聚焦首个可编辑控件
+  $("degrade").addEventListener("click", () => openMemoryGroup());
   // 无人值守验收：把本窗口自己的管理面连接交给探针断言（不新增权限——页面本来就能调这些 op）
   (window as unknown as { __mgmtCall?: unknown }).__mgmtCall =
     (op: string, args: Record<string, unknown> = {}) => mgmt?.call(op, args);
