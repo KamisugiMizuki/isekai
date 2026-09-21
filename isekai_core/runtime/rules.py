@@ -57,8 +57,10 @@ async def resolve(manifest_path: str | Path, request: dict[str, Any], *, timeout
         raise RulePluginError("规则插件返回的第一行不是合法 JSON") from exc
     if not isinstance(result, dict) or not isinstance(result.get("resolution"), dict):
         raise RulePluginError("规则插件结果必须包含 resolution 对象")
-    if not isinstance(result.get("effects"), list):
-        raise RulePluginError("规则插件结果必须包含 effects 数组")
+    # 世界后果清单：B0 resolver 用 `effects`，战役裁定器用 `consequences`——
+    # 两者都要认，否则新协议一上线就被拦在插件边界（TRPG_RULE_PLUGIN_SPEC §响应）
+    if not isinstance(result.get("effects"), list) and not isinstance(result.get("consequences"), list):
+        raise RulePluginError("规则插件结果必须包含 effects 或 consequences 数组")
     if not isinstance(result.get("claims", []), list):
         raise RulePluginError("规则插件结果的 claims 必须是数组")
     return result

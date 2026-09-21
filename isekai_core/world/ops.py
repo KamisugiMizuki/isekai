@@ -100,6 +100,20 @@ SYNC_OPS = frozenset(
         "backup.restore",
         "backup.list",
         "proactive.list",
+        # TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）：编排态读写 + 联合提交
+        "trpg.campaign.create",
+        "trpg.campaign.list",
+        "trpg.campaign.info",
+        "trpg.campaign.status",
+        "trpg.scene.open",
+        "trpg.scene.view",
+        "trpg.action.declare",
+        "trpg.action.confirm",
+        "trpg.action.abandon",
+        "trpg.choice.select",
+        "trpg.rule_state.read",
+        "trpg.commit",
+        "trpg.recover",
     }
 )
 ASYNC_OPS = frozenset(
@@ -370,6 +384,33 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return _budget_view(cfg, store, args)
         if op == "runtime.budget.set":
             return _budget_set(cfg, store, args)
+        # TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）：编排态读写与联合提交
+        if op == "trpg.campaign.create":
+            return _trpg_campaign_create(cfg, store, runtime, args)
+        if op == "trpg.campaign.list":
+            return _trpg_campaign_list(cfg, store, runtime, args)
+        if op == "trpg.campaign.info":
+            return _trpg_campaign_info(cfg, store, runtime, args)
+        if op == "trpg.campaign.status":
+            return _trpg_campaign_status(cfg, store, runtime, args)
+        if op == "trpg.scene.open":
+            return _trpg_scene_open(cfg, store, runtime, args)
+        if op == "trpg.scene.view":
+            return _trpg_scene_view(cfg, store, runtime, args)
+        if op == "trpg.action.declare":
+            return _trpg_action_declare(cfg, store, runtime, args)
+        if op == "trpg.action.confirm":
+            return _trpg_action_confirm(cfg, store, runtime, args)
+        if op == "trpg.action.abandon":
+            return _trpg_action_abandon(cfg, store, runtime, args)
+        if op == "trpg.choice.select":
+            return _trpg_choice_select(cfg, store, runtime, args)
+        if op == "trpg.rule_state.read":
+            return _trpg_rule_state(cfg, store, runtime, args)
+        if op == "trpg.commit":
+            return _trpg_commit(cfg, store, runtime, args)
+        if op == "trpg.recover":
+            return _trpg_recover(cfg, store, runtime, args)
 
         if op.startswith("runtime."):
             return _runtime_op(runtime, op, args, cfg=cfg)
@@ -922,8 +963,190 @@ async def _draft_user_event(cfg: Config, llm: Any, store: Store | None, args: di
     )
 
 
-async def _resolve_trpg_action(cfg: Config, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:
-    """Call an external rules process, then apply only its structured world result."""
+# ---------------------------------------------------------------- TRPG 战役运行时
+#
+# 设计：TRPG_CAMPAIGN_RUNTIME_SPEC。这些 op 只做编排与校验，不解析规则语义；
+# 规则私有状态由插件解释、由核心托管版本，世界后果仍走 WorldRuntime 的统一提交边界。
+
+
+def _campaign_service(runtime: Any) -> Any:
+    service = getattr(runtime, "campaign", None)
+    if service is None:
+        raise UmpError(Err.INTERNAL, "本次调用没有带上运行层服务，无法使用战役运行时", retryable=False)
+    return service
+
+
+def _campaign_call(fn: Any, *positional: Any, **kwargs: Any) -> dict[str, Any]:
+    """把战役运行时的可预期错误翻成管理面错误码（别落成 internal: ValueError）。"""
+    from ..runtime import campaign as campaign_mod  # 延迟导入：避免包级循环
+
+    try:
+        return fn(*positional, **kwargs)
+    except campaign_mod.CampaignError as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+
+
+def _json_arg(args: dict[str, Any], key: str, default: Any) -> Any:
+    value = args.get(key, default)
+    if isinstance(value, str) and value.strip().startswith(("{", "[")):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return value if value is not None else default
+
+
+def _campaign_ref(args: dict[str, Any]) -> tuple[str, str, str]:
+    instance_id = str(args.get("instance_id") or "")
+    timeline_id = str(args.get("timeline_id") or "")
+    campaign_id = str(args.get("campaign_id") or "")
+    if not instance_id or not timeline_id or not campaign_id:
+        raise UmpError(Err.INVALID, "战役操作需要 instance_id / timeline_id / campaign_id", retryable=False)
+    return instance_id, timeline_id, campaign_id
+
+
+def _trpg_campaign_create(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id = str(args.get("instance_id") or "")
+    timeline_id = str(args.get("timeline_id") or "")
+    scene = _json_arg(args, "scene", None)
+    return _campaign_call(
+        _campaign_service(runtime).create,
+        instance_id,
+        timeline_id,
+        ruleset_id=str(args.get("ruleset_id") or ""),
+        ruleset_version=str(args.get("ruleset_version") or ""),
+        plugin_manifest=str(args.get("plugin_manifest") or ""),
+        participants=[str(item) for item in _json_arg(args, "participants", []) or []],
+        status=str(args.get("status") or "active"),
+        note=str(args.get("note") or ""),
+        scene=scene if isinstance(scene, dict) else None,
+    )
+
+
+def _trpg_campaign_list(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id = str(args.get("instance_id") or "")
+    timeline_id = str(args.get("timeline_id") or "") or None
+    return {"campaigns": _campaign_call(_campaign_service(runtime).campaigns, instance_id, timeline_id)}
+
+
+def _trpg_campaign_info(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    return _campaign_call(_campaign_service(runtime).info, instance_id, timeline_id, campaign_id)
+
+
+def _trpg_campaign_status(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    return _campaign_call(
+        _campaign_service(runtime).status, instance_id, timeline_id, campaign_id,
+        status=str(args.get("status") or ""), reason=str(args.get("reason") or args.get("note") or ""),
+    )
+
+
+def _trpg_scene_open(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    fields = {
+        key: _json_arg(args, key, default)
+        for key, default in (
+            ("kind", "exploration"), ("location_refs", []), ("participants", []), ("public_facts", []),
+            ("private_views", {}), ("active_risks", []), ("available_actions", []), ("turn_state", {}),
+        )
+    }
+    if args.get("scene_id"):
+        fields["scene_id"] = str(args["scene_id"])
+    return _campaign_call(_campaign_service(runtime).open_scene, instance_id, timeline_id, campaign_id, **fields)
+
+
+def _trpg_scene_view(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    return _campaign_call(
+        _campaign_service(runtime).view, instance_id, timeline_id, campaign_id,
+        audience=str(args.get("audience") or "public_party"),
+    )
+
+
+def _trpg_action_declare(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    return _campaign_call(
+        _campaign_service(runtime).declare,
+        instance_id, timeline_id, campaign_id,
+        actor_id=str(args.get("actor_id") or ""),
+        raw_text=str(args.get("raw_text") or ""),
+        intent=str(args.get("intent") or ""),
+        target_refs=[str(item) for item in _json_arg(args, "target_refs", []) or []],
+        method=str(args.get("method") or ""),
+        expected_result=str(args.get("expected_result") or ""),
+        preconditions=[str(item) for item in _json_arg(args, "preconditions", []) or []],
+        visible_risks=[str(item) for item in _json_arg(args, "visible_risks", []) or []],
+        auto_confirm=bool(args.get("auto_confirm")),
+        action_id=str(args.get("action_id") or "") or None,
+    )
+
+
+def _trpg_action_confirm(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    action_id = str(args.get("action_id") or "")
+    revision = args.get("action_revision")
+    if not action_id or revision is None:
+        raise UmpError(Err.INVALID, "确认行动需要 action_id 与 action_revision", retryable=False)
+    changes = _json_arg(args, "changes", None)
+    return _campaign_call(
+        _campaign_service(runtime).confirm,
+        instance_id, timeline_id, campaign_id, action_id,
+        action_revision=int(revision), changes=changes if isinstance(changes, dict) else None,
+    )
+
+
+def _trpg_action_abandon(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    return _campaign_call(
+        _campaign_service(runtime).abandon,
+        instance_id, timeline_id, campaign_id, str(args.get("action_id") or ""),
+        reason=str(args.get("reason") or args.get("note") or ""),
+    )
+
+
+def _trpg_choice_select(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    return _campaign_call(
+        _campaign_service(runtime).select_choice,
+        instance_id, timeline_id, campaign_id, str(args.get("choice_id") or ""),
+        selection=str(args.get("selection") or ""),
+        idempotency_key=str(args.get("idempotency_key") or ""),
+    )
+
+
+def _trpg_rule_state(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    return _campaign_call(_campaign_service(runtime).rule_state, instance_id, timeline_id, campaign_id)
+
+
+def _trpg_commit(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    return _campaign_call(
+        _campaign_service(runtime).commit,
+        instance_id, timeline_id, campaign_id, str(args.get("action_id") or ""),
+        idempotency_key=str(args.get("idempotency_key") or ""),
+        audience=str(args.get("audience") or "public_party"),
+    )
+
+
+def _trpg_recover(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id = str(args.get("instance_id") or "")
+    timeline_id = str(args.get("timeline_id") or "")
+    if not instance_id or not timeline_id:
+        raise UmpError(Err.INVALID, "恢复需要 instance_id 与 timeline_id", retryable=False)
+    return _campaign_call(_campaign_service(runtime).recover, instance_id, timeline_id)
+
+
+async def _resolve_trpg_action(
+    cfg: Config, store: Store | None, args: dict[str, Any], *, runtime: Any = None
+) -> dict[str, Any]:
+    """Call an external rules process, then apply only its structured world result.
+
+    带 `campaign_id` 时走战役裁定器路径（TRPG_CAMPAIGN_RUNTIME_SPEC §四）：读规则状态快照、
+    调插件、把四段结果存进行动；**不写世界**——世界与规则状态一起由 `trpg.commit` 落。
+    不带 `campaign_id` 时保持 B0 无状态 resolver 的既有语义（直接落世界事件）。
+    """
     if store is None:
         raise UmpError(Err.STATE_BLOCKED, "缺少存储上下文", retryable=False)
     instance_id = str(args.get("instance_id") or "")
@@ -931,8 +1154,24 @@ async def _resolve_trpg_action(cfg: Config, store: Store | None, args: dict[str,
     plugin = str(args.get("plugin_manifest") or "")
     action_id = str(args.get("action_id") or "")
     intent = str(args.get("intent") or "").strip()
-    if not instance_id or not timeline_id or not plugin or not action_id or not intent:
+    campaign_id = str(args.get("campaign_id") or "")
+    if not campaign_id and not intent:
         raise UmpError(Err.INVALID, "TRPG 调用需要实例、时间线、插件清单、行动标识与意图", retryable=False)
+    if not instance_id or not timeline_id or not plugin or not action_id:
+        raise UmpError(Err.INVALID, "TRPG 调用需要实例、时间线、插件清单与行动标识", retryable=False)
+    if campaign_id:
+        from ..runtime import campaign as campaign_mod
+
+        service = _campaign_service(runtime)
+        try:
+            return await service.resolve(
+                instance_id, timeline_id, campaign_id, action_id,
+                plugin_manifest=plugin,
+                world_snapshot=args.get("world_snapshot") if isinstance(args.get("world_snapshot"), dict) else None,
+                timeout=float(args.get("timeout") or 60.0),
+            )
+        except campaign_mod.CampaignError as exc:
+            raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
     from ..runtime import drafts, rules
 
     world = _world_service(cfg, store)
@@ -1261,7 +1500,7 @@ async def dispatch_async(
         if op == "event.draft":
             return await _draft_user_event(cfg, llm, store, args)
         if op == "trpg.action.resolve":
-            return await _resolve_trpg_action(cfg, store, args)
+            return await _resolve_trpg_action(cfg, store, args, runtime=runtime)
         if op == "world.package.generate":
             package, errors, usage = await generate_package(
                 llm, str(args.get("brief") or ""), name=str(args.get("name") or "未命名世界"), **kwargs

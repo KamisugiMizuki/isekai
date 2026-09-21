@@ -645,6 +645,129 @@ CREATE TABLE IF NOT EXISTS experience(
   PRIMARY KEY(instance_id, timeline_id, character_id, id)
 );
 CREATE INDEX IF NOT EXISTS ix_experience_window ON experience(instance_id, timeline_id, character_id, world_seconds);
+
+-- TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）：核心托管的编排状态与规则私有状态附件。
+-- 全部键在 (instance_id, timeline_id) 上：随该线的提交 / 回滚 / 分叉 / 导入导出走同一条装载路径。
+CREATE TABLE IF NOT EXISTS trpg_campaign(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  campaign_id TEXT NOT NULL,
+  ruleset_id TEXT NOT NULL DEFAULT '',
+  ruleset_version TEXT NOT NULL DEFAULT '',
+  plugin_manifest TEXT NOT NULL DEFAULT '',
+  participants TEXT NOT NULL DEFAULT '[]',   -- JSON：玩家角色 / NPC 引用
+  current_scene_id TEXT NOT NULL DEFAULT '',
+  state_revision INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'preparing',  -- preparing/active/waiting/paused/blocked/archived
+  note TEXT NOT NULL DEFAULT '',
+  created_world INTEGER NOT NULL DEFAULT 0,
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  created_real REAL NOT NULL DEFAULT 0,
+  updated_real REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, campaign_id)
+);
+
+CREATE TABLE IF NOT EXISTS trpg_scene(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  campaign_id TEXT NOT NULL,
+  scene_id TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'exploration',
+  location_refs TEXT NOT NULL DEFAULT '[]',
+  world_snapshot TEXT NOT NULL DEFAULT '{}', -- {snapshot 引用，不复制世界事实正文}
+  participants TEXT NOT NULL DEFAULT '[]',
+  public_facts TEXT NOT NULL DEFAULT '[]',
+  private_views TEXT NOT NULL DEFAULT '{}',
+  active_risks TEXT NOT NULL DEFAULT '[]',
+  available_actions TEXT NOT NULL DEFAULT '[]',
+  turn_state TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'open',
+  revision INTEGER NOT NULL DEFAULT 1,
+  created_world INTEGER NOT NULL DEFAULT 0,
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, campaign_id, scene_id)
+);
+
+CREATE TABLE IF NOT EXISTS trpg_action(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  campaign_id TEXT NOT NULL,
+  scene_id TEXT NOT NULL DEFAULT '',
+  action_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL DEFAULT '',
+  raw_text TEXT NOT NULL DEFAULT '',
+  intent TEXT NOT NULL DEFAULT '',
+  target_refs TEXT NOT NULL DEFAULT '[]',
+  method TEXT NOT NULL DEFAULT '',
+  expected_result TEXT NOT NULL DEFAULT '',
+  preconditions TEXT NOT NULL DEFAULT '[]',
+  visible_risks TEXT NOT NULL DEFAULT '[]',
+  confirmation TEXT NOT NULL DEFAULT 'pending',  -- pending/confirmed/modified/abandoned
+  action_revision INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'received',       -- 见 campaign.ACTION_STATES
+  resolution TEXT NOT NULL DEFAULT '{}',         -- 插件原始响应（含 rule_state_patch / consequences / scene_transition）
+  joint_commit_id TEXT NOT NULL DEFAULT '',
+  failure_code TEXT NOT NULL DEFAULT '',
+  created_world INTEGER NOT NULL DEFAULT 0,
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  created_real REAL NOT NULL DEFAULT 0,
+  updated_real REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, campaign_id, action_id)
+);
+
+CREATE TABLE IF NOT EXISTS trpg_choice(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  campaign_id TEXT NOT NULL,
+  scene_id TEXT NOT NULL DEFAULT '',
+  choice_id TEXT NOT NULL,
+  action_id TEXT NOT NULL DEFAULT '',
+  prompt_ref TEXT NOT NULL DEFAULT '',
+  choices TEXT NOT NULL DEFAULT '[]',
+  audience TEXT NOT NULL DEFAULT 'public_party',
+  expires_world INTEGER,
+  created_revision INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'open',           -- open/selected/cancelled/expired
+  selection TEXT NOT NULL DEFAULT '',
+  created_real REAL NOT NULL DEFAULT 0,
+  updated_real REAL NOT NULL DEFAULT 0,
+  created_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, campaign_id, choice_id)
+);
+
+-- 规则状态附件：字段由插件定义，核心只做版本边界（不解析 opaque_state）
+CREATE TABLE IF NOT EXISTS trpg_rule_state(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  campaign_id TEXT NOT NULL,
+  ruleset_id TEXT NOT NULL,
+  state_revision INTEGER NOT NULL DEFAULT 1,
+  opaque_state TEXT NOT NULL DEFAULT '{}',
+  created_world INTEGER NOT NULL DEFAULT 0,
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  updated_real REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, campaign_id, ruleset_id)
+);
+
+-- 联合提交记录：规则状态 patch + 世界后果 + 场景转换同批落地的凭据（幂等键在此）
+CREATE TABLE IF NOT EXISTS trpg_commit(
+  joint_commit_id TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  campaign_id TEXT NOT NULL,
+  action_id TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL,
+  campaign_revision INTEGER NOT NULL DEFAULT 0,
+  world_revision INTEGER NOT NULL DEFAULT 0,
+  world_commit_id TEXT NOT NULL DEFAULT '',
+  state_revisions TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'committed',
+  result TEXT NOT NULL DEFAULT '{}',
+  created_world INTEGER NOT NULL DEFAULT 0,
+  created_real REAL NOT NULL DEFAULT 0,
+  UNIQUE(instance_id, timeline_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS ix_trpg_commit_campaign ON trpg_commit(instance_id, timeline_id, campaign_id);
 """
 
 
@@ -674,6 +797,101 @@ def _relabel_payload(payload: dict[str, Any], instance_id: str, timeline_id: str
             rows.append(row)
         out[key] = rows
     return out
+
+
+#: TRPG 战役运行时的表与列（TRPG_CAMPAIGN_RUNTIME_SPEC §十）：列名单一真源，
+#: 读 / 写 / 装载共用，避免「导出有、导入后没」的老毛病。
+TRPG_COLUMNS: dict[str, tuple[str, ...]] = {
+    "campaign": (
+        "instance_id", "timeline_id", "campaign_id", "ruleset_id", "ruleset_version",
+        "plugin_manifest", "participants", "current_scene_id", "state_revision", "status",
+        "note", "created_world", "updated_world", "created_real", "updated_real",
+    ),
+    "scene": (
+        "instance_id", "timeline_id", "campaign_id", "scene_id", "kind", "location_refs",
+        "world_snapshot", "participants", "public_facts", "private_views", "active_risks",
+        "available_actions", "turn_state", "status", "revision",
+        "created_world", "updated_world",
+    ),
+    "action": (
+        "instance_id", "timeline_id", "campaign_id", "scene_id", "action_id", "actor_id",
+        "raw_text", "intent", "target_refs", "method", "expected_result", "preconditions",
+        "visible_risks", "confirmation", "action_revision", "status", "resolution",
+        "joint_commit_id", "failure_code", "created_world", "updated_world",
+        "created_real", "updated_real",
+    ),
+    "choice": (
+        "instance_id", "timeline_id", "campaign_id", "scene_id", "choice_id", "action_id",
+        "prompt_ref", "choices", "audience", "expires_world", "created_revision", "status",
+        "selection", "created_real", "updated_real", "created_world",
+    ),
+    "rule_state": (
+        "instance_id", "timeline_id", "campaign_id", "ruleset_id", "state_revision",
+        "opaque_state", "created_world", "updated_world", "updated_real",
+    ),
+    "commit": (
+        "joint_commit_id", "instance_id", "timeline_id", "campaign_id", "action_id",
+        "idempotency_key", "campaign_revision", "world_revision", "world_commit_id",
+        "state_revisions", "status", "result", "created_world", "created_real",
+    ),
+}
+#: 主键列（冲突目标与更新时排除）
+TRPG_KEYS: dict[str, tuple[str, ...]] = {
+    "campaign": ("instance_id", "timeline_id", "campaign_id"),
+    "scene": ("instance_id", "timeline_id", "campaign_id", "scene_id"),
+    "action": ("instance_id", "timeline_id", "campaign_id", "action_id"),
+    "choice": ("instance_id", "timeline_id", "campaign_id", "choice_id"),
+    "rule_state": ("instance_id", "timeline_id", "campaign_id", "ruleset_id"),
+    "commit": ("joint_commit_id",),
+}
+#: 提交账本只增不改：同一幂等键重放返回原记录，不覆盖
+TRPG_APPEND_ONLY = frozenset({"commit"})
+_TRPG_SQL_CACHE: dict[str, str] = {}
+
+
+def _trpg_sql(kind: str) -> str:
+    cached = _TRPG_SQL_CACHE.get(kind)
+    if cached:
+        return cached
+    columns = TRPG_COLUMNS[kind]
+    keys = TRPG_KEYS[kind]
+    updates = [name for name in columns if name not in keys]
+    statement = (
+        f"INSERT INTO trpg_{kind}({', '.join(columns)})"
+        f" VALUES({', '.join(':' + name for name in columns)})"
+    )
+    if kind in TRPG_APPEND_ONLY:
+        statement += " ON CONFLICT DO NOTHING"
+    else:
+        statement += " ON CONFLICT DO UPDATE SET " + ", ".join(
+            f"{name}=excluded.{name}" for name in updates
+        )
+    _TRPG_SQL_CACHE[kind] = statement
+    return statement
+
+
+def _trpg_row(kind: str, item: dict[str, Any]) -> dict[str, Any]:
+    """按表列补齐缺省值：调用方只给关心的字段，其余落 schema 默认之外的稳定默认。"""
+    defaults: dict[str, Any] = {name: "" for name in TRPG_COLUMNS[kind]}
+    defaults.update({"expires_world": None})
+    for name in TRPG_COLUMNS[kind]:
+        if name in ("state_revision", "action_revision", "revision", "created_revision"):
+            defaults[name] = 1
+        elif name.endswith(("_world", "_real")):
+            defaults[name] = 0
+    return {**defaults, **{key: value for key, value in item.items() if key in TRPG_COLUMNS[kind]}}
+
+
+def _trpg_where(kind: str, keys: dict[str, Any]) -> tuple[str, tuple[Any, ...]]:
+    if kind not in TRPG_COLUMNS:
+        raise ValueError(f"未知的战役运行时表：{kind}")
+    if not keys:
+        raise ValueError("战役运行时查询必须带作用域")
+    unknown = [name for name in keys if name not in TRPG_COLUMNS[kind]]
+    if unknown:
+        raise ValueError(f"未知列：{', '.join(unknown)}")
+    where = " AND ".join(f"{name}=?" for name in keys)
+    return where, tuple(keys[name] for name in keys)
 
 
 def _row_priority(row: dict[str, Any], key: str = "priority") -> int:
@@ -1955,6 +2173,12 @@ class Store:
                 "first_contact",
                 "session_notice",
                 "narrative_unit",
+                "trpg_campaign",
+                "trpg_scene",
+                "trpg_action",
+                "trpg_choice",
+                "trpg_rule_state",
+                "trpg_commit",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute(
@@ -2377,6 +2601,14 @@ class Store:
             "disclosure",       # 回滚同时撤销授权与依赖它的派生（§7.2）
             "reaction",         # 短期反应随线版本化：回滚撤销派生状态（§11.1 / 附录B#17）
             "narrative_unit",   # 叙事单元 / 暂缓标记 / 审计结果同样是派生状态（NARRATIVE_LAYER §7.2）
+            # 战役运行时：场景 / 行动 / 选择是派生编排状态，随回滚撤销；战役与规则状态由
+            # 快照回写给出「提交那一刻」的值（TRPG_CAMPAIGN_RUNTIME_SPEC §十七）
+            "trpg_scene",
+            "trpg_action",
+            "trpg_choice",
+            "trpg_campaign",
+            "trpg_rule_state",
+            "trpg_commit",
         ):
             self._conn.execute(f"DELETE FROM {table} WHERE timeline_id=?", (timeline_id,))
         # 向量表两种形态都清：按线（新）与按 memory 归属（兼容早期没有 timeline_id 的行）
@@ -2494,6 +2726,7 @@ class Store:
         customs: Iterable[dict[str, Any]] = (),
         clear_effects: Iterable[Any] = (),
         reactions: Iterable[dict[str, Any]] = (),
+        trpg: dict[str, Any] | None = None,
     ) -> bool:
         """把一批事实转移整体提交（§2.7：一批失败即整批回到批前水位）。
 
@@ -2703,9 +2936,52 @@ class Store:
                    WHERE timeline_id=? AND generation=?""",
                 (processed_world, 1 if catching_up else 0, 1 if limited else 0, timeline_id, generation),
             )
+            # 战役运行时的同批写入：规则状态 patch、场景 / 行动 / 选择与联合提交凭据
+            # 必须在**这一个事务**里落地，否则「规则扣了资源、世界没变」这种半条状态会出现。
+            self._trpg_apply(self._conn, trpg)
             return True
 
-    # ---------- 运行层快照（导出 / 导入：按已完成水位） ----------
+    # ---------- TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC §十） ----------
+
+    def trpg_upserts(self, rows: dict[str, Any] | None) -> None:
+        """把一组战役运行时行写进库（自成一次事务；批提交走 apply_runtime_batch 的同名参数）。"""
+        if not rows:
+            return
+        with self._lock, self._conn:
+            self._trpg_apply(self._conn, rows)
+
+    def _trpg_apply(self, conn: sqlite3.Connection, rows: dict[str, Any]) -> None:
+        """按 kind 逐行 upsert（供批提交在**同一事务内**调用，别自己开事务）。"""
+        for kind, items in (rows or {}).items():
+            if kind not in TRPG_COLUMNS:
+                raise ValueError(f"未知的战役运行时表：{kind}")
+            for item in items or []:
+                conn.execute(_trpg_sql(kind), _trpg_row(kind, item))
+
+    def trpg_get(self, kind: str, **keys: Any) -> dict[str, Any] | None:
+        where, params = _trpg_where(kind, keys)
+        row = self._conn.execute(f"SELECT * FROM trpg_{kind} WHERE {where}", params).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def trpg_list(self, kind: str, **keys: Any) -> list[dict[str, Any]]:
+        where, params = _trpg_where(kind, keys)
+        rows = self._conn.execute(
+            f"SELECT * FROM trpg_{kind} WHERE {where} ORDER BY rowid", params
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def trpg_commit_by_key(self, instance_id: str, timeline_id: str, idempotency_key: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT * FROM trpg_commit WHERE instance_id=? AND timeline_id=? AND idempotency_key=?""",
+            (instance_id, timeline_id, str(idempotency_key)),
+        ).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def trpg_delete(self, kind: str, **keys: Any) -> int:
+        where, params = _trpg_where(kind, keys)
+        with self._lock, self._conn:
+            cur = self._conn.execute(f"DELETE FROM trpg_{kind} WHERE {where}", params)
+            return int(cur.rowcount or 0)
 
     def runtime_dump(self, instance_id: str, timeline_id: str, *, watermark: int) -> dict[str, Any]:
         def rows(sql: str, *args: Any) -> list[dict[str, Any]]:
@@ -2832,6 +3108,49 @@ class Store:
             "intents": rows(
                 """SELECT * FROM intent WHERE instance_id=? AND timeline_id=? AND source_world<=?
                    ORDER BY character_id, id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            # 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC §十三）：按水位截断，回滚 / 分叉 / 导出共用
+            "trpg_campaigns": rows(
+                """SELECT * FROM trpg_campaign WHERE instance_id=? AND timeline_id=? AND created_world<=?
+                   ORDER BY campaign_id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "trpg_scenes": rows(
+                """SELECT * FROM trpg_scene WHERE instance_id=? AND timeline_id=? AND created_world<=?
+                   ORDER BY scene_id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "trpg_actions": rows(
+                """SELECT * FROM trpg_action WHERE instance_id=? AND timeline_id=? AND created_world<=?
+                   ORDER BY action_id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "trpg_choices": rows(
+                """SELECT * FROM trpg_choice WHERE instance_id=? AND timeline_id=? AND created_world<=?
+                   ORDER BY choice_id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "trpg_rule_states": rows(
+                """SELECT * FROM trpg_rule_state WHERE instance_id=? AND timeline_id=? AND created_world<=?
+                   ORDER BY ruleset_id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            "trpg_commits": rows(
+                """SELECT * FROM trpg_commit WHERE instance_id=? AND timeline_id=? AND created_world<=?
+                   ORDER BY created_real""",
                 instance_id,
                 timeline_id,
                 watermark,
@@ -2974,6 +3293,19 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, office_id) DO NOTHING""",
                     row,
                 )
+            # 战役运行时：装载路径与写入共用同一份列定义（store.TRPG_COLUMNS），
+            # 少一处就会出现「导出有、导入后没」——本仓库踩过四次的老账。
+            self._trpg_apply(
+                self._conn,
+                {
+                    "campaign": payload.get("trpg_campaigns") or [],
+                    "scene": payload.get("trpg_scenes") or [],
+                    "action": payload.get("trpg_actions") or [],
+                    "choice": payload.get("trpg_choices") or [],
+                    "rule_state": payload.get("trpg_rule_states") or [],
+                    "commit": payload.get("trpg_commits") or [],
+                },
+            )
             for row in payload.get("customs") or []:
                 self._conn.execute(
                     """INSERT INTO custom_state(instance_id, timeline_id, custom_id, name, applies_to, form,

@@ -36,6 +36,7 @@ from . import (
     life,
 )
 from . import memory as memory_mod, personality, planning, versioning
+from . import trpg as trpg_runtime
 from .calendar import Calendar, calendar_from_package
 from .clock import DEFAULT_RATE_MAX, ClockState, RateCommand, describe, natural_second, settle, target_world
 
@@ -161,6 +162,8 @@ class RuntimeService:
         self.autocommit_enabled = bool(autocommit_enabled)
         self.autocommit_minutes = max(1, int(autocommit_minutes))
         self.autocommit_events = max(1, int(autocommit_events))
+        #: TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）：战役编排 + 规则状态托管 + 联合提交
+        self.campaign = trpg_runtime.CampaignRuntime(store, self)
 
     # ---------- 基础读取 ----------
 

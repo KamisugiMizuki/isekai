@@ -78,6 +78,21 @@ OP_BY_COMMAND = {
     ("runtime", "fork"): "runtime.fork",
     ("runtime", "rollback"): "runtime.rollback",
     ("runtime", "budget-set"): "runtime.budget.set",
+    # TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）
+    ("trpg", "campaign-new"): "trpg.campaign.create",
+    ("trpg", "campaign-list"): "trpg.campaign.list",
+    ("trpg", "campaign-info"): "trpg.campaign.info",
+    ("trpg", "campaign-status"): "trpg.campaign.status",
+    ("trpg", "scene-open"): "trpg.scene.open",
+    ("trpg", "scene"): "trpg.scene.view",
+    ("trpg", "declare"): "trpg.action.declare",
+    ("trpg", "confirm"): "trpg.action.confirm",
+    ("trpg", "abandon"): "trpg.action.abandon",
+    ("trpg", "resolve"): "trpg.action.resolve",
+    ("trpg", "commit"): "trpg.commit",
+    ("trpg", "choose"): "trpg.choice.select",
+    ("trpg", "rule-state"): "trpg.rule_state.read",
+    ("trpg", "recover"): "trpg.recover",
     ("runtime", "backfill"): "runtime.backfill",
     ("event", "render"): "event.render",
     ("event", "expand"): "event.expand",
@@ -149,6 +164,47 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
         return args
     if group == "narrative":
         return {"instance_id": ns.id, "timeline_id": ns.timeline, "character_id": ns.card or ""}
+    if group == "trpg":
+        args: dict[str, Any] = {"instance_id": ns.id, "timeline_id": ns.timeline}
+        if ns.campaign:
+            args["campaign_id"] = ns.campaign
+        if cmd == "campaign-new":
+            args.update({
+                "ruleset_id": ns.ruleset or "",
+                "ruleset_version": ns.ruleset_version or "",
+                "plugin_manifest": ns.plugin or "",
+                "status": ns.status or "active",
+                "participants": [ns.actor] if ns.actor else [],
+            })
+            if ns.kind:
+                args["scene"] = {"kind": ns.kind, "location_refs": [ns.ref] if ns.ref else []}
+        if cmd == "campaign-status":
+            args.update({"status": ns.status or "", "reason": ns.reason or ""})
+        if cmd == "scene-open":
+            args["kind"] = ns.kind or "exploration"
+        if cmd == "declare":
+            args.update({
+                "actor_id": ns.actor or "",
+                "intent": ns.intent or "",
+                "raw_text": ns.intent or "",
+                "auto_confirm": bool(ns.auto_confirm),
+            })
+        if cmd == "confirm":
+            args.update({"action_id": ns.action or "", "action_revision": int(ns.revision or 0)})
+        if cmd in ("abandon", "commit"):
+            args["action_id"] = ns.action or ""
+        if cmd == "commit":
+            args["idempotency_key"] = ns.idempotency or ""
+        if cmd == "resolve":
+            args.update({
+                "action_id": ns.action or "",
+                "plugin_manifest": ns.plugin or "",
+                "actor_id": ns.actor or "",
+                "intent": ns.intent or "",
+            })
+        if cmd == "choose":
+            args.update({"choice_id": ns.choice or "", "selection": ns.selection or ""})
+        return args
     if group == "event":
         args = {"instance_id": ns.id, "timeline_id": ns.timeline}
         if cmd == "draft":
@@ -287,7 +343,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "group",
         choices=[
-            "package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive", "narrative"
+            "package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive", "narrative",
+            "trpg",
         ],
     )
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
@@ -324,6 +381,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--resume", dest="pause_resume", action="store_true", help="预算：恢复该任务")
     parser.add_argument("--candidate", default=None, help="把文件内容当作候选对象提交")
     parser.add_argument("--limit", default=None, help="条数上限（披露候选等）")
+    parser.add_argument("--campaign", default=None, help="TRPG：战役标识")
+    parser.add_argument("--ruleset", default=None, help="TRPG：规则系统标识")
+    parser.add_argument("--ruleset-version", dest="ruleset_version", default=None, help="TRPG：规则版本")
+    parser.add_argument("--plugin", default=None, help="TRPG：规则插件清单路径")
+    parser.add_argument("--actor", default=None, help="TRPG：行动者（玩家角色标识）")
+    parser.add_argument("--action", default=None, help="TRPG：行动标识")
+    parser.add_argument("--revision", type=int, default=None, help="TRPG：行动 / 场景版本")
+    parser.add_argument("--choice", default=None, help="TRPG：待选择标识")
+    parser.add_argument("--selection", default=None, help="TRPG：选择结果")
+    parser.add_argument("--idempotency", default=None, help="TRPG：联合提交幂等键")
+    parser.add_argument("--intent", default=None, help="TRPG：行动意图 / 原始声明")
+    parser.add_argument("--kind", default=None, help="TRPG：场景类型")
+    parser.add_argument("--status", default=None, help="TRPG：战役状态")
+    parser.add_argument("--reason", default=None, help="TRPG：状态变更原因")
+    parser.add_argument("--auto-confirm", dest="auto_confirm", action="store_true", help="TRPG：低风险行动直接确认")
     ns = parser.parse_args(argv)
     if (ns.group, ns.command) not in OP_BY_COMMAND:
         parser.error(f"未知命令 {ns.group} {ns.command}")

@@ -263,6 +263,14 @@ def _restore_runtime_state(
             "memories": _remap_rows(payload.get("memories"), instance_id, new_id),
             "memory_tasks": _remap_rows(payload.get("memory_tasks"), instance_id, new_id),
             "citations": [dict(row) for row in (payload.get("citations") or []) if isinstance(row, dict)],
+            # 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC §十七）：战役、场景、行动、选择、
+            # 规则状态附件与联合提交账本都随件；campaign_id 在实例作用域内唯一，不重铸。
+            "trpg_campaigns": _remap_rows(payload.get("trpg_campaigns"), instance_id, new_id),
+            "trpg_scenes": _remap_rows(payload.get("trpg_scenes"), instance_id, new_id),
+            "trpg_actions": _remap_rows(payload.get("trpg_actions"), instance_id, new_id),
+            "trpg_choices": _remap_rows(payload.get("trpg_choices"), instance_id, new_id),
+            "trpg_rule_states": _remap_rows(payload.get("trpg_rule_states"), instance_id, new_id),
+            "trpg_commits": _remap_rows(payload.get("trpg_commits"), instance_id, new_id),
         }
         loaded += store.runtime_load(instance_id, new_id, rows)
         store.clock_put(
