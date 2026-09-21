@@ -12,10 +12,23 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
+from .package import normalize_name
+
 Payload = dict[str, Any]
 Converter = Callable[[Payload], Payload]
 
 _REGISTRY: dict[tuple[str, str], Converter] = {}
+#: 首次登记时的写法：查找按规范化键，展示按原样（§十 残余「名称规范化细则」）
+_DISPLAY: dict[tuple[str, str], tuple[str, str]] = {}
+
+
+def normalize_format(name: str) -> str:
+    """格式标识的规范化：去首尾空白 + NFKC + 大小写折叠（与实例 / 包名同一套规则，§7.4）。
+
+    规范化只作用于**登记与查找**：`Terra V1.2` 与 `terra v1.2` 命中同一个转换器；
+    `converters()` 仍按首次登记时的写法展示。转换器返回的载荷不做任何规范化。
+    """
+    return normalize_name(name)
 
 
 class ConverterError(ValueError):
@@ -24,20 +37,24 @@ class ConverterError(ValueError):
 
 def register_converter(source: str, target: str, fn: Converter) -> None:
     """登记一个可信转换器（内置迁移与测试共用这一个入口）。"""
-    _REGISTRY[(str(source), str(target))] = fn
+    key = (normalize_format(source), normalize_format(target))
+    _REGISTRY[key] = fn
+    _DISPLAY.setdefault(key, (str(source), str(target)))
 
 
 def unregister_converter(source: str, target: str) -> None:
-    _REGISTRY.pop((str(source), str(target)), None)
+    key = (normalize_format(source), normalize_format(target))
+    _REGISTRY.pop(key, None)
+    _DISPLAY.pop(key, None)
 
 
 def converters() -> list[tuple[str, str]]:
     """已注册的转换器清单（管理面展示与兼容判定共用同一份表）。"""
-    return sorted(_REGISTRY)
+    return sorted(_DISPLAY.get(key, key) for key in _REGISTRY)
 
 
 def converter_for(source: str, target: str) -> Converter | None:
-    return _REGISTRY.get((str(source), str(target)))
+    return _REGISTRY.get((normalize_format(source), normalize_format(target)))
 
 
 def can_convert(source: str, target: str) -> bool:

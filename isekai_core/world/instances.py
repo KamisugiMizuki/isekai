@@ -254,6 +254,13 @@ def convert_instance(
 
     setting = json.loads(row["setting"])
     converted = converters.convert_payload(setting, source=source, target=target)  # 副本上转换
+    # 转换出处随设定一起落地（§十 残余「元数据物理存放位置」）：随导出 / 导入走，不另设侧车文件
+    converted["converted_from"] = {
+        "data_format": source,
+        "rules_version": str(row.get("rules_version") or ""),
+        "converter": f"{source} → {target}",
+        "at": time.time(),
+    }
     package = converted.get("world_package") if isinstance(converted.get("world_package"), dict) else {}
     errors = [str(item) for item in validate_package(package)]
     from .cards import validate_card

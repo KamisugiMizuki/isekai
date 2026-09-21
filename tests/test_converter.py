@@ -107,3 +107,33 @@ def test_converter_failure_reason_reaches_the_caller(store, world, tmp_path) -> 
         assert "转换产物未通过完整校验" in str(exc.value), exc.value
     finally:
         converters.unregister_converter("9.9", "0.1")
+
+
+def test_format_identifiers_are_normalised() -> None:
+    """格式标识规范化（§十 残余）：大小写 / 全角 / 首尾空白命中同一个转换器；展示按登记写法。"""
+    converters.register_converter("Terra Ｖ1.2", "0.1", lambda payload: payload)
+    try:
+        assert converters.can_convert("terra v1.2", "0.1")
+        assert converters.can_convert("  TERRA V1.2  ", "0.1")
+        assert ("Terra Ｖ1.2", "0.1") in converters.converters(), "展示按首次登记的写法"
+    finally:
+        converters.unregister_converter("terra v1.2", "0.1")
+    assert not converters.can_convert("terra v1.2", "0.1"), "注销也走规范化键"
+
+
+def test_conversion_provenance_lands_in_the_setting(store, world) -> None:
+    """转换出处随设定落地（§十 残余「元数据物理存放位置」）：不另设侧车文件，随导出 / 导入走。"""
+    info, _timeline_id, _character = make_instance(store, world)
+    _make_old(store, info)
+    before_rules = store.instance_get(info["id"])["rules_version"]
+    converters.register_converter(OLD_FORMAT, "0.1", lambda payload: {**payload})
+    try:
+        out = convert_instance(store, info["id"], confirmed=True)
+        assert out["converted"] is True
+        provenance = json.loads(store.instance_get(info["id"])["setting"])["converted_from"]
+        assert provenance["data_format"] == OLD_FORMAT
+        assert provenance["rules_version"] == before_rules
+        assert provenance["converter"] == f"{OLD_FORMAT} → 0.1"
+        assert provenance["at"] > 0
+    finally:
+        converters.unregister_converter(OLD_FORMAT, "0.1")

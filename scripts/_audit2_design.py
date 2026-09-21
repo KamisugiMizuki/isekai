@@ -247,7 +247,7 @@ def c_blackbox_metadata(case: Case) -> tuple[str, str]:
     assert snapshot, "提交快照不在（说明「提交列表只给元数据」的另一半：快照确实存在但不经列表暴露）"
 
     setting = json.loads(case.store.instance_get(info["id"])["setting"])
-    assert set(setting.keys()) <= {"world_package", "original_name", "cards", "imported_from"}, setting.keys()
+    assert set(setting.keys()) <= {"world_package", "original_name", "cards", "imported_from", "converted_from"}, setting.keys()
 
     public = case.store.instance_get(info["id"])
     info_payload = {

@@ -288,7 +288,10 @@
   容器件 256 MiB，`world/package.py:MAX_PACKAGE_BYTES` · `read_json_file` · `world/ops.py::_read_user_json`）。
 - 生成器提示词、有限字段表单及对话式修订交互。
 - **转换器注册格式已落地**（`world/converters.py`：注册表 + 未确认不动数据 + 副本转换 + 完整校验 + 原子发布）；
-  名称规范化细则与元数据物理存放位置仍余。
+  **名称规范化细则与元数据物理存放位置 2026-09-22 落地**——格式标识走 `converters.normalize_format`
+  （去首尾空白 + NFKC + 大小写折叠，与实例 / 包名同一套规则；登记与查找用规范化键，`converters()` 按登记写法展示）；
+  转换出处写进**实例设定的 `converted_from`**（`data_format` / `rules_version` / `converter` / `at`），
+  随设定导出 / 导入走，不另设侧车文件。行为验收 `tests/test_converter.py`（含规范化等价与出处落地两项）。
 - 历史回填的实现参数：**分卷（十年一卷）与批量（10–20 条均衡分批）、传本选载范围已落地**
   （`runtime/events.py::backfill_plan` + 创建期联合校验 `backfill_product_errors`）；**「已确认缺载」的表示方式已落地**
   （`claim_coverage` 表：`pending` 尚未生成 / `absent` 已确认缺载 / `done` 已展开，`claim.coverage` 可读）；
