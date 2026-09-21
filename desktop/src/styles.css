@@ -28,6 +28,25 @@
   box-sizing: border-box;
 }
 
+/* 浏览器外表面跟随主题（§四）：选区 / 插入符 / 勾选框 / 滚动条都从变量取色，别露 UA 的蓝 */
+html {
+  color-scheme: light dark;
+  accent-color: var(--ink);
+  caret-color: var(--ink);
+  scrollbar-color: var(--border) transparent;
+}
+
+::selection {
+  background: var(--ink);
+  color: var(--bg);
+}
+
+/* 焦点可见（§四）：所有可聚焦控件一律描边；「边框从透明换成浅灰」是 1.43:1 的假焦点 */
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
 .hidden {
   display: none;
 }
@@ -51,6 +70,38 @@ body {
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
+}
+
+/* 基础控件（§四）：按钮与输入同一套外观，别让 UA 默认样式混进来
+   （渲染态实测：管理页 29 个元素回退 Arial，就是因为按钮没拿 font: inherit） */
+button {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  flex-shrink: 0; /* 行内挤不下时换行，不压缩按钮 */
+}
+
+button:hover:enabled {
+  border-color: var(--ink);
+}
+
+button:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+/* 输入控件的禁用态要看得出来：生成在途、只用全文（降级）时相关字段就是禁用的。
+   放在文件末尾、并带上各面选择器：管理面 / 设置面给输入框的 color 规则特异度更高，
+   排在前面会被它们盖掉（.row input / #pane-settings input 都是 (1,1,1)）。 */
+
+/* 主操作：激活 / 创建实例 / AI 生成 */
+button.primary {
+  border-color: var(--ink);
+  font-weight: 600;
 }
 
 #sidebar {
@@ -112,9 +163,12 @@ nav {
   font: inherit;
 }
 
-.nav:hover,
-.nav:focus-visible {
+.nav:hover {
   border-color: var(--border);
+}
+
+.nav:focus-visible {
+  border-color: var(--ink);
 }
 
 .nav.active {
@@ -312,14 +366,14 @@ nav {
   padding: 0;
 }
 
-#settings-form {
+#pane-settings form {
   display: flex;
   flex-direction: column;
   gap: 10px;
   max-width: 520px;
 }
 
-#settings-form label {
+#pane-settings form label {
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -327,7 +381,13 @@ nav {
   color: var(--muted);
 }
 
-#settings-form input {
+#pane-settings form .row label {
+  flex-direction: row;
+  align-items: center;
+}
+
+#pane-settings input:not([type="checkbox"]),
+#pane-settings select {
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -339,7 +399,19 @@ nav {
 .row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap; /* 5 控件行在 min 宽 820 时换行，不靠压缩硬塞 */
   gap: 10px;
+}
+
+/* .hidden 在文件靠前、.row 在后：同等特异度下 display:flex 会盖掉 display:none，
+   于是 .row.hidden（如 #inst-convert-row）在界面上仍然显示（2026-09-21 截图核对发现）。 */
+.row.hidden {
+  display: none;
+}
+
+/* 组内结果槽：空时不占位（就近反馈，但空着不吃 gap） */
+.note:empty {
+  display: none;
 }
 
 .facts {
@@ -356,7 +428,18 @@ nav {
 
 .facts dd {
   margin: 0;
-  word-break: break-all;
+  overflow-wrap: anywhere; /* 长 URL / 中文词组不再被 break-all 劈断 */
+}
+
+/* 版本与计数：零实例时不占首屏（折叠一条摘要行） */
+#manage-facts-box > summary {
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+#manage-facts-box[open] > summary {
+  margin-bottom: 6px;
 }
 
 h2 {
@@ -364,12 +447,15 @@ h2 {
   font-size: 16px;
 }
 
-/* 世界管理面（阶段 1） */
-#pane-manage h3 {
+/* 分组标题：13px/600 + 上方 1px 分隔线——层级不靠灰度承载（§四） */
+#pane-manage h3,
+#pane-settings h3 {
   margin: 18px 0 6px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
   font-size: 13px;
   font-weight: 600;
-  color: var(--muted);
+  color: var(--ink);
 }
 
 #pane-manage .row input,
@@ -405,17 +491,22 @@ h2 {
   font-family: inherit;
 }
 
+/* 删除闸门：离开实例行，独立一行（§3.2 破坏性操作带二次确认） */
+.delete-row {
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.delete-row > .muted:first-child {
+  min-width: 56px;
+}
+
 .muted.bad {
-  color: var(--danger, #b3261e);
+  color: var(--bad);
 }
 
 /* 设置面：备份 / 关于分组（§3.3） */
-#pane-settings h3 {
-  margin: 18px 0 6px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--muted);
-}
 
 #backup-list {
   display: flex;
@@ -443,12 +534,7 @@ h2 {
   list-style: none;
 }
 
-/* 设置面控件：焦点一律可见（§四） */
-#pane-settings input:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
+/* 设置面控件：焦点一律可见（§四）：通用 :focus-visible 规则已覆盖，这里只需勾选框间距 */
 #pane-settings input[type="checkbox"] {
   margin-right: 6px;
 }
@@ -472,11 +558,6 @@ button.session.active {
   font-weight: 600;
 }
 
-button.session:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
 /* 顶栏：语义召回降级标识与输入框上方的提示（§六 / §五） */
 #degrade {
   border-color: var(--muted);
@@ -485,4 +566,19 @@ button.session:focus-visible {
 
 #composer-note {
   font-size: 12px;
+}
+
+/* 输入控件的禁用态要看得出来（放末尾：管理面 / 设置面给输入框的 color 规则特异度与本组相同，
+   只有排在它们后面才生效）。生成在途 / 只用全文（降级）时被禁用的字段都走这里。 */
+input:disabled,
+select:disabled,
+textarea:disabled,
+#pane-manage .row input:disabled,
+#pane-manage .row select:disabled,
+#pane-settings input:disabled,
+#pane-settings select:disabled {
+  color: var(--muted);
+  cursor: default;
+  background: transparent;
+  border-style: dashed; /* 白底上「不变灰就看不出来」：用虚线边框把「不可编辑」说清楚 */
 }

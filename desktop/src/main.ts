@@ -103,9 +103,25 @@ const state = {
   //: 壳给的日志目录：未就绪 / 超时文案里要点出来（§2「等待超时给日志位置」）
   logDir: "",
   backupDir: "",
+  //: 顶栏世界时钟（§3.1）：只跟当前查看的线，且只在激活时显示；冻结 / 未激活不显示
+  chatClock: null as ClockView | null,
+  //: 核心给的配置文件路径（settings.get 的 core.config_file）：「打开配置目录」取它的父目录
+  configFile: "",
 };
 
 const HISTORY_PAGE = 200;
+
+/// 验收观察点：记账本壳发出去的管理面 op（不新增权限——页面本来就能调这些 op；只在内存里留最近 200 条）
+const opLog: string[] = [];
+
+function traceOps(client: MgmtClient): void {
+  const raw = client.call.bind(client);
+  client.call = (op, args, timeoutMs) => {
+    opLog.push(op);
+    if (opLog.length > 200) opLog.shift();
+    return raw(op, args, timeoutMs);
+  };
+}
 
 let ump: UmpClient | null = null;
 let mgmt: MgmtClient | null = null;
@@ -207,10 +223,7 @@ function renderMessages(anchor?: number): void {
   const list = $("messages");
   list.innerHTML = "";
   if (state.messages.length === 0) {
-    const empty = document.createElement("li");
-    empty.className = "empty muted";
-    empty.textContent = "还没有对话。发一条消息试试。";
-    list.appendChild(empty);
+    list.appendChild(emptyState());
   }
   for (const message of state.messages) {
     const item = document.createElement("li");
@@ -254,7 +267,8 @@ function renderMessages(anchor?: number): void {
     if (message.role === "character" && message.delivery) {
       chips.appendChild(chip(`投递：${message.delivery}`, message.delivery === "delivered" ? "ok" : ""));
     }
-    if (message.role === "user" && message.state === "failed") {
+    if (message.role === "user" && message.state === "failed" && message.envId) {
+      // 只有持有稳定出站标识的消息才给重试（sendMessage 抛错路径不设 envId → 不给按不动的按钮）
       const retry = document.createElement("button");
       retry.className = "link";
       retry.textContent = "重试";
@@ -274,6 +288,36 @@ function renderMessages(anchor?: number): void {
   }
   // anchor = 渲染前「距底部」的距离：更早的消息接在前面时用它把视口钉在原处，不让视图跳走
   list.scrollTop = anchor === undefined ? list.scrollHeight : list.scrollHeight - anchor;
+}
+
+/// 空态按状态分支（§四：空实例 / 无会话各有明确空态）：无实例就给一条直达入口，
+/// 不再说「发一条消息试试」跟顶栏 chip「还没有世界实例」互相矛盾（P0-1）。
+function emptyState(): HTMLElement {
+  const empty = document.createElement("li");
+  empty.className = "empty muted";
+  if (!world.instances.length) {
+    empty.textContent = "还没有世界实例。";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.id = "empty-create";
+    button.className = "primary";
+    button.textContent = "创建你的第一个世界";
+    button.addEventListener("click", () => openFirstWorld());
+    empty.appendChild(button);
+    return empty;
+  }
+  empty.textContent = state.sessionId
+    ? "还没有对话。发一条消息试试。"
+    : "还没有选中的会话：从左侧「会话」列表点一条开始。";
+  return empty;
+}
+
+/// 首跑引导落点：切到管理页并把世界包生成入口顶到眼前（只导航与聚焦，不替用户做任何事）
+function openFirstWorld(): void {
+  document.querySelector<HTMLButtonElement>('nav .nav[data-pane="manage"]')?.click();
+  const brief = $<HTMLInputElement>("pkg-brief");
+  brief.scrollIntoView({ block: "center" });
+  brief.focus();
 }
 
 function chip(text: string, kind: string): HTMLElement {
@@ -410,31 +454,38 @@ async function scheduleReconnect(): Promise<void> {
   }
 }
 
+/// 重启核心：全程占住「连接权」（restartInFlight）——管理令牌是一次性的，
+/// 让时钟轮询里的重建路径同时去连只会两边都认证失败（2026-09 实测）。
 async function restartCore(): Promise<void> {
-  setStatus("重启核心中…", "pending");
-  hideRestart();
-  state.phase = "starting";
-  reconnectToken += 1; // 作废在途重连链
+  restartInFlight = true;
   try {
-    await invoke("core_restart");
-  } catch (error) {
-    setStatus(`重启失败：${error}`, "bad");
-    showRestart();
-    return;
-  }
-  const status = await waitForCore();
-  const info = coreStatusText(status.state, status.error);
-  if (status.state === "ready" || status.state === "compatibility_blocked") {
-    // 兼容性阻断也连管理面：核心只读但管理入口保留（§5.7）
+    setStatus("重启核心中…", "pending");
+    hideRestart();
+    state.phase = "starting";
+    reconnectToken += 1; // 作废在途重连链
     try {
-      await connectChat(status);
+      await invoke("core_restart");
     } catch (error) {
-      setStatus(`${info.text}（管理面未连上：${error}）`, info.kind);
+      setStatus(`重启失败：${error}`, "bad");
+      showRestart();
+      return;
+    }
+    const status = await waitForCore();
+    const info = coreStatusText(status.state, status.error);
+    if (status.state === "ready" || status.state === "compatibility_blocked") {
+      // 兼容性阻断也连管理面：核心只读但管理入口保留（§5.7）
+      try {
+        await connectChat(status);
+      } catch (error) {
+        setStatus(`${info.text}（管理面未连上：${error}）`, info.kind);
+        showRestart();
+      }
+    } else {
+      setStatus(info.text, info.kind);
       showRestart();
     }
-  } else {
-    setStatus(info.text, info.kind);
-    showRestart();
+  } finally {
+    restartInFlight = false;
   }
 }
 
@@ -519,8 +570,11 @@ async function connectChat(status: CoreStatus): Promise<void> {
     showRestart();
     return;
   }
+  mgmt?.close(); // 旧连接（若有）先关：重建时别把旧 socket 挂在那里
   mgmt = new MgmtClient(status.endpoint, status.mgmt);
+  traceOps(mgmt);
   await mgmt.connect();
+  mgmtTokenUsed = String(status.mgmt ?? ""); // 记下这次用掉的一次性令牌：没换令牌就没有可重建的凭据
   state.endpoint = status.endpoint;
   state.bootstrap = status.bootstrap ?? null;
 
@@ -547,10 +601,14 @@ async function connectChat(status: CoreStatus): Promise<void> {
   const info = coreStatusText(status.state, status.error);
   if (info.kind === "ok") hideRestart();
   else showRestart(); // 阻断态仍要留恢复入口（§5.7 / §2.9）
-  const suffix = chatEnabled() && !opened ? "（还没有世界实例：先在管理面创建）" : "";
+  // 还没世界实例时，顶栏 chip 与聊天空态说同一件事（空态给直达按钮，两者不再互相矛盾）
+  const suffix = chatEnabled() && (!opened || !world.instances.length)
+    ? "（还没有世界实例：先在管理面创建）"
+    : "";
   setStatus(`${info.text}${suffix}`, info.kind);
   renderComposeGate();
   renderManagePane(overview);
+  void refreshClockChip(); // 顶栏世界时钟（§3.1）：连上就按当前查看的线跟一次
 }
 
 async function loadHistory(): Promise<void> {
@@ -725,6 +783,7 @@ async function switchSession(row: SessionRow, connect = false): Promise<void> {
   await loadHistory();
   await loadSessions();
   renderTopbar();
+  void refreshClockChip(); // 换会话 = 换一条线：顶栏时钟跟着走
   hideRestart();
 }
 
@@ -804,13 +863,11 @@ async function lineActive(row: SessionRow): Promise<boolean> {
 
 function renderManagePane(overview: Record<string, unknown>): void {
   const counts = (overview.counts as Record<string, number>) ?? {};
+  // 版本三项与设置面「关于 / 诊断」重复：只留一处（关于面是版本的正位），这里只放本页独有的计数
   renderFacts($("manage-facts"), [
-    ["应用版本", String(overview.app ?? "-")],
-    ["数据格式版本", String(overview.data_format ?? "-")],
-    ["世界规则版本", String(overview.rules ?? "-")],
-    ["协议版本", String(overview.ump ?? "-")],
     ["核心状态", String(overview.state ?? "-")],
     ["端点", String(overview.endpoint ?? "-")],
+    ["协议版本", String(overview.ump ?? "-")],
     ["会话/线程/通道", `${counts.sessions ?? 0} / ${counts.threads ?? 0} / ${counts.channels ?? 0}`],
     ["消息条数", String(counts.messages ?? 0)],
   ]);
@@ -1124,6 +1181,10 @@ function bindNav(): void {
 interface SettingsPayload {
   llm: Record<string, unknown>;
   core: Record<string, unknown>;
+  //: 冻结契约（核心侧同步扩展中）：settings.set 接受任一段，成功返回与 settings.get 同形
+  memory?: Record<string, unknown>;
+  commit?: Record<string, unknown>;
+  backup?: Record<string, unknown>;
 }
 
 /// 最近一次变更时间：核心 settings 段不带时间字段，壳读本地配置文件的 mtime 补上（不伪造服务端字段）
@@ -1142,6 +1203,7 @@ function fillSettings(settings: SettingsPayload): void {
   $<HTMLInputElement>("set-timeout").value = String(settings.llm.timeout_s ?? "");
   $<HTMLInputElement>("set-max-tokens").value = String(settings.llm.max_tokens ?? "");
   $<HTMLInputElement>("set-temperature").value = String(settings.llm.temperature ?? "");
+  state.configFile = String(settings.core.config_file ?? "");
   renderFacts($("settings-facts"), [
     ["当前模型", String(settings.llm.model ?? "-")],
     ["最近一次变更", changedLabel(Number(settings.llm.changed_at ?? 0))],
@@ -1149,6 +1211,137 @@ function fillSettings(settings: SettingsPayload): void {
     ["单段上限 / 单批段数", `${settings.core.max_text_len} / ${settings.core.max_parts}`],
     ["上下文条数", String(settings.core.context_history_max ?? "-")],
   ]);
+  fillMemorySegment(settings.memory);
+  fillCommitSegment(settings.commit);
+}
+
+/// 记忆向量化组（§3.3）：核心给了 memory 段就填成可编辑表单；没给就照实说明并保留本地事实展示
+function fillMemorySegment(segment: Record<string, unknown> | undefined): void {
+  const mode = $<HTMLSelectElement>("set-mem-mode");
+  const url = $<HTMLInputElement>("set-mem-base-url");
+  const model = $<HTMLInputElement>("set-mem-model");
+  const key = $<HTMLInputElement>("set-mem-api-key");
+  if (!segment) {
+    mode.value = "chat";
+    url.value = "";
+    model.value = "";
+    key.value = "";
+    key.placeholder = "（核心这一版未开放 memory 段）";
+    renderMemModeGate();
+    return;
+  }
+  mode.value = segment.mode === "separate" ? "separate" : "chat";
+  url.value = String(segment.base_url ?? "");
+  model.value = String(segment.model ?? "");
+  key.value = "";
+  key.placeholder = segment.api_key_set ? `已配置：${segment.api_key}` : "尚未配置（留空表示不修改）";
+  renderMemModeGate();
+  renderFacts($("mem-facts"), [
+    ["召回模式", segment.mode === "separate" ? "独立服务（远程语义召回）" : "只用全文（降级）"],
+    ["服务地址", String(segment.base_url || "未配置")],
+    ["模型", String(segment.model || "未配置")],
+    ["API Key", segment.api_key_set ? "已配置（读取打码）" : "尚未配置"],
+    ["当前状态", segment.ready ? "可用：记忆检索走远程语义召回" : "不可用：已降级为全文召回"],
+  ]);
+}
+
+/// 只用全文（降级）时独立服务三项不参与召回：置灰但保留已填值（改的是模式，不动配置）
+function renderMemModeGate(): void {
+  const separate = $<HTMLSelectElement>("set-mem-mode").value === "separate";
+  for (const id of ["set-mem-base-url", "set-mem-model", "set-mem-api-key"]) {
+    $<HTMLInputElement>(id).disabled = !separate;
+  }
+}
+
+function fillCommitSegment(segment: Record<string, unknown> | undefined): void {
+  if (!segment) return;
+  $<HTMLInputElement>("set-commit-enabled").checked = Boolean(segment.auto_enabled);
+  $<HTMLInputElement>("set-commit-minutes").value = String(segment.minutes ?? "");
+  $<HTMLInputElement>("set-commit-events").value = String(segment.events ?? "");
+  renderFacts($("commit-facts"), [
+    ["提交开关", segment.auto_enabled ? "开启" : "关闭"],
+    ["现实间隔", segment.minutes === undefined ? "（未知）" : `${segment.minutes} 分钟`],
+    ["事件阈值", segment.events === undefined ? "（未知）" : `${segment.events} 条新增事件`],
+    ["当前状态", segment.auto_enabled ? "按现实间隔或新增事件条数触发" : "已关闭（不影响状态日常持久化）"],
+  ]);
+}
+
+/// 写入 settings.set 的一段：成功即以核心返回的同形结果回填；失败照实显示核心的原因（不伪造成功）
+async function saveSegment(key: string, segment: Record<string, unknown>, noteId: string): Promise<void> {
+  const note = $(noteId);
+  note.className = "muted note";
+  note.textContent = "保存中…";
+  try {
+    const saved = (await mgmt!.call("settings.set", { [key]: segment })) as unknown as SettingsPayload;
+    fillSettings(saved);
+    note.className = "muted note";
+    note.textContent = (saved as unknown as Record<string, unknown>)[key]
+      ? "已保存并生效"
+      : `已保存，但核心未回读 ${key} 段（界面显示的值可能滞后）`;
+  } catch (error) {
+    note.className = "muted note bad";
+    note.textContent = `保存失败（未改动）：${error}`;
+  }
+}
+
+async function saveMemoryForm(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (!mgmt) return;
+  const mode = $<HTMLSelectElement>("set-mem-mode").value;
+  if (mode === "chat") {
+    // 「只用全文（降级）」：核心的 mode 由「有没有配向量模型」派生，没有「清空键」语义。
+    // 先按契约把 mode=chat 发出去；核心不开放这个键就如实说明（不假装成功、不悄悄改别的键）。
+    const note = $("mem-note");
+    note.className = "muted note";
+    note.textContent = "保存中…";
+    try {
+      const saved = (await mgmt.call("settings.set", { memory: { mode: "chat" } })) as unknown as SettingsPayload;
+      fillSettings(saved);
+      note.textContent = "已保存并生效：记忆检索按全文召回";
+    } catch (error) {
+      note.className = "muted note bad";
+      note.textContent =
+        `保存失败（未改动）：${error}｜当前核心的召回模式由「有没有配向量模型」派生，` +
+        "要让记忆回到全文降级，只能清掉配置文件里的 memory_embedding_* 后重启核心。";
+    }
+    return;
+  }
+  const segment: Record<string, unknown> = {
+    base_url: $<HTMLInputElement>("set-mem-base-url").value.trim(),
+    model: $<HTMLInputElement>("set-mem-model").value.trim(),
+  };
+  const key = $<HTMLInputElement>("set-mem-api-key").value.trim();
+  if (key) segment.api_key = key; // 留空不改（与 LLM 段同一写法）
+  await saveSegment("memory", segment, "mem-note");
+}
+
+async function saveCommitForm(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (!mgmt) return;
+  await saveSegment(
+    "commit",
+    {
+      auto_enabled: $<HTMLInputElement>("set-commit-enabled").checked,
+      minutes: Number($<HTMLInputElement>("set-commit-minutes").value),
+      events: Number($<HTMLInputElement>("set-commit-events").value),
+    },
+    "commit-note",
+  );
+}
+
+async function saveBackupForm(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (!mgmt) return;
+  await saveSegment(
+    "backup",
+    {
+      dir: $<HTMLInputElement>("set-backup-dir").value.trim(),
+      interval_hours: Number($<HTMLInputElement>("set-backup-interval").value),
+      keep: Number($<HTMLInputElement>("set-backup-keep").value),
+    },
+    "backup-note",
+  );
+  await loadBackups();
 }
 
 /// 记忆检索是否走远程语义召回：判据与核心一致（模型 + 地址 + 凭据都齐才可用），缺任一项即全文降级（§六 / §十.7）
@@ -1274,6 +1467,10 @@ async function loadBackups(): Promise<void> {
     const listed = await mgmt.call("backup.list");
     const backups = (listed.backups ?? []) as unknown as BackupEntry[];
     state.backupDir = String(listed.dir ?? "");
+    // 备份组表单（§3.3）：目录 / 间隔 / 保留数就填核心回的值（与下方事实同一份真值）
+    $<HTMLInputElement>("set-backup-dir").value = state.backupDir;
+    $<HTMLInputElement>("set-backup-interval").value = String(listed.interval_hours ?? "");
+    $<HTMLInputElement>("set-backup-keep").value = String(listed.keep ?? "");
     renderFacts($("backup-facts"), [
       ["备份目录", state.backupDir || "-"],
       [
@@ -1412,7 +1609,7 @@ async function loadAbout(): Promise<void> {
   ]);
 }
 
-/// 打开目录（日志 / 备份）：走壳的 open_dir，不新增依赖
+/// 打开目录（日志 / 备份 / 配置）：走壳的 open_dir，不新增依赖
 async function openDir(path: string, note: HTMLElement): Promise<void> {
   if (!path) {
     note.textContent = "还不知道目录位置：先连上核心或做一次备份";
@@ -1424,6 +1621,16 @@ async function openDir(path: string, note: HTMLElement): Promise<void> {
   } catch (error) {
     note.textContent = String(error);
   }
+}
+
+/// 打开配置目录（§3.3 关于）：目录取核心给的配置文件路径的父目录（壳复用既有 open_dir）
+async function openConfigDir(): Promise<void> {
+  const file = state.configFile || state.facts?.config_file || "";
+  if (!file) {
+    $("about-note").textContent = "还不知道配置文件位置：先连上核心或重新读取设置";
+    return;
+  }
+  await openDir(file.replace(/[\\/][^\\/]*$/, ""), $("about-note"));
 }
 
 async function saveSettings(event: SubmitEvent): Promise<void> {
@@ -1527,6 +1734,48 @@ const world: WorldCache = {
 let disclosureSelection: DisclosureSelection | null = null;
 const GENERATE_TIMEOUT_MS = 600000;
 
+/// 生成（世界包 / 角色卡）闸门：进行中禁用该组三个控件，二次点击直接拦下（连点 = 第二次付费调用）。
+/// 过程没有进度事件，只有已用时长与上限——不装进度条、不写「一两分钟」（§3.1 诚实反馈）。
+const generateBusy = { package: false, card: false };
+/// 调用上限：与确认框里写的一致；完成后以核心回的 usage.limit 为准
+const GENERATE_LIMIT = { package: 6, card: 2 };
+const GENERATE_CONTROLS = {
+  package: ["pkg-generate", "pkg-brief", "pkg-name"],
+  card: ["card-generate", "card-brief", "card-name-input"],
+};
+/// 每个组各一个进度计时器：同组重入时先清掉上一只，绝不让计时器泄漏着一直改写结果槽
+const progressTimers: Record<"package" | "card", number | null> = { package: null, card: null };
+
+function setGenerateGate(kind: "package" | "card", busy: boolean): void {
+  generateBusy[kind] = busy;
+  for (const id of GENERATE_CONTROLS[kind]) {
+    ($(id) as HTMLButtonElement | HTMLInputElement).disabled = busy;
+  }
+}
+
+function elapsedLabel(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function startProgress(kind: "package" | "card", slotId: string): void {
+  stopProgress(kind);
+  const started = Date.now();
+  const tick = (): void =>
+    groupNote(
+      slotId,
+      `${kind === "package" ? "世界包" : "角色卡"}生成中：已用 ${elapsedLabel(Date.now() - started)}` +
+        ` / 上限 ${elapsedLabel(GENERATE_TIMEOUT_MS)}　调用上限 ${GENERATE_LIMIT[kind]} 次（过程中无法取消）`,
+    );
+  tick();
+  progressTimers[kind] = window.setInterval(tick, 1000);
+}
+
+function stopProgress(kind: "package" | "card"): void {
+  if (progressTimers[kind] !== null) window.clearInterval(progressTimers[kind]);
+  progressTimers[kind] = null;
+}
+
 function fillSelect(select: HTMLSelectElement | null, entries: Array<[string, string]>): void {
   if (!select) {
     console.warn("fillSelect: 目标节点不存在");
@@ -1543,10 +1792,37 @@ function fillSelect(select: HTMLSelectElement | null, entries: Array<[string, st
   if (entries.some(([value]) => value === previous)) select.value = previous;
 }
 
-function worldNote(text: string, bad = false): void {
+/// 页顶提示：只留跨组 / 严重事件；带锚点时给「回到该组」入口（组内结果就近在组里，页顶只是索引）
+let worldNoteAnchor = "";
+
+function worldNote(text: string, bad = false, anchor = ""): void {
   const note = $("world-note");
   note.textContent = text;
-  note.className = bad ? "muted bad" : "muted";
+  note.className = bad ? "muted note bad" : "muted note";
+  worldNoteAnchor = anchor;
+  $("world-note-jump").classList.toggle("hidden", !anchor);
+}
+
+/// 组内结果槽：动作的结果落在动作所在的那一组（§3.1 就近反馈；页顶只有一个 1800px 外的槽）
+function groupNote(slotId: string, text: string, bad = false): void {
+  const note = document.getElementById(slotId) as HTMLElement | null;
+  if (!note) {
+    console.warn(`groupNote: 目标节点不存在 ${slotId}`);
+    return;
+  }
+  note.textContent = text;
+  note.className = bad ? "muted note bad" : "muted note";
+}
+
+/// 组内提示按组写进槽；跨组 / 严重事件才写页顶
+function reportNote(slotId: string, text: string, bad = false): void {
+  if (slotId === "world-note") worldNote(text, bad);
+  else groupNote(slotId, text, bad);
+}
+
+/// 「回到该组」：滚回发出这条页顶事件的那一组
+function jumpToWorldGroup(): void {
+  document.getElementById(worldNoteAnchor)?.scrollIntoView({ block: "center" });
 }
 
 function showErrors(target: string, errors: string[] | undefined): void {
@@ -1566,6 +1842,8 @@ async function loadWorld(): Promise<void> {
     world.cards = (cards.cards ?? []) as unknown as CardEntry[];
     world.instances = (instances.instances ?? []) as unknown as InstanceEntry[];
     worldNote("");
+    // 零实例时把「版本与计数」折叠成一行：首屏留给世界包与实例两组（P0-1）
+    $<HTMLDetailsElement>("manage-facts-box").open = world.instances.length > 0;
   } catch (error) {
     worldNote(String(error), true);
     return;
@@ -1597,6 +1875,7 @@ async function loadWorld(): Promise<void> {
   fillSelect($<HTMLSelectElement>("import-select"), importOptions);
   const selected = $<HTMLSelectElement>("inst-select").value;
   world.instanceId = selected;
+  renderDeleteGate();
   if (selected) void showInstance(selected);
   else renderFacts($("world-facts"), [["实例", "还没有实例"]]);
   void loadDrafts();
@@ -1658,8 +1937,26 @@ async function showInstance(instanceId: string): Promise<void> {
     await refreshClock(info.id, world.timeline);
     void loadUsage();
   } catch (error) {
-    worldNote(String(error), true);
+    // 实例详情读不出来属于跨组事实（选择、重命名、导出、删除全靠它）：写页顶并给「回到该组」锚点
+    worldNote(String(error), true, "group-instances");
   }
+}
+
+/* ---------- 删除闸门（§3.2）：离开实例选择行，要求键入实例名，同处写明保留什么 ---------- */
+
+let deleteResult = "";
+
+function instanceNameOf(id: string): string {
+  return world.instances.find((item) => item.id === id)?.name ?? "";
+}
+
+/// 删除按钮只在键入的名字与选中实例完全一致时可点（浏览器原生 OK 即执行的破坏性路径先过这道闸）
+function renderDeleteGate(): void {
+  const id = $<HTMLSelectElement>("inst-select").value;
+  const name = instanceNameOf(id);
+  const typed = $<HTMLInputElement>("inst-delete-name").value.trim();
+  $<HTMLButtonElement>("inst-delete").disabled = !name || typed !== name;
+  $("inst-delete-note").textContent = deleteResult || "将保留：世界包 / 角色卡 / 导出件";
 }
 
 function currentCharacterName(cardId: string): string {
@@ -1840,13 +2137,80 @@ async function refreshClock(instanceId = world.instanceId, timelineId = world.ti
   }
 }
 
+/* ---------- 顶栏世界时钟（§3.1）：世界在跑，聊天页也要看得见 ---------- */
+
+/// 时钟跟随的目标：聊天页当前会话这条线优先；还没开会话时退回管理页正在查看的实例（同一份事实）
+function clockTarget(): { instance_id: string; timeline_id: string } {
+  return state.instanceId && state.timelineId
+    ? { instance_id: state.instanceId, timeline_id: state.timelineId }
+    : { instance_id: world.instanceId, timeline_id: world.timeline };
+}
+
+/// 顶栏时钟只显示「当前查看且已激活」的线：冻结 / 未激活就整枚隐藏，不拿别的线的钟充数
+async function refreshClockChip(): Promise<void> {
+  const chip = $("topbar-clock");
+  const pair = clockTarget();
+  if (!mgmt || !pair.instance_id || !pair.timeline_id) {
+    state.chatClock = null;
+  } else {
+    try {
+      // 3 秒上限：本地时钟读不出来只可能是连接没了（核心重启 / 断线），别等默认 30 秒
+      const clock = (await mgmt.call("runtime.clock", pair, 3000)).clock as unknown as ClockView;
+      const now = clockTarget();
+      if (now.instance_id !== pair.instance_id || now.timeline_id !== pair.timeline_id) return; // 已被切走
+      state.chatClock = clock;
+    } catch (error) {
+      state.chatClock = null;
+      // 核心重启后旧的管理面连接已死（或响应不回来）：令牌是一次性的，只能整条重建再继续跟
+      const text = String(error);
+      if (text.includes("未连接核心") || text.includes("管理面响应超时")) void rebuildMgmt();
+    }
+  }
+  const clock = state.chatClock;
+  if (!clock || clock.state !== "active") {
+    chip.classList.add("hidden");
+    return;
+  }
+  chip.classList.remove("hidden");
+  chip.textContent = `${clock.label}　倍率 ${clock.rate}${clock.catching_up ? "　追赶中" : ""}`;
+}
+
+let mgmtRebuilding = false;
+
+/// 「重启核心」路径正在跑：它自己会连，别的重建路径让开（管理令牌是一次性的，不许两个人抢）
+let restartInFlight = false;
+
+/// 上一次认证用掉的（一次性）管理面令牌：只有核心重启换了新令牌才值得重建连接
+let mgmtTokenUsed = "";
+
+/// 管理面断开（核心重启 / 网络断）后重建连接：重新握手拿新的一次性令牌，并重载世界数据与聊天通道。
+/// 与「重启核心」按钮路径互斥：那条路自己会连，重复抢令牌只会让两边都认证失败。
+async function rebuildMgmt(): Promise<void> {
+  if (!mgmt || mgmtRebuilding || restartInFlight) return;
+  mgmtRebuilding = true;
+  const mine = reconnectToken;
+  try {
+    const status = await waitForCore();
+    if (reconnectToken !== mine || restartInFlight) return; // 期间有别的连接流程接管
+    if (String(status.mgmt ?? "") === mgmtTokenUsed) return; // 令牌没换 = 还是这个核心，没有可换的凭据
+    if (status.state !== "ready" && status.state !== "compatibility_blocked") return;
+    await connectChat(status);
+  } catch (error) {
+    setStatus(`管理面重建失败：${error}${logHint()}`, "bad");
+    showRestart();
+  } finally {
+    mgmtRebuilding = false;
+  }
+}
+
 async function clockAction(action: () => Promise<string>, pair?: { instance_id: string; timeline_id: string }): Promise<void> {
   try {
     const message = await action();
     await refreshClock(pair?.instance_id, pair?.timeline_id);
-    worldNote(message);
+    await refreshClockChip();
+    groupNote("clock-note", message);
   } catch (error) {
-    worldNote(String(error), true);
+    groupNote("clock-note", String(error), true);
   }
 }
 
@@ -1865,17 +2229,18 @@ async function saveDraft(
       errors,
     });
   } catch (error) {
-    worldNote(`草稿保存失败：${error}`, true);
+    reportNote(kind === "card" ? "card-note" : "pkg-note", `草稿保存失败：${error}`, true);
   }
 }
 
-async function worldAction(action: () => Promise<string | void>): Promise<void> {
+/// 世界管理面动作的统一封装：结果写进本组的槽（就近），只有跨组 / 严重事件才写页顶
+async function worldAction(action: () => Promise<string | void>, slotId = "world-note"): Promise<void> {
   try {
     const message = await action();
     await loadWorld();
-    if (message) worldNote(message);
+    if (message) reportNote(slotId, message);
   } catch (error) {
-    worldNote(String(error), true);
+    reportNote(slotId, String(error), true);
   }
 }
 
@@ -2105,18 +2470,23 @@ async function discardDraft(): Promise<string> {
 
 function bindWorld(): void {
   $("world-refresh").addEventListener("click", () => void loadWorld());
-  $("pkg-import").addEventListener("click", () => void worldAction(importPackage));
-  $("card-import").addEventListener("click", () => void worldAction(importCard));
+  $("world-note-jump").addEventListener("click", () => jumpToWorldGroup());
+  $("pkg-import").addEventListener("click", () => void worldAction(importPackage, "pkg-note"));
+  $("card-import").addEventListener("click", () => void worldAction(importCard, "card-note"));
   $<HTMLSelectElement>("card-package-select").addEventListener("change", () =>
     renderCardImportGate(),
   );
-  $("inst-convert").addEventListener("click", () => void worldAction(convertSelectedInstance));
-  $("card-add").addEventListener("click", () => void worldAction(addCharacter));
-  $("draft-continue").addEventListener("click", () => void worldAction(continueDraft));
-  $("draft-discard").addEventListener("click", () => void worldAction(discardDraft));
+  $("inst-convert").addEventListener("click", () =>
+    void worldAction(convertSelectedInstance, "inst-convert-note"),
+  );
+  $("card-add").addEventListener("click", () => void worldAction(addCharacter, "card-note"));
+  $("draft-continue").addEventListener("click", () => void worldAction(continueDraft, "draft-note"));
+  $("draft-discard").addEventListener("click", () => void worldAction(discardDraft, "draft-note"));
   $<HTMLSelectElement>("inst-select").addEventListener("change", (event) => {
-    void showInstance((event.target as HTMLSelectElement).value);
+    deleteResult = "";
+    void showInstance((event.target as HTMLSelectElement).value).then(() => renderDeleteGate());
   });
+  $<HTMLInputElement>("inst-delete-name").addEventListener("input", () => renderDeleteGate());
   $("clock-activate").addEventListener("click", () => {
     const pair = { instance_id: world.instanceId, timeline_id: world.timeline };
     void clockAction(async () => {
@@ -2153,8 +2523,11 @@ function bindWorld(): void {
     }, pair);
   });
 
-  // 时钟显示：世界在走，界面每 2 秒跟一次（管理页可见时才请求）
+  // 时钟显示：世界在走，界面每 2 秒跟一次。
+  // 顶栏时钟在聊天页也要看得见（§3.1），所以这条轮询不再只在管理页可见时跑：
+  // 顶栏跟当前会话那条线；管理页可见时再额外跟一次正在查看的实例。
   setInterval(() => {
+    void refreshClockChip();
     if (!$("pane-manage").classList.contains("hidden")) void refreshClock();
   }, 2000);
 
@@ -2166,7 +2539,7 @@ function bindWorld(): void {
       const errors = (result.errors ?? []) as string[];
       showErrors("pkg-errors", errors);
       return errors.length ? "" : `${file} 通过校验`;
-    }),
+    }, "pkg-note"),
   );
 
   $("pkg-template").addEventListener("click", () =>
@@ -2177,37 +2550,50 @@ function bindWorld(): void {
       await mgmt!.call("world.package.save", { path: file, package: created.package });
       showErrors("pkg-errors", created.errors as string[]);
       return `已写入 ${file}（骨架还需填内容）`;
-    }),
+    }, "pkg-note"),
   );
 
   $("pkg-generate").addEventListener("click", () =>
     void worldAction(async () => {
+      if (generateBusy.package) return ""; // in-flight 守卫：连点不发第二次（第二次就是第二次付费调用）
       const brief = $<HTMLInputElement>("pkg-brief").value.trim();
       if (!brief) throw new Error("先写一段世界描述");
       const file = $<HTMLInputElement>("pkg-file").value.trim() || "world.json";
       const settings = (await mgmt!.call("settings.get")) as unknown as SettingsPayload;
       const ok = window.confirm(
         `将向 ${settings.llm.model}（${settings.llm.base_url}）发送你填写的世界描述与生成上下文，` +
-          `预计调用 3–6 次（含重试，上限 6 次），用量会在完成后显示。继续？`,
+          `预计调用 3–6 次（含重试，上限 ${GENERATE_LIMIT.package} 次），最长等 ${GENERATE_TIMEOUT_MS / 60000} 分钟；` +
+          "过程中无法取消（核心没有取消 op，只能等它结束或失败）。用量在完成后显示，继续？",
       );
       if (!ok) return "已取消，未发送任何内容";
-      worldNote("AI 生成中，可能需要一两分钟…");
-      const result = await mgmt!.call(
-        "world.package.generate",
-        { brief, name: $<HTMLInputElement>("pkg-name").value.trim() || file.replace(/\.json$/, "") },
-        GENERATE_TIMEOUT_MS,
-      );
+      const started = Date.now();
+      setGenerateGate("package", true);
+      startProgress("package", "pkg-note");
+      let result: Record<string, unknown>;
+      try {
+        result = await mgmt!.call(
+          "world.package.generate",
+          { brief, name: $<HTMLInputElement>("pkg-name").value.trim() || file.replace(/\.json$/, "") },
+          GENERATE_TIMEOUT_MS,
+        );
+      } finally {
+        stopProgress("package");
+        setGenerateGate("package", false);
+      }
       const errors = (result.errors ?? []) as string[];
       const usage = result.usage as { calls?: number; limit?: number; paused?: boolean } | undefined;
+      const cost =
+        `调用 ${usage?.calls ?? "?"}/${usage?.limit ?? GENERATE_LIMIT.package} 次 · ` +
+        `用时 ${elapsedLabel(Date.now() - started)} / 上限 ${elapsedLabel(GENERATE_TIMEOUT_MS)}`;
       if (errors.length) {
         showErrors("pkg-errors", errors);
         await saveDraft(file, "package", result.candidate, errors);
-        return `生成未通过校验，已存为草稿（调用 ${usage?.calls ?? "?"}/${usage?.limit ?? "?"}）`;
+        return `生成未通过校验，已存为草稿（${cost}）`;
       }
       await mgmt!.call("world.package.save", { path: file, package: result.candidate });
       showErrors("pkg-errors", []);
-      return `已生成并写入 ${file}（调用 ${usage?.calls ?? "?"}/${usage?.limit ?? "?"}）`;
-    }),
+      return `已生成并写入 ${file}（${cost}）`;
+    }, "pkg-note"),
   );
 
   $("card-template").addEventListener("click", () =>
@@ -2221,11 +2607,12 @@ function bindWorld(): void {
       });
       await mgmt!.call("world.card.save", { card_path: file, card: created.card });
       return `已写入 ${file}（骨架未确认）`;
-    }),
+    }, "card-note"),
   );
 
   $("card-generate").addEventListener("click", () =>
     void worldAction(async () => {
+      if (generateBusy.card) return ""; // in-flight 守卫：连点不发第二次
       const pkg = $<HTMLSelectElement>("pkg-select").value;
       const brief = $<HTMLInputElement>("card-brief").value.trim();
       const file = $<HTMLInputElement>("card-file").value.trim() || "card.json";
@@ -2234,26 +2621,38 @@ function bindWorld(): void {
       const settings = (await mgmt!.call("settings.get")) as unknown as SettingsPayload;
       const ok = window.confirm(
         `将向 ${settings.llm.model}（${settings.llm.base_url}）发送角色描述与目标世界包，` +
-          `预计调用 1–2 次（上限 2 次）。继续？`,
+          `预计调用 1–2 次（上限 ${GENERATE_LIMIT.card} 次），最长等 ${GENERATE_TIMEOUT_MS / 60000} 分钟；` +
+          "过程中无法取消（核心没有取消 op，只能等它结束或失败）。继续？",
       );
       if (!ok) return "已取消，未发送任何内容";
-      worldNote("AI 生成角色卡中…");
-      const result = await mgmt!.call(
-        "world.card.generate",
-        { package_path: pkg, brief },
-        GENERATE_TIMEOUT_MS,
-      );
+      const started = Date.now();
+      setGenerateGate("card", true);
+      startProgress("card", "card-note");
+      let result: Record<string, unknown>;
+      try {
+        result = await mgmt!.call(
+          "world.card.generate",
+          { package_path: pkg, brief },
+          GENERATE_TIMEOUT_MS,
+        );
+      } finally {
+        stopProgress("card");
+        setGenerateGate("card", false);
+      }
       const errors = (result.errors ?? []) as string[];
       const usage = result.usage as { calls?: number; limit?: number } | undefined;
+      const cost =
+        `调用 ${usage?.calls ?? "?"}/${usage?.limit ?? GENERATE_LIMIT.card} 次 · ` +
+        `用时 ${elapsedLabel(Date.now() - started)} / 上限 ${elapsedLabel(GENERATE_TIMEOUT_MS)}`;
       if (errors.length) {
         showErrors("card-errors", errors);
         await saveDraft(file, "card", result.candidate, errors);
-        return `生成未通过校验，已存为草稿（调用 ${usage?.calls ?? "?"}/${usage?.limit ?? "?"}）`;
+        return `生成未通过校验，已存为草稿（${cost}）`;
       }
       await mgmt!.call("world.card.save", { card_path: file, card: result.candidate });
       showErrors("card-errors", []);
-      return `已生成并写入 ${file}（仍需确认；调用 ${usage?.calls ?? "?"}/${usage?.limit ?? "?"}）`;
-    }),
+      return `已生成并写入 ${file}（仍需确认；${cost}）`;
+    }, "card-note"),
   );
 
   $("card-confirm").addEventListener("click", () =>
@@ -2264,7 +2663,7 @@ function bindWorld(): void {
       await mgmt!.call("world.card.confirm", { package_path: pkg, card_path: card });
       showErrors("card-errors", []);
       return `${card} 已确认，可用于创建实例`;
-    }),
+    }, "card-note"),
   );
 
   $("inst-create").addEventListener("click", () =>
@@ -2284,7 +2683,7 @@ function bindWorld(): void {
       });
       const info = result.instance as unknown as InstanceEntry;
       return `已创建实例「${info.name}」（默认冻结）`;
-    }),
+    }, "inst-note"),
   );
 
   $("inst-rename-btn").addEventListener("click", () =>
@@ -2294,7 +2693,7 @@ function bindWorld(): void {
       if (!id || !name) throw new Error("先选实例并填新名称");
       await mgmt!.call("instance.rename", { id, name });
       return `已重命名为「${name}」`;
-    }),
+    }, "inst-note"),
   );
 
   $("inst-export").addEventListener("click", () =>
@@ -2306,7 +2705,7 @@ function bindWorld(): void {
       const result = await mgmt!.call("instance.export", { id, path: file });
       const manifest = result.manifest as Record<string, unknown>;
       return `已导出 ${file}（设置 + ${JSON.stringify(manifest.counts ?? {})}）`;
-    }),
+    }, "inst-note"),
   );
 
   $("inst-import").addEventListener("click", () =>
@@ -2316,18 +2715,33 @@ function bindWorld(): void {
       const result = await mgmt!.call("instance.import", { path: file });
       const info = result.instance as unknown as InstanceEntry;
       return `已导入为「${info.name}」（默认冻结）`;
-    }),
+    }, "inst-note"),
   );
 
+  /// 删除（§3.2）：独立一行 + 键入实例名确认；结果写这一行自己的槽，不动实例行
   $("inst-delete").addEventListener("click", () =>
     void worldAction(async () => {
       const id = $<HTMLSelectElement>("inst-select").value;
-      if (!id) throw new Error("先选实例");
-      const entry = world.instances.find((item) => item.id === id);
-      if (!window.confirm(`删除实例「${entry?.name ?? id}」及其对话？此操作不可撤销。`)) return "";
+      const name = instanceNameOf(id);
+      if (!id || !name) throw new Error("先选实例");
+      if ($<HTMLInputElement>("inst-delete-name").value.trim() !== name) {
+        throw new Error(`未确认：请键入实例名「${name}」再删除`);
+      }
+      if (
+        !window.confirm(
+          `删除实例「${name}」及其对话？此操作不可撤销。\n` +
+            "· 将保留：世界包 / 角色卡 / 导出件（都不受影响）\n" +
+            "· 随实例删除：它的时间线、会话、记忆与预算账本",
+        )
+      ) {
+        return "";
+      }
       await mgmt!.call("instance.delete", { id });
-      return "已删除";
-    }),
+      deleteResult = `已删除「${name}」`;
+      $<HTMLInputElement>("inst-delete-name").value = "";
+      $("inst-delete-note").textContent = deleteResult;
+      return "";
+    }, "inst-note"),
   );
 }
 
@@ -2385,8 +2799,14 @@ async function boot(): Promise<void> {
   $("open-log-dir").addEventListener("click", () =>
     void openDir(state.logDir, $("about-note")),
   );
+  $("open-config-dir").addEventListener("click", () => void openConfigDir());
   $("settings-form").addEventListener("submit", (event) => void saveSettings(event));
   $("settings-reload").addEventListener("click", () => void loadSettings());
+  // 设置面各组的可编辑表单（§3.3）：各自保存、各自就近回报；只写核心契约，不在壳里另存一份
+  $("mem-form").addEventListener("submit", (event) => void saveMemoryForm(event));
+  $("commit-form").addEventListener("submit", (event) => void saveCommitForm(event));
+  $("backup-form").addEventListener("submit", (event) => void saveBackupForm(event));
+  $<HTMLSelectElement>("set-mem-mode").addEventListener("change", () => renderMemModeGate());
   // 内建聊天开关（默认开）：状态在壳自己的设置里，停用后不建立聊天通道连接
   const chatBox = $<HTMLInputElement>("set-chat-enabled");
   chatBox.checked = chatEnabled();
@@ -2398,6 +2818,7 @@ async function boot(): Promise<void> {
   // 无人值守验收：把本窗口自己的管理面连接交给探针断言（不新增权限——页面本来就能调这些 op）
   (window as unknown as { __mgmtCall?: unknown }).__mgmtCall =
     (op: string, args: Record<string, unknown> = {}) => mgmt?.call(op, args);
+  (window as unknown as { __opLog?: unknown }).__opLog = opLog;
   // 桌面提醒：开关（默认开）+ 入口按钮（系统通知的兜底入口，点它走同一条定位逻辑）
   const notifyBox = $<HTMLInputElement>("set-notify-enabled");
   notifyBox.checked = notifyEnabled();

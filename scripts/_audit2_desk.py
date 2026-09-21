@@ -7,6 +7,7 @@
   .venv/Scripts/python.exe scripts/_audit2_desk.py storage    # 存储不可用根 → UI 存储错误
   .venv/Scripts/python.exe scripts/_audit2_desk.py nointerp   # 缺 .venv 的根 → 启动失败诊断
   .venv/Scripts/python.exe scripts/_audit2_desk.py notify     # §3.1/A17 桌面提醒：真壳登记 / 通知 / 点击定位
+  .venv/Scripts/python.exe scripts/_audit2_desk.py onboard    # 首跑零实例：空态直达入口 + 管理页首屏顺序
 
 只读策略：仓库内文件（data/isekai.db、config/config.yaml、logs/、desktop/、isekai_core/、tests/）
 一律不改；一切可写数据落在 %LOCALAPPDATA%/Temp/isekai_audit2_*，用 junction 指回仓库的
@@ -554,21 +555,22 @@ def section_static() -> None:
           code="desktop/src/main.ts（notice.create / notice.resolve / notify_message）· "
                "desktop/src-tauri/src/main.rs（notify_message / open_notice）")
 
-    # §3.3 设置面：界面里是否存在各设置组
+    # §3.3 设置面：界面里是否存在各设置组（按组控件的 id / 事实节点认，不靠散文里的词）
     html = (REPO / "desktop" / "index.html").read_text(encoding="utf-8")
-    groups = {"LLM": "set-base-url", "备份": "backup-now", "关于": "about-facts"}
-    wanted = {"记忆向量化": ("向量", "embed"), "提交": ("autocommit", "自动提交"),
-              "世界 / 会话": ("激活数量上限", "世界包目录"), "用量": ("用量", "调用上限")}
-    wanted = {k: tuple(t for t in toks if t not in src) for k, toks in wanted.items()}  # 只认渲染层/模板里的控件
-    wanted.pop("用量", None)   # 用量组在设置面没有组：单列到 M18 的活体证据
-    missing = [name for name, tokens in wanted.items()
-               if not any(tok in html or tok in src for tok in tokens)]
+    settings_groups = {
+        "LLM": "set-base-url", "记忆向量化": "set-mem-mode", "提交": "set-commit-enabled",
+        "世界 / 会话": "worldset-facts", "用量": "usage-facts", "备份": "backup-now",
+        "外观": "appearance-note", "关于": "about-facts",
+    }
+    readonly_keys = ("创作目录（世界包 / 角色卡）", "可同时激活的线", "主动每日额度", "倍率上限（仅开发者）")
+    missing = [name for name, token in settings_groups.items() if token not in html]
+    missing_keys = [key for key in readonly_keys if key not in src]
     controls = sorted(set(re.findall(r'id="(set-[a-z-]+)"', html)))
-    check("S4 §3.3 设置面设置组齐备（记忆向量化 / 提交 / 世界·会话 / 用量）",
-          "FAIL" if missing else "PASS",
-          f"已有组={list(groups)}；index.html+main.ts 中缺失组={missing}；可用设置控件={controls}",
-          clause="§3.3 设置面表格（记忆向量化 / 提交 / 世界·会话 / 用量 各行）",
-          code="desktop/index.html:142-176 · desktop/src/main.ts:629-655")
+    check("S4 §3.3 设置面设置组齐备（LLM / 记忆向量化 / 提交 / 世界·会话 / 用量 / 备份 / 外观 / 关于）",
+          "FAIL" if (missing or missing_keys) else "PASS",
+          f"缺组={missing or '无'}；只读事实缺={missing_keys or '无'}；可用设置控件={controls}",
+          clause="§3.3 设置面表格（LLM / 记忆向量化 / 提交 / 世界·会话 / 用量 / 备份 / 外观 / 关于 各行）",
+          code="desktop/index.html（设置面各分组） · desktop/src/main.ts renderLocalFacts")
 
     # §3.3 生成模型设置显示「最近一次变更时间」
     fill = re.search(r"function fillSettings\(settings: SettingsPayload\): void \{(.*?)\n\}", src, re.S)
@@ -606,6 +608,65 @@ def section_static() -> None:
           f"文档状态行={'有' if header else '无'}；陈旧表述「阶段 1 起的界面与操作未实现」={'仍在' if stale else '已删'}；"
           f"已按实况写明阶段 1+ 已实现={'是' if stated else '否'}（对照 desktop/index.html 的生成 / 审定 / 实例管理 / 披露 / 草稿 / 备份）",
           clause="DESKTOP_SPEC §八 实施分期 / 头部状态行", code="docs/DESKTOP_SPEC.md:5")
+
+    # ---- 2026-09-21 impeccable critique 的既定顺序修复：harden → layout/typeset → polish → onboard → 零碎 → §3.3
+    css = (REPO / "desktop" / "src" / "styles.css").read_text(encoding="utf-8")
+    control_ids = ["topbar-clock", "manage-facts-box", "world-note-jump", "pkg-note", "card-note",
+                   "inst-note", "inst-delete-name", "inst-delete", "inst-delete-note",
+                   "mem-form", "set-mem-mode", "set-mem-base-url", "set-mem-model", "set-mem-api-key",
+                   "mem-note", "commit-form", "set-commit-enabled", "set-commit-minutes",
+                   "set-commit-events", "commit-note", "backup-form", "set-backup-dir",
+                   "set-backup-interval", "set-backup-keep", "appearance-note", "open-config-dir"]
+    missing_ids = [item for item in control_ids if f'id="{item}"' not in html]
+    wired = {
+        "生成在途闸门（禁用 + 重入守卫）": "function setGenerateGate" in src and "generateBusy.package" in src,
+        "生成进度行（已用 / 上限）": "function startProgress" in src and "function elapsedLabel" in src,
+        "生成确认写明无法取消": "过程中无法取消" in src,
+        "删除闸门（离开实例行 + 键入实例名）": "function renderDeleteGate" in src and "将保留：世界包 / 角色卡 / 导出件" in src,
+        "组内结果槽": "function groupNote" in src and "function reportNote" in src,
+        "动作结果按组落槽": 'worldAction(importPackage, "pkg-note")' in src and 'worldAction(addCharacter, "card-note")' in src,
+        "页顶锚点回跳": "function jumpToWorldGroup" in src and "worldNoteAnchor" in src,
+        "顶栏世界时钟": "function refreshClockChip" in src and "function clockTarget" in src,
+        "时钟轮询不再限管理页": "void refreshClockChip();\n    if (!$(\"pane-manage\")" in src,
+        "空态按状态分支": "function emptyState" in src and "function openFirstWorld" in src,
+        "retry 缺 envId 不渲染": 'message.state === "failed" && message.envId' in src,
+        "记忆段走 settings.set": 'saveSegment("memory"' in src or '"memory",' in src,
+        "提交段走 settings.set": '"commit",' in src and "saveSegment" in src,
+        "备份段走 settings.set": '"backup",' in src and "saveSegment" in src,
+        "打开配置目录（复用 open_dir + 配置路径父目录）": "function openConfigDir" in src and '"open_dir"' in src,
+        "管理面重建（核心重启后一次性令牌重新 auth）": "function rebuildMgmt" in src,
+        "管理面 op 记账（探针观察点）": "function traceOps" in src and "__opLog" in src,
+    }
+    missing_wired = [key for key, present in wired.items() if not present]
+    css_tokens = {
+        "基础 button 规则": bool(re.search(r"^button \{", css, re.M)),
+        ".primary 主操作": "button.primary" in css,
+        "h3 分组分隔线": "border-top: 1px solid var(--border)" in css and re.search(r"#pane-manage h3,\s*\n#pane-settings h3", css),
+        ".row 换行 + 按钮不压缩": "flex-wrap: wrap" in css and "flex-shrink: 0" in css,
+        "错误色用已有 --bad": "color: var(--bad)" in css and "--danger" not in css,
+        "长串换行 overflow-wrap": "overflow-wrap: anywhere" in css and "word-break: break-all" not in css,
+        "全局 :focus-visible": bool(re.search(r"^:focus-visible \{", css, re.M)),
+        "浏览器外表面取主题色": "color-scheme: light dark" in css and "::selection" in css,
+        "空槽不占位": ".note:empty" in css,
+        "被禁用的输入看得出禁用": "input:disabled" in css and "background: transparent" in css,
+        ".row.hidden 真的收起": ".row.hidden" in css,
+    }
+    missing_css = [key for key, present in css_tokens.items() if not present]
+    dev_ids = [item for item in re.findall(r'id="(set-[a-z-]+)"', html)
+               if re.search(r"rate_max|max_active|catch_up|render_calls|per_day|quota", item)]
+    check("S8 2026-09-21 critique 既定顺序修复项在界面 / 渲染层 / 样式里的落点",
+          "PASS" if not (missing_ids or missing_wired or missing_css) else "FAIL",
+          f"界面控件缺={missing_ids or '无'}；渲染层接线缺={missing_wired or '无'}；样式缺={missing_css or '无'}",
+          clause="DESKTOP_SPEC §3.1 附近反馈 / 顶栏世界时钟 · §3.3 设置面 · §四 视觉与可访问性",
+          code="desktop/index.html · desktop/src/main.ts · desktop/src/styles.css")
+    check("S9 开发者专用键不在设置表单里（只作只读事实）",
+          "PASS" if not dev_ids and "worldset-facts" in html and "倍率上限（仅开发者）" in src else "FAIL",
+          f"设置表单里出现的开发者键={dev_ids or '无'}（rate_max / max_active_timelines / "
+          f"catch_up_batches / render_calls_per_day / 各类 token 额度一律只读）；"
+          f"只读事实节点=worldset-facts={'在' if 'worldset-facts' in html else '缺'}；"
+          f"「倍率上限（仅开发者）」文案={'在' if '倍率上限（仅开发者）' in src else '缺'}",
+          clause="§3.3 世界 / 会话组：倍率上限只读且仅开发者可配置",
+          code="desktop/index.html（settings 面各表单） · desktop/src/main.ts renderLocalFacts")
 
 
 # ================================================================== main
@@ -913,7 +974,7 @@ async def section_main() -> None:
     await cdp.js("document.getElementById('card-add-note').value='审计未审定';"
                  "document.getElementById('card-add').click()")
     await asyncio.sleep(3.0)
-    note_bad = await cdp.js("document.getElementById('world-note').textContent")
+    note_bad = await note_of(cdp, "card-note", "world-note")
     units_mid = one(root, "SELECT COUNT(*) FROM unit")
     joins_mid = one(root, "SELECT COUNT(*) FROM character_join")
     check("M16 §十.19 补卡用未审定卡被拒，且不留半个角色",
@@ -941,7 +1002,7 @@ async def section_main() -> None:
     await cdp.js("document.getElementById('pkg-brief').value='审计用的世界描述';"
                  "document.getElementById('pkg-file').value='a2gen.json';"
                  "document.getElementById('pkg-generate').click()")
-    note_gen = await cdp.wait("document.getElementById('world-note').textContent", "草稿", 90)
+    note_gen = await wait_note(cdp, ("pkg-note", "world-note"), "草稿", 90)
     confirm_gen = await cdp.js("window.__confirmArgs.slice(-1)[0] || ''")
     drafts_after = [p.name for p in (root / "packages").glob("*.draft.json")]
     check("M18 §十.11/§3.3 用量：生成前给出调用预估与上限，完成后回报调用次数；未过校验存草稿",
@@ -960,7 +1021,7 @@ async def section_main() -> None:
     if name:
         await cdp.select("draft-select", name)
         await cdp.js("document.getElementById('draft-discard').click()")
-        note_discard = await cdp.wait("document.getElementById('world-note').textContent", "已丢弃", 30)
+        note_discard = await wait_note(cdp, ("draft-note", "world-note"), "已丢弃", 30)
     else:
         note_discard = ""
     pkgs_after = sorted(p.name for p in (root / "packages").glob("*.json")
@@ -972,6 +1033,237 @@ async def section_main() -> None:
           f"草稿文件已删={not (root / 'packages' / f'{name}.draft.json').exists()}",
           clause="§3.2 草稿：只有「丢弃草稿」才删除；§十.9 丢弃草稿不损伤正式资产",
           code="main.ts:1277-1283,1233-1256")
+
+    # ================= 2026-09-21 impeccable critique（harden → … → §3.3）新增行为断言 =================
+    # 结果全部对界面行为取证：生成闸门与仪表、删除闸门、就近反馈、顶栏世界时钟、设置表单 round-trip。
+
+    await cdp.pane("manage")
+    await asyncio.sleep(1.0)
+
+    # ---- M34 harden：10 分钟付费生成的在途仪表（已用 / 上限）与重入闸门
+    gen_controls = await cdp.js(
+        "({pkg: ['pkg-generate','pkg-brief','pkg-name'].every(i=>!!document.getElementById(i)),"
+        " card: ['card-generate','card-brief','card-name-input'].every(i=>!!document.getElementById(i))})")
+    await clear_notes(cdp, "pkg-note", "world-note")
+    gen_before = (await ops_log(cdp)).count("world.package.generate")
+    # 页面侧观察点：① disabled 属性突变记录（不受探针采样节奏影响，能看见瞬时的在途窗口）；
+    # ② 闸门刚合上的那个微任务里自动补一次「连点」（程序化 click + 派发 click）——
+    #    浏览器对 disabled 按钮两条路都不派发，这正是「连点不得发第二次」的现场。
+    await cdp.js(
+        "(()=>{window.__gateLog=[];window.__reentry={tried:false,disabledAtClick:null};"
+        "const b=document.getElementById('pkg-generate');"
+        "if(window.__gateObs)window.__gateObs.disconnect();"
+        "window.__gateObs=new MutationObserver(()=>{const d=b.disabled;"
+        "window.__gateLog.push({d:d,note:document.getElementById('pkg-note').textContent});"
+        "if(d&&!window.__reentry.tried){window.__reentry.tried=true;"
+        "b.click();b.dispatchEvent(new MouseEvent('click',{bubbles:true}));"
+        "window.__reentry.disabledAtClick=b.disabled;}});"
+        "window.__gateObs.observe(b,{attributes:true,attributeFilter:['disabled']});})()")
+    await cdp.js("document.getElementById('pkg-brief').value='审计闸门用世界描述';"
+                 "document.getElementById('pkg-file').value='a2gate.json';"
+                 "document.getElementById('pkg-generate').click()")
+    gen_final = await wait_note(cdp, ("pkg-note", "world-note"), "草稿", 150)
+    gate = await cdp.js("({log:(window.__gateLog||[]).slice(),reentry:window.__reentry||null})")
+    await cdp.js("if(window.__gateObs)window.__gateObs.disconnect()")
+    gen_after = (await ops_log(cdp)).count("world.package.generate")
+    inflight = next((row for row in (gate["log"] or []) if row.get("d")), {})
+    reentry = gate["reentry"] or {}
+    check("M34 §3.1/§十.11 生成在途有仪表（已用 / 上限）、相关控件禁用、连点不发起第二次调用",
+          "PASS" if (gen_controls["pkg"] and gen_controls["card"]
+                     and inflight and "生成中" in str(inflight.get("note"))
+                     and "已用" in str(inflight.get("note")) and "上限" in str(inflight.get("note"))
+                     and "无法取消" in str(inflight.get("note"))
+                     and reentry.get("tried") and reentry.get("disabledAtClick") is True
+                     and (gen_after - gen_before) == 1
+                     and "调用" in str(gen_final) and "用时" in str(gen_final)) else "FAIL",
+          f"生成三控件存在（世界包={gen_controls['pkg']}、角色卡={gen_controls['card']}）；"
+          f"在途禁用记录（disabled 突变，共 {len(gate['log'] or [])} 条）={inflight}；"
+          f"在途连点尝试={reentry}（tried=True 且点击时按钮仍是 disabled）；"
+          f"三次点击后 world.package.generate 实际调用数={gen_after - gen_before}（只发一次）；"
+          f"完成后提示={gen_final!r}",
+          clause="§3.1 界面状态可见（生成过程有已用时长与上限，不用「一两分钟」糊）／§十.11 调用上限与用量回报",
+          code="desktop/src/main.ts setGenerateGate / startProgress / GENERATE_LIMIT / window.__opLog",
+          expected="在途时三控件禁用、进度行给已用与上限、连点只发一次调用、完成后回报实际用量与用时")
+
+    # ---- M35 harden：删除实例的闸门（离开实例行 + 键入实例名 + 写清保留什么）
+    gate_inst = (await mgmt_call(cdp, "instance.create",
+                                 package_path=str(root / "packages" / "w0.json"),
+                                 card_paths=[str(root / "packages" / "good.json")],
+                                 display_name="审计删除用实例"))["instance"]
+    await cdp.js("document.getElementById('world-refresh').click()")
+    await asyncio.sleep(2.5)
+    await cdp.select("inst-select", str(gate_inst["id"]))
+    await asyncio.sleep(2.5)
+    gate0 = await cdp.js(
+        "({disabled: document.getElementById('inst-delete').disabled,"
+        " note: document.getElementById('inst-delete-note').textContent,"
+        " row: !!document.getElementById('inst-delete').closest('.delete-row'),"
+        " same_row: document.getElementById('inst-select').parentElement"
+        "   === document.getElementById('inst-delete').parentElement})")
+    # ① 名字不对（含空）：不给删；真派发一次点击也不落
+    await cdp.js("document.getElementById('inst-delete-name').value='不是这个名字';"
+                 "document.getElementById('inst-delete-name').dispatchEvent(new Event('input'));")
+    gate_wrong = await cdp.js("document.getElementById('inst-delete').disabled")
+    await cdp.js("document.getElementById('inst-delete').click()")
+    await asyncio.sleep(1.5)
+    alive_after_wrong = one(root, "SELECT COUNT(*) FROM instance WHERE id=?", (gate_inst["id"],))
+    # ② 键入正确名字 → 可点 → 删除（保留清单写在同一行）
+    await cdp.js(f"document.getElementById('inst-delete-name').value={json.dumps(str(gate_inst['name']))};"
+                 "document.getElementById('inst-delete-name').dispatchEvent(new Event('input'));")
+    gate_right = await cdp.js("document.getElementById('inst-delete').disabled")
+    await cdp.js("document.getElementById('inst-delete').click()")
+    await asyncio.sleep(3.5)
+    gone = one(root, "SELECT COUNT(*) FROM instance WHERE id=?", (gate_inst["id"],))
+    del_note = await cdp.js("document.getElementById('inst-delete-note').textContent")
+    del_confirm = await cdp.js("window.__confirmArgs.slice(-1)[0] || ''")
+    check("M35 §3.2 删除实例要键入实例名才放行；入口离开实例行，并写明保留什么",
+          "PASS" if (gate0["disabled"] is True and gate0["row"] and not gate0["same_row"]
+                     and "将保留：世界包 / 角色卡 / 导出件" in str(gate0["note"])
+                     and gate_wrong is True and alive_after_wrong == 1
+                     and gate_right is False and gone == 0
+                     and "已删除" in str(del_note)
+                     and "不可撤销" in str(del_confirm) and "将保留" in str(del_confirm)) else "FAIL",
+          f"未输入名字时删除按钮 disabled={gate0['disabled']}（输入错名字后仍={gate_wrong}，"
+          f"派发点击后实例仍在=实例表 {alive_after_wrong} 行）；入口在独立 .delete-row={gate0['row']}、"
+          f"与实例下拉同一行={gate0['same_row']}（应为 False）；行内保留清单={gate0['note']!r}；"
+          f"键入正确名字后可点={gate_right is False} → 删除后实例表 {gone} 行；结果提示={del_note!r}；"
+          f"确认框={str(del_confirm)[:120]!r}",
+          clause="§3.2 删除需二次确认，明确范围与失去的进展（破坏性操作不贴着它的目标）",
+          code="desktop/index.html#inst-delete-name · main.ts renderDeleteGate / inst-delete 处理器",
+          expected="未键入实例名时不可点、点击不生效；键入后删除并回报；保留清单与确认框都写清范围")
+
+    # ---- M36 polish：动作结果就近落在本组的行内槽，页顶不再承接组内结果
+    await cdp.pane("manage")
+    await clear_notes(cdp, "pkg-note", "world-note")
+    await cdp.js("(()=>{const s=document.getElementById('pkg-select');"
+                 "const hit=[...s.options].find(o=>o.value==='w0.json');"
+                 "s.value=(hit||s.options[0]).value;})()")
+    await cdp.js("document.getElementById('pkg-check').click()")
+    checked = await wait_note(cdp, ("pkg-note",), "通过校验", 30)
+    top_note = await cdp.js("document.getElementById('world-note').textContent")
+    checked_pkg = await cdp.js("document.getElementById('pkg-select').value")
+    slots = await cdp.js(
+        "['pkg-note','card-note','inst-note','draft-note','clock-note','role-note','disclose-note',"
+        "'card-import-note','card-add-facts','world-facts'].filter(i=>!!document.getElementById(i)).length")
+    check("M36 §3.1 动作结果就近落在本组的行内槽（页顶只留跨组 / 严重事件）",
+          "PASS" if ("通过校验" in str(checked) and not str(top_note).strip() and (slots or 0) == 10) else "FAIL",
+          f"点「校验」（选 {checked_pkg}）→ 世界包组结果槽="
+          f"{checked!r}；同一时刻页顶 #world-note={top_note!r}（应为空：组内结果不再挤页顶）；"
+          f"每组行内槽存在={slots}/10（世界包 / 角色卡 / 实例 / 草稿 / 运行 / 角色 / 披露 / 卡导入 / 补卡事实 / 实例事实）",
+          clause="§3.1 结果回到动作旁边（1800px 长页只有一个页顶槽时，结果常落在屏幕外）",
+          code="desktop/index.html（各组 .note 槽） · main.ts groupNote / reportNote / worldAction(slot)")
+    # 页顶锚点：跨组事件带「回到该组」入口
+    anchor = await cdp.js("({btn: !!document.getElementById('world-note-jump'),"
+                          " target: document.getElementById('group-instances') ? 'yes' : 'no'})")
+    check("M37 polish：页顶跨组事件可点回该组（锚点存在）",
+          "PASS" if anchor["btn"] and anchor["target"] == "yes" else "FAIL",
+          f"页顶「回到该组」入口={anchor['btn']}；锚点目标 #group-instances={anchor['target']}；"
+          f"跨组 / 严重事件（实例详情读不出来）写页顶时给锚点，组内结果只写组内槽",
+          clause="§3.1 反馈位置：页顶只留跨组事件并锚定回组",
+          code="desktop/index.html#world-note-jump · main.ts worldNote(text, bad, anchor) / jumpToWorldGroup")
+
+    # ---- M38 零碎升 P1：世界时钟回到顶栏（聊天页可见），2s 轮询不再只在管理页跑
+    await cdp.pane("manage")
+    await cdp.select("inst-select", instances[0]["id"])
+    await asyncio.sleep(1.5)
+    line_label = await cdp.js("document.getElementById('clock-label').textContent")
+    if "冻结" in str(line_label):
+        await cdp.js("document.getElementById('clock-activate').click()")
+        await cdp.wait("document.getElementById('clock-label').textContent", "倍率", 25)
+    chat_session = await cdp.js(
+        "(()=>{const bs=[...document.querySelectorAll('#sessions button.session')];"
+        "const hit=bs.find(b=>!b.textContent.includes('初始会话'));"
+        "(hit||bs[0])?.click(); return (hit||bs[0])?.textContent||'';})()")
+    await asyncio.sleep(2.0)
+    await cdp.pane("chat")
+    chip = {}
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        chip = await cdp.js("({hidden: document.getElementById('topbar-clock').classList.contains('hidden'),"
+                            " text: document.getElementById('topbar-clock').textContent,"
+                            " manage_hidden: document.getElementById('pane-manage').classList.contains('hidden')})")
+        if not chip.get("hidden") and chip.get("text"):
+            break
+        await asyncio.sleep(0.5)
+    await cdp.js("window.__opLog.length=0")   # 只数这一段：管理页隐藏期间顶栏时钟的轮询
+    await asyncio.sleep(6.0)
+    polled = (await ops_log(cdp)).count("runtime.clock")
+    chip_later = await cdp.js("({hidden: document.getElementById('topbar-clock').classList.contains('hidden'),"
+                              " text: document.getElementById('topbar-clock').textContent})")
+    check("M38 §3.1 世界时钟在顶栏可见（当前查看且已激活的线），离开管理页仍在跟",
+          "PASS" if (not chip.get("hidden") and "倍率" in str(chip.get("text"))
+                     and chip.get("manage_hidden") and polled >= 2 and not chip_later.get("hidden")) else "FAIL",
+          f"会话={chat_session!r}；聊天页顶栏时钟={chip.get('text')!r}（隐藏={chip.get('hidden')}，"
+          f"管理页隐藏={chip.get('manage_hidden')}）；管理页隐藏的 6 秒内 runtime.clock 轮询次数={polled}"
+          f"（≥2 即证明轮询不再只在管理页可见时跑）；6 秒后时钟={chip_later.get('text')!r}",
+          clause="§3.1 顶栏仅显示当前查看且已激活的线的世界时钟",
+          code="desktop/index.html#topbar-clock · main.ts clockTarget / refreshClockChip（bindWorld 的 2s 轮询）")
+
+    # ---- M39 §3.3 设置面三组可编辑表单：round-trip（改一项 → settings.get 读到新值 → 改回）
+    await cdp.pane("settings")
+    await cdp.wait("document.getElementById('mem-form') ? '1' : '0'", "1", 20)
+    saved_segments = await mgmt_call(cdp, "settings.get")
+    rt_rows = []
+    for seg, form, field, value, sub, note_id in (
+        ("memory", "mem-form", "set-mem-model", "audit2-embed-rt", "model", "mem-note"),
+        ("commit", "commit-form", "set-commit-events", "7", "events", "commit-note"),
+        ("backup", "backup-form", "set-backup-keep", "5", "keep", "backup-note"),
+    ):
+        if not saved_segments.get(seg):
+            note_absent = await note_of(cdp, note_id)
+            rt_rows.append((seg, "DEFERRED",
+                            f"settings.get 未回 {seg} 段（核心侧未落地）；界面回执={note_absent!r}"))
+            continue
+        original = (saved_segments.get(seg) or {}).get(sub)
+
+        async def submit(text: str) -> str:
+            if seg == "memory":
+                await cdp.js("(()=>{const s=document.getElementById('set-mem-mode');s.value='separate';"
+                             "s.dispatchEvent(new Event('change'));})()")
+            await cdp.js(f"document.getElementById({json.dumps(field)}).value={json.dumps(text)};"
+                         f"document.getElementById({json.dumps(form)}).requestSubmit();")
+            deadline = time.time() + 25
+            note = ""
+            while time.time() < deadline:
+                note = await note_of(cdp, note_id)
+                if note and "保存中" not in note:
+                    break
+                await asyncio.sleep(0.3)
+            return note
+
+        note_new = await submit(value)
+        mid = ((await mgmt_call(cdp, "settings.get")).get(seg) or {}).get(sub)
+        restore = str(original) if original not in (None, "") else ""
+        note_back = await submit(restore) if restore else "（原值为空，跳过改回）"
+        back = ((await mgmt_call(cdp, "settings.get")).get(seg) or {}).get(sub)
+        ok_rt = (str(mid) == str(value) and "已保存" in str(note_new)
+                 and (not restore or str(back) == str(original)))
+        rt_rows.append((seg, "PASS" if ok_rt else "FAIL",
+                        f"{seg}.{sub}：{original!r} → 写入 {value!r} → settings.get 读到 {mid!r} → 改回 {back!r}；"
+                        f"回执={note_new!r}/{note_back!r}"))
+    unsupported = [row for row in rt_rows if row[1] == "DEFERRED"]
+    failed = [row for row in rt_rows if row[1] == "FAIL"]
+    check("M39 §3.3 记忆向量化 / 提交 / 备份三组表单可编辑，写入走 settings.set 并回读",
+          "FAIL" if failed else ("DEFERRED" if unsupported else "PASS"),
+          "；".join(row[2] for row in rt_rows)
+          + f"｜settings.get 段={sorted(k for k in saved_segments if k in ('llm', 'core', 'memory', 'commit', 'backup'))}",
+          clause="§3.3 设置面：记忆向量化 / 提交 / 备份三组由 UI 写入本地配置（不要求手编配置）",
+          code="desktop/index.html#mem-form/#commit-form/#backup-form · main.ts saveSegment / fillMemorySegment",
+          expected="改一项后在 settings.get 里读得到新值，再改回；核心未落地该段时照实记 DEFERRED 并留下核心回执")
+    seg_facts = await cdp.js(
+        "({mem: document.getElementById('mem-facts').textContent,"
+        " commit: document.getElementById('commit-facts').textContent,"
+        " backup: document.getElementById('backup-facts').textContent,"
+        " appearance: document.getElementById('appearance-note').textContent,"
+        " opencfg: !!document.getElementById('open-config-dir')})")
+    check("M40 §3.3 外观组只读说明 + 打开配置目录入口（默认安装不再走进死胡同）",
+          "PASS" if (seg_facts["appearance"] and "跟随系统明暗" in str(seg_facts["appearance"])
+                     and seg_facts["opencfg"]) else "FAIL",
+          f"外观组文案={seg_facts['appearance']!r}；打开配置目录按钮={seg_facts['opencfg']}"
+          f"（目录取 settings.get 的 core.config_file 父目录，壳复用既有 open_dir）；"
+          f"记忆组事实={str(seg_facts['mem'])[:60]!r}…；备份组事实={str(seg_facts['backup'])[:60]!r}…",
+          clause="§3.3 外观：黑白极简主题，跟随系统明暗；关于：日志目录 / 脱敏诊断（配置目录同类入口）",
+          code="desktop/index.html#appearance-note/#open-config-dir · main.ts openConfigDir")
 
     # ---- 备份：立即备份 / 失败保留旧备份 / 打开目录
     await cdp.pane("settings")
@@ -1175,8 +1467,8 @@ async def section_main() -> None:
     packages_dir = root / "packages"
     files_before = sorted(p.name for p in packages_dir.glob("*"))
     await cdp.pane("manage")
-    await cdp.js("document.getElementById('world-note').textContent='';"
-                 "document.getElementById('pkg-errors').textContent='';"
+    await clear_notes(cdp, "pkg-note", "card-note", "world-note")
+    await cdp.js("document.getElementById('pkg-errors').textContent='';"
                  "document.getElementById('card-errors').textContent='';")
 
     # ① 坏包：核心的原因原样上界面，不过校验就不落盘
@@ -1195,17 +1487,17 @@ async def section_main() -> None:
           expected="拒绝原因带「未落盘」字样并原样进界面；创作目录不新增文件")
 
     # ② 好包：导入成功 → 包列表出现并选中；再导一次 → 问一句覆盖 → 带 force 覆盖
-    await cdp.js("document.getElementById('world-note').textContent=''")
+    await clear_notes(cdp, "pkg-note", "world-note")
     drive2 = await pick_import_file(cdp, "pkg-import", good_pkg, "选择要导入的世界包")
-    pkg_note = await cdp.wait("document.getElementById('world-note').textContent", "已导入", 45)
+    pkg_note = await wait_note(cdp, ("pkg-note", "world-note"), "已导入", 45)
     pkg_view = await cdp.js("({opts:[...document.getElementById('pkg-select').options].map(o=>o.value),"
                             " sel: document.getElementById('pkg-select').value})")
     core_pkgs = [str(item.get("file")) for item
                  in ((await mgmt_call(cdp, "world.package.list")).get("packages") or [])]
     conf_before = await cdp.js("window.__confirmArgs.length")
-    await cdp.js("document.getElementById('world-note').textContent=''")
+    await clear_notes(cdp, "pkg-note", "world-note")
     drive2b = await pick_import_file(cdp, "pkg-import", good_pkg, "选择要导入的世界包")
-    forced_note = await cdp.wait("document.getElementById('world-note').textContent", "覆盖了同名文件", 45)
+    forced_note = await wait_note(cdp, ("pkg-note", "world-note"), "覆盖了同名文件", 45)
     conf_after = await cdp.js("window.__confirmArgs.length")
     conf_last = await cdp.js("window.__confirmArgs.slice(-1)[0] || ''")
     ok_i2 = (pkg_file in pkg_view["opts"] and pkg_view["sel"] == pkg_file and pkg_file in core_pkgs
@@ -1248,9 +1540,9 @@ async def section_main() -> None:
           expected="没选包时入口不可点且写明要先选包；超限文件带「加载限额」原因被拒，不落盘")
 
     # ④ 好卡：对着已导入的包做联合校验 → 卡列表出现并选中
-    await cdp.js("document.getElementById('world-note').textContent=''")
+    await clear_notes(cdp, "card-note", "world-note")
     drive4 = await pick_import_file(cdp, "card-import", good_card, "选择要导入的角色卡")
-    card_note = await cdp.wait("document.getElementById('world-note').textContent", "已导入", 45)
+    card_note = await wait_note(cdp, ("card-note", "world-note"), "已导入", 45)
     card_view = await cdp.js("({opts:[...document.getElementById('card-select').options].map(o=>o.value),"
                              " sel: document.getElementById('card-select').value})")
     core_cards = [str(item.get("file")) for item
@@ -1271,25 +1563,30 @@ async def section_main() -> None:
     orig_fmt = str(one(root, "SELECT data_format FROM instance WHERE id=?", (inst0,)) or "")
     await cdp.select("inst-select", inst0)
     await asyncio.sleep(2.0)
-    compat_hidden = await cdp.js("document.getElementById('inst-convert-row').classList.contains('hidden')")
+    compat_hidden = await cdp.js("({cls: document.getElementById('inst-convert-row').classList.contains('hidden'),"
+                                 " display: getComputedStyle(document.getElementById('inst-convert-row')).display})")
     db_exec(root, "UPDATE instance SET data_format='9.9' WHERE id=?", (inst0,))
     await cdp.select("inst-select", inst0)
     await asyncio.sleep(2.0)
     bad_row = await cdp.js("({hidden: document.getElementById('inst-convert-row').classList.contains('hidden'),"
+                           " display: getComputedStyle(document.getElementById('inst-convert-row')).display,"
                            " note: document.getElementById('inst-convert-note').textContent})")
     ref = (await mgmt_call(cdp, "instance.convert", instance_id=inst0, confirmed=False)).get("convert") or {}
     await cdp.js("document.getElementById('inst-convert').click()")
     conv_note = await cdp.wait("document.getElementById('inst-convert-note').textContent", "转换器", 40)
     db_exec(root, "UPDATE instance SET data_format=? WHERE id=?", (orig_fmt, inst0))
     await cdp.select("inst-select", inst0)
-    ok_i5 = (compat_hidden is True and bad_row["hidden"] is False and "9.9" in str(bad_row["note"])
+    ok_i5 = (compat_hidden["cls"] is True and compat_hidden["display"] == "none"
+             and bad_row["hidden"] is False and bad_row["display"] != "none" and "9.9" in str(bad_row["note"])
              and ref.get("state") == "blocked"
              and str(ref.get("hint") or "") in str(conv_note)
              and str(ref.get("reason") or "") in str(conv_note) and "用兼容版本" in str(conv_note))
     check("I5 §7.6 不兼容实例才显示转换入口；点开照实显示核心的原因（无转换器 → 用兼容版本）",
           "PASS" if ok_i5 else "FAIL",
-          f"data_format={orig_fmt}（compatible）时转换行隐藏={compat_hidden}；"
-          f"改成 9.9 再开管理页 → 行隐藏={bad_row['hidden']}、行内提示={bad_row['note']!r}；"
+          f"data_format={orig_fmt}（compatible）时转换行 class 含 hidden={compat_hidden['cls']}、"
+          f"计算样式 display={compat_hidden['display']!r}（.hidden 必须真的把行收起来）；"
+          f"改成 9.9 再开管理页 → 行 class 含 hidden={bad_row['hidden']}、display={bad_row['display']!r}、"
+          f"行内提示={bad_row['note']!r}；"
           f"核心 instance.convert(confirmed=false)={ref}；点「转换…」后行内提示={conv_note!r}"
           f"（含核心 hint={ref.get('hint')!r} 与 reason）",
           clause="§7.6 打开实例做兼容检查：convertible / blocked 才提示转换与原因；没有可信转换器就停在提示上",
@@ -1892,6 +2189,57 @@ async def section_nointerp() -> None:
     dump("nointerp")
 
 
+# ================================================================== onboard（首跑）
+
+async def section_onboard() -> None:
+    """首跑 / 零实例：聊天空态给直达入口（不与顶栏 chip 互相矛盾），管理页首屏不是版本表。"""
+    root = make_root("onboard")
+    kill_tree()
+    proc, cdp, _ = await boot_shell(root, PORT + 5,
+                                    {"ISEKAI_LLM_FAKE": "1", "ISEKAI_LLM_FAKE_REPLY": "首跑占位回复"})
+    status = await cdp.wait("document.getElementById('status').textContent", "已就绪", 120)
+    await cdp.js(STUB)
+    empty = await cdp.js(
+        "(()=>{const e=document.querySelector('#messages li.empty');"
+        "return {text: e?e.textContent:'', btn: !!document.getElementById('empty-create'),"
+        " chip: document.getElementById('status').textContent};})()")
+    await cdp.js("document.getElementById('empty-create')?.click()")
+    await asyncio.sleep(2.0)
+    landed = await cdp.js(
+        "({manage: !document.getElementById('pane-manage').classList.contains('hidden'),"
+        " chat_hidden: document.getElementById('pane-chat').classList.contains('hidden'),"
+        " focused: document.activeElement && document.activeElement.id,"
+        " open: document.getElementById('manage-facts-box').open,"
+        " first_h3: (document.querySelector('#pane-manage h3')||{}).textContent || '',"
+        " facts_rows: document.querySelectorAll('#manage-facts dt').length})")
+    check("O1 §四/P0-1 零实例首跑：空态给直达入口，点了到管理页并聚焦世界包生成入口",
+          "PASS" if (empty["btn"] and "还没有世界实例" in str(empty["text"])
+                     and "还没有世界实例" in str(empty["chip"])
+                     and landed["manage"] and landed["chat_hidden"]
+                     and landed["focused"] == "pkg-brief" and landed["open"] is False
+                     and landed["first_h3"].strip() == "世界包") else "FAIL",
+          f"空态文案={empty['text']!r}（直达按钮={empty['btn']}）；顶栏 chip={empty['chip']!r}"
+          f"（与空态同一口径：不再一边说「发一条消息试试」一边说「还没有世界实例」）；"
+          f"点击后 管理页可见={landed['manage']}、聊天页隐藏={landed['chat_hidden']}、"
+          f"焦点={landed['focused']!r}；版本与计数折叠={landed['open'] is False}（{landed['facts_rows']} 行事实表不再占首屏）；"
+          f"管理页首组={landed['first_h3']!r}",
+          clause="§四 空实例 / 无会话有明确空态；§3.2 首次启动无可用世界包时提供入口",
+          code="desktop/src/main.ts emptyState / openFirstWorld · desktop/index.html#manage-facts-box")
+    manage_facts = await cdp.js("document.getElementById('manage-facts').textContent")
+    await cdp.pane("settings")
+    await cdp.wait("document.getElementById('about-facts').textContent", "应用版本", 25)
+    about_facts = await cdp.js("document.getElementById('about-facts').textContent")
+    duplicated = [key for key in ("应用版本", "数据格式版本", "世界规则版本") if key in str(manage_facts)]
+    check("O2 §3.3 版本三项只留一处（管理页不再重复「关于 / 诊断」）",
+          "PASS" if not duplicated and "应用版本" in str(about_facts) else "FAIL",
+          f"管理页版本与计数={manage_facts!r}（重复的三项={duplicated or '无'}）；"
+          f"关于 / 诊断={str(about_facts)[:80]!r}…（版本的正位）",
+          clause="§3.3 关于：应用 / 数据格式版本、日志目录、脱敏诊断",
+          code="desktop/src/main.ts renderManagePane / loadAbout")
+    kill_tree()
+    dump("onboard")
+
+
 # ================================================================== notify（§3.1 末条 / §十.17 桌面提醒）
 
 #: 主动消息正文（假 LLM）：通知正文应当是它，不是任何内部标识
@@ -1938,6 +2286,34 @@ async def mgmt_call(cdp: Cdp, op: str, **args):
     """
     return await cdp.js(f"window.__mgmtCall({json.dumps(op)},{json.dumps(args)})",
                         await_promise=True) or {}
+
+
+async def note_of(cdp: Cdp, *ids: str) -> str:
+    """读一组提示槽的文本：结果按就近原则落在组内槽，页顶 #world-note 只留跨组 / 严重事件。"""
+    expr = "+".join(f"(document.getElementById({json.dumps(i)})?.textContent||'')" for i in ids)
+    return str(await cdp.js(expr) or "")
+
+
+async def wait_note(cdp: Cdp, ids: tuple, want: str, timeout: float = 45.0) -> str:
+    """等组内 / 页顶提示里出现 want（观察面是这些槽的并集，判据不变）。"""
+    deadline = time.time() + timeout
+    value = ""
+    while time.time() < deadline:
+        value = await note_of(cdp, *ids)
+        if want in value:
+            return value
+        await asyncio.sleep(0.4)
+    return value
+
+
+async def clear_notes(cdp: Cdp, *ids: str) -> None:
+    await cdp.js(";".join(
+        f"(document.getElementById({json.dumps(i)})||{{}}).textContent=''" for i in ids))
+
+
+async def ops_log(cdp: Cdp) -> list:
+    """壳发出去的管理面 op 记账（main.ts traceOps → window.__opLog）。"""
+    return list(await cdp.js("(window.__opLog||[]).slice()") or [])
 
 
 def foreground_pid() -> int:
@@ -2344,6 +2720,8 @@ async def amain() -> None:
             await section_llmfail()
         if which in ("storage", "all"):
             await section_storage()
+        if which in ("onboard", "all"):
+            await section_onboard()
         if which in ("notify", "all"):
             await section_notify()
         if which in ("nointerp", "all"):

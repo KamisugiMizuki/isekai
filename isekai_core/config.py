@@ -242,6 +242,7 @@ SETTABLE_SECTIONS: dict[str, tuple[str, dict[str, str]]] = {
     "memory": (
         "runtime",
         {
+            "mode": "memory_embedding_base_url",  # 派生态：chat = 清掉三项（见 validate_section_updates）
             "base_url": "memory_embedding_base_url",
             "model": "memory_embedding_model",
             "api_key": "memory_embedding_api_key",
@@ -270,6 +271,14 @@ def validate_section_updates(section: str, updates: dict[str, Any]) -> dict[str,
     for key, value in updates.items():
         if key not in mapping:
             raise SettingsError(f"{section} 段不开放这个键：{key}")
+        if key == "mode":
+            # 记忆向量化的「模式」是派生值：chat = 只用全文 → 显式清空三项（这里落空串是有意的，与「空串=不改」不同）
+            if value not in ("chat", "separate"):
+                raise SettingsError("memory.mode 只能是 chat 或 separate")
+            if value == "chat":
+                for target in ("memory_embedding_base_url", "memory_embedding_model", "memory_embedding_api_key"):
+                    cleaned[target] = ""
+            continue
         if key == "auto_enabled":
             cleaned[mapping[key]] = bool(value)
         elif key in _NUMERIC_SECTION_KEYS:

@@ -25,6 +25,7 @@
         <header id="topbar">
           <div id="title">未连接</div>
           <div class="row">
+            <div id="topbar-clock" class="chip hidden"></div>
             <div id="degrade" class="chip small hidden"></div>
             <button id="restart" class="hidden">重启核心</button>
             <div id="status" class="chip pending">启动中…</div>
@@ -34,14 +35,14 @@
         <section id="pane-chat" class="pane">
           <div class="row">
             <button id="history-more" class="link hidden">加载更多（更早的消息）</button>
-            <span id="history-note" class="muted"></span>
+            <span id="history-note" class="muted note"></span>
           </div>
           <div class="row">
             <button id="notice-open" class="link hidden">提醒：打开最新一条主动消息</button>
-            <span id="notice-note" class="muted"></span>
+            <span id="notice-note" class="muted note"></span>
           </div>
           <ol id="messages" aria-live="polite"></ol>
-          <div id="composer-note" class="muted"></div>
+          <div id="composer-note" class="muted note"></div>
           <form id="composer">
             <textarea id="input" rows="1" placeholder="Enter 发送，Shift+Enter 换行"></textarea>
             <button type="submit" id="send">发送</button>
@@ -52,11 +53,15 @@
           <h2>世界</h2>
           <div class="row">
             <button id="world-refresh">刷新</button>
-            <span id="world-note" class="muted"></span>
+            <button id="world-note-jump" class="link hidden">回到该组</button>
+            <span id="world-note" class="muted note"></span>
           </div>
-          <dl id="manage-facts" class="facts"></dl>
+          <details id="manage-facts-box" open>
+            <summary>版本与计数</summary>
+            <dl id="manage-facts" class="facts"></dl>
+          </details>
 
-          <h3>世界包</h3>
+          <h3 id="group-pkg">世界包</h3>
           <div class="row">
             <select id="pkg-select" aria-label="世界包"></select>
             <button id="pkg-check">校验</button>
@@ -67,11 +72,41 @@
           <div class="row">
             <input id="pkg-brief" placeholder="用一段话描述这个世界，交给 AI 生成" />
             <input id="pkg-name" placeholder="世界包名称（可留空）" />
-            <button id="pkg-generate">AI 生成</button>
+            <button id="pkg-generate" class="primary">AI 生成</button>
+            <span id="pkg-note" class="muted note"></span>
           </div>
           <pre id="pkg-errors" class="muted"></pre>
 
-          <h3>角色卡</h3>
+          <h3 id="group-instances">世界实例</h3>
+          <div class="row">
+            <select id="inst-select" aria-label="世界实例"></select>
+            <input id="inst-rename-input" placeholder="新名称" />
+            <button id="inst-rename-btn">重命名</button>
+            <button id="inst-export">导出</button>
+            <span id="inst-note" class="muted note"></span>
+          </div>
+          <div class="row">
+            <select id="inst-package-select" aria-label="创建实例用的世界包"></select>
+            <select id="inst-cards-select" aria-label="创建实例用的角色卡" multiple size="3"></select>
+            <input id="inst-name-input" placeholder="实例显示名（可留空）" />
+            <button id="inst-create" class="primary">创建实例</button>
+          </div>
+          <div class="row">
+            <select id="import-select" aria-label="导出件（导入为实例）"></select>
+            <button id="inst-import">导入为实例</button>
+          </div>
+          <div class="row hidden" id="inst-convert-row">
+            <button id="inst-convert">转换…</button>
+            <span id="inst-convert-note" class="muted note"></span>
+          </div>
+          <div class="row delete-row">
+            <span class="muted">删除实例</span>
+            <input id="inst-delete-name" placeholder="键入实例名以确认" autocomplete="off" />
+            <button id="inst-delete">删除</button>
+            <span id="inst-delete-note" class="muted">将保留：世界包 / 角色卡 / 导出件</span>
+          </div>
+
+          <h3 id="group-cards">角色卡</h3>
           <div class="row">
             <select id="card-select" aria-label="角色卡"></select>
             <button id="card-confirm">确认卡片</button>
@@ -81,12 +116,13 @@
           <div class="row">
             <select id="card-package-select" aria-label="归属世界包（导入角色卡用）"></select>
             <button id="card-import">导入角色卡…</button>
-            <span id="card-import-note" class="muted"></span>
+            <span id="card-import-note" class="muted note"></span>
           </div>
           <div class="row">
             <input id="card-brief" placeholder="角色描述，如：盐滩上记水位尺的年轻堤务吏" />
             <input id="card-name-input" placeholder="角色名（可留空）" />
-            <button id="card-generate">AI 生成</button>
+            <button id="card-generate" class="primary">AI 生成</button>
+            <span id="card-note" class="muted note"></span>
           </div>
           <pre id="card-errors" class="muted"></pre>
           <div class="row">
@@ -97,59 +133,36 @@
           <p class="muted">补入用上面「世界实例」选中的实例与上面「角色卡」选中的卡片；加入点不早于实例初始时刻、不晚于已完成水位，补入本身不激活冻结线。</p>
           <dl id="card-add-facts" class="facts"></dl>
 
-          <h3>草稿（未完成的创作）</h3>
+          <h3 id="group-drafts">草稿（未完成的创作）</h3>
           <div class="row">
             <select id="draft-select" aria-label="草稿"></select>
             <button id="draft-continue">继续编辑</button>
             <button id="draft-discard">丢弃草稿</button>
-            <span id="draft-note" class="muted"></span>
+            <span id="draft-note" class="muted note"></span>
           </div>
 
-          <h3>世界实例</h3>
-          <div class="row">
-            <select id="inst-select" aria-label="世界实例"></select>
-            <input id="inst-rename-input" placeholder="新名称" />
-            <button id="inst-rename-btn">重命名</button>
-            <button id="inst-export">导出</button>
-            <button id="inst-delete">删除</button>
-          </div>
-          <div class="row">
-            <select id="inst-package-select" aria-label="创建实例用的世界包"></select>
-            <select id="inst-cards-select" aria-label="创建实例用的角色卡" multiple size="3"></select>
-            <input id="inst-name-input" placeholder="实例显示名（可留空）" />
-            <button id="inst-create">创建实例</button>
-          </div>
-          <div class="row">
-            <select id="import-select" aria-label="导出件（导入为实例）"></select>
-            <button id="inst-import">导入为实例</button>
-          </div>
-          <div class="row hidden" id="inst-convert-row">
-            <button id="inst-convert">转换…</button>
-            <span id="inst-convert-note" class="muted"></span>
-          </div>
-
-          <h3>运行（当前查看的实例）</h3>
+          <h3 id="group-run">运行（当前查看的实例）</h3>
           <div class="row">
             <span id="clock-label" class="muted">未连接或未选择实例</span>
           </div>
           <div class="row">
-            <button id="clock-activate">激活</button>
+            <button id="clock-activate" class="primary">激活</button>
             <button id="clock-freeze">冻结</button>
             <input id="clock-rate" type="number" min="1" step="1" placeholder="倍率（世界秒 / 现实秒）" />
             <button id="clock-set-rate">设定倍率</button>
-            <span id="clock-note" class="muted"></span>
+            <span id="clock-note" class="muted note"></span>
           </div>
-          <h3>多角色与披露（阶段 5）</h3>
+          <h3 id="group-roles">多角色与披露（阶段 5）</h3>
           <div class="row">
             <select id="role-select" aria-label="会话角色"></select>
             <button id="role-switch">切换会话角色</button>
-            <span id="role-note" class="muted"></span>
+            <span id="role-note" class="muted note"></span>
           </div>
           <div class="row">
             <select id="disclose-to" aria-label="披露的接收角色"></select>
             <button id="disclose-confirm">披露选中的片段</button>
             <button id="disclose-cancel" class="hidden">取消选择</button>
-            <span id="disclose-note" class="muted">在聊天里点角色消息上的「披露」选定片段</span>
+            <span id="disclose-note" class="muted note">在聊天里点角色消息上的「披露」选定片段</span>
           </div>
           <dl id="disclosure-facts" class="facts"></dl>
           <p class="muted">披露只开放指定片段；默认互相看不见。撤回只能靠回滚。</p>
@@ -172,18 +185,44 @@
             <div class="row">
               <button type="submit">保存</button>
               <button type="button" id="settings-reload">重新读取</button>
-              <span id="settings-note" class="muted"></span>
+              <span id="settings-note" class="muted note"></span>
             </div>
           </form>
           <dl id="settings-facts" class="facts"></dl>
 
           <h3>记忆向量化（语义召回）</h3>
+          <form id="mem-form">
+            <label>模式
+              <select id="set-mem-mode">
+                <option value="separate">独立服务（远程语义召回）</option>
+                <option value="chat">只用全文（降级）</option>
+              </select>
+            </label>
+            <label>服务地址<input id="set-mem-base-url" autocomplete="off" placeholder="如 http://127.0.0.1:1234/v1" /></label>
+            <label>模型<input id="set-mem-model" autocomplete="off" /></label>
+            <label>API Key<input id="set-mem-api-key" type="password" autocomplete="off" placeholder="留空表示不修改" /></label>
+            <div class="row">
+              <button type="submit">保存</button>
+              <span id="mem-note" class="muted note"></span>
+            </div>
+          </form>
           <dl id="mem-facts" class="facts"></dl>
-          <p class="muted">用于远程语义召回的地址 / 模型 / Key 由核心运行时配置管理；这里只读、读取打码，缺任一项即按全文召回降级。</p>
+          <p class="muted">说明用于远程语义召回；选「只用全文（降级）」不启用独立服务，已填的地址 / 模型留在配置里但不参与召回。缺任一项即按全文召回降级。</p>
 
           <h3>提交（自动提交）</h3>
+          <form id="commit-form">
+            <div class="row">
+              <label><input id="set-commit-enabled" type="checkbox" /> 开启自动提交</label>
+            </div>
+            <label>现实间隔（分钟）<input id="set-commit-minutes" type="number" min="1" step="1" /></label>
+            <label>事件阈值（条新增事件）<input id="set-commit-events" type="number" min="1" step="1" /></label>
+            <div class="row">
+              <button type="submit">保存</button>
+              <span id="commit-note" class="muted note"></span>
+            </div>
+          </form>
           <dl id="commit-facts" class="facts"></dl>
-          <p class="muted">自动提交按现实间隔或新增事件条数触发；关闭不影响状态日常持久化。当前为只读（核心运行时配置）。</p>
+          <p class="muted">自动提交按现实间隔或新增事件条数触发；关闭不影响状态日常持久化。</p>
 
           <h3>世界 / 会话</h3>
           <dl id="worldset-facts" class="facts"></dl>
@@ -196,32 +235,44 @@
           <h3>内建聊天</h3>
           <div class="row">
             <label><input id="set-chat-enabled" type="checkbox" checked /> 启用内建聊天通道</label>
-            <span id="chat-note" class="muted"></span>
+            <span id="chat-note" class="muted note"></span>
           </div>
           <p class="muted">停用内建聊天后，壳不再登记 / 连接 builtin 聊天通道（不连 UMP、不提交对话），管理面、备份与设置照常可用；开关状态保存在本机。</p>
 
           <h3>桌面提醒</h3>
           <div class="row">
             <label><input id="set-notify-enabled" type="checkbox" checked /> 主动消息到达时发系统通知</label>
-            <span id="notify-note" class="muted"></span>
+            <span id="notify-note" class="muted note"></span>
           </div>
           <p class="muted">提醒只作已固化主动消息的入口，不是第二份历史；通知与提醒入口都由受信管理面解析定位原实例 / 时间线 / 角色会话。目标被删除 / 归档 / 回滚或重绑时显示管理错误，不改投其他角色、不激活冻结线；系统通知不可用时历史仍可读取。关闭开关只停止登记提醒，管理面照常。</p>
 
           <h3>备份</h3>
           <dl id="backup-facts" class="facts"></dl>
+          <form id="backup-form">
+            <label>备份目录<input id="set-backup-dir" autocomplete="off" /></label>
+            <label>检查间隔（小时）<input id="set-backup-interval" type="number" min="1" step="1" /></label>
+            <label>保留份数<input id="set-backup-keep" type="number" min="1" step="1" /></label>
+            <div class="row">
+              <button type="submit">保存</button>
+              <span id="backup-note" class="muted note"></span>
+            </div>
+          </form>
           <div class="row">
             <button id="backup-now">立即备份</button>
             <button id="backup-restore">恢复备份…（选文件）</button>
             <button id="backup-open">打开备份目录</button>
-            <span id="backup-note" class="muted"></span>
           </div>
           <ul id="backup-list"></ul>
+
+          <h3>外观</h3>
+          <p class="muted" id="appearance-note">黑白极简主题，跟随系统明暗。</p>
 
           <h3>关于 / 诊断</h3>
           <dl id="about-facts" class="facts"></dl>
           <div class="row">
             <button id="open-log-dir">打开日志目录</button>
-            <span id="about-note" class="muted">日志与诊断只含阶段、耗时与错误码，不含对话正文、实情、记忆或凭据。</span>
+            <button id="open-config-dir">打开配置目录</button>
+            <span id="about-note" class="muted note">日志与诊断只含阶段、耗时与错误码，不含对话正文、实情、记忆或凭据。</span>
           </div>
         </section>
       </main>

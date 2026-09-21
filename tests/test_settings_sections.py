@@ -46,3 +46,23 @@ async def test_settings_set_rejects_unknown_and_developer_keys(tmp_path) -> None
         assert "nonsense" in str(exc2.value)
         after = await mgmt.call("settings.get")
         assert after["commit"]["minutes"] == 60, "被拒的写入不得改动原值"
+
+
+async def test_memory_mode_can_fall_back_to_fulltext(tmp_path) -> None:
+    """界面上的「只用全文（降级）」必须真的改得动：mode=chat → 清掉三项，再读回 mode=chat。"""
+    async with running_core(tmp_path) as h:
+        mgmt = await open_mgmt(h)
+        configured = await mgmt.call(
+            "settings.set",
+            memory={"mode": "separate", "base_url": "https://example.invalid/v1", "model": "m"},
+        )
+        assert configured["memory"]["mode"] == "separate" and configured["memory"]["base_url"]
+
+        downgraded = await mgmt.call("settings.set", memory={"mode": "chat"})
+        assert downgraded["memory"]["mode"] == "chat", "降级开关无效"
+        assert downgraded["memory"]["base_url"] == "" and downgraded["memory"]["model"] == ""
+        assert downgraded["memory"]["ready"] is False
+
+        with pytest.raises(UmpError) as exc:
+            await mgmt.call("settings.set", memory={"mode": "nonsense"})
+        assert "mode" in str(exc.value)
