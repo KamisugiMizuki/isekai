@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from .package import new_package_id
-from .validate import EXPIRY_KINDS, SUPPORTED_EFFECTS, _all_ids
+from .validate import EXPIRY_KINDS, SUPPORTED_EFFECTS, _all_ids, lifespan_errors
 
 DRIVERS = ("anchor", "event", "dialog", "time")
 CONFIDENCE_BANDS = {
@@ -88,6 +88,21 @@ def region_of(card: dict[str, Any]) -> str:
     return str(identity.get("region") or "")
 
 
+def effective_lifespan(identity: dict[str, Any], race: dict[str, Any] | None) -> dict[str, Any]:
+    """个体寿命的生效形态（§十 残余「个体覆盖的优先级与冲突规则」）。
+
+    优先级：卡片 `identity.died`（固死，另有分支）> 卡片 `identity.lifespan` > 种族 `lifespan`。
+    卡级覆盖是合法的个体差异（不是冲突）：只要卡片声明了寿命形态（`mode` 或 `max_years`），就用它，
+    哪怕种族声明的是 `long` / `unbounded`；返回空表 = 不据以推算寿终。
+    """
+    own = identity.get("lifespan") if isinstance(identity.get("lifespan"), dict) else {}
+    if own.get("mode") is not None or isinstance(own.get("max_years"), int):
+        return own
+    if isinstance(race, dict) and isinstance(race.get("lifespan"), dict):
+        return race["lifespan"]
+    return {}
+
+
 def validate_card(card: dict[str, Any], package: dict[str, Any], *, moment: int) -> list[str]:
     """单卡校验：身份 / 渠道 / 知识 / 单元 / 认知 / 日程。moment = 实例初始世界秒。"""
     errors: list[str] = []
@@ -117,13 +132,32 @@ def validate_card(card: dict[str, Any], package: dict[str, Any], *, moment: int)
         errors.append("identity.born: 缺少世界秒出生时刻（整数；纪元开始前为负数）")
     elif born > moment:
         errors.append("identity.born: 出生时刻不能晚于实例初始时刻")
-    elif race is not None:
-        lifespan = race.get("lifespan") if isinstance(race.get("lifespan"), dict) else {}
-        mode = lifespan.get("mode")
-        if mode is None:
-            max_years = lifespan.get("max_years")
-            if seconds_per_year and isinstance(max_years, int) and born + max_years * seconds_per_year < moment:
-                errors.append(f"identity: 出生与寿命覆盖不相容（{race.get('name')} 最长 {max_years} 年，初始时刻已超出）")
+    else:
+        # 个体寿命覆盖（§十 残余）：卡片可声明自己的寿命形态，与种族带同一套形态校验
+        own = identity.get("lifespan")
+        if own is not None:
+            errors.extend(lifespan_errors(own, "identity.lifespan"))
+        died = identity.get("died")
+        fixed_death = isinstance(died, int) and not isinstance(died, bool)
+        if died is not None and not fixed_death:
+            errors.append("identity.died: 必须是世界秒整数（固死）")
+        elif fixed_death and died < born:
+            errors.append("identity.died: 固死时刻不能早于出生时刻")
+        # 有固死就按固死走，不再拿寿命带推相容性；否则用**生效形态**（卡片覆盖优先于种族带）
+        if not fixed_death and (race is not None or isinstance(own, dict)):
+            effective = effective_lifespan(identity, race)
+            mode = effective.get("mode")
+            if mode is None:
+                max_years = effective.get("max_years")
+                if seconds_per_year and isinstance(max_years, int) and born + max_years * seconds_per_year < moment:
+                    source = (
+                        "卡片覆盖"
+                        if isinstance(own, dict) and own.get("max_years") is not None
+                        else str(race.get("name"))
+                    )
+                    errors.append(
+                        f"identity: 出生与寿命覆盖不相容（{source} 最长 {max_years} 年，初始时刻已超出）"
+                    )
 
     sources = {s.get("id") for s in package.get("sources", []) if isinstance(s, dict)}
     for index, channel in enumerate(card.get("channels") or []):

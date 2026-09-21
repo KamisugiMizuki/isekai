@@ -15,6 +15,39 @@ SEGMENT_KEYS = ("id", "name", "start", "end")
 LIFESPAN_MODES = ("long", "unbounded")
 ENTITY_KINDS = ("person", "org", "place", "item")
 
+
+def lifespan_errors(lifespan: Any, where: str) -> list[str]:
+    """寿命声明的形态校验（种族默认与卡片个体覆盖**共用这一份**，§十 残余「寿命带形态」）。
+
+    两种合法形态，不能混写：
+
+    - `{"mode": "long"|"unbounded"}`：不据以推算寿终（`long` = 极长但本设定内不定年限）；
+    - `{"min_years": n, "max_years": m}`：正整数年、`min ≤ max`，寿终按 `born + max 年` 推。
+    """
+    if not isinstance(lifespan, dict):
+        return [f"{where}: 缺少寿命覆盖"]
+    errors: list[str] = []
+    mode = lifespan.get("mode")
+    has_band = lifespan.get("min_years") is not None or lifespan.get("max_years") is not None
+    if mode is not None:
+        if mode not in LIFESPAN_MODES:
+            errors.append(f"{where}.mode: 必须是 {'/'.join(LIFESPAN_MODES)} 之一")
+        if has_band:
+            errors.append(f"{where}: mode 与 min_years/max_years 不能同时声明（两种形态混写）")
+        return errors
+    low, high = lifespan.get("min_years"), lifespan.get("max_years")
+    ok = (
+        isinstance(low, int)
+        and not isinstance(low, bool)
+        and isinstance(high, int)
+        and not isinstance(high, bool)
+        and low > 0
+        and high >= low
+    )
+    if not ok:
+        errors.append(f"{where}: 需要 min_years ≤ max_years 的正整数年")
+    return errors
+
 #: 加载限额（§2.3）：超限明确拒绝，不静默裁掉设定
 MAX_DEPTH = 12
 MAX_NODES = 20000
@@ -445,14 +478,7 @@ def _validate_races_entities(package: dict[str, Any], errors: list[str]) -> None
         if not isinstance(lifespan, dict):
             errors.append(f"races[{index}].lifespan: 缺少寿命覆盖")
             continue
-        mode = lifespan.get("mode")
-        if mode is not None:
-            if mode not in LIFESPAN_MODES:
-                errors.append(f"races[{index}].lifespan.mode: 必须是 {'/'.join(LIFESPAN_MODES)} 之一")
-            continue
-        low, high = lifespan.get("min_years"), lifespan.get("max_years")
-        if not isinstance(low, int) or not isinstance(high, int) or low <= 0 or high < low:
-            errors.append(f"races[{index}].lifespan: 需要 min_years ≤ max_years 的正整数年")
+        errors.extend(lifespan_errors(lifespan, f"races[{index}].lifespan"))
     race_ids = set(_ids(races))
 
     entities = package.get("entities")

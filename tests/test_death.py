@@ -34,6 +34,56 @@ def test_death_moment_from_lifespan_or_fixed() -> None:
     assert events.death_moment(unbounded, package, calendar) is None, "没有寿命依据就不替设定发明死亡"
 
 
+def test_lifespan_form_and_overrides() -> None:
+    """寿命 schema（§十 残余）：两种形态同一套校验；个体覆盖优先于种族带，固死优先于覆盖。"""
+    from isekai_core.world.cards import effective_lifespan, validate_card
+    from isekai_core.world.validate import lifespan_errors, validate_package
+
+    # 形态：mode 与 min/max 不能混写；未知 mode 报错
+    assert lifespan_errors({"mode": "long"}, "x") == []
+    assert "不能同时声明" in " ".join(lifespan_errors({"mode": "long", "max_years": 3}, "x"))
+    assert "long/unbounded" in " ".join(lifespan_errors({"mode": "ageless"}, "x"))
+
+    package = sample_package()
+    calendar = calendar_from_package(package)
+    born = int(sample_card(package)["identity"]["born"])
+
+    # 种族 band 与 mode 混写：整包校验拒绝
+    bad = sample_package()
+    bad["races"][0]["lifespan"] = {"mode": "long", "min_years": 1, "max_years": 2}
+    assert any("混写" in item for item in validate_package(bad)), validate_package(bad)
+
+    # 卡级覆盖：种族声明 long（不推寿终）也照样按卡片自己的年限推
+    long_package = sample_package()
+    long_package["races"][0]["lifespan"] = {"mode": "long"}
+    card = sample_card(long_package)
+    assert events.death_moment(card, long_package, calendar) is None, "种族 long 时不推"
+    card["identity"]["lifespan"] = {"min_years": 3, "max_years": 5}
+    assert effective_lifespan(card["identity"], long_package["races"][0]) == {"min_years": 3, "max_years": 5}
+    assert events.death_moment(card, long_package, calendar) == born + 5 * calendar.year_seconds
+
+    # 固死优先于卡级覆盖
+    card["identity"]["died"] = born + 10
+    assert events.death_moment(card, long_package, calendar) == born + 10
+
+    # 冲突：固死早于出生 / 卡级形态非法 → 校验拒绝
+    card["identity"]["died"] = born - 1
+    assert any("不能早于出生" in item for item in validate_card(card, long_package, moment=DAY * 1500))
+    card["identity"].pop("died")
+    card["identity"]["lifespan"] = {"mode": "long", "min_years": 1}
+    assert any("混写" in item for item in validate_card(card, long_package, moment=DAY * 1500))
+    card["identity"]["lifespan"] = {"min_years": 5, "max_years": 3}
+    assert any("正整数年" in item for item in validate_card(card, long_package, moment=DAY * 1500))
+
+    # 相容性检查用生效形态：种族带太短但卡级覆盖够长 → 不再报「不相容」
+    short = sample_package()
+    short["races"][0]["lifespan"] = {"min_years": 1, "max_years": 2}
+    short_card = sample_card(short)
+    assert any("不相容" in item for item in validate_card(short_card, short, moment=DAY * 1500))
+    short_card["identity"]["lifespan"] = {"min_years": 100, "max_years": 200}
+    assert not any("不相容" in item for item in validate_card(short_card, short, moment=DAY * 1500))
+
+
 def test_death_event_is_registered_separately_and_spreads(store) -> None:
     world_service = RuntimeService(store)
     package = sample_package()

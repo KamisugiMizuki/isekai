@@ -296,7 +296,12 @@
   （`runtime/events.py::backfill_plan` + 创建期联合校验 `backfill_product_errors`）；**「已确认缺载」的表示方式已落地**
   （`claim_coverage` 表：`pending` 尚未生成 / `absent` 已确认缺载 / `done` 已展开，`claim.coverage` 可读）；
   超长时代的折半阈值、要点人物挑选与名册生成的体量仍余。
-- 种族与寿命 schema：寿命带的形态与历法换算、特殊寿命（极长 / 无上界）的编码、个体覆盖的优先级与冲突规则。
+- 种族与寿命 schema：**2026-09-22 落地**——两种形态共用 `world/validate.py::lifespan_errors`（`{mode: long|unbounded}`
+  或 `{min_years, max_years}`，正整数年且 min ≤ max），**混写即拒**；历法换算走 `calendar.year_seconds`
+  （`runtime/events.py::death_moment` 按出生 + 上限年推）；**个体覆盖优先级**：卡片 `identity.died`（固死）
+  > 卡片 `identity.lifespan` > 种族 `lifespan`（`world/cards.py::effective_lifespan`，卡级覆盖是合法个体差异）；
+  冲突规则：固死不得早于出生、卡级覆盖必须自身合法、「出生与寿命不相容」按**生效形态**判。
+  行为验收 `tests/test_death.py::test_lifespan_form_and_overrides`。
 - 制度声明的字段形态（职权、延续、空缺与承接）与文化惯例声明（适用群体、允许变化范围）的校验规则；与既有史料、节庆与生活模板的对齐。
 
 ## 附录 A：世界包字段（设计级）

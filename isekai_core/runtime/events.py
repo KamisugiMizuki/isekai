@@ -17,7 +17,7 @@ import hashlib
 import json
 from typing import Any, Iterable
 
-from ..world.cards import region_of
+from ..world.cards import effective_lifespan, region_of
 from ..world.validate import DENSITY_TARGETS, EXPIRY_KINDS, SUPPORTED_EFFECTS as SUPPORTED_EFFECT_NAMES
 
 #: 候选槽建议起点（附录 A）：槽数是搜索空间，不是发生数量
@@ -585,9 +585,9 @@ def as_json(value: Any) -> str:
 
 
 def death_moment(card: dict[str, Any], package: dict[str, Any], calendar: Any) -> int | None:
-    """角色的寿终世界时刻：卡片固化的死亡优先，否则按种族寿命上限与出生时刻推出。
+    """角色的寿终世界时刻：卡片固化的死亡优先，其次卡片 `identity.lifespan` 覆盖，最后种族寿命上限。
 
-    种族声明 `mode`（long / unbounded）时不推寿终——不能替设定发明死亡。
+    种族或卡片声明 `mode`（long / unbounded）时不推寿终——不能替设定发明死亡。
     """
     identity = card.get("identity") if isinstance(card.get("identity"), dict) else {}
     fixed = identity.get("died")
@@ -601,9 +601,9 @@ def death_moment(card: dict[str, Any], package: dict[str, Any], calendar: Any) -
     race = races.get(str(race_id))
     if race is None:
         return None
-    lifespan = race.get("lifespan") if isinstance(race.get("lifespan"), dict) else {}
+    lifespan = effective_lifespan(identity, race)
     if lifespan.get("mode") is not None:
-        return None
+        return None  # 声明了 long / unbounded：不替设定发明死亡
     max_years = lifespan.get("max_years")
     if not isinstance(max_years, int) or max_years <= 0:
         return None
