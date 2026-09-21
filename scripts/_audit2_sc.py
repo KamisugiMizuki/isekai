@@ -1939,7 +1939,7 @@ async def main() -> int:
     if args.only is None:
         for index, item in enumerate(DEFERRED_ITEMS, start=1):
             results.append({**item, "id": f"D{index}", "seconds": 0.0})
-            print(f"[DEFER] D{index} {item['clause']}")
+            print(f"[DEFERRED] D{index} {item['clause']}")
             print(f"       原因：{item['observed']}")
     for cid, fn in selected:
         started = time.monotonic()

@@ -338,17 +338,54 @@ def c_builtin_disable(case: Case) -> tuple[str, str]:
     return ("PASS" if ok else "FAIL"), detail
 
 
-@item("§7.1-03 插件隔离｜插件崩溃不影响核心（宿主后置，附相邻机制实测）")
+@item("§7.1-03 插件隔离｜插件进程崩溃不影响核心（真实子进程实测）")
 def c_plugin_isolation(case: Case) -> tuple[str, str]:
-    plugin_files = [
-        p.relative_to(ROOT).as_posix()
-        for p in ROOT.rglob("*plugin*")
-        if not {"node_modules", ".venv", ".git", "__pycache__"} & set(p.parts)
-    ]
-    return "DEFERRED", (
-        "第三方插件宿主按 CHANNEL_PLUGIN_SPEC 实施分期后置（DESIGN §6.1 阶段 0「后置」、§9「保持后置」）："
-        f"仓库内 plugin 相关文件只有 {plugin_files or '无'}（全是 docs/ 下的 SPEC），没有可注入崩溃的插件进程。"
-        "相邻机制已实测：单条连接连续协议错误到 PROTOCOL_ERROR_LIMIT 只断这条连接、核心继续服务（见下一条同批实测）"
+    from isekai_core import plugins as plugins_mod
+
+    folder = case.dir / "plugins" / "boom"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "main.py").write_text(
+        (ROOT / "tests" / "plugin_stubs" / "crash.py").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (folder / "manifest.json").write_text(
+        json.dumps({"id": "boom-plugin", "name": "崩溃插件", "version": "0.1.0", "ump": "1.x",
+                    "entry": ["python", "main.py"]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    service = SessionService(
+        store=case.store,
+        cfg=case.cfg,
+        llm=case.llm,
+        deliver=lambda *a, **k: asyncio.sleep(0, result=True),
+    )
+    server = CoreServer(cfg=case.cfg, store=case.store, service=service)
+    host = plugins_mod.PluginHost(cfg=case.cfg, store=case.store, server=server, folder=case.dir / "plugins")
+    previous = plugins_mod.HOST
+    plugins_mod.install(host)
+    try:
+        async def scenario() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            enabled = await host.enable("boom-plugin", timeout=25.0)
+            # 崩溃之后管理面照常答话：宿主自己列得出手上这个插件（走的是注册过的 op，不是直调函数）
+            listed = server._mgmt_call("plugin.list", {})
+            return enabled, list((listed or {}).get("plugins") or [])
+
+        enabled, rows = asyncio.run(scenario())
+    finally:
+        plugins_mod.install(previous)
+
+    row = case.store.plugin_get("boom-plugin") or {}
+    ok = (
+        enabled.get("enabled") is False
+        and enabled.get("state") == "failed"
+        and "boom-plugin" not in host._running
+        and not int(row.get("enabled") or 0)
+        and any(str(item.get("id")) == "boom-plugin" for item in rows)
+    )
+    return ("PASS" if ok else "FAIL"), (
+        "真子进程崩溃：enable → enabled="
+        f"{enabled.get('enabled')}/state={enabled.get('state')}/note={str(enabled.get('note'))[:48]!r}；"
+        f"崩溃后管理面 plugin.list 照常回 {len(rows)} 条、store.enabled={int(row.get('enabled') or 0)}、"
+        f"不自动重启={'boom-plugin' not in host._running}"
     )
 
 

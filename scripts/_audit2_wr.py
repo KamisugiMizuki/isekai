@@ -861,10 +861,14 @@ def c_personality() -> None:
             "confidence": personality.PROMOTE_CONFIDENCE + 0.05,
         }])
         op_names = set(ops.SYNC_OPS) | set(ops.ASYNC_OPS)
-        migration_ops = [name for name in op_names if "migrat" in name or "promote" in name]
+        # 判据只认性格单元自己的入口：`trpg.campaign.migrate` 是规则版本转换器（2026-09-22 新增），
+        # 与单元迁移无关——按名字含 migrat 全收会把别的功能读成「多了迁移入口」（实测过一次假 FAIL）
+        migration_ops = [name for name in op_names
+                         if ("migrat" in name or "promote" in name) and not name.startswith("trpg.")]
         check("§10.2 条1 驱动迁移隐式形成、不另设可见的迁移事件或迁移日志",
               "mode 就地变为 anchor，管理面无迁移入口",
-              f"promote 后 mode={promoted[0]['mode']}，迁移相关 op={migration_ops or '无'}",
+              f"promote 后 mode={promoted[0]['mode']}，单元迁移相关 op={migration_ops or '无'}"
+              f"（同名排除：{sorted(n for n in op_names if n.startswith('trpg.') and 'migrat' in n) or '无'}）",
               "PASS" if promoted[0]["mode"] == "anchor" and not migration_ops else "FAIL",
               code_ref="isekai_core/runtime/personality.py:180-188、world/ops.py:38-105")
 

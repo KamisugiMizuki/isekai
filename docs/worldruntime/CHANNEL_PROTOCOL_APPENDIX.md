@@ -151,7 +151,7 @@
 - 每连接发送队列上限 / 背压阈值：**未定义**（channel.py:50 只有串行化发送锁 `send_lock`，缓冲交给 websockets）。
 - 在线连接数上限：**未实现**（channel.py:85 `_conns` 无界 dict）。
 - 入站文本的**字节**上限：未单独设（只有码点数上限与 1 MiB 帧上限）。
-- 插件 stderr 容量限制与脱敏：**未实现**（无子进程插件宿主；CHANNEL_PLUGIN_SPEC §3.2 的要求，见 `scripts/_audit2_chan.py` D02 / D05）。
+- 插件 stderr：**容量上限已实现**（`plugins.py:34-35` `STDERR_KEEP_LINES=200` 只留最近 200 行、`STDERR_LINE_CHARS=500` 单行截断；实测 `scripts/_audit2_chan.py` 刷 300 行 stderr 只留上限条数）；**脱敏未做**——只保证容量，不净化插件自行写出的内容（§六 已声明不给这个保证）。
 - 速率限制 / 频率限制、附件与流式的尺寸上限：**未实现**（§2.1「v1 仅文本、非流式」、§七 更后置）。
 - 客户端重连退避（`desktop/src/main.ts:331` `RECONNECT_DELAYS_MS`）与生成 / 记忆预算类配额不属本文范围（§九 另条、各自 SPEC）。
 
