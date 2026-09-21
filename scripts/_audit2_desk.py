@@ -664,7 +664,7 @@ def section_static() -> None:
         "生成确认写明无法取消": "过程中无法取消" in src,
         "生成前 API Key 闸门（世界包 / 角色卡共用一处）":
             "function apiKeyBlocked" in src and "function openApiKeyField" in src
-            and "还没配 API Key" in src and 'apiKeyBlocked(settings, "pkg-note")' in src
+            and "还没配 API Key" in src and 'apiKeyBlocked(settings, "gw-generate-note")' in src
             and 'apiKeyBlocked(settings, "card-note")' in src,
         "设置面 API Key 事实行（已配置 / 未配置）": '"API Key", settings.llm.api_key_set' in src,
         "删除闸门（离开实例行 + 键入实例名）": "function renderDeleteGate" in src and "将保留：世界包 / 角色卡 / 导出件" in src,
@@ -702,7 +702,7 @@ def section_static() -> None:
         "读不到预算的降级有 ponytail 标注": "ponytail:" in src,
         "两组生成互斥（全局在途闸门 + 发起前拦下）":
             "function generateBlocked" in src and "generateBusy.package || generateBusy.card" in src
-            and 'generateBlocked("package", "pkg-note")' in src
+            and 'generateBlocked("package", "gw-generate-note")' in src
             and 'generateBlocked("card", "card-note")' in src,
         "降级 chip 可点（落点是设置面记忆组首个可编辑控件）":
             "function openMemoryGroup" in src and "openMemoryGroup()" in src
@@ -1136,10 +1136,12 @@ async def section_main() -> None:
           code="main.ts:1203-1229 · isekai_core/world/ops.py:250-268")
     # AI 生成 → 用量提示 + 草稿
     drafts_before = [p.name for p in (root / "packages").glob("*.draft.json")]
-    await cdp.js("document.getElementById('pkg-brief').value='审计用的世界描述';"
-                 "document.getElementById('pkg-file').value='a2gen.json';"
-                 "document.getElementById('pkg-generate').click()")
-    note_gen = await wait_note(cdp, ("pkg-note", "world-note"), "草稿", 90)
+    await cdp.js("document.getElementById('pkg-open-workspace').click()")  # P1：生成入口在工作区
+    await asyncio.sleep(1.0)
+    await cdp.js("document.getElementById('gw-brief').value='审计用的世界描述';"
+                 "document.getElementById('gw-file').value='a2gen.json';"
+                 "document.getElementById('gw-generate').click()")
+    note_gen = await wait_note(cdp, ("gw-generate-note", "world-note"), "草稿", 90)
     confirm_gen = await cdp.js("window.__confirmArgs.slice(-1)[0] || ''")
     drafts_after = [p.name for p in (root / "packages").glob("*.draft.json")]
     check("M18 §十.11/§3.3 用量：生成前给出调用预估与上限，完成后回报调用次数；未过校验存草稿",
@@ -1179,9 +1181,9 @@ async def section_main() -> None:
 
     # ---- M34 harden：10 分钟付费生成的在途仪表（已用 / 上限）与重入闸门
     gen_controls = await cdp.js(
-        "({pkg: ['pkg-generate','pkg-brief','pkg-name'].every(i=>!!document.getElementById(i)),"
+        "({pkg: ['pkg-open-workspace','gw-generate','gw-brief','gw-name','gw-file'].every(i=>!!document.getElementById(i)),"
         " card: ['card-generate','card-brief','card-name-input'].every(i=>!!document.getElementById(i))})")
-    await clear_notes(cdp, "pkg-note", "world-note")
+    await clear_notes(cdp, "gw-generate-note", "world-note")
     gen_before = (await ops_log(cdp)).count("world.package.generate")
     # ---- M41 准备：把实例级预算上限改成一个只有核心知道的数字（654321），再用确认框里的数字
     # 证明「上限从核心读」而不是壳里写死的常量；同时记下核心账本里今日的调用次数。
@@ -1205,11 +1207,11 @@ async def section_main() -> None:
         "onAttr:function(id,live){this.log.push({id:id,ev:'attr',live:live});this.armed[id]=(live==='off');},"
         "onText:function(id,live){if(live==='off'){this.writesOff++;}else if(this.armed[id]){this.leaks++;}}};"
         "const liveOf=id=>document.getElementById(id).getAttribute('aria-live');"
-        "const b=document.getElementById('pkg-generate');"
+        "const b=document.getElementById('gw-generate');"
         "const c=document.getElementById('card-generate');"
         "if(window.__gateObs)window.__gateObs.disconnect();"
         "window.__gateObs=new MutationObserver(()=>{const d=b.disabled;"
-        "window.__gateLog.push({d:d,note:document.getElementById('pkg-note').textContent});"
+        "window.__gateLog.push({d:d,note:document.getElementById('gw-generate-note').textContent});"
         "if(d&&!window.__reentry.tried){window.__reentry.tried=true;"
         "b.click();b.dispatchEvent(new MouseEvent('click',{bubbles:true}));"
         "window.__reentry.disabledAtClick=b.disabled;"
@@ -1217,7 +1219,7 @@ async def section_main() -> None:
         "c.click();c.dispatchEvent(new MouseEvent('click',{bubbles:true}));"
         "window.__mutex.cardDisabledAtClick=c.disabled;"
         "window.__mutex.cardNote=document.getElementById('card-note').textContent;"
-        "window.__live.inflight={pkg:liveOf('pkg-note'),card:liveOf('card-note')};}});"
+        "window.__live.inflight={pkg:liveOf('gw-generate-note'),card:liveOf('card-note')};}});"
         "window.__gateObs.observe(b,{attributes:true,attributeFilter:['disabled']});"
         "if(window.__liveObs)window.__liveObs.disconnect();"
         "window.__liveObs=new MutationObserver(ms=>{for(const m of ms){const el=m.target;const live=liveOf(el.id);"
@@ -1225,12 +1227,12 @@ async def section_main() -> None:
         "window.__live.onText(el.id,live);"
         "if(window.__live.log.length<40){window.__live.log.push({id:el.id,ev:'text',live:live,"
         "text:(el.textContent||'').slice(0,20)});}}});"
-        "for(const id of ['pkg-note','card-note']){window.__liveObs.observe(document.getElementById(id),"
+        "for(const id of ['gw-generate-note','card-note']){window.__liveObs.observe(document.getElementById(id),"
         "{attributes:true,attributeFilter:['aria-live'],childList:true,characterData:true,subtree:true});}})()")
-    await cdp.js("document.getElementById('pkg-brief').value='审计闸门用世界描述';"
-                 "document.getElementById('pkg-file').value='a2gate.json';"
-                 "document.getElementById('pkg-generate').click()")
-    gen_final = await wait_note(cdp, ("pkg-note", "world-note"), "草稿", 150)
+    await cdp.js("document.getElementById('gw-brief').value='审计闸门用世界描述';"
+                 "document.getElementById('gw-file').value='a2gate.json';"
+                 "document.getElementById('gw-generate').click()")
+    gen_final = await wait_note(cdp, ("gw-generate-note", "world-note"), "草稿", 150)
     gate = await cdp.js("({log:(window.__gateLog||[]).slice(),reentry:window.__reentry||null,"
                         "mutex:window.__mutex||null,live:window.__live?{log:window.__live.log.slice(),"
                         "writesOff:window.__live.writesOff,leaks:window.__live.leaks,"
@@ -1297,7 +1299,7 @@ async def section_main() -> None:
     # 判据全部来自页面侧 MutationObserver（就是上面 M34 那个生成现场，不另起一次付费调用）：
     # ① 闸门合上那一刻两槽都是 off；② 在途落到槽里的文本写入全部发生在 off 期间（落进 polite 的 = 0）；
     # ③ 结束后两槽回 polite（只有结果那一句才播报）。
-    live_pkg = await cdp.js("document.getElementById('pkg-note').getAttribute('aria-live')")
+    live_pkg = await cdp.js("document.getElementById('gw-generate-note').getAttribute('aria-live')")
     live_card = await cdp.js("document.getElementById('card-note').getAttribute('aria-live')")
     live = gate.get("live") or {}
     inflight_live = live.get("inflight") or {}
@@ -1307,14 +1309,14 @@ async def section_main() -> None:
           "PASS" if (inflight_live.get("pkg") == "off" and inflight_live.get("card") == "off"
                      and int(live.get("writesOff") or 0) >= 1 and int(live.get("leaks") or 0) == 0
                      and live_pkg == "polite" and live_card == "polite") else "FAIL",
-          f"闸门合上那一刻（disabled 突变回调里读）两槽 aria-live：pkg-note={inflight_live.get('pkg')!r}、"
+          f"闸门合上那一刻（disabled 突变回调里读）两槽 aria-live：gw-generate-note={inflight_live.get('pkg')!r}、"
           f"card-note={inflight_live.get('card')!r}；生成在途落到槽里的文本写入：落进 off 槽 "
           f"{live.get('writesOff')} 条记录、落进 polite 槽（off 窗口内）{live.get('leaks')} 条"
-          f"（后者就是「重复播报数百次」的现场，必须为 0）；结束后两槽 aria-live：pkg-note={live_pkg!r}、"
+          f"（后者就是「重复播报数百次」的现场，必须为 0）；结束后两槽 aria-live：gw-generate-note={live_pkg!r}、"
           f"card-note={live_card!r}；aria-live 突变时间线={attr_line}；在途头几条文本写入={text_line[:3]}",
           clause="§四 可访问性：live region 只播「该说的那一句」，逐秒进度不逐条播报",
           code="desktop/src/main.ts setGenerateGate → setLiveGate / startProgress / groupNote",
-          expected="生成在途 pkg-note 与 card-note 的 aria-live=off（文本照写、界面照看）；在途没有任何文本写进 "
+          expected="生成在途 gw-generate-note 与 card-note 的 aria-live=off（文本照写、界面照看）；在途没有任何文本写进 "
                    "polite 的槽；结束 / 失败后两槽回到 polite，只有结果那一句被播报")
 
     # ---- M50 复审④（P2）：预算句的口径（数字与口径都要对得上）
@@ -2129,17 +2131,17 @@ async def section_main() -> None:
     key_off = ((await mgmt_call(cdp, "settings.set", llm={"api_key": ""})).get("llm") or {})
     key_read_off = ((await mgmt_call(cdp, "settings.get")).get("llm") or {})
     await clear_notes(cdp, "pkg-note", "world-note")
-    await cdp.js("document.getElementById('pkg-brief').value='审计 I6 未配 Key 的世界描述';"
-                 "document.getElementById('pkg-file').value='a2nokey.json';"
+    await cdp.js("document.getElementById('gw-brief').value='审计 I6 未配 Key 的世界描述';"
+                 "document.getElementById('gw-file').value='a2nokey.json';"
                  "window.__confirmArgs=[]; window.__opLog.length=0;"
                  "window.confirm=(m)=>{window.__confirmArgs.push(String(m)); return false;};"
-                 "document.getElementById('pkg-generate').click()")
-    gate_note = await cdp.wait("document.getElementById('pkg-note').textContent", "还没配 API Key", 25)
-    gate = await cdp.js("({text: document.getElementById('pkg-note').textContent,"
-                        " link: !!document.querySelector('#pkg-note button.api-key-jump'),"
+                 "document.getElementById('gw-generate').click()")
+    gate_note = await cdp.wait("document.getElementById('gw-generate-note').textContent", "还没配 API Key", 25)
+    gate = await cdp.js("({text: document.getElementById('gw-generate-note').textContent,"
+                        " link: !!document.querySelector('#gw-generate-note button.api-key-jump'),"
                         " confirms: window.__confirmArgs.length,"
                         " called: (window.__opLog||[]).includes('world.package.generate')})")
-    await cdp.js("document.querySelector('#pkg-note button.api-key-jump').click()")
+    await cdp.js("document.querySelector('#gw-generate-note button.api-key-jump').click()")
     await asyncio.sleep(1.5)
     jump = await cdp.js("({pane: !document.getElementById('pane-settings').classList.contains('hidden'),"
                         " focus: (document.activeElement||{}).id || '',"
@@ -2164,11 +2166,11 @@ async def section_main() -> None:
     await clear_notes(cdp, "pkg-note", "world-note")
     await cdp.js("window.__confirmArgs=[];"
                  "window.confirm=(m)=>{window.__confirmArgs.push(String(m)); return false;};"
-                 "document.getElementById('pkg-generate').click()")
-    back_note = await cdp.wait("document.getElementById('pkg-note').textContent", "已取消", 30)
+                 "document.getElementById('gw-generate').click()")
+    back_note = await cdp.wait("document.getElementById('gw-generate-note').textContent", "已取消", 30)
     back = await cdp.js("({confirms: window.__confirmArgs.length,"
                         " last: window.__confirmArgs.slice(-1)[0] || '',"
-                        " stale: !!document.querySelector('#pkg-note button.api-key-jump')})")
+                        " stale: !!document.querySelector('#gw-generate-note button.api-key-jump')})")
     ok_i6 = (key_off.get("api_key_set") is False and key_read_off.get("api_key_set") is False
              and "还没配 API Key" in str(gate_note) and "去设置面" in str(gate["text"])
              and gate["link"] is True and int(gate["confirms"] or 0) == 0 and not gate["called"]
@@ -3028,7 +3030,7 @@ async def section_onboard() -> None:
           "PASS" if (empty["btn"] and "还没有世界实例" in str(empty["text"])
                      and "还没有世界实例" in str(empty["chip"])
                      and landed["manage"] and landed["chat_hidden"]
-                     and landed["focused"] == "pkg-brief" and landed["open"] is False
+                     and landed["focused"] == "pkg-open-workspace" and landed["open"] is False
                      and landed["first_h3"].strip() == "世界包") else "FAIL",
           f"空态文案={empty['text']!r}（直达按钮={empty['btn']}）；顶栏 chip={empty['chip']!r}"
           f"（与空态同一口径：不再一边说「发一条消息试试」一边说「还没有世界实例」）；"

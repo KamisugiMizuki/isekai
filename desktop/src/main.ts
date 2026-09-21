@@ -315,9 +315,9 @@ function emptyState(): HTMLElement {
 /// 首跑引导落点：切到管理页并把世界包生成入口顶到眼前（只导航与聚焦，不替用户做任何事）
 function openFirstWorld(): void {
   document.querySelector<HTMLButtonElement>('nav .nav[data-pane="manage"]')?.click();
-  const brief = $<HTMLInputElement>("pkg-brief");
-  brief.scrollIntoView({ block: "center" });
-  brief.focus();
+  const entry = $<HTMLButtonElement>("pkg-open-workspace");
+  entry.scrollIntoView({ block: "center" });
+  entry.focus();
 }
 
 /// 设置面落点：切到设置页并把生成模型的 API Key 输入框顶到眼前（同样只导航与聚焦）
@@ -1832,7 +1832,7 @@ const generateBusy = { package: false, card: false };
 /// 调用上限：与核心 generator 的默认值一致（段数 × 2 / 卡片 2）；完成后以核心回的 usage.limit 为准
 const GENERATE_LIMIT = { package: 6, card: 2 };
 const GENERATE_CONTROLS = {
-  package: ["pkg-generate", "pkg-brief", "pkg-name"],
+  package: ["pkg-open-workspace", "gw-generate", "gw-brief", "gw-name", "gw-file"],
   card: ["card-generate", "card-brief", "card-name-input"],
 };
 /// 每个组各一个进度计时器：同组重入时先清掉上一只，绝不让计时器泄漏着一直改写结果槽
@@ -1854,7 +1854,7 @@ function setGenerateGate(kind: "package" | "card", busy: boolean): void {
 /// 播报几百句「同一句话只差几秒」。生成期间两个进度槽置 aria-live=off（文本照写、界面照看），
 /// 结束 / 失败后回 polite，只有结果那一句才播报。闸门跟 generateBusy 同一处开关：两条生成路径都走这里。
 function setLiveGate(quiet: boolean): void {
-  for (const slotId of ["pkg-note", "card-note"]) {
+  for (const slotId of ["pkg-note", "gw-generate-note", "card-note"]) {
     $(slotId).setAttribute("aria-live", quiet ? "off" : "polite");
   }
 }
@@ -2901,9 +2901,313 @@ async function discardDraft(): Promise<string> {
   return `已丢弃草稿「${name}」`;
 }
 
+/* ---------- 生成工作区（DESKTOP_GENERATION_WORKSPACE_SPEC §3 / §五，P1） ---------- */
+
+/// 参数层旋钮：与核心 `world/generator.py` 的 KNOB_* 三张表同源（改一处必改另一处；
+/// `scripts/_audit2_gen_ws.py static` 会对拍这两份清单）
+const GENWS_TONES: Array<[string, string]> = [
+  ["genre", "体裁"],
+  ["tone", "基调"],
+  ["supernatural", "超自然在场度"],
+  ["tech", "技术水位"],
+  ["naming", "命名风格"],
+  ["conflict", "冲突主线"],
+  ["era_start", "纪元起点"],
+  ["current_year", "当前年"],
+  ["history_depth", "史料深度"],
+];
+const GENWS_COUNTS: Array<[string, string]> = [
+  ["axioms", "世界公理"],
+  ["regions", "区域"],
+  ["institutions", "制度（含职位）"],
+  ["customs", "惯例"],
+  ["env_types", "环境类型"],
+  ["races", "种族"],
+  ["roles", "角色位"],
+  ["lexicon", "用词表"],
+  ["sources", "传本"],
+  ["canon", "实情条目"],
+  ["narratives", "说法条目"],
+  ["entities", "登记实体"],
+  ["life", "生活线模板"],
+  ["families", "事件族"],
+  ["festivals", "节庆"],
+];
+const GENWS_LISTS: Array<[string, string]> = [
+  ["include", "必须出现"],
+  ["exclude", "禁止出现"],
+  ["homage", "可参考致敬"],
+];
+/// 段名与核心 `PACKAGE_SEGMENTS` 一致：段级失败由核心按「段名：」前缀回报
+const GENWS_SEGMENTS = ["设定核心", "双轨与名册", "机制与现状"];
+const genws = {
+  candidate: null as Record<string, unknown> | null,
+  errors: [] as string[],
+  usage: null as { calls?: number; limit?: number } | null,
+  model: "",
+  dirty: false,
+  savedAt: null as number | null,
+};
+
+function genwsRenderKnobs(): void {
+  const box = $("gw-knobs");
+  box.innerHTML = "";
+  const add = (label: string, node: HTMLElement): void => {
+    const wrap = document.createElement("label");
+    wrap.textContent = label;
+    wrap.append(node);
+    box.append(wrap);
+  };
+  for (const [key, label] of GENWS_TONES) {
+    const input = document.createElement("input");
+    input.id = `gw-knob-${key}`;
+    input.placeholder = "可留空";
+    add(label, input);
+  }
+  for (const [key, label] of GENWS_COUNTS) {
+    const input = document.createElement("input");
+    input.id = `gw-knob-${key}`;
+    input.type = "number";
+    input.min = "0";
+    input.step = "1";
+    input.placeholder = "0 = 不生成";
+    add(label, input);
+  }
+  for (const [key, label] of GENWS_LISTS) {
+    const area = document.createElement("textarea");
+    area.id = `gw-knob-${key}`;
+    area.rows = 2;
+    area.placeholder = "一行一条，可留空";
+    add(label, area);
+  }
+}
+
+function genwsReadKnobs(): Record<string, unknown> {
+  const knobs: Record<string, unknown> = {};
+  for (const [key] of GENWS_TONES) {
+    const value = $<HTMLInputElement>(`gw-knob-${key}`).value.trim();
+    if (value) knobs[key] = value;
+  }
+  for (const [key] of GENWS_COUNTS) {
+    const raw = $<HTMLInputElement>(`gw-knob-${key}`).value.trim();
+    if (raw === "") continue;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 0) throw new Error(`旋钮「${key}」要填非负整数`);
+    knobs[key] = value;
+  }
+  for (const [key] of GENWS_LISTS) {
+    const lines = $<HTMLTextAreaElement>(`gw-knob-${key}`)
+      .value.split("\n")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (lines.length) knobs[key] = lines;
+  }
+  return knobs;
+}
+
+function genwsRenderStatus(): void {
+  const parts = [`模型 ${genws.model || "未读取"}`];
+  parts.push(`调用 ${genws.usage?.calls ?? 0}/${genws.usage?.limit ?? GENERATE_LIMIT.package}`);
+  if (genws.errors.length) parts.push(`校验未过 ${genws.errors.length} 条`);
+  else if (genws.candidate) parts.push("校验通过");
+  else parts.push("尚未生成");
+  if (genws.savedAt) parts.push(`已保存 ${stamp(genws.savedAt)}`);
+  else if (genws.dirty) parts.push("有未保存的改动");
+  $("gw-status").textContent = parts.join(" · ");
+}
+
+function genwsSegmentOf(item: string): string {
+  const head = item.split("：")[0];
+  return GENWS_SEGMENTS.find((label) => head.startsWith(label)) ?? "";
+}
+
+function genwsRenderSegments(): void {
+  const list = $<HTMLOListElement>("gw-segments");
+  list.innerHTML = "";
+  if (!genws.candidate) return;
+  for (const label of GENWS_SEGMENTS) {
+    const mine = genws.errors.filter((item) => genwsSegmentOf(item) === label);
+    const item = document.createElement("li");
+    item.className = mine.length ? "seg bad" : "seg ok";
+    item.textContent = `${label}：${mine.length ? `未通过（${mine.length} 条）` : "已通过"}`;
+    list.append(item);
+  }
+  const whole = genws.errors.filter((item) => genwsSegmentOf(item) === "");
+  if (whole.length) {
+    const item = document.createElement("li");
+    item.className = "seg bad";
+    item.textContent = `整包校验：未通过（${whole.length} 条）`;
+    list.append(item);
+  }
+}
+
+function genwsRenderSummary(): void {
+  const target = $("gw-summary");
+  const pkg = genws.candidate;
+  if (!pkg) {
+    renderFacts(target, []);
+    return;
+  }
+  const count = (value: unknown): number => (Array.isArray(value) ? value.length : 0);
+  const meta = (pkg.meta ?? {}) as Record<string, unknown>;
+  const calendar = (pkg.calendar ?? {}) as Record<string, unknown>;
+  const world = (pkg.world ?? {}) as Record<string, unknown>;
+  const environment = (pkg.environment ?? {}) as Record<string, unknown>;
+  const events = (pkg.events ?? {}) as Record<string, unknown>;
+  renderFacts(target, [
+    ["名称", String(meta.display_name ?? "未命名")],
+    ["纪元", String(calendar.era ?? "—")],
+    ["公理", String(count(world.axioms))],
+    ["制度 / 惯例", `${count(world.institutions)} / ${count(world.customs)}`],
+    ["环境类型", String(count(environment.types))],
+    ["种族 / 实体", `${count(pkg.races)} / ${count(pkg.entities)}`],
+    ["传本", String(count(pkg.sources))],
+    ["实情 / 说法", `${count(pkg.canon)} / ${count(pkg.narratives)}`],
+    ["事件族", String(count(events.families))],
+    ["生活线 / 角色位", `${count(pkg.life)} / ${count(pkg.roles)}`],
+  ]);
+}
+
+function genwsOpen(): void {
+  for (const pane of Array.from(document.querySelectorAll<HTMLElement>(".pane"))) {
+    pane.classList.toggle("hidden", pane.id !== "pane-genws");
+  }
+  for (const button of Array.from(document.querySelectorAll<HTMLButtonElement>("nav .nav"))) {
+    button.classList.toggle("active", button.dataset.pane === "manage"); // 面包屑仍在管理页下
+  }
+  if (!$<HTMLInputElement>("gw-file").value.trim()) $<HTMLInputElement>("gw-file").value = "world.json";
+  genwsRenderStatus();
+  void genwsMaybeResume();
+}
+
+/// 草稿续作（§五）：进工作区时该名下有草稿就先问「继续上次 / 重新开始」
+async function genwsMaybeResume(): Promise<void> {
+  if (!mgmt || genws.candidate) return;
+  try {
+    const listed = await mgmt.call("world.draft.list");
+    const drafts = ((listed.drafts ?? []) as Array<{ name?: string; kind?: string }>).filter(
+      (item) => item.kind === "package",
+    );
+    if (!drafts.length) return;
+    const name = String(drafts[0].name ?? "");
+    const resume = window.confirm(
+      `发现未完成的世界包草稿「${name}」：继续上次？\n取消 = 重新开始（草稿保留在「草稿」组，想用再载入）。`,
+    );
+    if (!resume) {
+      $("gw-resume").textContent = `已跳过草稿「${name}」（未删除，可在管理页「草稿」组载入）`;
+      return;
+    }
+    const loaded = await mgmt.call("world.draft.load", { name });
+    const draft = (loaded.draft ?? {}) as { payload?: Record<string, unknown>; errors?: string[] };
+    genws.candidate = (draft.payload ?? null) as Record<string, unknown> | null;
+    genws.errors = (draft.errors ?? []) as string[];
+    genws.model = "";
+    genws.usage = null;
+    genws.savedAt = null;
+    genws.dirty = true;
+    showErrors("gw-errors", genws.errors);
+    genwsRenderSegments();
+    genwsRenderSummary();
+    genwsRenderStatus();
+    $("gw-resume").textContent = `已载回草稿「${name}」（未过校验的项照旧列出）`;
+  } catch (error) {
+    $("gw-resume").textContent = String(error);
+  }
+}
+
+function genwsClose(): void {
+  if (genws.dirty && !window.confirm("这份生成结果还没保存（保存为世界包 / 存为草稿）。仍要返回管理页？未保存的内容留在工作区里，不会丢。")) {
+    return;
+  }
+  document.querySelector<HTMLButtonElement>('nav .nav[data-pane="manage"]')?.click();
+}
+
+async function genwsGenerate(): Promise<string> {
+  if (generateBlocked("package", "gw-generate-note")) return ""; // 两组互斥：本组连点 / 另一组在跑都拦下
+  const brief = $<HTMLTextAreaElement>("gw-brief").value.trim();
+  if (!brief) throw new Error("先写一段世界描述");
+  const file = $<HTMLInputElement>("gw-file").value.trim() || "world.json";
+  const knobs = genwsReadKnobs();
+  const settings = (await mgmt!.call("settings.get")) as unknown as SettingsPayload;
+  if (apiKeyBlocked(settings, "gw-generate-note")) return ""; // 没配 Key：不弹确认框，也不发起调用
+  genws.model = String(settings.llm.model ?? "");
+  const knobCount = Object.keys(knobs).length;
+  const ok = window.confirm(
+    `将向 ${settings.llm.model}（${settings.llm.base_url}）发送你填写的世界描述、${knobCount} 个旋钮取值与生成上下文，` +
+      `预计调用 3–6 次（含重试，上限 ${GENERATE_LIMIT.package} 次），最长等 ${GENERATE_TIMEOUT_MS / 60000} 分钟；` +
+      `预算：${await budgetLine("package")}；` +
+      "过程中无法取消（核心没有取消 op，只能等它结束或失败）。用量在完成后显示，继续？",
+  );
+  if (!ok) return "已取消，未发送任何内容";
+  const started = Date.now();
+  setGenerateGate("package", true);
+  startProgress("package", "gw-generate-note");
+  let result: Record<string, unknown>;
+  try {
+    result = await mgmt!.call(
+      "world.package.generate",
+      {
+        brief,
+        name: $<HTMLInputElement>("gw-name").value.trim() || file.replace(/\.json$/, ""),
+        knobs,
+      },
+      GENERATE_TIMEOUT_MS,
+    );
+  } finally {
+    stopProgress("package");
+    setGenerateGate("package", false);
+  }
+  genws.candidate = (result.candidate ?? null) as Record<string, unknown> | null;
+  genws.errors = (result.errors ?? []) as string[];
+  genws.usage = (result.usage ?? null) as { calls?: number; limit?: number } | null;
+  genws.savedAt = null;
+  genws.dirty = true;
+  showErrors("gw-errors", genws.errors);
+  genwsRenderSegments();
+  genwsRenderSummary();
+  genwsRenderStatus();
+  const cost =
+    `调用 ${genws.usage?.calls ?? "?"}/${genws.usage?.limit ?? GENERATE_LIMIT.package} 次 · ` +
+    `用时 ${elapsedLabel(Date.now() - started)} / 上限 ${elapsedLabel(GENERATE_TIMEOUT_MS)}`;
+  if (!genws.errors.length) {
+    return `生成完成（${cost}）：三段都过了校验，可以 [保存为世界包]`;
+  }
+  await saveDraft(file, "package", genws.candidate, genws.errors); // 失败自动留一份中间态（§十.11）
+  genws.dirty = false;
+  genwsRenderStatus();
+  return `生成未通过校验，已存为草稿（${cost}）`;
+}
+
+async function genwsSave(): Promise<string> {
+  if (!genws.candidate) throw new Error("先生成一份候选");
+  if (genws.errors.length) throw new Error("校验没过：先修到没有错误再保存（或 [存为草稿]）");
+  const file = $<HTMLInputElement>("gw-file").value.trim() || "world.json";
+  await mgmt!.call("world.package.save", { path: file, package: genws.candidate });
+  genws.dirty = false;
+  genws.savedAt = Date.now() / 1000;
+  genwsRenderStatus();
+  return `已保存 ${file}（出现在管理页「世界包」列表里）`;
+}
+
+async function genwsSaveDraft(): Promise<string> {
+  if (!genws.candidate) throw new Error("先生成一份候选");
+  const file = $<HTMLInputElement>("gw-file").value.trim() || "world.json";
+  await saveDraft(file, "package", genws.candidate, genws.errors);
+  genws.dirty = false;
+  genws.savedAt = Date.now() / 1000;
+  genwsRenderStatus();
+  return `已存为草稿（管理页「草稿」组可继续）`;
+}
+
 function bindWorld(): void {
   $("world-refresh").addEventListener("click", () => void loadWorld());
   $("world-note-jump").addEventListener("click", () => jumpToWorldGroup());
+  $("pkg-open-workspace").addEventListener("click", () => genwsOpen());
+  $("gw-back").addEventListener("click", () => genwsClose());
+  $("gw-generate").addEventListener("click", () => void worldAction(genwsGenerate, "gw-generate-note"));
+  $("gw-save").addEventListener("click", () => void worldAction(genwsSave, "gw-generate-note"));
+  $("gw-save-draft").addEventListener("click", () => void worldAction(genwsSaveDraft, "gw-generate-note"));
+  genwsRenderKnobs();
   $("pkg-import").addEventListener("click", () => void worldAction(importPackage, "pkg-note"));
   $("card-import").addEventListener("click", () => void worldAction(importCard, "card-import-note"));
   $<HTMLSelectElement>("card-package-select").addEventListener("change", () =>
@@ -2985,51 +3289,6 @@ function bindWorld(): void {
       await mgmt!.call("world.package.save", { path: file, package: created.package });
       showErrors("pkg-errors", created.errors as string[]);
       return `已写入 ${file}（骨架还需填内容）`;
-    }, "pkg-note"),
-  );
-
-  $("pkg-generate").addEventListener("click", () =>
-    void worldAction(async () => {
-      if (generateBlocked("package", "pkg-note")) return ""; // 两组互斥：本组连点 / 另一组在跑都拦下
-      const brief = $<HTMLInputElement>("pkg-brief").value.trim();
-      if (!brief) throw new Error("先写一段世界描述");
-      const file = $<HTMLInputElement>("pkg-file").value.trim() || "world.json";
-      const settings = (await mgmt!.call("settings.get")) as unknown as SettingsPayload;
-      if (apiKeyBlocked(settings, "pkg-note")) return ""; // 没配 Key：不弹确认框，也不发起调用
-      const ok = window.confirm(
-        `将向 ${settings.llm.model}（${settings.llm.base_url}）发送你填写的世界描述与生成上下文，` +
-          `预计调用 3–6 次（含重试，上限 ${GENERATE_LIMIT.package} 次），最长等 ${GENERATE_TIMEOUT_MS / 60000} 分钟；` +
-          `预算：${await budgetLine("package")}；` +
-          "过程中无法取消（核心没有取消 op，只能等它结束或失败）。用量在完成后显示，继续？",
-      );
-      if (!ok) return "已取消，未发送任何内容";
-      const started = Date.now();
-      setGenerateGate("package", true);
-      startProgress("package", "pkg-note");
-      let result: Record<string, unknown>;
-      try {
-        result = await mgmt!.call(
-          "world.package.generate",
-          { brief, name: $<HTMLInputElement>("pkg-name").value.trim() || file.replace(/\.json$/, "") },
-          GENERATE_TIMEOUT_MS,
-        );
-      } finally {
-        stopProgress("package");
-        setGenerateGate("package", false);
-      }
-      const errors = (result.errors ?? []) as string[];
-      const usage = result.usage as { calls?: number; limit?: number; paused?: boolean } | undefined;
-      const cost =
-        `调用 ${usage?.calls ?? "?"}/${usage?.limit ?? GENERATE_LIMIT.package} 次 · ` +
-        `用时 ${elapsedLabel(Date.now() - started)} / 上限 ${elapsedLabel(GENERATE_TIMEOUT_MS)}`;
-      if (errors.length) {
-        showErrors("pkg-errors", errors);
-        await saveDraft(file, "package", result.candidate, errors);
-        return `生成未通过校验，已存为草稿（${cost}）`;
-      }
-      await mgmt!.call("world.package.save", { path: file, package: result.candidate });
-      showErrors("pkg-errors", []);
-      return `已生成并写入 ${file}（${cost}）`;
     }, "pkg-note"),
   );
 

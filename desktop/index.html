@@ -74,9 +74,7 @@
             <button id="pkg-import">导入世界包…</button>
           </div>
           <div class="row">
-            <input id="pkg-brief" placeholder="用一段话描述这个世界，交给 AI 生成" />
-            <input id="pkg-name" placeholder="世界包名称（可留空）" />
-            <button id="pkg-generate" class="primary">AI 生成</button>
+            <button id="pkg-open-workspace" class="primary">AI 生成世界包</button>
             <span id="pkg-note" class="muted note" role="status" aria-live="polite"></span>
           </div>
           <pre id="pkg-errors" class="muted"></pre>
@@ -196,6 +194,42 @@
           <p class="muted">只画她讲出口的线索与它们之间的关系（同一件事又被提起）；没讲出口的只留一个记号，不带内容。世界内部数据不上图。</p>
 
           <dl id="world-facts" class="facts"></dl>
+        </section>
+
+        <section id="pane-genws" class="pane hidden">
+          <div class="row genws-topbar">
+            <strong id="gw-crumb">管理 ▸ 世界包 ▸ 生成</strong>
+            <button id="gw-back">返回</button>
+            <span id="gw-status" class="muted note" role="status" aria-live="polite"></span>
+          </div>
+          <div class="genws-grid">
+            <section class="genws-col">
+              <h3>① 意图与约束</h3>
+              <label>世界名<input id="gw-name" placeholder="可留空，默认用文件名" /></label>
+              <label>一段话描述<textarea id="gw-brief" rows="4" placeholder="用一段话描述这个世界"></textarea></label>
+              <div id="gw-knobs"></div>
+              <label>文件名<input id="gw-file" placeholder="如 greytide.json" /></label>
+              <p id="gw-resume" class="muted note"></p>
+            </section>
+            <section class="genws-col">
+              <h3>② 分段与条目</h3>
+              <div class="row">
+                <button id="gw-generate" class="primary">生成</button>
+                <span id="gw-generate-note" class="muted note" role="status" aria-live="polite"></span>
+              </div>
+              <ol id="gw-segments" class="genws-segments"></ol>
+              <p class="muted">分段生成：设定核心 / 双轨与名册 / 机制与现状。条目表（展开 / 加 / 改 / 锁定）随 P2 进。</p>
+            </section>
+            <section class="genws-col">
+              <h3>③ 预览与落盘</h3>
+              <dl id="gw-summary" class="facts"></dl>
+              <div class="row">
+                <button id="gw-save" class="primary">保存为世界包</button>
+                <button id="gw-save-draft">存为草稿</button>
+              </div>
+              <pre id="gw-errors" class="muted"></pre>
+            </section>
+          </div>
         </section>
 
         <section id="pane-settings" class="pane hidden">
