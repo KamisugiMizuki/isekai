@@ -34,6 +34,35 @@ def test_initial_state_comes_from_declaration(store, world) -> None:
     assert customs[0]["forms"], "允许范围随行保存，判定不用再查包"
 
 
+def test_declared_institutions_must_be_consistently_interpretable() -> None:
+    """制度/惯例的一致解释（§十 残余 + 附录 C #13）：跨制度职位 id 唯一、在任者闭合、空缺可判定。
+
+    「与史料、节庆对齐」的落点是**结构引用闭合**：节庆模板与史料条目的 `institution_state` /
+    `custom_state` 目标走 `_all_ids`（含制度 / 职位 / 惯例），指向未声明对象在创建期即失败。
+    """
+    assert validate_package(sample_package()) == [], "样本包本身要合法"
+
+    dup = sample_package()
+    other = json.loads(json.dumps(dup["world"]["institutions"][0]))
+    other["id"] = "inst-2"
+    other["offices"][0]["id"] = dup["world"]["institutions"][0]["offices"][0]["id"]
+    dup["world"]["institutions"].append(other)
+    assert any("跨制度重名" in item for item in validate_package(dup)), validate_package(dup)
+
+    dangling = sample_package()
+    dangling["world"]["institutions"][0]["offices"][0]["holder"] = "en-不存在"
+    assert any("在任者不是已登记的实体" in item for item in validate_package(dangling)), validate_package(dangling)
+
+    vacant_ok = sample_package()
+    vacant_ok["world"]["institutions"][0]["offices"][0]["holder"] = ""
+    assert validate_package(vacant_ok) == [], "空串 = 空缺，合法"
+
+    undecidable = sample_package()
+    undecidable["world"]["institutions"][0]["offices"][0]["holder"] = ""
+    undecidable["world"]["institutions"][0]["vacancy_policy"] = {"continues": [], "suspended": []}
+    assert any("无法被一致解释" in item for item in validate_package(undecidable)), validate_package(undecidable)
+
+
 def test_vacancy_rules_are_decidable() -> None:
     """空缺期间哪件事继续、哪件事暂停：按声明判，未声明的事务不给答案。"""
     package = sample_package()

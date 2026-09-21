@@ -128,6 +128,7 @@ def validate_package(package: dict[str, Any]) -> list[str]:
     _validate_environment(package.get("environment"), errors)
     known = _validate_canon_sources(package, errors)
     _validate_races_entities(package, errors)
+    _validate_institution_refs(package, errors)
     _validate_historiography(package, known, errors)
     _validate_events(package, known, errors)
     _validate_event_calendar(package, errors)
@@ -272,7 +273,11 @@ def _validate_world(world: Any, errors: list[str]) -> None:
 
 
 def _validate_offices(institution: dict[str, Any], where: str, errors: list[str]) -> None:
-    """职位与空缺规则：职位标识唯一、在任者可空（= 空缺）；空缺期间事务必须可判定。"""
+    """职位与空缺规则：职位标识唯一、在任者可空（= 空缺）；空缺期间事务必须可判定。
+
+    在任者必须指向**已登记的实体**（与 `change_allowed` 对制度状态效果的同一把尺）；
+    真的出现空缺时，`vacancy_policy` 不能两条都空——否则「空缺期间事务如何继续」无法被一致解释。
+    """
     offices = institution.get("offices")
     if offices is None:
         return
@@ -310,6 +315,14 @@ def _validate_offices(institution: dict[str, Any], where: str, errors: list[str]
             continue
         if not isinstance(items, list) or any(not _text(entry) for entry in items):
             errors.append(f"{where}.vacancy_policy.{key}: 必须是事务名列表")
+    vacant = any(
+        isinstance(office, dict) and not str(office.get("holder") or "").strip()
+        for office in offices
+    )
+    if vacant and not (policy.get("continues") or policy.get("suspended")):
+        errors.append(
+            f"{where}.vacancy_policy: 有职位空缺，但『照旧』与『暂停』都是空的——空缺期间的事务无法被一致解释"
+        )
 
 
 def _validate_custom_forms(custom: dict[str, Any], where: str, errors: list[str]) -> None:
@@ -485,6 +498,9 @@ def _validate_races_entities(package: dict[str, Any], errors: list[str]) -> None
     if not isinstance(entities, list):
         errors.append("entities: 缺少名册列表")
         entities = []
+    elif not entities:
+        # 名册是结构引用的落点（在任者、效果目标都指向这里）：空名册让引用无从闭合
+        errors.append("entities: 至少一个登记人物（名册；制度在任者与结构引用要闭合到它）")
     _check_unique(entities, "entities", errors)
     for index, item in enumerate(entities):
         if not isinstance(item, dict):
@@ -544,6 +560,42 @@ def _validate_historiography(package: dict[str, Any], known: set[str], errors: l
             errors.append(f"{where}.entries: 史料须有条目范围，不能是空壳（阻断项）")
         else:
             _check_refs(entries, known, f"{where}.entries", errors)
+
+
+def _validate_institution_refs(package: dict[str, Any], errors: list[str]) -> None:
+    """制度/惯例的跨结构一致性（§十 残余「与既有史料、节庆与生活模板的对齐」）。
+
+    - **职位标识全包唯一**：跨制度重名会让 `office_index` 静默覆盖，同一个 id 出现两套归属；
+    - **在任者必须是已登记实体**（空串 / 缺省 = 空缺，合法）；
+    - 效果目标等结构引用走 `_all_ids`（已含制度 / 职位 / 惯例），所以节庆模板与史料条目
+      对 `institution_state` / `custom_state` 的引用天然闭合到这里声明的范围。
+    """
+    world = package.get("world") if isinstance(package.get("world"), dict) else {}
+    entities = _entity_ids(package)
+    if not entities:
+        # 分段生成时名册段还没落地：这一条是跨段一致性，等名册在了再判（空名册本身由名册段报错）
+        return
+    seen: dict[str, str] = {}
+    for index, institution in enumerate(world.get("institutions") or []):
+        if not isinstance(institution, dict):
+            continue
+        where = f"world.institutions[{index}]"
+        institution_id = _str_value(institution.get("id"))
+        for o_index, office in enumerate(institution.get("offices") or []):
+            if not isinstance(office, dict):
+                continue
+            office_id = _str_value(office.get("id"))
+            if office_id:
+                owner = seen.get(office_id)
+                if owner is not None and owner != institution_id:
+                    errors.append(
+                        f"{where}.offices[{o_index}].id: 职位标识 {office_id!r} 已在制度 {owner!r} 里用过"
+                        "（跨制度重名会让同一 id 有两套归属）"
+                    )
+                seen.setdefault(office_id, institution_id)
+            holder = str(office.get("holder") or "").strip()
+            if holder and holder not in entities:
+                errors.append(f"{where}.offices[{o_index}].holder: 在任者不是已登记的实体 {holder!r}")
 
 
 def _all_ids(package: dict[str, Any]) -> set[str]:
