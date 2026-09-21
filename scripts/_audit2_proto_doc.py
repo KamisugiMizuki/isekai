@@ -9,7 +9,7 @@ from isekai_core import config, session, store, ump, version  # noqa: E402
 DOC = next((REPO / "docs").rglob("CHANNEL_PROTOCOL_APPENDIX.md")).read_text(encoding="utf-8")
 SRC = {n: (REPO / "isekai_core" / n).read_text(encoding="utf-8") for n in ("channel.py", "llm.py", "log.py")}
 LOG = tuple(int(x) for x in re.search(r"maxBytes=(\d+) \* (\d+) \* (\d+), backupCount=(\d+)", SRC["log.py"]).groups())
-LIMITS = {k: getattr(version, k) for k in ("MAX_FRAME_BYTES", "HANDSHAKE_TIMEOUT_S", "PROTOCOL_ERROR_LIMIT", "DEFAULT_MAX_TEXT_LEN", "DEFAULT_MAX_PARTS")} | {  # ⑤ 常量名 → 代码取值
+LIMITS = {k: getattr(version, k) for k in ("MAX_FRAME_BYTES", "HANDSHAKE_TIMEOUT_S", "PROTOCOL_ERROR_LIMIT", "DEFAULT_MAX_TEXT_LEN", "DEFAULT_MAX_PARTS", "DEFAULT_MAX_CONNECTIONS", "DEFAULT_MAX_QUEUED_INBOUND", "DEFAULT_RATE_LIMIT_MSGS", "DEFAULT_RATE_LIMIT_WINDOW_S")} | {  # ⑤ 常量名 → 代码取值
     "SEND_TIMEOUT_S": session.SEND_TIMEOUT_S, "merge_batch_max": config.RuntimeConfig().merge_batch_max, "core.log maxBytes": LOG[0] * LOG[1] * LOG[2], "core.log backupCount": LOG[3],
     "pending_outbound limit": inspect.signature(store.Store.pending_outbound).parameters["limit"].default, "ping_interval": int(re.search(r"ping_interval=(\d+)", SRC["channel.py"]).group(1)), "ping_timeout": int(re.search(r"ping_timeout=(\d+)", SRC["channel.py"]).group(1))}
 RESULT: list[bool] = []

@@ -963,6 +963,10 @@ function onEnvelope(env: Envelope): void {
   if (env.type === "binding") {
     // 管理面换代通知：更新令牌并按真值重载历史（旧令牌的视图作废）
     if (String(payload.thread_id ?? "") === state.threadId) {
+      if (String(payload.state ?? "active") === "revoked") {
+        // 旧绑定作废：不拿旧令牌覆盖当前令牌（核心紧接着会发 active 的那条）
+        return;
+      }
       state.token = String(payload.binding_token ?? state.token);
       void loadHistory().then(() => setStatus("已就绪", "ok"));
       setStatus("绑定已更新，正在重载历史…", "pending");

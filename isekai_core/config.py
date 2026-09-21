@@ -14,7 +14,14 @@ from typing import Any
 
 import yaml
 
-from .version import DEFAULT_MAX_PARTS, DEFAULT_MAX_TEXT_LEN
+from .version import (
+    DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_MAX_PARTS,
+    DEFAULT_MAX_QUEUED_INBOUND,
+    DEFAULT_MAX_TEXT_LEN,
+    DEFAULT_RATE_LIMIT_MSGS,
+    DEFAULT_RATE_LIMIT_WINDOW_S,
+)
 
 DEFAULT_PLACEHOLDER_PROMPT = (
     "你是 isekai 核心进程的占位对话端（阶段 0：世界与角色尚未接入）。"
@@ -133,6 +140,11 @@ class Config:
     max_text_len: int = DEFAULT_MAX_TEXT_LEN
     max_parts: int = DEFAULT_MAX_PARTS
     context_history_max: int = 20
+    #: 容量与限速（CHANNEL_PLUGIN_SPEC §3.2；仅 config.yaml，不进设置面）
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
+    max_queued_inbound: int = DEFAULT_MAX_QUEUED_INBOUND
+    rate_limit_msgs: int = DEFAULT_RATE_LIMIT_MSGS
+    rate_limit_window_s: float = DEFAULT_RATE_LIMIT_WINDOW_S
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     backup: BackupConfig = field(default_factory=BackupConfig)
     #: 阶段 0 占位会话三元组与提示词；阶段 1 起被真实实例 / 角色卡取代
@@ -343,6 +355,10 @@ def load_config(root: str | os.PathLike[str] | None = None) -> Config:
         max_text_len=int(core_raw.get("max_text_len") or DEFAULT_MAX_TEXT_LEN),
         max_parts=int(core_raw.get("max_parts") or DEFAULT_MAX_PARTS),
         context_history_max=int(core_raw.get("context_history_max") or 20),
+        max_connections=int(core_raw.get("max_connections") or DEFAULT_MAX_CONNECTIONS),
+        max_queued_inbound=int(core_raw.get("max_queued_inbound") or DEFAULT_MAX_QUEUED_INBOUND),
+        rate_limit_msgs=int(core_raw.get("rate_limit_msgs") or DEFAULT_RATE_LIMIT_MSGS),
+        rate_limit_window_s=float(core_raw.get("rate_limit_window_s") or DEFAULT_RATE_LIMIT_WINDOW_S),
         runtime=_runtime_config(raw),
         backup=_mapped(BackupConfig, raw, "backup"),
     )

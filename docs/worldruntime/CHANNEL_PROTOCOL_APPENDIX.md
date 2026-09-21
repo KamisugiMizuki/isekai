@@ -33,14 +33,14 @@
 |---|---|---|---|---|---|---|
 | `hello` | c2s | 否 | 否 | `channel{id,name,version}` 必；`capabilities{segments,status,max_text_len,max_parts}` 否；`auth{bootstrap｜credential}` 必 | 首帧必须是 hello，否则 protocol_error + 关闭 1008；`channel.id` 非空 ≤64，`name`/`version` 缺省取 id / `"0"`；`auth` 须给 bootstrap 或 credential 之一，否则 auth_required；限额须为正整数，缺省 4000 / 10 | ump.py:142-174, 177-179 · channel.py:163-168 |
 | `hello_ack` | s2c | 否 | 否 | `channel_instance`、`name`、`negotiated{segments,status,max_text_len,max_parts}`、`protocol`、`state`∈CORE_STATES、`threads[{id,binding_version,binding_token}]`、`credential`（仅引导首连） | 回协商结果与既有 thread 令牌（重连不必再问管理面）；解析期只校验 `state` 属于 `CORE_STATES` | channel.py:198-218 · ump.py:227-229, 52 |
-| `binding` | s2c | 是 | 否 | `thread_id`、`binding_version`、`binding_token`、`state`∈{active,revoked} | 管理面绑定 / 重绑后推给在线通道；实际只产出 `state="active"`，`revoked` 仅存在于校验枚举（未实现生成方） | channel.py:430-450 · ump.py:230-232 |
+| `binding` | s2c | 是 | 否 | `thread_id`、`binding_version`、`binding_token`、`state`∈{active,revoked} | 管理面绑定 / 重绑后推给在线通道：**换代先发 `revoked`（旧版本号 + 旧令牌，发给旧绑定所在连接）再发 `active`**；只发 active 会让客户端拿着旧令牌直到下一次发送才吃 `binding_expired` | channel.py::_thread_bind · ump.py:230-232 |
 | `user_message` | c2s | 是 | 是 | `text` 必：非空且非纯空白、≤协商 max_text_len | 唯一用户输入入口；去重键 = 已认证通道 + thread + `id` | ump.py:180-185 · session.py:88-167 · store.py::inbound_put |
 | `accepted` | s2c | 是 | 否 | `ref` ≤64 必；`state`∈ACCEPT_STATES（queued/processing/done/failed/cancelled）；`message_id`（未固化时为 null）；retry(outbound) 路径另带 `delivery` 汇总 | 「已持久接收」的确认，不等于已生成回复；重复输入返回同一逻辑轮次的最新状态 | ump.py:206-209, 51 · session.py:156-167, 252-260 |
 | `reply` | s2c | 是 | 否 | `message_id` ≤64 必；`parts` 非空数组、每项 `text` 为 str；`batch_index` ≥0；`batch_count` ≥1；另有 `reply_to`（主动消息为 null）与 `covers[]` | 已固化最终回复；批次数与序号发送前确定，重试不重排、不换 `message_id` | ump.py:210-223 · session.py:716-729 |
 | `system_notice` | s2c | 是 | 否 | `text` 必：非空字符串；`message_id` | 联络系统 / 管理机制的说明（归档、追赶提示），不是角色发言，不进角色上下文 | ump.py:233-235 · session.py:703-714, 463-474 |
 | `delivery` | c2s | 是 | 是 | `message_id` ≤64 必；`batch_index` 非负整数（缺省 0）；`state`∈{accepted,failed,unknown} | 投递回执：只按原出站标识更新原投递记录，不代表用户已读 | ump.py:186-192, 50 · channel.py:348-369 |
 | `retry` | c2s | 是 | 是 | `ref` ≤64 必；`kind`∈{input,outbound} 或缺省 | input：恢复同一逻辑轮次的新尝试；outbound：只重发固化结果；作废 / 已完成不可重放 | ump.py:193-196 · session.py:235-286 |
-| `status` | s2c | 是 | 否 | `state`∈{thinking,idle,interrupted} | 只发给声明 `status` 能力的通道；实测只产出 thinking / idle，`interrupted` 未实现 | ump.py:224-226 · channel.py:130-137 · session.py:780-782 |
+| `status` | s2c | 是 | 否 | `state`∈{thinking,idle,interrupted} | 只发给声明 `status` 能力的通道；`thinking` / `idle` 包住每一轮生成，`interrupted` 在轮次被打断时（回滚 / 重绑 / 冻结 / 删除期间作废）夹在中间发出 | ump.py:224-226 · channel.py:130-137 · session.py::_status（三处 drop 分支） |
 | `error` | s2c | 否 | 否 | `code` ≤64 必；`message` str（可缺）；`retryable` bool（缺省 false）；`ref`；`stage`∈Stage（缺省 protocol） | 有限、脱敏的错误结果，见 ③ | ump.py:197-205, 331-340 |
 | `ping` | 双向 | 否 | 否 | 无（payload 可省略） | 核心收到即回 `pong`（复用同 thread） | ump.py:39-42 · channel.py:272-276 |
 | `pong` | 双向 | 否 | 否 | 无 | 核心收到即忽略；`UmpClient` 不发 UMP ping——连接心跳由 websockets 协议层 `ping_interval` 负责 | channel.py:278-279 · client.py:43 |
@@ -64,7 +64,7 @@
 | `PROTOCOL` | protocol | 协议 / 解析期（默认值） | ump.py:78 · channel.py:165, 294 |
 | `AUTH` | auth | 认证期：`hello.auth` 缺失 / 凭据不匹配 | ump.py:152, 156 · channel.py:230, 243 |
 
-`Err` 枚举（16 项，值即线上 `error.code`；「retryable」列写代码实际取值）：
+`Err` 枚举（18 项，值即线上 `error.code`；「retryable」列写代码实际取值）：
 
 | 枚举名 | code | 语义 | retryable | 主要抛出点 |
 |---|---|---|---|---|
@@ -83,6 +83,8 @@
 | `STATE_BLOCKED` | state_blocked | 核心非 ready（此路可重试）、时间线冻结 / 归档、角色身故归档、实例兼容性阻断 | 依站点 | channel.py:282（true）· channel.py:514、session.py:110, 121, 131（false） |
 | `GENERATION_FAILED` | generation_failed | 生成阶段失败归类：空回复、管理面生成类操作失败 | 依站点 | session.py:380（true）· world/ops.py::dispatch_async（跟随 LLMError） |
 | `LLM_NOT_CONFIGURED` | llm_not_configured | 未配置 LLM API Key | 否 | world/ops.py::dispatch_async · llm.py:58 |
+| `OVERLOADED` | overloaded | 容量闸：在线连接数达上限（拒新连接）、单会话排队入站达上限（拒新输入） | 是 | channel.py::_channel_handshake · session.py::accept |
+| `RATE_LIMITED` | rate_limited | 速率闸：该连接本窗口入站帧数超限（持续超限即断这条连接） | 是 | channel.py::_rate_ok |
 | `INTERNAL` | internal | 未预期的内部异常（脱敏，不回显细节） | 依站点 | session.py:371（true）· channel.py:418（false） |
 
 生成阶段的 code 由 `LLMError` 直接产出（llm.py:26-31，构造 `retryable` 默认 **true**），经 session.py:353-364 原样作为 `error.code` 上线（`stage=generate`）：
@@ -135,6 +137,10 @@
 | `core.log backupCount` | 3 | log.py:27-28 | 保留 3 份备份（最多 4 个文件 ≈ 8 MiB） |
 | `ping_interval` | 20 | channel.py:96 · client.py:43, 165 | websockets 协议层心跳间隔（秒） |
 | `ping_timeout` | 20 | channel.py:97 · client.py:43, 165 | 心跳超时即断连（秒） |
+| `DEFAULT_MAX_CONNECTIONS` | 32 | version.py:40 · config.py:144 · channel.py::_channel_handshake | 在线连接数上限：第 N+1 条连接收到 `overloaded`（可重试）并关闭 1013 `connection limit`；在线的连接不受影响，同通道重连不算新增 |
+| `DEFAULT_MAX_QUEUED_INBOUND` | 32 | version.py:41 · config.py:145 · session.py::accept | 单会话排队入站达上限：新输入收到 `overloaded`（可重试），已接受的照常处理；重复发送（同 env_id）不走这道闸 |
+| `DEFAULT_RATE_LIMIT_MSGS` | 60 | version.py:42 · config.py:146 · channel.py::_rate_ok | 该连接本窗口入站帧超限：回 `rate_limited`（可重试）且不处理这一帧；超过 2 倍即断这条连接（1008 `rate limit`） |
+| `DEFAULT_RATE_LIMIT_WINDOW_S` | 10.0 | version.py:43 · config.py:147 · channel.py::_rate_ok | 上面那个窗口的长度（秒）；固定窗口计数，不是令牌桶 |
 
 同一类容量事实（未进上表，代码为据）：
 
@@ -146,13 +152,19 @@
 
 **未实现 / 未定义（代码里没有的东西，别当它有）：**
 
-- 入站队列容量上限：**未实现**——核心不设入站排队额度（`session.py:81-82` 的会话锁表与任务集都是无界 dict/set，入站先落库、无容量门），背压只靠 `PROTOCOL_ERROR_LIMIT` 与握手 / 发送超时。
 - 客户端接收队列上限：**未定义**（client.py:40 `asyncio.Queue()` 未给 `maxsize`）。
 - 每连接发送队列上限 / 背压阈值：**未定义**（channel.py:50 只有串行化发送锁 `send_lock`，缓冲交给 websockets）。
-- 在线连接数上限：**未实现**（channel.py:85 `_conns` 无界 dict）。
 - 入站文本的**字节**上限：未单独设（只有码点数上限与 1 MiB 帧上限）。
 - 插件 stderr：**容量上限已实现**（`plugins.py:34-35` `STDERR_KEEP_LINES=200` 只留最近 200 行、`STDERR_LINE_CHARS=500` 单行截断；实测 `scripts/_audit2_chan.py` 刷 300 行 stderr 只留上限条数）；**脱敏未做**——只保证容量，不净化插件自行写出的内容（§六 已声明不给这个保证）。
-- 速率限制 / 频率限制、附件与流式的尺寸上限：**未实现**（§2.1「v1 仅文本、非流式」、§七 更后置）。
+- 附件与流式的尺寸上限：随这两项能力本身一起做（§七 更后置；当前 `ump._reject_unsupported_extensions` 显式拒绝相关字段）。
 - 客户端重连退避（`desktop/src/main.ts:331` `RECONNECT_DELAYS_MS`）与生成 / 记忆预算类配额不属本文范围（§九 另条、各自 SPEC）。
+
+**已实现（原先记在这一节，2026-09-22 落地，行为验收 `tests/test_channel_limits.py` 5 项）：**
+
+- 入站队列容量上限 → `core.max_queued_inbound`（默认 32）：排队满了拒新输入（`overloaded` / 可重试），已接受的不丢。
+- 在线连接数上限 → `core.max_connections`（默认 32）：超出只拒新连接（`overloaded` + 1013），不动在线的。
+- 速率限制 → `core.rate_limit_msgs` / `core.rate_limit_window_s`（默认 60 帧 / 10 秒）：超限帧回 `rate_limited`，持续超限断这条连接。
+- `binding.state=revoked` 产出方 → 换代时先给旧绑定发 revoked 再发 active（`channel.py::_thread_bind`）。
+- `status.state=interrupted` 产出方 → 轮次被打断（回滚 / 重绑 / 冻结 / 删除期间作废）时夹在 thinking 与 idle 之间发出（`session.py` 三处 drop 分支）。
 
 复跑对拍：`.venv/Scripts/python.exe scripts/_audit2_proto_doc.py`（比对本文 ②③⑤ 的集合与数值；不一致即 FAIL 并打印两侧差异）。

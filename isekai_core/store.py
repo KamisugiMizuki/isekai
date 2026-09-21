@@ -1800,6 +1800,14 @@ class Store:
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
 
+    def inbound_queued_count(self, session_id: str) -> int:
+        """该会话排队中的入站条数（§3.2 容量闸：满了拒绝新输入，不丢弃已接受的）。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM message WHERE session_id=? AND role='user' AND state='queued'",
+            (session_id,),
+        ).fetchone()
+        return int((row or {"n": 0})["n"])
+
     def interrupt_open_turns(self) -> int:
         """启动时收尾上次进程留下的未完成轮次：标记中断，等待显式重试。
 

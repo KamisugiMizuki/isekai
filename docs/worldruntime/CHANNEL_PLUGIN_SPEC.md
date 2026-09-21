@@ -212,6 +212,9 @@
   （信封 / 消息类型 / 错误码 / 计数方式 / 上限常量，逐条带代码出处），配套 `scripts/_audit2_proto_doc.py` 机器对拍。
 - 有界重试 / 超时 / 队列参数：插件宿主侧的超时（握手 / 停用有界退出）与帧 · 入站队列 · stderr 日志上限已落地
   （`isekai_core/plugins.py`）；**客户端自身的重试策略仍留给插件**（§3.2 不替插件定退避）。
+  **核心侧容量闸 2026-09-22 落地**（`isekai_core/version.py` 的 `DEFAULT_*` + `core` 段配置）：在线连接数
+  （`max_connections`）、单会话排队入站（`max_queued_inbound`）、每连接入站帧限速（`rate_limit_msgs` /
+  `rate_limit_window_s`）；超限回 `overloaded` / `rate_limited`（都可重试），行为验收 `tests/test_channel_limits.py`。
 - 认证材料传递方式已定：核心签发通道凭据后经**该插件自己的环境**交给它（`ISEKAI_PLUGIN_ID` / `ISEKAI_PLUGIN_CREDENTIAL`；
   子进程 env 走白名单，核心的 LLM Key 与管理凭据都不进去）。
 - 附件与流式协议在启用这些能力时另行扩展，不提前铺设；当前实现**显式拒绝**相关字段

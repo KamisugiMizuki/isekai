@@ -135,6 +135,20 @@ class SessionService:
                     stage=Stage.RECEIVE,
                 )
 
+        # 容量闸（CHANNEL_PLUGIN_SPEC §3.2）：排队满了就拒新输入，已接受的照常处理。
+        # 重复发送（同 env_id）不走这道闸——幂等重放必须能查回既有状态。
+        if self.store.inbound_find(channel_id, thread_id, env_id) is None:
+            cap = int(getattr(self.cfg, "max_queued_inbound", 0) or 0)
+            queued = self.store.inbound_queued_count(str(thread_row["session_id"]))
+            if cap and queued >= cap:
+                raise UmpError(
+                    Err.OVERLOADED,
+                    f"排队入站已达上限（{cap}），稍后重试",
+                    retryable=True,
+                    ref=env_id,
+                    stage=Stage.RECEIVE,
+                )
+
         try:
             row, created = self.store.inbound_put(
                 session_id=thread_row["session_id"],
@@ -334,6 +348,8 @@ class SessionService:
             log.info("waiting turn dropped: %s seq=%s", stale, row["seq"])
             for item in batch:
                 self.store.inbound_set_state(int(item["seq"]), "cancelled", error_code=stale)
+            # 打断要说出来（status.interrupted）：客户端别把这轮当成正常结束
+            await self._status(row, "interrupted")
             await self._status(row, "idle")
             return None
         return batch
@@ -388,6 +404,7 @@ class SessionService:
             log.info("turn dropped: %s seq=%s", stale, row["seq"])
             for seq in seqs:
                 self.store.inbound_set_state(seq, "cancelled", error_code=stale)
+            await self._status(row, "interrupted")
             await self._status(row, "idle")
             return
         thread = self.store.thread_get(row["channel_id"], row["thread_id"])
@@ -396,6 +413,7 @@ class SessionService:
             log.info("turn dropped: binding changed seq=%s", row["seq"])
             for seq in seqs:
                 self.store.inbound_set_state(seq, "cancelled", error_code=Err.BINDING_EXPIRED)
+            await self._status(row, "interrupted")
             await self._status(row, "idle")
             return
 

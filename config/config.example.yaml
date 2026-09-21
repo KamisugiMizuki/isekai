@@ -17,6 +17,11 @@ core:
   max_text_len: 4000     # 单段字符上限，与通道协商取小
   max_parts: 10          # 单批最大段数，与通道协商取小
   context_history_max: 20 # 生成上下文里带多少条历史往来
+  # 容量与限速（CHANNEL_PLUGIN_SPEC §3.2「帧、队列与日志有容量上限」）：开发者级，不进设置面
+  max_connections: 32     # 在线通道连接数上限：超出只拒新连接，不动在线的
+  max_queued_inbound: 32  # 单会话排队入站上限：满了回 overloaded（可重试），不丢弃已接受的
+  rate_limit_msgs: 60     # 每连接每窗口允许的入站帧数
+  rate_limit_window_s: 10.0
 
 # 世界运行层参数：全局统一、仅开发者可配置（WORLD_RUNTIME_SPEC §2.2 / §2.6 / §4）
 # 刻意不提供 UI 入口：这些是世界运行预算，不是日常可调项

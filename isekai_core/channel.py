@@ -11,6 +11,7 @@ import asyncio
 import hmac
 import json
 import secrets
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,6 +49,9 @@ class _Conn:
     generation: int = 0
     errors: int = 0
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: 限速窗口（固定窗口计数；§3.2）
+    window_start: float = 0.0
+    window_count: int = 0
 
 
 def negotiate(client_caps: dict[str, Any], cfg: Config) -> dict[str, Any]:
@@ -181,6 +185,22 @@ class CoreServer:
         try:
             hello = ump.parse_hello(envelope.payload)
             channel_row, credential = self._authorize(hello)
+            # 在线连接数上限（§3.2）：只拒新连接，不动已在线的；重连（同通道标识）不算新增
+            if channel_row["id"] not in self._conns and len(self._conns) >= int(self.cfg.max_connections):
+                await self._send_raw(
+                    conn.ws,
+                    ump.error_envelope(
+                        UmpError(
+                            Err.OVERLOADED,
+                            f"在线连接数已达上限（{int(self.cfg.max_connections)}），稍后重试",
+                            retryable=True,
+                            stage=Stage.RECEIVE,
+                        )
+                    ),
+                )
+                await _safe_close(conn.ws, 1013, "connection limit")
+                log.warning("connection refused: limit=%s", self.cfg.max_connections)
+                return False
             caps = negotiate(hello["capabilities"], self.cfg)
             self.store.channel_set_handshake(channel_row["id"], UMP_VERSION, caps)
         except UmpError as exc:
@@ -260,12 +280,46 @@ class CoreServer:
                         await _safe_close(conn.ws, 1008, "too many protocol errors")
                         return
                     continue
+                if not await self._rate_ok(conn, envelope):
+                    continue
                 await self._dispatch(conn, envelope)
         except ConnectionClosed:
             pass
         finally:
             if conn.channel_id and self._conns.get(conn.channel_id) is conn:
                 del self._conns[conn.channel_id]
+
+    async def _rate_ok(self, conn: _Conn, envelope: Envelope) -> bool:
+        """每连接固定窗口限速（§3.2）：超限回 `rate_limited`（可重试）并丢掉这一帧的处理权，
+        持续超限（> 2 倍）断开这条连接——违规只影响它自己，不牵动核心与其他通道。
+
+        ponytail: 固定窗口计数，不是令牌桶；够用在这种「客户端不该压测核心」的闸上。
+        """
+        now = time.monotonic()
+        if now - conn.window_start >= float(self.cfg.rate_limit_window_s):
+            conn.window_start, conn.window_count = now, 0
+        conn.window_count += 1
+        limit = int(self.cfg.rate_limit_msgs)
+        if conn.window_count <= limit:
+            return True
+        closing = conn.window_count > limit * 2
+        await self._send_conn(
+            conn,
+            ump.error_envelope(
+                UmpError(
+                    Err.RATE_LIMITED,
+                    "消息速率超限，稍后重试" if not closing else "消息速率持续超限，连接即将断开",
+                    retryable=True,
+                    stage=Stage.RECEIVE,
+                ),
+                thread_id=envelope.thread_id,
+                ref=envelope.id,
+            ),
+        )
+        if closing:
+            log.warning("connection closed by rate limit: channel=%s", conn.channel_id)
+            await _safe_close(conn.ws, 1008, "rate limit")
+        return False
 
     async def _dispatch(self, conn: _Conn, envelope: Envelope) -> None:
         try:
@@ -428,9 +482,38 @@ class CoreServer:
     # ---------- 设置面 ----------
 
     async def _thread_bind(self, args: dict[str, Any]) -> dict[str, Any]:
-        """管理面绑定 / 重绑：换代表令并通知在线通道（§2.2 binding 通知）。"""
+        """管理面绑定 / 重绑：换代表令并通知在线通道（§2.2 binding 通知）。
+
+        换代要让在线通道知道旧的作废了：先给旧绑定发 `state="revoked"`（换通道时发旧通道，
+        同通道时就是它自己），再发新的 `state="active"`。只发 active 的话，客户端会一直拿着
+        旧令牌，直到下一次发送才吃到 `binding_expired`。
+        """
+        previous: dict[str, Any] | None = None
+        try:
+            channel = self.store.channel_by_name(str(args.get("channel") or ""))
+            if channel is not None:
+                previous = self.store.thread_get(channel["id"], str(args.get("thread_id") or ""))
+        except Exception:  # noqa: BLE001 —— 读不到旧绑定（或参数不是名）不影响绑定本身
+            previous = None
         result = self._mgmt_call("thread.bind", args)
         row = result["thread"]
+        if previous is not None and int(previous["binding_version"]) != int(row["binding_version"]):
+            old_conn = self._conns.get(str(previous["channel_id"]))
+            if old_conn is not None:
+                await self._send_conn(
+                    old_conn,
+                    ump.make(
+                        "binding",
+                        {
+                            "thread_id": previous["thread_id"],
+                            "binding_version": previous["binding_version"],
+                            "binding_token": previous["binding_token"],
+                            "state": "revoked",
+                        },
+                        thread_id=previous["thread_id"],
+                        id=ump.new_id("s"),
+                    ),
+                )
         conn = self._conns.get(row["channel_id"])
         if conn is not None:
             await self._send_conn(

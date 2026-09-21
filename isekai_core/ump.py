@@ -33,6 +33,8 @@ class Err:
     STATE_BLOCKED = "state_blocked"
     GENERATION_FAILED = "generation_failed"
     LLM_NOT_CONFIGURED = "llm_not_configured"
+    OVERLOADED = "overloaded"
+    RATE_LIMITED = "rate_limited"
     INTERNAL = "internal"
 
 

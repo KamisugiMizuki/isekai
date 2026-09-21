@@ -79,6 +79,11 @@ async def test_rebind_notifies_connected_channel(tmp_path):
             rebound = await mgmt.call(
                 "thread.bind", channel="builtin", thread_id="dm-1", session_id=info["session"]["id"]
             )
+            # 换代先通知旧绑定作废，再给新的令牌（2026-09-22：只发 active 会让客户端拿着旧令牌硬撞 binding_expired）
+            revoked = await client.expect(lambda e: e.type == "binding", timeout=5)
+            assert revoked.payload["thread_id"] == "dm-1"
+            assert revoked.payload["state"] == "revoked"
+            assert revoked.payload["binding_version"] == info["thread"]["binding_version"]
             notice = await client.expect(lambda e: e.type == "binding", timeout=5)
             assert notice.payload["thread_id"] == "dm-1"
             assert notice.payload["state"] == "active"
