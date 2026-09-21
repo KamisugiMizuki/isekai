@@ -178,7 +178,9 @@ def weave(
     }
 
 
-def constraint_lines(unit: dict[str, Any], *, activity: str = "", deferred: bool = False) -> list[str]:
+def constraint_lines(
+    unit: dict[str, Any], *, activity: str = "", deferred: bool = False, act: str = ""
+) -> list[str]:
     """结构化表达约束（§6.1）：给生成器的范围与口气，不是评分、不是内部字段。"""
     lines = ["她最近能提起的事（只说这些；可以只讲一部分，也可以先不提）："]
     for item in unit.get("materials") or []:
@@ -187,6 +189,10 @@ def constraint_lines(unit: dict[str, Any], *, activity: str = "", deferred: bool
         lines.append(f"她此刻在做：{activity}")
     lines.append("没列在这里的事她不知道：不要补谁做的、为什么、后来怎样，也不要把听来的说成亲眼见到。")
     lines.append("没把握就用不确定的说法；她自己打算里的事还没做成时只能说打算，不能说已经做了。")
+    if act == "承":
+        lines.append("这件事还没了结：她自己也在等下文，说不准后面会怎样。")
+    elif act == "收":
+        lines.append("这件事她心里已经有数了：可以有个收束的说法，不用故意留悬念。")
     if deferred:
         lines.append("这件事她之前没讲出口（还在犹豫）：现在也可以只提一句，或者先按住不说。")
     return lines
@@ -252,3 +258,163 @@ def parse_audit(text: str) -> tuple[bool, str] | None:
     if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
         return None
     return bool(payload["ok"]), str(payload.get("why") or "")
+
+
+# ---------- 戏剧性 / 三幕 / 分享欲（§9.5：原「暂不纳入」项的落地口径） ----------
+
+#: 够戏剧才值得她先动一步、也才压得过「这会儿不想讲」
+DRAMA_MIN = 0.5
+#: 分享欲低于此值时，素材不够戏剧就先不主动提自己的事
+SHARE_DRIVE_MIN = 0.35
+ACTS = ("起", "承", "收")
+
+
+def drama(unit: dict[str, Any], *, blocked: bool = False, unresolved: bool = False) -> float:
+    """戏剧性评分（0–1）：有亲历、多来源、有后续、受阻、还悬着。
+
+    这是**排序 / 取舍信号，不是闸门**：它决定她先动哪一步、这会儿说不说，
+    不决定世界发生什么——事实仍只从合法候选与受支持效果来（§1.1-2）。
+    """
+    materials = unit.get("materials") or []
+    score = 0.0
+    if any(str(item.get("entry")) == "experience" for item in materials):
+        score += 0.2
+    if len(materials) > 2 or len({str(item.get("source") or "") for item in materials}) > 1:
+        score += 0.15
+    if str(unit.get("relation")) in ("补充", "连续"):
+        score += 0.15
+    if blocked:
+        score += 0.25
+    if unresolved:
+        score += 0.3
+    return max(0.0, min(1.0, round(score, 4)))
+
+
+def act_of(unit: dict[str, Any], *, unresolved: bool = False, resolved: bool = False) -> str:
+    """三幕位置（组合视图，不是状态机）：起 = 刚起头；承 = 还悬着 / 有后续；收 = 已有终局。
+
+    只用来决定「先想哪一步、用什么口气」；没有合法依据时停在未解决，
+    不为了凑完整的故事曲线补事实（§1.1-5）。
+    """
+    if resolved:
+        return "收"
+    if unresolved or str(unit.get("relation")) in ("补充", "连续"):
+        return "承"
+    return "起"
+
+
+def share_drive(units: Iterable[dict[str, Any]] | None) -> float:
+    """分享欲 = 她现有表达倾向单元的**平均置信度**（0–1）。
+
+    不新立平行人格数值：数值就长在既有性格单元里（WORLD_RUNTIME §十），
+    黑箱不变——用户看不到这个数，只能感到她这几天话多还是话少。
+    """
+    live = [
+        float(row.get("confidence") or 0.0)
+        for row in units or ()
+        if not int(row.get("archived") or 0)
+    ]
+    if not live:
+        return 0.5  # 没有可依据的单元：按中性处理，不额外抑制
+    return max(0.0, min(1.0, sum(live) / len(live)))
+
+
+def willingness(drive: float, *, drama_score: float) -> bool:
+    """这会儿愿不愿意主动讲自己的事：分享欲低、素材又不戏剧，就先按住不说（§5.2）。"""
+    return float(drive) >= SHARE_DRIVE_MIN or float(drama_score) >= DRAMA_MIN
+
+
+def strict_note() -> str:
+    """重试用的加严提醒（主动路径与会话路径同一份措辞，不两处各写一遍）。"""
+    return "刚才那版说过了头：只说她确实知道的部分，没把握就用不确定的说法，或者干脆说不知道。"
+
+
+def _refs_of_row(row: dict[str, Any]) -> list[str]:
+    """refs 在库里是 JSON 文本：读侧在这里统一解，不在两处各解一遍。"""
+    value = row.get("refs")
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    try:
+        parsed = json.loads(str(value or "[]"))
+    except json.JSONDecodeError:
+        return []
+    return [str(item) for item in parsed] if isinstance(parsed, list) else []
+
+
+def map_payload(
+    units: Iterable[dict[str, Any]] | None,
+    *,
+    text_of: Any = None,
+    info_of: Any = None,
+) -> dict[str, Any]:
+    """故事图谱（管理元数据级）：她讲过的线索、它们之间的关系、以及「没讲出口」的记号。
+
+    - 节点正文只取**已经固化、用户本来就看过**的消息；没讲出口的节点不带内容；
+    - 边 = 两条线索共享材料引用（同一件事被再提起）；
+    - 不含实情层、未获知内容与他人私聊——黑箱与碎片化不变（DESIGN §2.2-9）。
+
+    ponytail: 边是 O(n²) 的引用比对，够用到现在这个量级（每角色每天至多数条）；
+    上百条时改成按 ref 建索引。
+    """
+    rows = [dict(row) for row in units or ()]
+    spoken = sorted(
+        (row for row in rows if str(row.get("stage")) == "spoken"),
+        key=lambda item: (int(item.get("created_world") or 0), str(item.get("id") or "")),
+    )
+    held = sorted(
+        (row for row in rows if str(row.get("stage")) == "deferred"),
+        key=lambda item: (int(item.get("created_world") or 0), str(item.get("id") or "")),
+    )
+    nodes: list[dict[str, Any]] = []
+    refs_of: dict[str, set[str]] = {}
+    for row in spoken:
+        identifier = str(row.get("id") or "")
+        refs_of[identifier] = set(_refs_of_row(row))
+        message_id = str(row.get("message_id") or "")
+        label = ""
+        if callable(text_of):
+            label = str(text_of(message_id) or "").strip()
+        node: dict[str, Any] = {
+            "id": identifier,
+            "kind": "spoken",
+            "at_world": int(row.get("created_world") or 0),
+            "world_day": int(row.get("world_day") or 0),
+            "message_id": message_id,
+            "label": label[:60] or "（她讲过这件事）",
+            "refs": len(refs_of[identifier]),
+        }
+        if callable(info_of):
+            node.update(info_of(row) or {})
+        nodes.append(node)
+    for row in held:
+        nodes.append(
+            {
+                "id": str(row.get("id") or ""),
+                "kind": "deferred",
+                "at_world": int(row.get("created_world") or 0),
+                "message_id": "",
+                "label": "（这件事她没讲出口）",
+                "refs": 0,
+            }
+        )
+    edges: list[dict[str, Any]] = []
+    ids = [str(node["id"]) for node in nodes if node["kind"] == "spoken"]
+    for index, left in enumerate(ids):
+        for right in ids[index + 1 :]:
+            shared = sorted(refs_of.get(left, set()) & refs_of.get(right, set()))
+            if shared:
+                edges.append({"from": left, "to": right, "kind": "同一件事又被提起", "refs": shared})
+    # 同一天讲的两条按先后串起来：图谱至少看得出她那天在说些什么（不额外暴露内容）
+    days: dict[int, list[str]] = {}
+    for node in nodes:
+        if node["kind"] == "spoken":
+            days.setdefault(int(node["world_day"]), []).append(str(node["id"]))
+    for day, members in sorted(days.items()):
+        for left, right in zip(members, members[1:]):
+            edges.append({"from": left, "to": right, "kind": "同一天讲的", "refs": []})
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "counts": {"spoken": len(spoken), "deferred": len(held), "links": len(edges)},
+    }
+

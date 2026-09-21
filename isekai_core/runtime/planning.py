@@ -74,8 +74,12 @@ def prompt(
     effects: list[dict[str, Any]],
     observations: list[dict[str, Any]],
     allowed: dict[str, list[str]],
+    pending: str = "",
 ) -> list[dict[str, str]]:
-    """让她自己决定要不要动手：只给可知信息，答案必须落在允许的类型与目标上。"""
+    """让她自己决定要不要动手：只给可知信息，答案必须落在允许的类型与目标上。
+
+    `pending` 是叙事层的提示（她手上最悬着的那条线）：只影响她想哪一步，不放宽闭集与前置条件。
+    """
     lines = [
         f"你在扮演「{name}」（{occupation}），现在是 {world_label}。",
         "请判断她自己会不会想做点什么（一件具体、办得到的小事），并只输出 JSON。",
@@ -92,6 +96,8 @@ def prompt(
             lines.append(f"- {kind}: {', '.join(targets)}")
     if aims:
         lines.append("她手上还没办完的事：" + "；".join(f"{item['object']}（{item['stage']}）" for item in aims[:3]))
+    if pending:
+        lines.append(f"她心里最放不下的那件事：{pending}（可以围绕它想一步，但只能从上面允许的类型与目标里选）")
     if observations:
         lines.append(
             "她能观察到的环境：" + "；".join(f"{item['name']}={item['value']}{item['unit']}" for item in observations[:4])

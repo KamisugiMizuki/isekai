@@ -1043,19 +1043,19 @@ class RuntimeService:
         query_vector: list[float] | None = None,
     ) -> dict[str, Any]:
         """本轮扮演定义 + 记忆简报（§5.1 第 5 步）：简报只进生成上下文，不展示给用户。"""
-        prompt = self.system_prompt(session, topic=topic)
+        prompt, unit = self.system_prompt(session, topic=topic, with_unit=True)
         instance_id = str(session.get("instance_id") or "")
         timeline_id = str(session.get("timeline_id") or "")
         character_id = str(session.get("character_id") or "")
         if not (instance_id and timeline_id and character_id):
-            return {"prompt": prompt, "memory_ids": [], "brief": ""}
+            return {"prompt": prompt, "memory_ids": [], "brief": "", "unit": unit}
         try:
             recalled = self.recall(
                 instance_id, timeline_id, character_id, topic=topic, world_seconds=world_seconds,
                 query_vector=query_vector,
             )
         except Exception:  # 召回失败不得阻断对话
-            return {"prompt": prompt, "memory_ids": [], "brief": ""}
+            return {"prompt": prompt, "memory_ids": [], "brief": "", "unit": unit}
         block = disclosure.brief_block(
             self.disclosed_fragments(instance_id, timeline_id, character_id)
         )
@@ -1076,7 +1076,7 @@ class RuntimeService:
         )
         if tendency:
             prompt = prompt + chr(10) + chr(10) + "她眼下的处境（短期反应，只作语气与取舍的依据，别当成情绪报告）：" + chr(10) + tendency
-        return {"prompt": prompt, "memory_ids": recalled["ids"], "brief": brief}
+        return {"prompt": prompt, "memory_ids": recalled["ids"], "brief": brief, "unit": unit}
 
     # ---------- 远程向量（§5.2） ----------
 
@@ -2266,6 +2266,12 @@ class RuntimeService:
             experiences = self.store.experience_window(
                 instance_id, timeline_id, character_id, until=world, limit=12
             )
+            effects_now = self.store.effect_window(
+                instance_id,
+                timeline_id,
+                until=world,
+                targets=[character_id, str(card.get("role_id") or ""), region_of(card)],
+            )
             consumed = self.store.proactive_consumed(
                 instance_id, timeline_id, character_id
             ) | self.store.narrative_consumed_refs(instance_id, timeline_id, character_id)
@@ -2305,9 +2311,25 @@ class RuntimeService:
                 # 没有可用的生成器：不算她「没讲出口」，也不记暂缓
                 skipped[character_id] = "生成失败"
                 continue
+            # 戏剧性 / 三幕 / 分享欲（§9.5）：只改「这会儿说不说、用什么口气」，
+            # 不改候选集合与事实——世界照旧只从合法候选与受支持效果长出来。
+            blocked = bool(
+                life.effect_note(effects_now, character_id, str(card.get("role_id") or ""), region_of(card))
+            )
+            pending = [
+                row
+                for row in self.store.intent_list(instance_id, timeline_id, character_id)
+                if str(row["stage"]) in ("adopted", "waiting", "deferred")
+            ]
+            drama_score = narrative.drama(unit, blocked=blocked, unresolved=bool(pending))
+            drive = narrative.share_drive(self.store.unit_list(instance_id, timeline_id, character_id))
+            if not narrative.willingness(drive, drama_score=drama_score):
+                skipped[character_id] = "这会儿不想讲自己的事"
+                continue
+            act = narrative.act_of(unit, unresolved=bool(pending))
             generation = self._generation(timeline_id)
             text, findings = await self._speak_unit(
-                card, unit, activity=activity, llm=llm, deferred=was_deferred
+                card, unit, activity=activity, llm=llm, deferred=was_deferred, act=act
             )
             if not text:
                 # 没讲出口也算一次取舍：记下来，本日内降级但不封死（§5.2）
@@ -2379,6 +2401,7 @@ class RuntimeService:
         strict: bool = False,
         deferred: bool = False,
         opener: bool = False,
+        act: str = "",
     ) -> list[dict[str, str]]:
         """一句话主动消息：素材来自她已获知 / 亲历的东西，不送秘密原文，也不许喊口号。
 
@@ -2392,8 +2415,8 @@ class RuntimeService:
             "不要解释、不要加引号、不要列点、不要提设定或来源标签。"
         )
         if strict:
-            head += "上一版说过了头：只说她确实知道的部分，没把握的就含糊过去。"
-        lines = narrative.constraint_lines(unit, activity=activity, deferred=deferred)
+            head += narrative.strict_note()
+        lines = narrative.constraint_lines(unit, activity=activity, deferred=deferred, act=act)
         return [
             {"role": "system", "content": head},
             {"role": "user", "content": "\n".join(lines)},
@@ -2435,6 +2458,7 @@ class RuntimeService:
         deferred: bool = False,
         temperature: float = 0.6,
         opener: bool = False,
+        act: str = "",
     ) -> tuple[str, list[dict[str, Any]]]:
         """按叙事单元生成一句话，并跑后验检查（有界重试，不扩大可见材料范围）。
 
@@ -2448,7 +2472,7 @@ class RuntimeService:
                 try:
                     text = await llm.chat(
                         self._proactive_prompt(
-                            card, unit, activity, strict=attempt > 0, deferred=deferred, opener=opener
+                            card, unit, activity, strict=attempt > 0, deferred=deferred, opener=opener, act=act
                         ),
                         temperature=temperature,
                         timeout=45.0,
@@ -2471,6 +2495,159 @@ class RuntimeService:
             return int(self.clock_row(timeline_id).get("generation") or 0)
         except Exception:
             return -1
+
+    def _pending_hint(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str,
+        card: dict[str, Any],
+        calendar: Calendar,
+        *,
+        watermark: int,
+        effects: list[dict[str, Any]],
+        intents: list[dict[str, Any]],
+    ) -> str:
+        """她手上最悬着的那条线（§9.5-2/3）：戏剧性 + 三幕位置只**提示**她该想哪一步。
+
+        提示只影响她自己的提案措辞与取舍；可行性与效果照旧由闭集与前置条件决定——
+        评分不产生事实，也不放宽任何合法门槛。
+        """
+        unit = narrative.weave(
+            narrative.rank(
+                narrative.materials(
+                    experiences=self.store.experience_window(
+                        instance_id, timeline_id, character_id, until=watermark, limit=8
+                    ),
+                    knowledge=self.store.knowledge_window(
+                        instance_id, timeline_id, character_id, until=watermark, limit=8
+                    ),
+                    world_seconds=watermark,
+                    day_seconds=calendar.day_seconds,
+                )
+            ),
+            day_seconds=calendar.day_seconds,
+        )
+        if unit is None:
+            return ""
+        unresolved = any(
+            str(row.get("stage")) in ("adopted", "waiting", "deferred") for row in intents
+        )
+        blocked = bool(
+            life.effect_note(effects, character_id, str(card.get("role_id") or ""), region_of(card))
+        )
+        if narrative.act_of(unit, unresolved=unresolved) not in ("起", "承"):
+            return ""
+        if narrative.drama(unit, blocked=blocked, unresolved=unresolved) < narrative.DRAMA_MIN:
+            return ""
+        return str(unit.get("topic") or "")
+
+    async def audit_reply(
+        self, unit: dict[str, Any] | None, text: str, *, llm: Any = None
+    ) -> tuple[bool, str]:
+        """会话问答轮的后验检查（§6.2 落地口径）：与主动路径同一套判据，不另立标准。"""
+        if not unit:
+            return True, ""
+        return await self._narrative_check(
+            llm, unit, str(text or ""), activity=str(unit.get("activity") or "")
+        )
+
+    def record_turn_unit(
+        self,
+        session: dict[str, Any],
+        unit: dict[str, Any] | None,
+        *,
+        message_id: str,
+        findings: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """问答轮里她讲过这条线索：记成 spoken——与主动消息同一本账，别把同一件事讲第二遍。"""
+        if not unit:
+            return
+        instance_id = str(session.get("instance_id") or "")
+        timeline_id = str(session.get("timeline_id") or "")
+        character_id = str(session.get("character_id") or "")
+        if not (instance_id and timeline_id and character_id):
+            return
+        try:
+            world = self.world_moment(instance_id, timeline_id)
+        except Exception:
+            return
+        calendar = self.calendar(self.store.instance_get(instance_id) or {})
+        self._record_narrative(
+            unit,
+            instance_id=instance_id,
+            timeline_id=timeline_id,
+            character_id=character_id,
+            world=world,
+            world_day=calendar.day_index(world),
+            stage="spoken",
+            message_id=str(message_id),
+            audit=list(findings or []),
+        )
+
+    def narrative_map(
+        self, instance_id: str, timeline_id: str, *, character_id: str | None = None
+    ) -> dict[str, Any]:
+        """故事图谱（§9.5-1）：她讲过的线索 + 没讲出口的记号 + 它们之间的关系。
+
+        只给管理元数据与**用户已经看过**的正文；实情层、未获知内容与他人私聊一律不进（DESIGN §2.2-9）。
+        """
+        rows = self.store.narrative_unit_list(instance_id, timeline_id, character_id=character_id)
+
+        def text_of(message_id: str) -> str:
+            row = self.store.outbound_by_message_id(str(message_id)) if message_id else None
+            return self.store.message_text(row) if row is not None else ""
+
+        return narrative.map_payload(rows, text_of=text_of)
+
+    def disclosure_candidates(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        from_character: str,
+        to_character: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """跨角色披露的候选（§9.5-4）：从对方**讲过**的线索里挑，用户选定后才走 disclose 授权。
+
+        自动的只是「挑出来摆到台面上」这一步；默认隔离不变——没有哪一条会自己走进接收角色的认知，
+        授权仍走 `disclose()` 的显式确认（SESSION_CORE §7.1）。
+        """
+        if not from_character or not to_character or from_character == to_character:
+            return []
+        granted: set[str] = set()
+        for row in self.store.disclosure_list(instance_id, timeline_id):
+            if str(row.get("from_character")) != from_character or str(row.get("to_character")) != to_character:
+                continue
+            try:
+                scope = json.loads(str(row.get("scope") or "{}"))
+            except json.JSONDecodeError:
+                scope = {}
+            for item in scope.get("refs") or []:
+                # scope.refs 存的是片段对象（ref/role/text），不是裸字符串
+                granted.add(str(item.get("ref") or "") if isinstance(item, dict) else str(item))
+        out: list[dict[str, Any]] = []
+        for row in self.store.narrative_unit_list(instance_id, timeline_id, character_id=from_character):
+            if str(row.get("stage")) != "spoken" or not str(row.get("message_id") or ""):
+                continue
+            ref = str(row["message_id"])
+            if ref in granted:
+                continue
+            message = self.store.outbound_by_message_id(ref)
+            if message is None:
+                continue
+            out.append(
+                {
+                    "ref": ref,
+                    "unit": str(row.get("id") or ""),
+                    "at_world": int(row.get("created_world") or 0),
+                    "text": self.store.message_text(message)[:120],
+                }
+            )
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
 
     def _record_narrative(
         self,
@@ -3349,6 +3526,16 @@ class RuntimeService:
                 ),
                 observations=snapshot["observations"],
                 allowed=allowed,
+                pending=self._pending_hint(
+                    instance_id,
+                    timeline_id,
+                    character_id,
+                    card,
+                    calendar,
+                    watermark=watermark,
+                    effects=snapshot["effects"],
+                    intents=snapshot["intents"],
+                ),
             )
             prompt_text = "\n".join(item["content"] for item in messages)
             reservation = self.reserve_call(
@@ -3611,9 +3798,17 @@ class RuntimeService:
         raise RuntimeStateError(f"实例内没有该角色：{character_id}")
 
     def system_prompt(
-        self, session: dict[str, Any], *, topic: str | None = None, now_real: float | None = None
-    ) -> str:
-        """会话层用的扮演定义：锁定设定 + 该角色截至当前水位的认知切片（无实情层注入）。"""
+        self,
+        session: dict[str, Any],
+        *,
+        topic: str | None = None,
+        now_real: float | None = None,
+        with_unit: bool = False,
+    ) -> Any:
+        """会话层用的扮演定义：锁定设定 + 该角色截至当前水位的认知切片（无实情层注入）。
+
+        `with_unit=True` 时连「本轮用到的叙事单元」一起返回（会话侧的后验检查要用它）。
+        """
         import time as _time
 
         from . import cognition
@@ -3644,21 +3839,23 @@ class RuntimeService:
             observations=snapshot["observations"],
         )
         prompt = cognition.render_prompt(context)
-        block = self._opening_block(snapshot, calendar=calendar, world=world, topic=topic)
+        block, unit = self._opening_block(snapshot, calendar=calendar, world=world, topic=topic)
         if block:
             prompt = prompt + chr(10) + chr(10) + block
+        if with_unit:
+            return prompt, unit
         return prompt
 
     def _opening_block(
         self, snapshot: dict[str, Any], *, calendar: Calendar, world: int, topic: str | None
-    ) -> str:
+    ) -> tuple[str, dict[str, Any] | None]:
         """自然开场素材（SESSION_CORE §5.4 / NARRATIVE_LAYER §5）：给她「最近能提起的事」。
 
         只在没有明确查询主题的开场里给；材料全部来自她**已经历 / 已获知**的东西，
-        没有素材就什么都不加（不补造趣事，也不因为多问几遍就多给）。
+        没有素材就什么都不加（不补造趣事，也不因为多问几遍就多给）。返回 (提示块, 本轮单元)。
         """
         if not narrative.is_open_turn(str(topic or "")):
-            return ""
+            return "", None
         unit = narrative.weave(
             narrative.rank(
                 narrative.materials(
@@ -3673,7 +3870,7 @@ class RuntimeService:
             limit_extra=1,
         )
         if unit is None:
-            return ""
-        return "\n".join(
-            narrative.constraint_lines(unit, activity=str(snapshot.get("current_activity") or ""))
-        )
+            return "", None
+        activity = str(snapshot.get("current_activity") or "")
+        unit["activity"] = activity  # 后验检查核数字时与约束行同一口径
+        return "\n".join(narrative.constraint_lines(unit, activity=activity)), unit

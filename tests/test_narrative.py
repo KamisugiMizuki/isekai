@@ -14,7 +14,9 @@ from contextlib import contextmanager
 from isekai_core.runtime import life as life_mod
 from isekai_core.runtime import narrative
 from isekai_core.runtime.service import RuntimeService
-from samples import DAY
+from isekai_core.world.instances import create_instance
+from conftest import bind_thread, open_mgmt, running_core
+from samples import DAY, sample_card, sample_package
 from test_runtime import make_instance, store, world  # noqa: F401  夹具在那边
 
 
@@ -341,3 +343,181 @@ def test_narrative_records_clear_on_rollback_and_travel_with_dump(store, world) 
 
     store.instance_delete(instance_id)
     assert store.narrative_unit_list(instance_id, timeline_id) == []
+
+
+# ---------- 戏剧性 / 三幕 / 分享欲（§9.5-2/3/5） ----------
+
+
+def test_drama_act_and_share_drive_are_signals_not_gates() -> None:
+    unit = narrative.weave(
+        narrative.rank([_item("cl-1", "knowledge", at=100, text="北堤的牌子停发了")]), day_seconds=DAY
+    )
+    assert narrative.act_of(unit) == "起"
+    assert narrative.act_of(unit, unresolved=True) == "承"
+    assert narrative.act_of(unit, resolved=True) == "收"
+
+    plain = narrative.drama(unit)
+    worst = narrative.drama(unit, blocked=True, unresolved=True)
+    assert 0.0 <= plain < worst <= 1.0
+    assert worst >= narrative.DRAMA_MIN
+    assert narrative.drama(unit) == narrative.drama(dict(unit)), "同一单元永远同一个分"
+
+    assert narrative.share_drive([]) == 0.5, "没有依据时按中性，不额外抑制"
+    assert narrative.share_drive([{"confidence": 0.8, "archived": 0}]) == 0.8
+    assert narrative.share_drive([{"confidence": 0.1, "archived": 1}]) == 0.5, "归档单元不参与表达"
+
+    assert narrative.willingness(0.8, drama_score=0.0)
+    assert not narrative.willingness(0.1, drama_score=0.1)
+    assert narrative.willingness(0.1, drama_score=narrative.DRAMA_MIN), "素材够戏剧就压得过「不想讲」"
+
+
+def test_act_shapes_the_tone_not_the_facts() -> None:
+    unit = narrative.weave(
+        narrative.rank([_item("cl-1", "knowledge", at=100, text="北堤的牌子停发了")]), day_seconds=DAY
+    )
+    assert "还没了结" in "\n".join(narrative.constraint_lines(unit, act="承"))
+    assert "已经有数了" in "\n".join(narrative.constraint_lines(unit, act="收"))
+    plain = "\n".join(narrative.constraint_lines(unit))
+    assert "还没了结" not in plain and "已经有数了" not in plain
+
+
+def test_low_share_drive_holds_back_unless_material_is_dramatic(store, world) -> None:  # noqa: F811
+    """分享欲低（表达倾向单元置信度压到底）→ 平素材不主动开口；换戏剧素材就讲。"""
+    service, instance_id, timeline_id, character_id = _ready(store)
+    world_s = int(service.clock_row(timeline_id)["processed_world"])
+    _know(store, instance_id, timeline_id, character_id, at=world_s, ref="cl-a", text="北堤的通行牌这三天都停发了")
+    for row in store.unit_list(instance_id, timeline_id, character_id):
+        store.unit_put({**row, "confidence": 0.05})
+    llm = ScriptedLLM()
+    with daytime():
+        first = asyncio.run(service.proactive_tick(instance_id, timeline_id, llm=llm, per_day=2))
+    assert first["spoken"] == 0 and first["skipped"].get(character_id) == "这会儿不想讲自己的事"
+    assert store.proactive_list(instance_id, timeline_id) == []
+    assert llm.calls == 0, "没开口就不该花掉一次生成"
+
+    # 素材换了：她自己当天的两条亲历（有后续）+ 手上还悬着事 → 够戏剧，压得过低分享欲
+    _live(store, instance_id, timeline_id, character_id, at=world_s - 60, ref="xp-1", text="她清早去看过堤上的水位")
+    _live(store, instance_id, timeline_id, character_id, at=world_s - 30, ref="xp-2", text="她在盐滩边守了一阵")
+    with daytime():
+        second = asyncio.run(service.proactive_tick(instance_id, timeline_id, llm=llm, per_day=2))
+    assert second["spoken"] == 1, second
+    prompt = next(item for item in llm.prompts if "告诉联络者" in item)
+    assert "还没了结" in prompt, "三幕位置进了口气约束"
+
+
+# ---------- 故事图谱（§9.5-1） ----------
+
+
+def test_story_map_shows_what_she_said_and_marks_what_she_held(store, world) -> None:  # noqa: F811
+    service, instance_id, timeline_id, character_id = _ready(store)
+    world_s = int(service.clock_row(timeline_id)["processed_world"])
+    _know(store, instance_id, timeline_id, character_id, at=world_s, ref="cl-a", text="北堤的通行牌这三天都停发了")
+    _know(store, instance_id, timeline_id, character_id, at=world_s, ref="cl-b", text="盐滩的秤被收走了")
+    with daytime():
+        asyncio.run(service.proactive_tick(instance_id, timeline_id, llm=ScriptedLLM(), per_day=2))
+    # 第二条素材会被后验检查拦下（数字越界）→ 记成「没讲出口」
+    _know(store, instance_id, timeline_id, character_id, at=world_s, ref="cl-c", text="驿站新到一份灾年编年的补页")
+    with daytime():
+        asyncio.run(
+            service.proactive_tick(instance_id, timeline_id, llm=ScriptedLLM(text="驿站到了 7 份补页。"), per_day=2)
+        )
+
+    payload = service.narrative_map(instance_id, timeline_id)
+    spoken = [node for node in payload["nodes"] if node["kind"] == "spoken"]
+    held = [node for node in payload["nodes"] if node["kind"] == "deferred"]
+    assert spoken and spoken[0]["message_id"] and spoken[0]["label"].strip()
+    assert payload["counts"]["spoken"] == len(spoken)
+    assert held and "没讲出口" in held[0]["label"]
+    assert "补页" not in held[0]["label"], "没讲出口的节点不带内容"
+    assert all(node["label"] != "（她讲过这件事）" for node in spoken), "讲过的节点用她真说过的那句话"
+
+
+# ---------- 跨角色披露候选（§9.5-4） ----------
+
+
+def _two_roles(store, *, moment: int = DAY * 1500):
+    service = RuntimeService(store)
+    package = sample_package(moment=moment)
+    first = sample_card(package, name="堤禾")
+    second = sample_card(package, name="潮生")
+    info = create_instance(store, package, [first, second])
+    timeline_id = store.timeline_list(info["id"])[0]["id"]
+    service.ensure_instance(info["id"], now_real=time.time())
+    service.activate(info["id"], timeline_id, now_real=time.time())
+    return (
+        service,
+        info["id"],
+        timeline_id,
+        str(first["meta"]["card_id"]),
+        str(second["meta"]["card_id"]),
+    )
+
+
+def test_disclosure_candidates_never_auto_grant(store, world) -> None:  # noqa: F811
+    service, instance_id, timeline_id, mine, other = _two_roles(store)
+    world_s = int(service.clock_row(timeline_id)["processed_world"])
+    _know(store, instance_id, timeline_id, mine, at=world_s, ref="cl-a", text="盐滩的秤被收走了")
+    with daytime():
+        asyncio.run(service.proactive_tick(instance_id, timeline_id, llm=ScriptedLLM(), per_day=2))
+    assert store.narrative_unit_list(instance_id, timeline_id, character_id=mine)
+
+    candidates = service.disclosure_candidates(
+        instance_id, timeline_id, from_character=mine, to_character=other
+    )
+    assert candidates and candidates[0]["text"].strip()
+    assert store.disclosure_list(instance_id, timeline_id) == [], "候选只是候选：不会自己变成授权"
+    assert service.disclosure_candidates(
+        instance_id, timeline_id, from_character=other, to_character=mine
+    ) == [], "对方没讲过的事不成候选"
+
+    service.disclose(
+        instance_id, timeline_id, from_character=mine, to_character=other, refs=[candidates[0]["ref"]]
+    )
+    after = service.disclosure_candidates(
+        instance_id, timeline_id, from_character=mine, to_character=other
+    )
+    assert all(item["ref"] != candidates[0]["ref"] for item in after), "已授权的片段不再重复推荐"
+
+
+# ---------- 问答轮的后验检查（§9.5-6，真核心 + 真 WS） ----------
+
+
+async def _room(h, mgmt, *, moment: int = DAY * 1500 + 30000, thread_id: str = "dm-1"):
+    """真实实例 + 已激活时间线 + 绑定 thread（默认世界时刻落在她的白天，不触发睡眠等待）。"""
+    package = sample_package(moment=moment)
+    card = sample_card(package)
+    info = create_instance(h.store, package, [card])
+    timeline_id = h.store.timeline_list(info["id"])[0]["id"]
+    character_id = str(card["meta"]["card_id"])
+    h.runtime.world.ensure_instance(info["id"], now_real=time.time())
+    h.runtime.world.activate(info["id"], timeline_id, now_real=time.time())
+    client, bound = await bind_thread(
+        h,
+        mgmt,
+        channel_id="builtin",
+        thread_id=thread_id,
+        instance=info["id"],
+        timeline=timeline_id,
+        character=character_id,
+    )
+    return client, bound, info["id"], timeline_id, character_id
+
+
+async def test_question_turn_runs_the_same_audit(tmp_path):
+    """无主题的问答轮也过后验检查，讲过的线索记进同一本账（§6.2 落地口径 / §9.5-6）。"""
+    async with running_core(tmp_path, replies=["盐滩的秤被收走了，我听说的。"]) as h:
+        mgmt = await open_mgmt(h)
+        client, bound, instance_id, timeline_id, character_id = await _room(h, mgmt)
+        thread = bound["thread"]
+        world = int(h.runtime.world.clock_row(timeline_id)["processed_world"])
+        _know(store=h.store, instance_id=instance_id, timeline_id=timeline_id, character_id=character_id,
+              at=world, ref="cl-qa", text="盐滩的秤被收走了")
+
+        await client.send_user_message(thread_id="dm-1", binding_token=thread["binding_token"], text="在吗")
+        reply = await client.expect(lambda e: e.type == "reply", timeout=10)
+
+        prompts = [json.dumps(call, ensure_ascii=False) for call in h.fake.calls]
+        assert any("忠实度判断" in item for item in prompts), "问答轮同样跑了后验检查"
+        rows = h.store.narrative_unit_list(instance_id, timeline_id, character_id=character_id)
+        assert rows and rows[0]["stage"] == "spoken"
+        assert rows[0]["message_id"] == reply.payload["message_id"], "讲过的线索挂在真正固化那条回复上"

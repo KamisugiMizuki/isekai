@@ -17,7 +17,7 @@ from . import ump
 from .config import Config
 from .llm import LLMError
 from .log import get_logger
-from .runtime import life, proactive
+from .runtime import life, narrative, proactive
 from .store import EnvelopeConflict, Store
 from .ump import Envelope, Err, Stage, UmpError
 
@@ -347,9 +347,10 @@ class SessionService:
         await self._status(row, "thinking")
         try:
             query_vector = await self._query_vector(rows)
-            messages, recalled = self._build_messages(rows, query_vector=query_vector)
+            messages, recalled, unit = self._build_messages(rows, query_vector=query_vector)
             self._recalled = list(recalled)
             text = await self.llm.chat(messages)
+            text, audit_findings = await self._audit_or_retry(unit, text, messages)
         except LLMError as exc:
             log.warning(
                 "generation failed seq=%s stage=%s code=%s elapsed=%.1fs",
@@ -419,8 +420,66 @@ class SessionService:
             },
         )
         self._settle_memory(rows, message_id=str(message_id), reply_text=chr(10).join(parts))
+        self._record_turn_unit(row, unit, message_id=str(message_id), findings=audit_findings)
         await self._send_batches(msg)
         await self._status(row, "idle")
+
+    async def _audit_or_retry(
+        self, unit: dict[str, Any] | None, text: str, messages: list[dict[str, Any]]
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """问答轮的后验检查（NARRATIVE_LAYER §6.2 落地口径）：不过就加严重试一次。
+
+        与主动路径的差别：这里不能拿用户的问题当筹码（拒答比越界更糟），
+        所以第二次仍不过时**照发并把检查结果留档**——管理面能看到这条留痕。
+        """
+        runtime = getattr(self, "runtime", None)
+        if runtime is None or not unit or not str(text or "").strip():
+            return text, []
+        try:
+            ok, why = await runtime.audit_reply(unit, text, llm=self.llm)
+        except Exception:  # 检查本身失败不算越界，也不阻断回答
+            log.exception("turn audit failed session=%s", unit.get("id"))
+            return text, []
+        if ok:
+            return text, []
+        findings = [{"kind": "audit", "detail": str(why or "")}]
+        strict = narrative.strict_note()
+        head = str((messages[0] or {}).get("content") or "")
+        retry_messages = [{"role": "system", "content": f"{head}\n\n{strict}"}, *messages[1:]]
+        try:
+            second = await self.llm.chat(retry_messages)
+        except Exception:
+            log.exception("turn audit retry failed")
+            return text, findings
+        if not str(second or "").strip():
+            return text, findings
+        try:
+            ok2, why2 = await runtime.audit_reply(unit, second, llm=self.llm)
+        except Exception:
+            return text, findings
+        if ok2:
+            return str(second), []
+        return str(second), [{"kind": "audit", "detail": str(why2 or "")}]
+
+    def _record_turn_unit(
+        self,
+        row: dict[str, Any],
+        unit: dict[str, Any] | None,
+        *,
+        message_id: str,
+        findings: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """她这一轮讲过的线索记进同一本账：主动消息与问答共用消费与图谱（§7.1）。"""
+        runtime = getattr(self, "runtime", None)
+        if runtime is None or not unit:
+            return
+        session = self.store.session_get(str(row["session_id"]))
+        if session is None:
+            return
+        try:
+            runtime.record_turn_unit(session, unit, message_id=str(message_id), findings=list(findings or []))
+        except Exception:
+            log.exception("record turn unit failed session=%s", row.get("session_id"))
 
     def _model_fingerprint(self) -> str:
         """产出这条回复的模型标识（§十.15）：换模型后旧回复仍看得出边界。"""
@@ -637,32 +696,38 @@ class SessionService:
 
     def _system_prompt_with_memory(
         self, rows: list[dict[str, Any]], *, query_vector: list[float] | None = None
-    ) -> tuple[str, list[str]]:
-        """真实实例：扮演定义 + 记忆简报；占位会话或无运行层时退回占位提示词。"""
+    ) -> tuple[str, list[str], dict[str, Any] | None]:
+        """真实实例：扮演定义 + 记忆简报；占位会话或无运行层时退回占位提示词。
+
+        第三个返回值是「本轮用到的叙事单元」（可能为 None）：问答轮的后验检查要用它。
+        """
         runtime = getattr(self, "runtime", None)
         session = self.store.session_get(rows[0]["session_id"]) if runtime is not None else None
         if runtime is None or session is None or str(session["instance_id"]).startswith("ph-"):
-            return self.cfg.placeholder["system_prompt"], []
+            return self.cfg.placeholder["system_prompt"], [], None
         try:
             context = runtime.turn_context(
                 session, topic=_batch_text(rows), query_vector=query_vector
             )
         except Exception:  # 运行层不可用不得阻断对话
             log.exception("runtime context failed session=%s", session["id"])
-            return self.cfg.placeholder["system_prompt"], []
-        return str(context.get("prompt") or ""), list(context.get("memory_ids") or [])
+            return self.cfg.placeholder["system_prompt"], [], None
+        unit = context.get("unit")
+        return str(context.get("prompt") or ""), list(context.get("memory_ids") or []), (
+            dict(unit) if isinstance(unit, dict) else None
+        )
 
     def _build_messages(
         self, rows: list[dict[str, Any]], *, query_vector: list[float] | None = None
-    ) -> tuple[list[dict[str, Any]], list[str]]:
-        """返回 (消息序列, 本轮注入的记忆标识)；记忆简报只进上下文（§5.1）。
+    ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any] | None]:
+        """返回 (消息序列, 本轮注入的记忆标识, 本轮叙事单元)；记忆简报只进上下文（§5.1）。
 
         合并批（§4.5）：批内各输入按接受顺序保留自己的原文，合成同一轮的用户侧输入；
         到期的真实状态（仍睡 / 已醒）作为口吻约束随扮演定义一起进上下文。
         """
         head = rows[0]
         history = self.store.context_window(head["session_id"], self.cfg.context_history_max)
-        prompt, recalled = self._system_prompt_with_memory(rows, query_vector=query_vector)
+        prompt, recalled, unit = self._system_prompt_with_memory(rows, query_vector=query_vector)
         hint = self._sleep_hint(head)
         if hint:
             prompt = f"{prompt}\n\n{hint}"
@@ -678,7 +743,7 @@ class SessionService:
                 messages.append({"role": "assistant", "content": _flatten(item["parts"])})
         for item in rows:
             messages.append({"role": "user", "content": item["text"] or ""})
-        return messages, recalled
+        return messages, recalled, unit
 
     # ---------- 投递 ----------
 

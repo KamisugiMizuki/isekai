@@ -54,6 +54,8 @@ SYNC_OPS = frozenset(
         "runtime.budget.set",
         "disclose.confirm",
         "disclose.list",
+        "disclose.suggest",
+        "narrative.map",
         "event.confirm",
         "runtime.timeline.rename",
         "runtime.timeline.archive",
@@ -343,6 +345,10 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return _disclose_confirm(cfg, store, args)
         if op == "disclose.list":
             return _disclose_list(cfg, store, args)
+        if op == "disclose.suggest":
+            return _disclose_suggest(cfg, store, args)
+        if op == "narrative.map":
+            return _narrative_map(cfg, store, args)
         if op == "event.confirm":
             return _confirm_user_event(cfg, store, args)
         if op == "runtime.timeline.rename":
@@ -750,6 +756,37 @@ def _disclose_list(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str,
     return {
         "disclosures": _world_service(cfg, store).disclosures(
             instance_id, timeline_id, to_character=str(args.get("to_character") or "") or None
+        )
+    }
+
+
+def _disclose_suggest(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """跨角色披露的候选（NARRATIVE_LAYER §9.5-4）：只把对方讲过的东西挑出来摆着。
+
+    授权仍走 `disclose.confirm` 的显式确认；候选正文只取用户已经看过的消息。
+    """
+    instance_id, timeline_id = _version_ids(args)
+    return {
+        "candidates": _world_service(cfg, store).disclosure_candidates(
+            instance_id,
+            timeline_id,
+            from_character=str(args.get("from_character") or ""),
+            to_character=str(args.get("to_character") or ""),
+            limit=int(args.get("limit") or 5),
+        )
+    }
+
+
+def _narrative_map(cfg: Config, store: Store, args: dict[str, Any]) -> dict[str, Any]:
+    """故事图谱（NARRATIVE_LAYER §9.5-1）：她讲过的线索 + 没讲出口的记号 + 关系。
+
+    黑箱不变：只回管理元数据与用户已经看过的正文，实情层与他人私聊一律不进。
+    """
+    instance_id, timeline_id = _version_ids(args)
+    character_id = str(args.get("character_id") or "")
+    return {
+        "map": _world_service(cfg, store).narrative_map(
+            instance_id, timeline_id, character_id=character_id or None
         )
     }
 

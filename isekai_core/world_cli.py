@@ -66,6 +66,8 @@ OP_BY_COMMAND = {
     ("runtime", "budget"): "runtime.budget",
     ("disclose", "confirm"): "disclose.confirm",
     ("disclose", "list"): "disclose.list",
+    ("disclose", "suggest"): "disclose.suggest",
+    ("narrative", "map"): "narrative.map",
     ("event", "draft"): "event.draft",
     ("event", "confirm"): "event.confirm",
     ("runtime", "timeline-rename"): "runtime.timeline.rename",
@@ -139,7 +141,14 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args["note"] = ns.note or ""
         if cmd == "list":
             args["to_character"] = ns.at or ""
+        if cmd == "suggest":
+            args["from_character"] = ns.card or ""
+            args["to_character"] = ns.at or ""
+            if ns.limit:
+                args["limit"] = int(ns.limit)
         return args
+    if group == "narrative":
+        return {"instance_id": ns.id, "timeline_id": ns.timeline, "character_id": ns.card or ""}
     if group == "event":
         args = {"instance_id": ns.id, "timeline_id": ns.timeline}
         if cmd == "draft":
@@ -276,7 +285,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--endpoint", default=None, help="连接已有核心（默认自行拉起）")
     parser.add_argument("--mgmt", default=None, help="已有核心的管理凭据")
     parser.add_argument(
-        "group", choices=["package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive"]
+        "group",
+        choices=[
+            "package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive", "narrative"
+        ],
     )
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
     parser.add_argument("--name", default=None)
@@ -311,6 +323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--activate", action="store_true", help="版本：分叉后立即激活")
     parser.add_argument("--resume", dest="pause_resume", action="store_true", help="预算：恢复该任务")
     parser.add_argument("--candidate", default=None, help="把文件内容当作候选对象提交")
+    parser.add_argument("--limit", default=None, help="条数上限（披露候选等）")
     ns = parser.parse_args(argv)
     if (ns.group, ns.command) not in OP_BY_COMMAND:
         parser.error(f"未知命令 {ns.group} {ns.command}")
