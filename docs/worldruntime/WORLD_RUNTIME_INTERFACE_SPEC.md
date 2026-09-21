@@ -1,6 +1,11 @@
 # WorldRuntime 对外接口设计
 
 > 状态：接口设计草案 v1.0，未实现声明。
+>
+> **接线现状（2026-09-22 探针 `scripts/_audit2_iface.py`：17 检查 / 3 PASS / 14 FAIL）**：本文声明的 14 个 op
+> 在管理面注册表里**一个都没有**。其中 5 项的能力已存在但换了名字（见 §十三 对照表），1 项走通道侧读接口，
+> 其余 8 项**没有对外入口**；`change.preview` / `change.commit` 与 `snapshot.read` 属于「连实现都没有」——
+> 前者是本文指定的唯一世界写入口，目前写世界的仍是三条各自为政的路径。别把本文的名字当成已接通的通道。
 > 定位：WorldRuntime 与 OC 故事层、TRPG 规则层、Writing Assistant 之间的解耦契约。
 > 相关总纲：[`DESIGN.md`](DESIGN.md)。
 > 相关底层模块：[`WORLD_RUNTIME_SPEC.md`](WORLD_RUNTIME_SPEC.md)、[`SESSION_CORE_SPEC.md`](SESSION_CORE_SPEC.md)、[`NARRATIVE_LAYER_SPEC.md`](NARRATIVE_LAYER_SPEC.md)。
@@ -493,7 +498,33 @@ Writing Assistant：
 - Writing Assistant 的大纲偏离可以被报告、接受或改写，但不会由底层自动制造必达节点。
 - 分支试演不污染主线，回滚不恢复已失效的异步任务，外部已投递文本仍按不可撤回语义处理。
 
-## 十二、与现有文档的关系
+## 十二、设计名 → 实现名对照（2026-09-22 实测）
+
+判据见 `scripts/_audit2_iface.py`（真 WS 逐个调规范名 + 直调内部实现取读数）。
+「已接（改名）」= 能力在真链路上可用，只是名字不同；「未接线」= 能力在，但没有对外入口；
+「无实现」= 连能力都没有。
+
+| 设计名（本文） | 实现名 | 状态 | 读数来源 |
+|---|---|---|---|
+| `runtime.timeline.fork` | `runtime.fork` | 已接（改名） | 真 WS 调通，返回新线 id |
+| `runtime.timeline.rollback` | `runtime.rollback` | 已接（改名，需 `confirm`） | 真 WS 调通，`world` / `generation` 读数 |
+| `runtime.time.advance` | `runtime.advance`（跟真实时间）+ `runtime.time.consume`（场景内消耗，§5.7 语义落在这里） | 已接（拆成两条） | 真 WS 调通，`consumed_seconds=600` |
+| `runtime.history.read` | 通道侧 `history.page` | 已接（另一条通道） | 真 WS 调通，返回 `messages` |
+| `runtime.rule_state.read` | `trpg.rule_state.read` | 已接（改名 + TRPG 命名空间） | 规则状态是**战役级**附件，故留在 `trpg.*` |
+| `runtime.knowledge.grant` | `disclose.*`（披露授权） | 部分覆盖 | 语义不同：`disclose` 是批准披露，不是直接授予认知 |
+| `runtime.scope.inspect` | `runtime.clock` / `service.view` | 未接线（字段不全） | `view()` 缺 `revision` / `runtime_generation` / `ruleset_version` / `available_actions` |
+| `runtime.subject.state.read` | `service.character_snapshot` | 未接线（只有 session 在用） | 返回 12 个键，管理面无入口 |
+| `runtime.cognition.project` | `service.turn_context` / `cognition.play_context` | 未接线（只有 session 在用） | 返回 prompt / unit / memory_ids，无 observer / purpose 参数 |
+| `runtime.snapshot.read` | — | 无实现 | 只有回滚用的 `commit_snapshot`；没有给生成用的读快照，代码里没有 `expires_at` |
+| `runtime.change.preview` | — | 无实现 | `change_intent` / `preview_id` / `base_snapshot_id` 在产品代码里 0 命中 |
+| `runtime.change.commit` | — | 无实现 | 存储级原子入口 `store.apply_runtime_batch` 由 4 个文件各自调用，没有统一提交边界 |
+| `runtime.generation.check` | 世代机制在（rollback 提升 + 迟到批被拒） | 未接线 | 无独立入口 |
+| `runtime.task.invalidate` | 同上（只有回滚副作用） | 未接线 | 无独立入口 |
+
+对照 `§十一 行为验收`：「任意变化都必须经过 preview / commit」目前**不成立**；「generation 拒绝旧结果」
+在功能层成立、在接口层不成立。
+
+## 十三、与现有文档的关系
 
 - `WORLD_RUNTIME_SPEC.md` 定义底层世界时钟、状态、认知和版本语义；本文件定义它们如何被外部消费。
 - `SESSION_CORE_SPEC.md` 定义会话、消息、生成和投递；本文件只提供其所需的世界快照、认知投影和受控提交边界。

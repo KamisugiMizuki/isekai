@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PY = str(ROOT / ".venv" / "Scripts" / "python.exe")
-CORE_PROBES = ["chan", "sc", "ws", "wr", "ee", "mem", "card", "design"]
+CORE_PROBES = ["chan", "sc", "ws", "wr", "ee", "mem", "card", "design", "iface"]
 DESK_ARGS = {"static": ["static"], "main": [], "restore": ["restore"], "notify": ["notify"]}
 
 TOTAL_RE = re.compile(r"TOTAL (\d+) PASS (\d+) FAIL (\d+) DEFERRED (\d+)")
