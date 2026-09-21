@@ -1705,15 +1705,26 @@ async def dispatch_async(
                 str(args.get("brief") or ""),
                 name=str(args.get("name") or "未命名世界"),
                 knobs=args.get("knobs"),
+                locked=args.get("locked"),
+                base=args.get("base"),
                 **kwargs,
             )
         elif op == "world.package.revise":
             package, errors, usage = await revise_package(
-                llm, _package_arg(args, cfg), str(args.get("instruction") or ""), **kwargs
+                llm,
+                _package_arg(args, cfg),
+                str(args.get("instruction") or ""),
+                locked=args.get("locked"),
+                **kwargs,
             )
         elif op == "world.package.fill":
             package, errors, usage = await fill_section(
-                llm, _package_arg(args, cfg), str(args.get("section") or ""), **kwargs
+                llm,
+                _package_arg(args, cfg),
+                str(args.get("section") or ""),
+                knobs=args.get("knobs"),
+                locked=args.get("locked"),
+                **kwargs,
             )
         elif op == "world.card.generate":
             package, errors, usage = await generate_card(

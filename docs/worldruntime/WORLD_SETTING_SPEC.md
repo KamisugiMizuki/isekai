@@ -290,7 +290,10 @@
   容器件 256 MiB，`world/package.py:MAX_PACKAGE_BYTES` · `read_json_file` · `world/ops.py::_read_user_json`）。
   机器对拍 `scripts/_audit2_pkg_doc.py`（键集 / 枚举 / 数值 / 前缀共 20 项，全绿）；顺带删除死常量
   `package.NAME_MAX_LEN`（定义后从未被引用，名称长度目前不设上限）。
-- 生成器提示词、有限字段表单及对话式修订交互。
+- 生成器提示词、有限字段表单及对话式修订交互：**2026-09-22 落地**（桌面「生成工作区」P1 参数层 + P2 条目层，见 `docs/core debugging/DESKTOP_GENERATION_WORKSPACE_SPEC.md` §七 落地进度）——
+  提示词由 `world/generator.py` 拼装：分段结构提示 + 最小内容标准 + 参数层旋钮段（`knob_brief`）+ 锁定条目段（`locks_note`）；
+  管理面 `world.package.generate` / `fill` / `revise` 收 `knobs` 与 `locked`；「重跑这段」= `fill` 的 `section` 收逗号分隔键列表，
+  非本段键由核心强制取原包（`restrict`）。角色卡的字段级工作区（§四）随桌面 P3 后置。
 - **转换器注册格式已落地**（`world/converters.py`：注册表 + 未确认不动数据 + 副本转换 + 完整校验 + 原子发布）；
   **名称规范化细则与元数据物理存放位置 2026-09-22 落地**——格式标识走 `converters.normalize_format`
   （去首尾空白 + NFKC + 大小写折叠，与实例 / 包名同一套规则；登记与查找用规范化键，`converters()` 按登记写法展示）；

@@ -30,11 +30,18 @@ from _audit2_desk import (  # noqa: E402
     dump,
     make_root,
     mgmt_call,
+    wait_note,
 )
 
 from isekai_core.world.example import example_package  # noqa: E402
-from isekai_core.world.generator import KNOB_COUNTS, KNOB_LISTS, KNOB_TONES  # noqa: E402
+from isekai_core.world.generator import (  # noqa: E402
+    KNOB_COUNTS,
+    KNOB_LISTS,
+    KNOB_TONES,
+    PACKAGE_SEGMENTS,
+)
 
+SEGMENT_LABELS = [label for label, _ in PACKAGE_SEGMENTS]
 ROOT = Path(__file__).resolve().parent.parent
 MAIN_TS = (ROOT / "desktop" / "src" / "main.ts").read_text(encoding="utf-8")
 INDEX = (ROOT / "desktop" / "index.html").read_text(encoding="utf-8")
@@ -44,6 +51,15 @@ def ts_table(name: str) -> list[tuple[str, str]]:
     """取 main.ts 里 `const <name>: Array<[string, string]> = [ ["k","标签"], … ];` 的表。"""
     body = MAIN_TS.split(f"const {name}: Array<[string, string]> = [")[1].split("];")[0]
     return [(key, label) for key, label in re.findall(r'\["([a-z_]+)", "([^"]+)"\]', body)]
+
+
+def ts_segment_keys() -> list[tuple[str, tuple[str, ...]]]:
+    """取 main.ts 里 `GENWS_SEGMENT_KEYS`（段名 → 顶层键列表）。"""
+    body = MAIN_TS.split("const GENWS_SEGMENT_KEYS: Array<[string, string[]]> = [")[1].split("];")[0]
+    rows = []
+    for label, keys in re.findall(r'\["([^"]+)", \[([^\]]*)\]\]', body):
+        rows.append((label, tuple(part.strip().strip('"') for part in keys.split(",") if part.strip())))
+    return rows
 
 
 def section_static() -> None:
@@ -62,6 +78,12 @@ def section_static() -> None:
           f"入口按钮={'pkg-open-workspace' in INDEX}；工作区 pane={'pane-genws' in INDEX}；残留内联框={leftovers}",
           clause="§二 入口改造：[AI 生成世界包] 只负责进工作区",
           code="desktop/index.html #pkg-open-workspace / #pane-genws")
+    check("G0c §3.1 分段与核心 PACKAGE_SEGMENTS 同源（段名 → 顶层键）",
+          "PASS" if ts_segment_keys() == [(label, tuple(keys)) for label, keys in PACKAGE_SEGMENTS] else "FAIL",
+          f"TS 段={[(label, list(keys)) for label, keys in ts_segment_keys()]}；"
+          f"核心段={[(label, list(keys)) for label, keys in PACKAGE_SEGMENTS]}",
+          clause="§3.1 ② 分段与条目：段 = 若干顶层键（重跑这段的粒度）",
+          code="desktop/src/main.ts GENWS_SEGMENT_KEYS · isekai_core/world/generator.py PACKAGE_SEGMENTS")
 
 
 async def section_main() -> None:
@@ -135,6 +157,53 @@ async def section_main() -> None:
               clause="§七 P1 验收：填表 → 生成（FakeLLM）→ 三段各显示状态；§3.1 ③ 摘要 + 校验错误清单",
               code="desktop/src/main.ts genwsGenerate / genwsRenderSegments / genwsRenderSummary")
 
+        # ---- G6/G7 P2：条目表（加 / 改 / 删 / 锁定）+ 重跑这段保留锁定条目
+        entries = await cdp.js(
+            "({rows: document.querySelectorAll('#gw-entries .entry-row').length,"
+            " heads: [...document.querySelectorAll('#gw-entries .entry-head')].map(e=>e.textContent.trim()),"
+            " adds: document.querySelectorAll('#gw-entries .entry-add').length,"
+            " edits: document.querySelectorAll('#gw-entries .entry-edit').length,"
+            " dels: document.querySelectorAll('#gw-entries .entry-delete').length,"
+            " segs: [...document.getElementById('gw-segment').options].map(o=>o.value)})")
+        check("G6 §3.3 条目表：段路径表头 + 一行一条（改 / 删 / 锁定）+ ＋加一条 + 段下拉",
+              "PASS" if (int(entries["rows"]) > 0 and int(entries["adds"]) >= 3 and int(entries["edits"]) == int(entries["rows"])
+                         and int(entries["dels"]) == int(entries["rows"])
+                         and entries["segs"] == SEGMENT_LABELS) else "FAIL",
+              f"条目行={entries['rows']}（改/删按钮各 {entries['edits']}/{entries['dels']}）；表头={entries['heads'][:4]}；"
+              f"＋加一条={entries['adds']}；段下拉={entries['segs']}",
+              clause="§3.3 每段可展开成条目表：一行一条 id·摘要·来源 + [编辑][删除][锁定]，段头 [＋加一条] 与 [重跑这段]",
+              code="desktop/src/main.ts genwsRenderEntries / genwsAddEntry / genwsEditEntry / genwsDeleteEntry")
+
+        # 改一条 → 锁定 → 加一条 → 重跑「设定核心」（模型拿示例包覆盖）→ 锁定条目原样保留
+        await cdp.js(
+            "window.prompt = () => '审计改写过的公理';"
+            "document.querySelector('#gw-entries .entry-edit[data-ident=\"ax-1\"]').click();"
+            "document.querySelector('#gw-entries .entry-lock[data-ident=\"ax-1\"]').click();"
+            "document.querySelector('#gw-entries .entry-add[data-path=\"world.customs\"]').click()")
+        before = await cdp.js(
+            "({ax: [...document.querySelectorAll('#gw-entries .entry-row')].map(e=>e.textContent).find(t=>t.includes('ax-1')) || '',"
+            " customs: [...document.querySelectorAll('#gw-entries .entry-head')].find(e=>e.textContent.includes('world.customs'))?.textContent || '',"
+            " other: [...document.querySelectorAll('#gw-entries .entry-row')].map(e=>e.textContent).filter(t=>/^(src|cf|nv|hs|rc|en|ef|et)-/.test(t)).length,"
+            " status: document.getElementById('gw-status').textContent,"
+            " locked: document.querySelectorAll('#gw-entries .entry-lock:checked').length})")
+        await cdp.select("gw-segment", "设定核心")
+        await cdp.js("window.__confirmArgs=[]; document.getElementById('gw-rerun').click()")
+        rerun_note = await wait_note(cdp, ("gw-rerun-note",), "重跑", 90)
+        after = await cdp.js(
+            "({ax: [...document.querySelectorAll('#gw-entries .entry-row')].map(e=>e.textContent).find(t=>t.includes('ax-1')) || '',"
+            " other: [...document.querySelectorAll('#gw-entries .entry-row')].map(e=>e.textContent).filter(t=>/^(src|cf|nv|hs|rc|en|ef|et)-/.test(t)).length,"
+            " status: document.getElementById('gw-status').textContent,"
+            " errors: document.getElementById('gw-errors').textContent})")
+        check("G7 §3.3/§八 改 + 锁定 + 重跑这段：锁定条目内容原样保留，其他段条目不动",
+              "PASS" if ("审计改写过的公理" in str(before["ax"]) and "审计改写过的公理" in str(after["ax"])
+                         and int(after["other"]) == int(before["other"])
+                         and "锁定 1 条" in str(after["status"]) and not str(after["errors"]).strip()) else "FAIL",
+              f"改后该行={str(before['ax'])[:70]!r}；重跑前状态条={str(before['status'])[:90]!r}；"
+              f"重跑提示={str(rerun_note)[:70]!r}；重跑后该行={str(after['ax'])[:70]!r}（模型给的是示例包原文——锁定项没被覆盖）；"
+              f"其他段条目行数 {before['other']}→{after['other']}；重跑后状态条={str(after['status'])[:90]!r}",
+              clause="§3.3 锁定 = 重生成不覆盖（段级重跑同样保留）；§七 P2 验收：改一段后 [重跑这段]，其他段内容逐字段不变",
+              code="desktop/src/main.ts genwsRerun / genwsToggleLock · isekai_core/world/generator.py fill_section/apply_locks")
+
         # ---- G5 未保存返回有提示（先取消 → 留在工作区；再保存 → 返回成功）
         await cdp.js("window.__confirmArgs=[];"
                      "window.confirm=(m)=>{window.__confirmArgs.push(String(m)); return false;};"
@@ -153,13 +222,64 @@ async def section_main() -> None:
             " file: `${location.origin}`,"
             " in_list: Array.from(document.getElementById('pkg-select').options).some(o=>o.value==='a2genws.json')})")
         on_disk = (root / "packages" / "a2genws.json").exists()
+        saved_pkg = json.loads((root / "packages" / "a2genws.json").read_text(encoding="utf-8")) if on_disk else {}
+        locked_ax = [item for item in (saved_pkg.get("world") or {}).get("axioms") or [] if item.get("id") == "ax-1"]
+        locked_kept = bool(locked_ax) and locked_ax[0].get("text") == "审计改写过的公理"
         check("G4-G5 §七 P1 验收：未保存时返回有提示；保存后包出现在管理页列表（真落盘）",
               "PASS" if ("未保存" in str(held["note"]) and held["still"]
-                         and "已保存" in str(saved["note"]) and saved["in_list"] and on_disk) else "FAIL",
+                         and "已保存" in str(saved["note"]) and saved["in_list"] and on_disk and locked_kept) else "FAIL",
               f"返回时确认文案={str(held['note'])[:120]!r}（取消后仍在工作区={held['still']}）；"
-              f"保存提示={saved['note']!r}；管理页列表含该包={saved['in_list']}；磁盘上={on_disk}",
+              f"保存提示={saved['note']!r}；管理页列表含该包={saved['in_list']}；磁盘上={on_disk}；"
+              f"落盘后锁定条目仍是审计改写的那一版={locked_kept}（{str(locked_ax[:1])[:80]}）",
               clause="§五 顶栏与返回：离开前未保存提示；§七 P1 验收：保存后包出现在管理页列表",
               code="desktop/src/main.ts genwsClose / genwsSave / world.package.save")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+        dump("genws")
+
+
+async def section_broken() -> None:
+    """非法候选：校验拦住、不落盘（§七 P2 验收第二条）。"""
+    root = make_root("genws-bad")
+    bad = example_package()
+    bad["canon"] = []  # 抽掉实情条目：初始态与说法的引用悬空，最小内容也不达标
+    proc, cdp, _targets = await boot_shell(
+        root, 9932, {"ISEKAI_LLM_FAKE": "1", "ISEKAI_LLM_FAKE_REPLY": json.dumps(bad, ensure_ascii=False)}
+    )
+    try:
+        await cdp.wait("document.getElementById('status').textContent", "已就绪", 120)
+        await cdp.js(STUB)
+        await mgmt_call(cdp, "settings.set", llm={"api_key": FAKE_KEY, "model": "audit-fake"})
+        await cdp.js("document.getElementById('pkg-open-workspace').click()")
+        await asyncio.sleep(1.2)
+        await cdp.js(
+            "document.getElementById('gw-file').value='a2genws-bad.json';"
+            "document.getElementById('gw-brief').value='审计非法候选';"
+            "window.__confirmArgs=[];"
+            "document.getElementById('gw-generate').click()")
+        await asyncio.sleep(6.0)
+        state = await cdp.js(
+            "({note: document.getElementById('gw-generate-note').textContent,"
+            " errors: document.getElementById('gw-errors').textContent,"
+            " status: document.getElementById('gw-status').textContent,"
+            " segs: [...document.querySelectorAll('#gw-segments li')].map(e=>e.textContent)})")
+        await cdp.js("window.confirm=()=>true; document.getElementById('gw-save').click()")
+        await asyncio.sleep(1.5)
+        refused = await cdp.js("document.getElementById('gw-generate-note').textContent")
+        on_disk = (root / "packages" / "a2genws-bad.json").exists()
+        drafts = [item.name for item in (root / "packages").glob("*.draft.json")]
+        check("G8 §七 P2 验收：非法产物被 validate_package 拦住且不落盘（失败留草稿）",
+              "PASS" if (str(state["errors"]).strip() and "未通过校验" in str(state["note"])
+                         and "校验没过" in str(refused) and not on_disk and drafts) else "FAIL",
+              f"生成提示={str(state['note'])[:90]!r}；状态条={str(state['status'])[:80]!r}；段状态={state['segs']}；"
+              f"错误清单={str(state['errors'])[:150]!r}；点保存被拒={str(refused)[:80]!r}；"
+              f"磁盘上有该包={on_disk}（必须 False）；中间态草稿={drafts}",
+              clause="§七 P2 验收：非法产物被 validate_package 拦住且不落盘",
+              code="desktop/src/main.ts genwsGenerate / genwsSave · isekai_core/world/generator.py validate_package")
     finally:
         proc.terminate()
         try:
@@ -179,6 +299,11 @@ async def amain() -> None:
             check("main", "SKIP", f"没有可执行件 {EXE}（先构建桌壳）")
         else:
             await section_main()
+    if which in ("broken", "all"):
+        if not EXE.exists():
+            check("broken", "SKIP", f"没有可执行件 {EXE}（先构建桌壳）")
+        else:
+            await section_broken()
     print(f"[genws] 用时 {time.time() - started:.1f}s", flush=True)
 
 

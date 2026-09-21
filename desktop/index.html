@@ -218,7 +218,17 @@
                 <span id="gw-generate-note" class="muted note" role="status" aria-live="polite"></span>
               </div>
               <ol id="gw-segments" class="genws-segments"></ol>
-              <p class="muted">分段生成：设定核心 / 双轨与名册 / 机制与现状。条目表（展开 / 加 / 改 / 锁定）随 P2 进。</p>
+              <div class="row">
+                <select id="gw-segment" aria-label="要重跑的段"></select>
+                <button id="gw-rerun">重跑这段</button>
+                <span id="gw-rerun-note" class="muted note" role="status" aria-live="polite"></span>
+              </div>
+              <ol id="gw-entries" class="genws-entries"></ol>
+              <div class="row">
+                <input id="gw-instruction" placeholder="改一句话，如：把潮汐改成七日一次" />
+                <button id="gw-revise">按指令修订整包</button>
+              </div>
+              <p class="muted">勾选 = 锁定：重跑这段、整包重跑、按指令修订都不覆盖它，并原样带进提示词。</p>
             </section>
             <section class="genws-col">
               <h3>③ 预览与落盘</h3>

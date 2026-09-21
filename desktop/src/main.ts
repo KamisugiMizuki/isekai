@@ -2940,14 +2940,287 @@ const GENWS_LISTS: Array<[string, string]> = [
 ];
 /// 段名与核心 `PACKAGE_SEGMENTS` 一致：段级失败由核心按「段名：」前缀回报
 const GENWS_SEGMENTS = ["设定核心", "双轨与名册", "机制与现状"];
-const genws = {
-  candidate: null as Record<string, unknown> | null,
-  errors: [] as string[],
-  usage: null as { calls?: number; limit?: number } | null,
+/// 段 → 顶层键（与核心 `PACKAGE_SEGMENTS` 同源；`scripts/_audit2_gen_ws.py static` 对拍这两份清单）
+const GENWS_SEGMENT_KEYS: Array<[string, string[]]> = [
+  ["设定核心", ["meta", "calendar", "world"]],
+  ["双轨与名册", ["sources", "canon", "narratives", "races", "entities"]],
+  ["机制与现状", ["historiography", "environment", "events", "life", "roles", "comms", "initial_state"]],
+];
+/// 段内**有条目粒度**的路径（点分）：其余键是单对象，只随段整体重跑
+const GENWS_ENTRY_PATHS: Record<string, string[]> = {
+  world: ["world.axioms", "world.institutions", "world.customs"],
+  events: ["events.families"],
+};
+
+interface GenwsState {
+  candidate: Record<string, unknown> | null;
+  errors: string[];
+  usage: { calls?: number; limit?: number } | null;
+  model: string;
+  dirty: boolean;
+  savedAt: number | null;
+  locks: Record<string, string[]>;
+}
+
+const genws: GenwsState = {
+  candidate: null,
+  errors: [],
+  usage: null,
   model: "",
   dirty: false,
-  savedAt: null as number | null,
+  savedAt: null,
+  locks: {},
 };
+
+function genwsPathValue(path: string): unknown {
+  let node: unknown = genws.candidate;
+  for (const part of path.split(".")) {
+    if (!node || typeof node !== "object") return undefined;
+    node = (node as Record<string, unknown>)[part];
+  }
+  return node;
+}
+
+function genwsEntrySummary(item: Record<string, unknown>): string {
+  for (const key of ["statement", "text", "name", "summary", "title", "mandate"]) {
+    const value = item[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return JSON.stringify(item).slice(0, 60);
+}
+
+/// 摘要字段 = 摘要显示用的那个键；[改] 写回同一字段（读与写共用一处，别再各认一套）
+function genwsEntryField(item: Record<string, unknown>): string | null {
+  for (const key of ["statement", "text", "name", "summary", "title", "mandate"]) {
+    if (typeof item[key] === "string") return key;
+  }
+  return null;
+}
+
+/// [＋加一条] 的起手模板（字段形态照模板骨架；内容留空由用户或下一次重跑填）
+const GENWS_ENTRY_TEMPLATE: Record<string, Record<string, unknown>> = {
+  "world.axioms": { text: "" },
+  "world.institutions": { name: "", mandate: "", scope: "", succession: "", validity: "" },
+  "world.customs": { name: "", applies_to: "", practice: "", basis: "", variation: "" },
+  "events.families": { name: "", templates: [] },
+  sources: { name: "", kind: "personal", reach: "" },
+  canon: { statement: "", tags: [] },
+  narratives: { text: "", source_id: "", canon_ref: "", obtain: [], confidence: "believed" },
+  races: { name: "", lifespan: { min_years: 60, max_years: 90 } },
+  entities: { kind: "person", name: "", race_id: null, born: null, died: null },
+  life: { name: "", sleep: true, windows: [] },
+  roles: { name: "", description: "", life_template: "", channels: [] },
+};
+
+function genwsNextIdent(values: Array<Record<string, unknown>>): string {
+  const taken = new Set(values.map((item) => String(item.id ?? "")));
+  const first = [...taken][0] ?? "x-1";
+  const prefix = first.includes("-") ? first.slice(0, first.lastIndexOf("-")) : first;
+  for (let index = 1; index < 999; index += 1) {
+    const candidate = `${prefix}-新${index}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return `${prefix}-新`;
+}
+
+function genwsAddEntry(path: string): void {
+  const values = genwsPathValue(path);
+  if (!Array.isArray(values)) return;
+  const items = values as Array<Record<string, unknown>>;
+  const ident = genwsNextIdent(items);
+  items.push({ id: ident, ...(GENWS_ENTRY_TEMPLATE[path] ?? {}) });
+  genws.dirty = true;
+  genwsRenderEntries();
+  genwsRenderSummary();
+  genwsRenderStatus();
+}
+
+function genwsEditEntry(path: string, ident: string): void {
+  const values = genwsPathValue(path);
+  if (!Array.isArray(values)) return;
+  const item = (values as Array<Record<string, unknown>>).find((row) => String(row.id) === ident);
+  if (!item) return;
+  const field = genwsEntryField(item);
+  if (!field) return;
+  const next = window.prompt(`改「${ident}」的 ${field}：`, String(item[field] ?? ""));
+  if (next === null) return;
+  item[field] = next;
+  genws.dirty = true;
+  genwsRenderEntries();
+  genwsRenderSummary();
+  genwsRenderStatus();
+}
+
+function genwsDeleteEntry(path: string, ident: string): void {
+  const values = genwsPathValue(path);
+  if (!Array.isArray(values)) return;
+  const items = values as Array<Record<string, unknown>>;
+  const index = items.findIndex((row) => String(row.id) === ident);
+  if (index < 0) return;
+  items.splice(index, 1);
+  genwsToggleLock(path, ident, false); // 删了就顺手解锁：别让锁定集合里留个不在册的 id
+  genws.dirty = true;
+  genwsRenderEntries();
+  genwsRenderSummary();
+  genwsRenderStatus();
+}
+
+function genwsLockCount(): number {
+  return Object.values(genws.locks).reduce((total, ids) => total + ids.length, 0);
+}
+
+function genwsToggleLock(path: string, ident: string, on: boolean): void {
+  const set = new Set(genws.locks[path] ?? []);
+  if (on) set.add(ident);
+  else set.delete(ident);
+  if (set.size) genws.locks[path] = [...set].sort();
+  else delete genws.locks[path];
+  genws.dirty = true;
+  genwsRenderStatus();
+  genwsRenderEntries();
+}
+
+/// 条目表（§3.3）：一行一条 `id · 摘要 · 锁定`；勾选即锁定（重跑不覆盖）
+function genwsRenderEntries(): void {
+  const box = $("gw-entries");
+  box.innerHTML = "";
+  if (!genws.candidate) {
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = "还没有可列的条目：先生成一份候选";
+    box.append(item);
+    return;
+  }
+  const paths: string[] = [];
+  for (const [, keys] of GENWS_SEGMENT_KEYS) {
+    for (const key of keys) paths.push(...(GENWS_ENTRY_PATHS[key] ?? [key]));
+  }
+  let rows = 0;
+  for (const path of paths) {
+    const values = genwsPathValue(path);
+    if (!Array.isArray(values) || !values.length) continue;
+    const head = document.createElement("li");
+    head.className = "entry-head";
+    head.textContent = `${path}（${values.length} 条 · 锁定 ${(genws.locks[path] ?? []).length}）`;
+    const add = document.createElement("button");
+    add.className = "entry-add";
+    add.dataset.path = path;
+    add.textContent = "＋加一条";
+    add.addEventListener("click", () => genwsAddEntry(path));
+    head.append(" ", add);
+    box.append(head);
+    for (const value of values) {
+      if (!value || typeof value !== "object") continue;
+      const item = value as Record<string, unknown>;
+      const ident = String(item.id ?? "");
+      if (!ident) continue;
+      const row = document.createElement("li");
+      row.className = "entry-row";
+      const label = document.createElement("label");
+      const tick = document.createElement("input");
+      tick.type = "checkbox";
+      tick.className = "entry-lock";
+      tick.dataset.path = path;
+      tick.dataset.ident = ident;
+      tick.checked = (genws.locks[path] ?? []).includes(ident);
+      tick.addEventListener("change", () => genwsToggleLock(path, ident, tick.checked));
+      const text = document.createElement("span");
+      text.textContent = `${ident} · ${genwsEntrySummary(item)}`;
+      const edit = document.createElement("button");
+      edit.className = "entry-edit";
+      edit.dataset.path = path;
+      edit.dataset.ident = ident;
+      edit.textContent = "改";
+      edit.addEventListener("click", () => genwsEditEntry(path, ident));
+      const remove = document.createElement("button");
+      remove.className = "entry-delete";
+      remove.dataset.path = path;
+      remove.dataset.ident = ident;
+      remove.textContent = "删";
+      remove.addEventListener("click", () => genwsDeleteEntry(path, ident));
+      label.append(tick, text, edit, remove);
+      row.append(label);
+      box.append(row);
+      rows += 1;
+    }
+  }
+  if (!rows) {
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = "这份候选还没有条目";
+    box.append(item);
+  }
+}
+
+function genwsSegmentKeys(): string[] {
+  const want = $<HTMLSelectElement>("gw-segment").value;
+  return GENWS_SEGMENT_KEYS.find(([label]) => label === want)?.[1] ?? [];
+}
+
+/// 生成 / 重跑 / 修订的公共落点：候选、错误、状态、条目表一起刷新
+function genwsAbsorb(result: Record<string, unknown>, what: string): string {
+  genws.candidate = (result.candidate ?? null) as Record<string, unknown> | null;
+  genws.errors = (result.errors ?? []) as string[];
+  genws.usage = (result.usage ?? null) as { calls?: number; limit?: number } | null;
+  genws.dirty = true;
+  genws.savedAt = null;
+  showErrors("gw-errors", genws.errors);
+  genwsRenderSegments();
+  genwsRenderSummary();
+  genwsRenderEntries();
+  genwsRenderStatus();
+  const locked = genwsLockCount();
+  return genws.errors.length
+    ? `${what}未通过校验：③ 里是错误清单（锁定 ${locked} 条原样保留）`
+    : `${what}完成：校验通过（锁定 ${locked} 条原样保留）`;
+}
+
+async function genwsRerun(): Promise<string> {
+  if (generateBlocked("package", "gw-rerun-note")) return "";
+  if (!genws.candidate) throw new Error("先生成一份候选");
+  const keys = genwsSegmentKeys();
+  if (!keys.length) throw new Error("先选要重跑的段");
+  setGenerateGate("package", true);
+  startProgress("package", "gw-rerun-note");
+  let result: Record<string, unknown>;
+  try {
+    result = await mgmt!.call(
+      "world.package.fill",
+      {
+        package: genws.candidate,
+        section: keys.join(","),
+        knobs: genwsReadKnobs(),
+        locked: genws.locks,
+      },
+      GENERATE_TIMEOUT_MS,
+    );
+  } finally {
+    stopProgress("package");
+    setGenerateGate("package", false);
+  }
+  return genwsAbsorb(result, `重跑「${$<HTMLSelectElement>("gw-segment").value}」`);
+}
+
+async function genwsRevise(): Promise<string> {
+  if (generateBlocked("package", "gw-rerun-note")) return "";
+  if (!genws.candidate) throw new Error("先生成一份候选");
+  const instruction = $<HTMLInputElement>("gw-instruction").value.trim();
+  if (!instruction) throw new Error("先写一句修订指令");
+  setGenerateGate("package", true);
+  startProgress("package", "gw-rerun-note");
+  let result: Record<string, unknown>;
+  try {
+    result = await mgmt!.call(
+      "world.package.revise",
+      { package: genws.candidate, instruction, locked: genws.locks },
+      GENERATE_TIMEOUT_MS,
+    );
+  } finally {
+    stopProgress("package");
+    setGenerateGate("package", false);
+  }
+  return genwsAbsorb(result, "按指令修订整包");
+}
 
 function genwsRenderKnobs(): void {
   const box = $("gw-knobs");
@@ -3008,6 +3281,7 @@ function genwsReadKnobs(): Record<string, unknown> {
 function genwsRenderStatus(): void {
   const parts = [`模型 ${genws.model || "未读取"}`];
   parts.push(`调用 ${genws.usage?.calls ?? 0}/${genws.usage?.limit ?? GENERATE_LIMIT.package}`);
+  parts.push(`锁定 ${genwsLockCount()} 条`);
   if (genws.errors.length) parts.push(`校验未过 ${genws.errors.length} 条`);
   else if (genws.candidate) parts.push("校验通过");
   else parts.push("尚未生成");
@@ -3076,6 +3350,11 @@ function genwsOpen(): void {
     button.classList.toggle("active", button.dataset.pane === "manage"); // 面包屑仍在管理页下
   }
   if (!$<HTMLInputElement>("gw-file").value.trim()) $<HTMLInputElement>("gw-file").value = "world.json";
+  fillSelect(
+    $<HTMLSelectElement>("gw-segment"),
+    GENWS_SEGMENT_KEYS.map(([label]) => [label, label]),
+  );
+  genwsRenderEntries();
   genwsRenderStatus();
   void genwsMaybeResume();
 }
@@ -3099,7 +3378,11 @@ async function genwsMaybeResume(): Promise<void> {
     }
     const loaded = await mgmt.call("world.draft.load", { name });
     const draft = (loaded.draft ?? {}) as { payload?: Record<string, unknown>; errors?: string[] };
-    genws.candidate = (draft.payload ?? null) as Record<string, unknown> | null;
+    const raw = (draft.payload ?? null) as Record<string, unknown> | null;
+    const wrapped = !!raw && typeof raw.package === "object" && raw.package !== null;
+    genws.candidate = (wrapped ? raw!.package : raw) as Record<string, unknown> | null;
+    const locks = wrapped ? raw!.locks : null;
+    genws.locks = locks && typeof locks === "object" ? (locks as Record<string, string[]>) : {};
     genws.errors = (draft.errors ?? []) as string[];
     genws.model = "";
     genws.usage = null;
@@ -3108,6 +3391,7 @@ async function genwsMaybeResume(): Promise<void> {
     showErrors("gw-errors", genws.errors);
     genwsRenderSegments();
     genwsRenderSummary();
+    genwsRenderEntries();
     genwsRenderStatus();
     $("gw-resume").textContent = `已载回草稿「${name}」（未过校验的项照旧列出）`;
   } catch (error) {
@@ -3142,37 +3426,31 @@ async function genwsGenerate(): Promise<string> {
   const started = Date.now();
   setGenerateGate("package", true);
   startProgress("package", "gw-generate-note");
+  const payload: Record<string, unknown> = {
+    brief,
+    name: $<HTMLInputElement>("gw-name").value.trim() || file.replace(/\.json$/, ""),
+    knobs,
+  };
+  if (genws.candidate) {
+    // 已有候选 → 这次是「整包重跑」：锁定条目原样带进提示词并在终局写回（§八）
+    payload.base = genws.candidate;
+    payload.locked = genws.locks;
+  }
   let result: Record<string, unknown>;
   try {
-    result = await mgmt!.call(
-      "world.package.generate",
-      {
-        brief,
-        name: $<HTMLInputElement>("gw-name").value.trim() || file.replace(/\.json$/, ""),
-        knobs,
-      },
-      GENERATE_TIMEOUT_MS,
-    );
+    result = await mgmt!.call("world.package.generate", payload, GENERATE_TIMEOUT_MS);
   } finally {
     stopProgress("package");
     setGenerateGate("package", false);
   }
-  genws.candidate = (result.candidate ?? null) as Record<string, unknown> | null;
-  genws.errors = (result.errors ?? []) as string[];
-  genws.usage = (result.usage ?? null) as { calls?: number; limit?: number } | null;
-  genws.savedAt = null;
-  genws.dirty = true;
-  showErrors("gw-errors", genws.errors);
-  genwsRenderSegments();
-  genwsRenderSummary();
-  genwsRenderStatus();
+  const message = genwsAbsorb(result, genwsLockCount() ? "整包重跑" : "生成");
   const cost =
     `调用 ${genws.usage?.calls ?? "?"}/${genws.usage?.limit ?? GENERATE_LIMIT.package} 次 · ` +
     `用时 ${elapsedLabel(Date.now() - started)} / 上限 ${elapsedLabel(GENERATE_TIMEOUT_MS)}`;
   if (!genws.errors.length) {
-    return `生成完成（${cost}）：三段都过了校验，可以 [保存为世界包]`;
+    return `${message}（${cost}）：可以 [保存为世界包]`;
   }
-  await saveDraft(file, "package", genws.candidate, genws.errors); // 失败自动留一份中间态（§十.11）
+  await saveDraft(file, "package", { package: genws.candidate, locks: genws.locks }, genws.errors); // 失败自动留一份中间态（§十.11）
   genws.dirty = false;
   genwsRenderStatus();
   return `生成未通过校验，已存为草稿（${cost}）`;
@@ -3192,7 +3470,7 @@ async function genwsSave(): Promise<string> {
 async function genwsSaveDraft(): Promise<string> {
   if (!genws.candidate) throw new Error("先生成一份候选");
   const file = $<HTMLInputElement>("gw-file").value.trim() || "world.json";
-  await saveDraft(file, "package", genws.candidate, genws.errors);
+  await saveDraft(file, "package", { package: genws.candidate, locks: genws.locks }, genws.errors);
   genws.dirty = false;
   genws.savedAt = Date.now() / 1000;
   genwsRenderStatus();
@@ -3207,6 +3485,8 @@ function bindWorld(): void {
   $("gw-generate").addEventListener("click", () => void worldAction(genwsGenerate, "gw-generate-note"));
   $("gw-save").addEventListener("click", () => void worldAction(genwsSave, "gw-generate-note"));
   $("gw-save-draft").addEventListener("click", () => void worldAction(genwsSaveDraft, "gw-generate-note"));
+  $("gw-rerun").addEventListener("click", () => void worldAction(genwsRerun, "gw-rerun-note"));
+  $("gw-revise").addEventListener("click", () => void worldAction(genwsRevise, "gw-rerun-note"));
   genwsRenderKnobs();
   $("pkg-import").addEventListener("click", () => void worldAction(importPackage, "pkg-note"));
   $("card-import").addEventListener("click", () => void worldAction(importCard, "card-import-note"));

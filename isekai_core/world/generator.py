@@ -61,6 +61,91 @@ KNOB_COUNTS: tuple[tuple[str, str], ...] = (
 KNOB_LISTS: tuple[tuple[str, str], ...] = (("include", "必须出现"), ("exclude", "禁止出现"), ("homage", "可参考致敬"))
 KNOB_KEYS = frozenset(key for key, _ in (*KNOB_TONES, *KNOB_COUNTS, *KNOB_LISTS))
 
+#: 锁定条目上限（每个段路径），防一句胡话把提示词撑爆
+LOCKS_MAX_PER_SECTION = 200
+
+
+def parse_locks(raw: Any) -> dict[str, list[str]]:
+    """锁定集合的信任边界：`{段路径: [条目 id]}`；路径是包内可寻址的点分路径（如 `world.axioms`）。
+
+    锁定 = 重生成不覆盖（DESKTOP_GENERATION_WORKSPACE_SPEC §3.3 / §八）：段级重跑与整包重跑都保留。
+    """
+    if raw in (None, "", {}):
+        return {}
+    if not isinstance(raw, dict):
+        raise PackageError("locked: 必须是对象 {段路径: [条目 id]}")
+    locks: dict[str, list[str]] = {}
+    for path, ids in raw.items():
+        if not isinstance(path, str) or not path.strip() or path.strip().startswith(".") or path.strip().endswith("."):
+            raise PackageError(f"locked: 段路径必须是包内点分路径（收到 {path!r}）")
+        items = [ids] if isinstance(ids, str) else ids
+        if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+            raise PackageError(f"locked.{path}: 条目 id 必须是字符串列表")
+        cleaned = sorted({item.strip() for item in items if item.strip()})
+        if cleaned:
+            locks[path.strip()] = cleaned[:LOCKS_MAX_PER_SECTION]
+    return locks
+
+
+def _path_value(node: Any, path: str) -> Any:
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _path_set(node: Any, path: str, value: Any) -> bool:
+    parts = path.split(".")
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or not isinstance(node.get(part), dict):
+            return False
+        node = node[part]
+    if not isinstance(node, dict):
+        return False
+    node[parts[-1]] = value
+    return True
+
+
+def apply_locks(candidate: dict[str, Any], current: dict[str, Any], locks: dict[str, list[str]]) -> dict[str, Any]:
+    """把锁定条目从 `current` 原样写回候选：锁定项排在前面，其余条目照候选顺序（可 diff、可复现）。"""
+    if not locks:
+        return candidate
+    out = clone_package(candidate)
+    for path, ids in locks.items():
+        values = _path_value(out, path)
+        sources = _path_value(current, path)
+        if not isinstance(values, list) or not isinstance(sources, list):
+            continue
+        by_id = {str(item.get("id")): item for item in sources if isinstance(item, dict)}
+        kept = [clone_package(by_id[ident]) for ident in ids if ident in by_id]
+        if not kept:
+            continue
+        wanted = set(ids)
+        rest = [item for item in values if not (isinstance(item, dict) and str(item.get("id")) in wanted)]
+        _path_set(out, path, kept + rest)
+    return out
+
+
+def locks_note(package: dict[str, Any], locks: dict[str, list[str]]) -> str:
+    """提示词里的「已定稿」段：把锁定条目原样带进去，并要求模型不要改动它们。"""
+    blocks: list[str] = []
+    for path in sorted(locks):
+        values = _path_value(package, path)
+        if not isinstance(values, list):
+            continue
+        wanted = set(locks[path])
+        items = [item for item in values if isinstance(item, dict) and str(item.get("id")) in wanted]
+        if items:
+            blocks.append(f"- {path}: {json.dumps(items, ensure_ascii=False)}")
+    if not blocks:
+        return ""
+    return (
+        "以下条目已定稿（用户锁定）：重跑后必须原样保留，不得改动字段与 id，也不要为它们另写一版。\n"
+        + "\n".join(blocks)
+        + "\n"
+    )
+
 
 def parse_knobs(raw: Any) -> dict[str, Any]:
     """旋钮载荷的信任边界：只收已知键，类型不对就报错（管理面输入，不静默吞）。
@@ -249,14 +334,21 @@ async def generate_package(
     name: str = "未命名世界",
     max_calls: int = DEFAULT_PACKAGE_CALLS,
     knobs: dict[str, Any] | None = None,
+    locked: dict[str, list[str]] | None = None,
+    base: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
     """对话式：用户描述 + 参数层旋钮 → 候选世界包（分段生成，逐段校验）→ 整包校验。
+
+    `locked` = `{段路径: [条目 id]}`（`parse_locks` 校验）；`base` = 锁定条目的出处（整包重跑时
+    把当前候选传进来，锁定项的**内容**才进得了提示词）。锁定项在段级校验与终局都原样写回。
 
     返回 (候选, 错误列表, 用量)；任一必需段落失败或调用预算用尽即整份不落盘，由调用方交回用户。
     """
     skeleton = template_package(name)
     package = clone_package(skeleton)
-    kwargs_knobs = knob_brief(knobs)
+    locks = parse_locks(locked)
+    source = clone_package(base) if isinstance(base, dict) else package
+    kwargs_knobs = knob_brief(knobs) + locks_note(source, locks)
     budget = {"calls": 0, "limit": max(1, int(max_calls))}
     for label, keys in PACKAGE_SEGMENTS:
         sub_skeleton = {key: skeleton[key] for key in keys}
@@ -284,8 +376,9 @@ async def generate_package(
         )
 
         def check(candidate: dict[str, Any], current: dict[str, Any] = package, only: tuple[str, ...] = keys) -> list[str]:
-            """只看本段负责的顶层键：别的段落还没生成，不该在本段报错。"""
+            """只看本段负责的顶层键：别的段落还没生成，不该在本段报错。锁定项先写回再判。"""
             merged = {**current, **{key: candidate.get(key, current[key]) for key in only}}
+            merged = apply_locks(merged, source, locks)
             return [item for item in validate_package(merged) if item.split(":")[0].split(".")[0].split("[")[0] in only]
 
         try:
@@ -300,55 +393,102 @@ async def generate_package(
             package[key] = candidate.get(key, package[key])
     # 文本产物的边界：谁、用什么模型生成的（管理元数据；不参与事实与可读性判定）
     stamp_generator_meta(package, model=str(getattr(llm, "model", "") or ""))
+    package = apply_locks(package, source, locks)
     return package, validate_package(package), _usage(budget, paused=False)
 
 
 async def revise_package(
-    llm: LLMClient, package: dict[str, Any], instruction: str, *, max_calls: int = DEFAULT_CARD_CALLS
+    llm: LLMClient,
+    package: dict[str, Any],
+    instruction: str,
+    *,
+    max_calls: int = DEFAULT_CARD_CALLS,
+    locked: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
-    """在现有世界包上按指令修订：产出完整新版本，不就地改文件。"""
+    """在现有世界包上按指令修订：产出完整新版本，不就地改文件。锁定条目（§3.3）修订后原样写回。"""
+    locks = parse_locks(locked)
+    source = clone_package(package)
     system = (
         "你是世界设定层的世界包修订器。按用户指令修改给定世界包，只改与指令相关的部分，其余保持原样。"
         + STRUCTURE_HINT
+        + locks_note(source, locks)
     )
     user = (
         f"修订指令：\n{instruction}\n\n当前世界包：\n{json.dumps(package, ensure_ascii=False)}\n\n"
         f"形状参考（字段类型与粒度照此填写；内容按当前世界包替换）：\n{json.dumps(EXAMPLE, ensure_ascii=False)}"
     )
     budget = {"calls": 0, "limit": max(1, int(max_calls))}
+
+    def check_locked(value: dict[str, Any]) -> list[str]:
+        return validate_package(apply_locks(value, source, locks))
+
     try:
         candidate, errors = await _generate_with_retry(
-            llm, system, user, package, validate_package, label="世界包修订", budget=budget
+            llm, system, user, package, check_locked, label="世界包修订", budget=budget
         )
     except BudgetExhausted as exc:
         return {**package}, [str(exc)], _usage(budget, paused=True)
-    return candidate, errors, _usage(budget, paused=False)
+    return apply_locks(candidate, source, locks), errors, _usage(budget, paused=False)
 
 
 async def fill_section(
-    llm: LLMClient, package: dict[str, Any], section: str, *, max_calls: int = DEFAULT_CARD_CALLS
+    llm: LLMClient,
+    package: dict[str, Any],
+    section: str,
+    *,
+    max_calls: int = DEFAULT_CARD_CALLS,
+    knobs: dict[str, Any] | None = None,
+    locked: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
-    """表单式补全：只补指定段落（world / sources / canon / narratives / races / events / life / roles …）。"""
-    if section not in package:
-        raise PackageError(f"未知段落：{section}")
+    """表单式补全：只补指定段落（world / sources / canon / narratives / races / events / life / roles …）。
+
+    「重跑这段」与「只补这段空缺」共用这一条：`section` 也接受逗号分隔的键列表（一次重跑一**段**，
+    段 = 若干顶层键，见 `PACKAGE_SEGMENTS`）；旋钮照旧生效，锁定条目（§3.3）原样写回并带进提示词。
+    """
+    keys = tuple(part.strip() for part in str(section).split(",") if part.strip())
+    if not keys:
+        raise PackageError("未知段落：空")
+    unknown = [key for key in keys if key not in package]
+    if unknown:
+        raise PackageError(f"未知段落：{'、'.join(unknown)}")
+    section = ",".join(keys)
+    locks = parse_locks(locked)
+    source = clone_package(package)
     system = (
-        "你是世界设定层的内容补全器。只补全用户指定的段落，其余段落原样返回。" + STRUCTURE_HINT
+        "你是世界设定层的内容补全器。只补全用户指定的段落，其余段落原样返回。"
+        + STRUCTURE_HINT
+        + knob_brief(knobs)
+        + locks_note(source, locks)
     )
     user = (
         f"需要补全的段落：{section}\n"
-        f"当前值（可能为空壳）：{json.dumps(package.get(section), ensure_ascii=False)}\n"
+        f"当前值（可能为空壳）：{json.dumps({key: package.get(key) for key in keys}, ensure_ascii=False)}\n"
         f"完整世界包（其他段落作为上下文，请原样返回）：{json.dumps(package, ensure_ascii=False)}\n\n"
         f"形状参考（字段类型与粒度照此填写；内容按当前世界包替换）：\n"
-        f"{json.dumps({section: EXAMPLE.get(section)}, ensure_ascii=False)}"
+        f"{json.dumps({key: EXAMPLE.get(key) for key in keys}, ensure_ascii=False)}"
     )
     budget = {"calls": 0, "limit": max(1, int(max_calls))}
+
+    def restrict(value: dict[str, Any]) -> dict[str, Any]:
+        """非本段的键一律取原包：「其余段落原样返回」由核心保证，不靠模型自觉（P2 验收口径）。"""
+        merged = {**package, **{key: value.get(key, package[key]) for key in keys}}
+        return apply_locks(merged, source, locks)
+
+    def check_locked(value: dict[str, Any]) -> list[str]:
+        """只判本段负责的键：别的段落还没重跑，不该在本段报错（与分段生成同一口径）。"""
+        return [
+            item
+            for item in validate_package(restrict(value))
+            if item.split(":")[0].split(".")[0].split("[")[0] in keys
+        ]
+
     try:
         candidate, errors = await _generate_with_retry(
-            llm, system, user, package, validate_package, label=f"段落 {section}", budget=budget
+            llm, system, user, package, check_locked, label=f"段落 {section}", budget=budget
         )
     except BudgetExhausted as exc:
         return {**package}, [str(exc)], _usage(budget, paused=True)
-    return candidate, errors, _usage(budget, paused=False)
+    return restrict(candidate), errors, _usage(budget, paused=False)
 
 
 async def generate_card(

@@ -719,6 +719,33 @@ textarea:disabled,
   color: var(--bad);
 }
 
+/* 条目表（§3.3）：段路径表头 + 一行一条 id·摘要·锁定 */
+.genws-entries {
+  list-style: none;
+  padding-left: 0;
+  margin: 6px 0;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.genws-entries .entry-head {
+  font-weight: 600;
+  color: var(--muted);
+  margin: 6px 0 2px;
+}
+
+.genws-entries .entry-row label {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.genws-entries .entry-lock {
+  flex: 0 0 auto;
+}
+
 /* 隐藏规则的最后一手（2026-09-21 复审：治症不治根）：`.hidden` 在文件靠前、`.row` 在后，
    同等特异度下 `display: flex` 会盖掉 `display: none`，于是 `.row.hidden`（如 #inst-convert-row）
    在界面上照样显示。解决办法是把这条规则放到文件最末尾——后写者胜，不靠 `!important` 记性。
