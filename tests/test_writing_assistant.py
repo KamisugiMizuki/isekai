@@ -304,7 +304,7 @@ async def test_gm_declaration_goes_through_trpg_path(tmp_path) -> None:
             campaign_id = str(campaign["campaign_id"])
             before = _counts(h, instance_id, timeline_id)
             gm_changes = {
-                "consequences": [{"kind": "institution_state", "target": "off-1", "value": "vacant",
+                "consequences": [{"kind": "state_change", "operation": "set", "target_refs": ["off-1"], "value": "vacant",
                                   "expiry": "until_cleared", "certainty": "confirmed"}],
                 "claims": [{"text": "堤长的位置空了出来", "source_id": "src-1", "audience": "公开"}],
             }

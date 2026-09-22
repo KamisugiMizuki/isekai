@@ -1,6 +1,6 @@
 # TRPG 规则共用模块设计
 
-> 状态：已定稿 v1.0（规则到世界的边界契约）；实现状态：独立公共模块仍属设计义务，当前部分校验由 Campaign Runtime / WorldRuntime 共同承接。
+> 状态：已定稿 v1.0（规则到世界的边界契约）；实现状态：独立公共模块已落地（`isekai_core/runtime/rule_common.py` ＋ 第二个真实示例插件），实现口径见 §十二。
 > 上游：[`TRPG_RULE_PLUGIN_SPEC.md`](TRPG_RULE_PLUGIN_SPEC.md)、[`TRPG_CAMPAIGN_RUNTIME_SPEC.md`](TRPG_CAMPAIGN_RUNTIME_SPEC.md)、[`../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md`](../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md)。
 > 使用方：[`TRPG_RULES_LAYER_SPEC.md`](TRPG_RULES_LAYER_SPEC.md)。
 >
@@ -348,3 +348,39 @@ GM 输入“守卫已经离开”“城门被毁”时，不应伪装成玩家�
 | 规则演进 | 私有字段留在插件结果；公共协议只在世界交界面破坏时升级 |
 
 以上场景必须覆盖真实插件进程、真实 WorldRuntime preview / commit 和联合提交边界；公共模块规范本身不代表独立实现已经存在。
+
+## 十二、实现状态（2026-09-22）
+
+公共层已作为独立模块落地：`isekai_core/runtime/rule_common.py`（纯函数，不碰库、不调模型）。
+三条路径都走它，没有旁路：
+
+- 战役行动：`trpg.action.resolve`（带 `campaign_id`）→ `CampaignRuntime.resolve` 规范化后停在 `reviewing`；
+- GM 直接变化：`trpg.gm.change` → 同一套规范化 → 同一条联合提交管线（`runtime/trpg.py::_joint_apply`）；
+- B0 兼容：`trpg.action.resolve`（不带 `campaign_id`）→ 规范化的 `campaign=False` 形态。
+
+| 本项目条文 | 实现 | 判据 |
+|---|---|---|
+| 规范化输出（§3.6） | `rule_common.normalize()` 返回 `status / origin / raw_resolution / rule_state_patch / changes / claims / scene_transition / world_time_request / errors / warnings`，外加 `pending`（候选 / 未确认 / 无法映射）与 `rejected`（首版不支持）两张分账 | `test_normalized_result_keeps_host_origin_and_private_resolution` |
+| 来源与版本只由宿主给（§3.6 末段） | `rule_common.origin_block()` 由路径构造；插件响应里的 `source_mode` / `campaign_id` / `expected_revision` 一概不采信 | 同上（响应里故意自报 `world_process` / `cp-evil` / `999`） |
+| 后果包闭集与形状（§3.8 / §5.1） | `change_intent` 类别 ＋ `player_choice`；kind / operation / certainty 与映射表复用 `runtime/change.py`（不另立第二份）；`target_refs` / `target` 单复数别名都认 | `test_unconfirmed_and_unmapped_outcomes_never_reach_the_world` |
+| 首版映射（§5.2） | `condition → activity_constraint`、`location_change → route_blocked`、`state_change → institution_state / custom_state / environment_state`（按世界包里登记的目标类别）、`knowledge_change → 说法`、`world_event → 事件帧`（不产生事实效果） | `test_two_differentiated_plugins_share_only_the_boundary`、`test_event_frame_alone_is_not_a_world_fact` |
+| 诚实拒绝与待审（§5.1 / §3.6 第 5 条） | `resource_change` / `relation_change` / `clock_progress` → `rejected` 并给替代路径；候选 / 未确认 / 目标判不出类别 / 说法引用不存在 / 自由字符串受众 → `needs_review`，一件不落盘 | `test_unconfirmed_and_unmapped_outcomes_never_reach_the_world`、`test_free_string_visibility_is_not_public`、`test_claim_reference_must_resolve_and_claims_keep_their_source` |
+| 两种兼容输入（§3.7） | `effects`（世界效果名）与 `consequences`（变化意图）过同一套确定性 / 受众 / 因果检查；B0 路径拒收 `rule_state_patch` / `scene_transition` / `time_advance` | `test_b0_compat_path_goes_through_the_same_checks` |
+| 时间与待选择（§5.1） | `time_advance` 后果转成联合时间请求（由提交管线同批前移时钟）；`player_choice` 只进 `scene_transition.available_choices` | `test_time_and_pending_choice_stay_out_of_world_facts` |
+| GM 直接变化（§七） | 与规则行动共用公共层与联合提交，来源保留 `gm_declaration` / `world_process` / `npc_script`，不伪造骰点、不造行动行 | `test_gm_direct_change_uses_the_same_boundary` |
+| 最低验证门槛（§九） | 第二个真实插件 `examples/tide_rules_plugin/`（成功数制骰池：压力 / 骰池 / 际遇），与 Terra 示例不共享属性、骰点或资源模型 | `test_two_differentiated_plugins_share_only_the_boundary` |
+
+行为验收在 `tests/test_trpg_rule_common.py`（真 WebSocket ＋ 真 SQLite ＋ 真插件子进程）与
+`tests/test_trpg_campaign.py`（联合提交 / 幂等 / 版本闸 / 常驻插件 / 受众隔离）。§十一 表格里属于其它层的行
+（`committed` / `duplicate` / `conflict` / `stale`、规则状态与世界后果的同批边界）由 Campaign Runtime 侧覆盖。
+
+仍留在别处、公共层不做的：
+
+- 目标是否存在、效果是否属于当前世界包闭集、时间能否推进 → WorldRuntime 提交边界（`drafts.normalize_draft` 与 `_joint_apply`）；
+- 行动状态机、场景、待选择、版本账本、幂等账本 → Campaign Runtime；
+- 规则私有 `resolution` 的解释、资源与关系的数值处理 → 具体规则插件（公共层只搬运与拒绝）。
+
+两处口径收紧，写实现时按前者：
+
+1. 插件响应的 `consequences[].kind` **必须**是变化意图类别（或 `player_choice`）；把 `institution_state` 这类世界效果名写进 `consequences` 会被拒绝并指明去处（世界效果名请放进 `effects` 兼容字段）。
+2. B0 兼容路径的 `effects` 要过同一套确定性 / 受众 / 因果检查：非 `confirmed` 的条目不再能借兼容字段落成事实。

@@ -35,7 +35,7 @@ print(json.dumps({
         "operations": [{"path": "/actors/pc-1/hp", "op": "add" if base == 0 else "increase", "value": 2}],
     },
     "consequences": [{
-        "kind": "institution_state", "target": "off-1", "value": "vacant",
+        "kind": "state_change", "operation": "set", "target_refs": ["off-1"], "value": "vacant",
         "expiry": "until_cleared", "certainty": "confirmed",
     }],
     "scene_transition": {"status": "advanced"},
@@ -142,8 +142,8 @@ def main() -> int:
             "--campaign", campaign_id, "--idempotency", "cli-gm",
             "--changes", json.dumps({
                 "consequences": [{
-                    "kind": "institution_state", "target": "off-1", "value": "occupied",
-                    "expiry": "until_cleared", "certainty": "confirmed",
+                    "kind": "state_change", "operation": "set", "target_refs": ["off-1"],
+                    "value": "occupied", "expiry": "until_cleared", "certainty": "confirmed",
                 }],
                 "claims": [{"text": "职位换了人", "source_id": "src-1", "audience": "public"}],
             }),

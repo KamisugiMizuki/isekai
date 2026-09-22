@@ -706,7 +706,7 @@ CREATE TABLE IF NOT EXISTS trpg_action(
   confirmation TEXT NOT NULL DEFAULT 'pending',  -- pending/confirmed/modified/abandoned
   action_revision INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'received',       -- 见 campaign.ACTION_STATES
-  resolution TEXT NOT NULL DEFAULT '{}',         -- 插件原始响应（含 rule_state_patch / consequences / scene_transition）
+  resolution TEXT NOT NULL DEFAULT '{}',         -- 公共模块规范化后的结果（resolution / changes / effects / claims / patch / 场景转换）
   joint_commit_id TEXT NOT NULL DEFAULT '',
   failure_code TEXT NOT NULL DEFAULT '',
   audience TEXT NOT NULL DEFAULT 'public_party',   -- 这份材料的受众（§十五）

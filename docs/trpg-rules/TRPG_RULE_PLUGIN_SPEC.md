@@ -67,6 +67,8 @@ TRPG 客户端
   "action_revision": 2,
   "actor_id": "investigator-1",
   "intent": "调查废弃礼拜堂",
+  "target_refs": ["off-1"],
+  "method": "",
   "world_snapshot": {
     "snapshot_id": "ws-12",
     "revision": "wr-18"
@@ -106,13 +108,13 @@ TRPG 客户端
     {
       "id": "c-001",
       "kind": "knowledge_change",
-      "subject": "investigator-1",
-      "target": "src-1",
       "operation": "reveal",
+      "subject_refs": ["investigator-1"],
+      "target_refs": ["src-1"],
       "value": {"claim_ref": "claim-001"},
       "certainty": "confirmed",
-      "visibility": {"audience": ["investigator-1"]},
-      "cause_ref": "act-001"
+      "visibility": "character:investigator-1",
+      "cause_refs": ["act-001"]
     }
   ],
   "scene_transition": {
@@ -126,11 +128,13 @@ TRPG 客户端
 }
 ```
 
+`consequences[].kind` 用 TRPG 规则共用模块的**变化意图类别**（`state_change` / `knowledge_change` / `world_event` / `condition` / `location_change` / `time_advance` / `player_choice`），不是 WorldRuntime 的效果名；世界效果名请走 `effects` 兼容字段。单数别名（`subject` / `target` / `cause_ref`）与 `{"audience": [...]}` 形态的 `visibility` 也认，但新插件请写复数与闭集受众。
+
 `resolution` 是规则结果记录，核心原样保存，不解析规则私有字段。`rule_state_patch` 只能写入该插件自己的规则状态命名空间，并以 `base_state_revision` 做并发校验。`consequences` 是规则插件声明的世界后果意图，先由 TRPG 规则共用模块检查，再由 WorldRuntime 校验目标、效果闭集、认知传播、版本和原子事务。`scene_transition` 只改变战役侧场景与待选择，不把未选择分支写成世界事实。规则状态 patch 与必要世界后果必须联合提交。
 
 ## 错误响应
 
-插件错误必须是结构化对象，不能用看似成功的 `resolution` 伪装失败：
+插件错误必须是结构化对象，不能用看似成功的 `resolution` 伪装失败（错误码字段名是 `code`；`kind` / `status` 也认，认不出的一律归 `needs_review`）：
 
 ```json
 {
@@ -152,6 +156,8 @@ TRPG 客户端
 错误响应不得包含可被当作规则状态 patch 或世界后果的半成品。
 ## 当前实现状态
 
+- **规则共用模块（2026-09-22 落地）**：`isekai_core/runtime/rule_common.py` 是插件结果进入世界的唯一规范化边界（见 `TRPG_RULE_COMMON_MODULE_SPEC.md` §十二）。它把已确认后果转成 `change_intent`、把候选 / 未确认 / 无法映射项放进待审、把首版不支持的 kind 明确拒绝并给替代路径——因此 `consequences[].kind` 必须是变化意图类别。规范化状态到行动状态的对照：`ready` → 停在 `reviewing`；`needs_review` → `awaiting_gm_review`；`rejected` → `rejected`；B0 路径没有待审落脚点，一律报 `invalid_input`。
+- **第二个真实插件示例**：`examples/tide_rules_plugin/`（成功数制骰池，规则状态是骰池与压力，与 Terra 示例不共享属性 / 骰点 / 资源模型）。
 - **B0 无状态 resolver（已实现）**：`trpg.action.resolve` 不带 `campaign_id` 时保持旧语义——调插件、校验 `effects`、直接落世界事件。
 - **战役裁定器（已实现）**：带 `campaign_id` 时读规则状态快照 → 调插件 → 把 `resolution` / `rule_state_patch` / `consequences` / `scene_transition` 存进行动并停在 `reviewing`，**不写世界**；世界与规则状态由 `trpg.commit` 联合提交（见 `TRPG_CAMPAIGN_RUNTIME_SPEC.md`）。
 - 插件响应的世界后果清单 `effects` 与 `consequences` 现在都接受（`runtime/rules.py` 的边界检查同时认两者）；`rule_state_patch`、结构化错误响应与常驻进程形态均已落地（见下三条）。

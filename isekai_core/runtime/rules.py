@@ -337,7 +337,9 @@ def plugin_error(result: dict[str, Any]) -> dict[str, Any] | None:
     error = result.get("error")
     if not isinstance(error, dict) or not error:
         return None
-    kind = str(error.get("kind") or error.get("status") or "").strip()
+    # 错误码字段名按协议是 `code`（TRPG_RULE_PLUGIN_SPEC「错误响应」）；`kind` / `status` 也认——
+    # 三个都不给就归 needs_review：让人看一眼比猜强
+    kind = str(error.get("kind") or error.get("code") or error.get("status") or "").strip()
     if kind not in ERROR_KINDS:
         kind = "needs_review"
     message = str(error.get("message") or error.get("detail") or error.get("reason") or "").strip()

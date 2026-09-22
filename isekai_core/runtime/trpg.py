@@ -32,7 +32,7 @@ SOURCE_EVENT: dict[str, str] = {
 }
 #: 直声明路径（`trpg.gm.change`）可指定的来源；`action` 不在此列（行动走行动路径）
 DIRECT_SOURCES: tuple[str, ...] = ("gm_declaration", "world_process", "npc_script")
-from . import drafts, rules
+from . import drafts, rule_common, rules
 
 log = get_logger("isekai.trpg")
 
@@ -469,6 +469,9 @@ class CampaignRuntime:
             "action_revision": int(row["action_revision"]),
             "actor_id": str(row["actor_id"]),
             "intent": str(row["intent"]),
+            # 行动声明的目标与方法也交给插件：规则裁定得知道这次行动冲着什么去的
+            "target_refs": _loads(row.get("target_refs"), []),
+            "method": str(row.get("method") or ""),
             "world_snapshot": {
                 "snapshot_id": str((world_snapshot or {}).get("snapshot_id") or ""),
                 "revision": int((world_snapshot or {}).get("revision") or world),
@@ -496,7 +499,16 @@ class CampaignRuntime:
             self._set_action_status(self._action_row(instance_id, timeline_id, campaign_id, action_id),
                                     "plugin_failed", failure_code="plugin_failed")
             raise CampaignRuntimeError(str(exc)) from exc
-        normalized = normalize_result(result)
+        normalized = rule_common.normalize(
+            result,
+            origin=rule_common.origin_block(
+                instance_id, timeline_id, campaign_id=campaign_id, action_ref=action_id,
+                source_mode="action", source_plugin=str(plugin_manifest or campaign_row["plugin_manifest"]),
+                expected_revision=world,
+                expected_state_revisions={ruleset_id: int(state["state_revision"]) if state else 0},
+            ),
+            package=self._world_package(instance_id),
+        )
         reported = normalized.get("plugin_error")
         if reported is not None:
             kind = str(reported["kind"])
@@ -513,10 +525,21 @@ class CampaignRuntime:
                 "errors": normalized["errors"],
                 "action_id": action_id,
             }
-        if normalized["errors"]:
-            failed = self._action_row(instance_id, timeline_id, campaign_id, action_id)
-            self._fail(failed, "awaiting_gm_review", code="needs_review")
-            return {"status": "needs_review", "errors": normalized["errors"], "action_id": action_id}
+        if normalized["status"] != "ready":
+            # 公共层已经判死 / 需人看：规则状态与世界都留原样，行动停在真实状态（§六）
+            self._fail(
+                self._action_row(instance_id, timeline_id, campaign_id, action_id),
+                "awaiting_gm_review" if normalized["status"] == "needs_review" else "rejected",
+                code=normalized["status"],
+            )
+            return {
+                "status": normalized["status"],
+                "action_id": action_id,
+                "errors": normalized["errors"],
+                "warnings": normalized["warnings"],
+                "pending": normalized["pending"],
+                "rejected": normalized["rejected"],
+            }
         row = {
             **self._action_row(instance_id, timeline_id, campaign_id, action_id),
             "status": campaign_mod.transition(
@@ -531,12 +554,14 @@ class CampaignRuntime:
         return {
             "status": "reviewing",
             "action_id": action_id,
-            "resolution": normalized["resolution"],
+            "resolution": normalized["raw_resolution"],
             "rule_state_patch": normalized["rule_state_patch"],
-            "consequences": normalized["consequences"],
+            "changes": normalized["changes"],
+            "consequences": normalized["payload"]["effects"],
             "scene_transition": normalized["scene_transition"],
-            "participants": normalized["participants"],
-            "legacy_effects": normalized["legacy_effects"],
+            "world_time_request": normalized["world_time_request"],
+            "participants": normalized["payload"]["participants"],
+            "warnings": normalized["warnings"],
         }
 
     # ------------------------------------------------------------ 联合提交
@@ -619,9 +644,28 @@ class CampaignRuntime:
                     "joint_commit_id": str(existing["joint_commit_id"])}
         campaign_row = self._campaign_row(instance_id, timeline_id, campaign_id)
         self._require_live(campaign_row, what="提交 GM 裁定")
-        payload = {**changes, "resolution": {"system": "gm", "outcome": "declared"}}
+        # GM 直接变化与规则裁定共用公共模块（§七）：同样查结构 / 受众 / 时间 / 因果，
+        # 只是没有行动与骰点，来源落 gm_declaration（或世界过程 / 剧本推进）。
+        normalized = rule_common.normalize(
+            {**changes, "resolution": {"system": "gm", "outcome": "declared"}},
+            origin=rule_common.origin_block(
+                instance_id, timeline_id, campaign_id=campaign_id, source_mode=source,
+                expected_revision=self._world(instance_id, timeline_id),
+            ),
+            package=self._world_package(instance_id),
+            audience=audience,
+        )
+        if normalized["status"] != "ready":
+            return {
+                "status": normalized["status"],
+                "action_id": "",
+                "errors": normalized["errors"],
+                "warnings": normalized["warnings"],
+                "pending": normalized["pending"],
+                "rejected": normalized["rejected"],
+            }
         return self._joint_apply(
-            campaign_row, payload,
+            campaign_row, normalized["payload"],
             instance_id=instance_id, timeline_id=timeline_id, campaign_id=campaign_id,
             action_row=None, action_id="", source_mode=source,
             idempotency_key=idempotency_key, audience=audience, now_real=now_real,
@@ -694,9 +738,8 @@ class CampaignRuntime:
 
         instance = self.store.instance_get(instance_id) or {}
         world = self._world(instance_id, timeline_id)
-        consequences = payload.get("consequences")
-        if consequences is None:
-            consequences = payload.get("effects") or []
+        # 后果只认公共模块规范化过的世界效果（规则状态 patch 之外没有第二个效果来源）
+        consequences = payload.get("effects") or []
         claims = payload.get("claims") or []
         draft_payload = {
             "intent": str((action_row or {}).get("intent") or ("GM 直接裁定" if action_row is None else "")),
@@ -1208,6 +1251,12 @@ class CampaignRuntime:
     def _world(self, instance_id: str, timeline_id: str) -> int:
         return int(self.runtime.world_moment(instance_id, timeline_id))
 
+    def _world_package(self, instance_id: str) -> dict[str, Any]:
+        """实例设定快照里的世界包：公共模块判定 `state_change` 的目标类别要用它（§5.2）。"""
+        instance = self.store.instance_get(instance_id) or {}
+        package = self.runtime.setting(instance).get("world_package")
+        return package if isinstance(package, dict) else {}
+
     def _campaign_row(self, instance_id: str, timeline_id: str, campaign_id: str) -> dict[str, Any]:
         row = self.store.trpg_get(
             "campaign", instance_id=instance_id, timeline_id=timeline_id, campaign_id=campaign_id
@@ -1384,82 +1433,3 @@ class CampaignRuntime:
         if row is None:
             return {"status": "committed", "joint_commit_id": joint_commit_id}
         return {**_loads(row["result"], {}), "status": "duplicate", "joint_commit_id": joint_commit_id}
-
-
-def normalize_result(result: dict[str, Any]) -> dict[str, Any]:
-    """把插件响应收敛成四段结果（§五）；旧 `effects` 字段按 B0 兼容路径接受。
-
-    这是「规则共用模块」的最小职责：结构、命名空间与确定性标记的检查在这里，
-    目标 / 效果闭集 / 版本 / 因果的检查在 WorldRuntime 的提交边界（§六）。
-    """
-    plugin_err = rules.plugin_error(result)
-    if plugin_err is not None:
-        # 结构化错误响应（§「错误响应」）：不是裁定，别往四段结果里塞；夹带半成品就一字不采信
-        errors = []
-        if plugin_err["half_baked"]:
-            errors.append(
-                "插件错误响应里带了裁定半成品（"
-                + "、".join(plugin_err["half_baked"])
-                + "）：规约禁止，一律不采信"
-            )
-        return {
-            "errors": errors,
-            "plugin_error": plugin_err,
-            "payload": {},
-            "resolution": {},
-            "rule_state_patch": None,
-            "consequences": [],
-            "scene_transition": {},
-            "participants": [],
-            "legacy_effects": False,
-        }
-    errors: list[str] = []
-    resolution = result.get("resolution")
-    if not isinstance(resolution, dict) or not resolution:
-        errors.append("插件响应缺少 resolution 对象")
-        resolution = {} if not isinstance(resolution, dict) else resolution
-    patch = result.get("rule_state_patch")
-    if patch is not None:
-        errors.extend(campaign_mod.validate_patch(patch))
-    consequences = result.get("consequences")
-    legacy = False
-    if consequences is None:
-        consequences = result.get("effects")
-        legacy = True
-    if consequences is None:
-        consequences = []
-    if not isinstance(consequences, list):
-        errors.append("consequences / effects 必须是数组")
-        consequences = []
-    for index, item in enumerate(consequences):
-        if not isinstance(item, dict):
-            errors.append(f"consequences[{index}] 必须是对象")
-            continue
-        if str(item.get("certainty") or "confirmed") != "confirmed":
-            errors.append(f"consequences[{index}]: 候选 / 未确认内容不能提交为世界事实")
-    transition = result.get("scene_transition")
-    if transition is not None and not isinstance(transition, dict):
-        errors.append("scene_transition 必须是对象")
-        transition = {}
-    claims = result.get("claims") or []
-    if not isinstance(claims, list):
-        errors.append("claims 必须是数组")
-        claims = []
-    payload = {
-        "resolution": resolution,
-        "consequences": consequences,
-        "rule_state_patch": patch,
-        "scene_transition": transition or {},
-        "claims": claims,
-        "participants": result.get("participants") or [],
-    }
-    return {
-        "errors": errors,
-        "payload": payload,
-        "resolution": resolution,
-        "rule_state_patch": patch,
-        "consequences": consequences,
-        "scene_transition": transition or {},
-        "participants": payload["participants"],
-        "legacy_effects": legacy,
-    }

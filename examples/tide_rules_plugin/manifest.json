@@ -1,0 +1,10 @@
+{
+  "id": "tide",
+  "name": "潮汐骰池（示例规则）",
+  "version": "0.1.0",
+  "ruleset_version": "0.1.0",
+  "protocol": "isekai.trpg.rules/1",
+  "entry": ["python", "tide_rules.py"],
+  "modes": ["stateless_resolver", "campaign_resolver"],
+  "state_schema": "tide.state/1"
+}

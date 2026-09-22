@@ -432,6 +432,8 @@ TRPG 规则层：
 - GM 直接变化使用 `source_mode=gm_declaration`，不伪造规则骰点，但经过同一预览 / 提交校验；
 - action_id 与 idempotency_key 分开：前者是规则行动身份，后者是底层提交幂等身份。
 
+**落地状态（2026-09-22）**：TRPG 侧的「规则共用模块」已独立落地（`isekai_core/runtime/rule_common.py`，见 `TRPG_RULE_COMMON_MODULE_SPEC.md` §十二）——插件结果先经它规范化成 `change_intent`，再由 Campaign Runtime 走本文件的提交语义（`runtime/trpg.py::_joint_apply` 是那条唯一管线：规则状态 patch ＋ 世界后果 ＋ 场景转换 ＋ 时间锚点同批）。两个差异化规则插件（`examples/terra_v12_rules_plugin`、`examples/tide_rules_plugin`）都经同一提交边界落世界，WorldRuntime 不读规则私有字段。
+
 ### 7.3 Writing Assistant
 
 ```text

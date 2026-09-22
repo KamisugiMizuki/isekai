@@ -1,6 +1,6 @@
 # TRPG 规则层模块设计
 
-> 状态：已定稿 v1.0（跨模块编排规范）；实现状态：底层 Campaign Runtime、规则插件协议和联合提交已落地，完整客户端仍属独立实现范围。
+> 状态：已定稿 v1.0（跨模块编排规范）；实现状态：底层 Campaign Runtime、规则插件协议、规则共用模块与联合提交已落地，完整客户端仍属独立实现范围。
 > 上游：[`../worldruntime/DESIGN.md`](../worldruntime/DESIGN.md)、[`../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md`](../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md)、[`../trpg-client/TRPG_CLIENT_SPEC.md`](../trpg-client/TRPG_CLIENT_SPEC.md)、[`TRPG_CAMPAIGN_RUNTIME_SPEC.md`](TRPG_CAMPAIGN_RUNTIME_SPEC.md)、[`TRPG_RULE_PLUGIN_SPEC.md`](TRPG_RULE_PLUGIN_SPEC.md)、[`TRPG_RULE_COMMON_MODULE_SPEC.md`](TRPG_RULE_COMMON_MODULE_SPEC.md)。
 > 评价依据：[`TRPG_GM_USER_EVALUATION_DRAFT.md`](TRPG_GM_USER_EVALUATION_DRAFT.md)。
 >

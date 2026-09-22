@@ -1668,11 +1668,11 @@ async def _resolve_trpg_action(
             )
         except campaign_mod.CampaignError as exc:
             raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
-    from ..runtime import drafts, rules
+    from ..runtime import drafts, rule_common, rules
 
     world = _world_service(cfg, store)
     try:
-        resolution = await rules.resolve(
+        plugin_result = await rules.resolve(
             plugin,
             {
                 "type": "resolve_action",
@@ -1682,14 +1682,27 @@ async def _resolve_trpg_action(
                 "context": args.get("context") if isinstance(args.get("context"), dict) else {},
             },
         )
-        payload = {
-            "intent": intent,
-            "effects": resolution["effects"],
-            "claims": resolution.get("claims") or [],
-            "participants": resolution.get("participants") or [],
-        }
         instance = store.instance_get(instance_id) or {}
         watermark = world.world_moment(instance_id, timeline_id)
+        # 规则共用模块是唯一入口（TRPG_RULE_COMMON_MODULE_SPEC §3.7）：B0 兼容路径与战役路径
+        # 过同一套确定性 / 受众 / 因果检查，只是不接受规则状态 patch 与场景转换。
+        boundary = rule_common.normalize(
+            plugin_result,
+            origin=rule_common.origin_block(
+                instance_id, timeline_id, action_ref=action_id, source_mode="action",
+                source_plugin=plugin, expected_revision=watermark,
+            ),
+            package=world.setting(instance)["world_package"], campaign=False,
+        )
+        if boundary["status"] != "ready":
+            # B0 没有待审 / 待选择的落脚点（§3.7）：如实拒绝，不假装接受
+            raise UmpError(Err.INVALID, _boundary_text(boundary), retryable=False)
+        payload = {
+            "intent": intent,
+            "effects": boundary["payload"]["effects"],
+            "claims": boundary["payload"]["claims"],
+            "participants": boundary["payload"]["participants"],
+        }
         targets, channels = world._known_targets(instance, timeline_id, world_seconds=watermark)
         normalized = drafts.normalize_draft(
             world.setting(instance)["world_package"], payload,
@@ -1697,13 +1710,21 @@ async def _resolve_trpg_action(
         )
         result = world.apply_external_event(
             instance_id, timeline_id, normalized, source="player_action", action_id=action_id,
-            resolution=resolution["resolution"],
+            resolution=boundary["raw_resolution"],
         )
     except rules.RulePluginError as exc:
         raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
     except ValueError as exc:
         raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
-    return {"accepted": True, "resolution": resolution["resolution"], **result}
+    return {"accepted": True, "resolution": boundary["raw_resolution"], **result}
+
+
+def _boundary_text(boundary: dict[str, Any]) -> str:
+    """公共模块的拒绝理由：错误 + 待审 + 首版不支持，一次说清，不猜。"""
+    parts = [str(item) for item in boundary.get("errors") or []]
+    parts += [f"{item['id']}：{item['reason']}" for item in boundary.get("pending") or []]
+    parts += [f"{item['id']}：{item['reason']}" for item in boundary.get("rejected") or []]
+    return "；".join(parts) or "规则结果无法进入世界边界"
 
 
 async def _extract_memories(cfg: Config, llm: Any, store: Store | None, args: dict[str, Any]) -> dict[str, Any]:

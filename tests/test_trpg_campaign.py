@@ -43,11 +43,14 @@ patch = {
 if mode == "bad_base":
     patch["base_state_revision"] = base + 5
 consequences = [{
-    "kind": "institution_state", "target": "off-1", "value": "vacant",
+    "kind": "state_change", "operation": "set", "target_refs": ["off-1"], "value": "vacant",
     "expiry": "until_cleared", "certainty": "confirmed",
 }]
+effects_only = None
 if mode == "bad_world":
-    consequences = [{
+    # 目标没进世界包：走 effects 兼容输入，由 WorldRuntime 的提交边界拒整批（§3.7）
+    consequences = []
+    effects_only = [{
         "kind": "institution_state", "target": "off-999", "value": "vacant",
         "expiry": "until_cleared", "certainty": "confirmed",
     }]
@@ -70,6 +73,12 @@ print(json.dumps({
     "consequences": consequences,
     "scene_transition": transition,
     "claims": [{"text": "职位出现变动", "source_id": "src-1", "audience": "public"}],
+    "participants": ["pc-1"],
+} if not effects_only else {
+    "resolution": {"system": "fake-rules", "outcome": "success", "mode": mode},
+    "rule_state_patch": patch,
+    "effects": effects_only,
+    "claims": [],
     "participants": ["pc-1"],
 }, ensure_ascii=False))
 '''
@@ -114,7 +123,7 @@ print(json.dumps({
         "operations": [{"path": "/actors/" + which + "/hp", "op": "add", "value": 1}],
     },
     "consequences": [{
-        "kind": "institution_state", "target": "off-1", "value": "vacant",
+        "kind": "state_change", "operation": "set", "target_refs": ["off-1"], "value": "vacant",
         "expiry": "until_cleared", "certainty": "confirmed",
     }],
     "scene_transition": {"status": "advanced"},
@@ -155,7 +164,7 @@ for line in sys.stdin:                     # 读到 EOF 就退出（核心被杀
             }],
         },
         "consequences": [{
-            "kind": "institution_state", "target": "off-1", "value": "vacant",
+            "kind": "state_change", "operation": "set", "target_refs": ["off-1"], "value": "vacant",
             "expiry": "until_cleared", "certainty": "confirmed",
         }],
         "scene_transition": {"status": "advanced"},
@@ -176,7 +185,7 @@ if kind == "half":
     answer = {
         "error": {"kind": "rejected", "message": "带半成品"},
         "consequences": [{
-            "kind": "institution_state", "target": "off-1", "value": "vacant",
+            "kind": "state_change", "operation": "set", "target_refs": ["off-1"], "value": "vacant",
             "expiry": "until_cleared", "certainty": "confirmed",
         }],
         "rule_state_patch": {
@@ -758,7 +767,7 @@ async def test_gm_change_commits_without_action_or_plugin(tmp_path) -> None:
             campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
             changes = {
                 "consequences": [{
-                    "kind": "institution_state", "target": "off-1", "value": "vacant",
+                    "kind": "state_change", "operation": "set", "target_refs": ["off-1"], "value": "vacant",
                     "expiry": "until_cleared", "certainty": "confirmed",
                 }],
                 "claims": [{"text": "职位出现变动", "source_id": "src-1", "audience": "public"}],
@@ -1080,7 +1089,7 @@ async def test_source_axis_is_fine_grained(tmp_path) -> None:
             campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
             changes = {
                 "consequences": [{
-                    "kind": "institution_state", "target": "off-1", "value": "vacant",
+                    "kind": "state_change", "operation": "set", "target_refs": ["off-1"], "value": "vacant",
                     "expiry": "until_cleared", "certainty": "confirmed",
                 }],
             }
