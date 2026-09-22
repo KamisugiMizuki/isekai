@@ -96,7 +96,12 @@ def _consequences(
     intent = str(request.get("intent") or "")
     consequences: list[dict[str, Any]] = []
     claims: list[dict[str, Any]] = []
-    transition: dict[str, Any] = {"status": "advanced", "next_phase": "对峙" if roll["banes"] else "推进"}
+    transition: dict[str, Any] = {
+        "status": "advanced",
+        "next_phase": "对峙" if roll["banes"] else "推进",
+        # 规则节拍：一次裁定走一个规则时间单位，**不动世界秒**（只有显式 time_advance 才动）
+        "rule_time_delta": 1,
+    }
 
     if roll["outcome"] == "失败":
         # 失败不是「没有变化」：被压制是持续约束，还留一个待选分支与一段世界时间

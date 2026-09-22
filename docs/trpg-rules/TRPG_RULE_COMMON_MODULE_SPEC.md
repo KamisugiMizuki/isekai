@@ -367,6 +367,7 @@ GM 输入“守卫已经离开”“城门被毁”时，不应伪装成玩家�
 | 诚实拒绝与待审（§5.1 / §3.6 第 5 条） | `resource_change` / `relation_change` / `clock_progress` → `rejected` 并给替代路径；候选 / 未确认 / 目标判不出类别 / 说法引用不存在 / 自由字符串受众 → `needs_review`，一件不落盘 | `test_unconfirmed_and_unmapped_outcomes_never_reach_the_world`、`test_free_string_visibility_is_not_public`、`test_claim_reference_must_resolve_and_claims_keep_their_source` |
 | 两种兼容输入（§3.7） | `effects`（世界效果名）与 `consequences`（变化意图）过同一套确定性 / 受众 / 因果检查；B0 路径拒收 `rule_state_patch` / `scene_transition` / `time_advance` | `test_b0_compat_path_goes_through_the_same_checks` |
 | 时间与待选择（§5.1） | `time_advance` 后果转成联合时间请求（由提交管线同批前移时钟）；`player_choice` 只进 `scene_transition.available_choices` | `test_time_and_pending_choice_stay_out_of_world_facts` |
+| 规则时间与世界时间（§九 / §十四） | `scene_transition.rule_time_delta` 只落场景节拍（`turn_state.rule_time`）；世界秒只有显式时间请求才动 | `test_two_differentiated_plugins_share_only_the_boundary`、探针 B01b |
 | GM 直接变化（§七） | 与规则行动共用公共层与联合提交，来源保留 `gm_declaration` / `world_process` / `npc_script`，不伪造骰点、不造行动行 | `test_gm_direct_change_uses_the_same_boundary` |
 | 最低验证门槛（§九） | 第二个真实插件 `examples/tide_rules_plugin/`（成功数制骰池：压力 / 骰池 / 际遇），与 Terra 示例不共享属性、骰点或资源模型 | `test_two_differentiated_plugins_share_only_the_boundary` |
 

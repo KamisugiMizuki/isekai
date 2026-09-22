@@ -323,6 +323,15 @@ async def acceptance_rows() -> None:
                f"tide resolution 键={sorted(tide_resolved['resolution'])}",
                "两套插件真进程；公共层只搬运 resolution 与规则状态")
 
+        tide_view = await h.mgmt.call("trpg.scene.view", instance_id=tide_instance,
+                                     timeline_id=tide_line, campaign_id=tide_id)
+        tide_beat = (tide_view.get("scene") or {}).get("turn_state", {}).get("rule_time")
+        expect("B01b 规则节拍与世界秒分开",
+               "插件申报的规则时间落在场景 turn_state，不改世界时钟",
+               tide_beat == 1,
+               f"turn_state.rule_time={tide_beat}",
+               "scene_transition.rule_time_delta → _apply_transition；世界时间只认显式请求")
+
         # B02 成功 / 代价 / 失败：已确认部分落成结构化后果，候选只能待审
         candidate_resolved, _ = await step(h, instance_id, timeline_id, fake_id, plugin,
                                            intent="candidate", key="b02", commit=False)

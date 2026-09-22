@@ -223,6 +223,10 @@ async def test_two_differentiated_plugins_share_only_the_boundary(tmp_path) -> N
                        if str(row["source"]) == "trpg_action"]
             kinds = [str(item["kind"]) for batch in effects for item in batch]
             assert "activity_constraint" in kinds, effects
+            # 规则节拍留在场景的 turn_state 里，不冒充世界秒（§九：规则时间与世界时间不一致不强行覆盖）
+            view = await mgmt.call("trpg.scene.view", instance_id=info["id"], timeline_id=timeline_id,
+                                   campaign_id=tide_campaign)
+            assert view["scene"]["turn_state"]["rule_time"] == 1, view["scene"]["turn_state"]
         finally:
             await mgmt.close()
 
