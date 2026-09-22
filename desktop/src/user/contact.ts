@@ -90,7 +90,21 @@ export class ContactPane implements Pane {
     const scroll = el("div", { class: "u-messages", tabindex: "0" });
     scroll.addEventListener("scroll", () => {
       this.atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 40;
+      if (this.atBottom) this.hideNewHint();
     });
+    const newHint = button(
+      "有新消息 ↓",
+      () => {
+        scroll.scrollTop = scroll.scrollHeight;
+        this.atBottom = true;
+        this.hideNewHint();
+      },
+      { class: "u-new-hint u-btn", id: "u-contact-new" },
+    );
+    newHint.hidden = true;
+    this.newHint = newHint;
+    const live = el("span", { class: "u-sr-only", role: "status", "aria-live": "polite" });
+    this.liveHost = live;
     this.systemHost = el("div", { class: "u-system" });
     const composerNote = el("p", { class: "u-note" });
     this.statusNote = composerNote;
@@ -128,6 +142,8 @@ export class ContactPane implements Pane {
       header,
       el("div", { class: "u-row" }, more),
       scroll,
+      newHint,
+      live,
       this.systemHost,
       composerNote,
       this.draftSlot,
@@ -143,6 +159,13 @@ export class ContactPane implements Pane {
 
   private scrollHost: HTMLElement | null = null;
   private headerHost: HTMLElement | null = null;
+  private newHint: HTMLButtonElement | null = null;
+  private liveHost: HTMLElement | null = null;
+  private rendered = 0;
+
+  private hideNewHint(): void {
+    if (this.newHint) this.newHint.hidden = true;
+  }
 
   /* ---------------------------------------------------------------- 选择与连接 */
 
@@ -435,8 +458,14 @@ export class ContactPane implements Pane {
       ...this.messages.map((message) => this.renderMessage(message)),
       ...this.pending.map((item) => this.renderPending(item)),
     );
+    const total = this.messages.length + this.pending.length;
     if (force || wasAtBottom) this.scrollHost.scrollTop = this.scrollHost.scrollHeight;
-    else this.scrollHost.scrollTop = this.scrollHost.scrollHeight - keep;
+    else {
+      this.scrollHost.scrollTop = this.scrollHost.scrollHeight - keep;
+      // 用户正在看旧记录：新内容不强制拉到底，给一个可点的入口（§6.1）
+      if (total > this.rendered && this.newHint) this.newHint.hidden = false;
+    }
+    this.rendered = total;
     const more = this.host?.querySelector("#u-contact-more") as HTMLButtonElement | null;
     if (more) more.hidden = !this.hasMore;
     this.updateGate();
@@ -555,6 +584,7 @@ export class ContactPane implements Pane {
       this.thinking = false;
       this.link?.confirmDelivery(event.messageId, event.batchIndex, "accepted");
       this.renderMessages();
+      if (this.liveHost) this.liveHost.textContent = "收到一条新回复"; // 读屏播报；不朗读全文、不逐秒播报
       this.setStatus("回复已保存", "ok");
       return;
     }

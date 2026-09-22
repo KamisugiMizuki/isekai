@@ -178,6 +178,7 @@ export function primary(label: string, onClick: () => void, opts: { disabled?: b
 export function dialog(title: string, body: Child[], actions: Array<{ label: string; run: () => void; primary?: boolean }>): { node: HTMLElement; close: () => void } {
   const overlay = el("div", { class: "u-dialog-backdrop" });
   const box = el("div", { class: "u-dialog", role: "dialog", "aria-modal": "true", "aria-label": title });
+  const restore = document.activeElement as HTMLElement | null;
   box.appendChild(el("h3", { class: "u-dialog-title", text: title }));
   const content = el("div", { class: "u-dialog-body" });
   append(content, body);
@@ -186,6 +187,7 @@ export function dialog(title: string, body: Child[], actions: Array<{ label: str
   const close = () => {
     overlay.remove();
     document.removeEventListener("keydown", onKey);
+    restore?.focus?.(); // 关掉模态要把焦点还给打开它的那个控件
   };
   for (const action of actions) {
     row.appendChild(
@@ -205,5 +207,7 @@ export function dialog(title: string, body: Child[], actions: Array<{ label: str
     if (event.key === "Escape") close();
   };
   document.addEventListener("keydown", onKey);
+  box.tabIndex = -1;
+  box.focus(); // 打开即入框：键盘 / 读屏用户不会掉在页面别处
   return { node: overlay, close };
 }

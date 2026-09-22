@@ -145,14 +145,14 @@ async def main() -> None:
         prefs = await cdp.js("JSON.stringify(window.__uiApp.probeState.prefs)")
         print("[向导]", json.dumps({"进入选择任务": reached_task, "偏好": prefs}, ensure_ascii=False)[:400])
         if not reached_task:
-            problems.append(f"连接测试没有走通：{await visible_text(cdp, '#u-main')[:300]}")
+            problems.append(f"连接测试没有走通：{(await visible_text(cdp, '#u-main'))[:300]}")
         elif '"ai.verified":true' not in str(prefs):
             problems.append("测试通过但没记下「已验证」")
         if "api_key" in str(await visible_text(cdp, "#u-main")) and "访问密钥" not in await visible_text(cdp, "#u-main"):
             problems.append("界面把密钥当正文显示了")
 
         # ---------------- 3) 从样例创建 ----------------
-        await click_text(cdp, "#u-main button", "选这个")
+        await click_text(cdp, "#u-main button", "开始联络")
         await wait_true(cdp, "!!document.getElementById('onb-sample')")
         options = await cdp.js(
             "[...document.querySelectorAll('#onb-character option')].map(o=>o.textContent).join(',')"
@@ -165,7 +165,7 @@ async def main() -> None:
             cdp, "(document.querySelector('#u-main')?.innerText||'').includes('开始运行并联络')", timeout=60.0
         )
         if not created:
-            problems.append(f"创建没有走到开始使用：{await visible_text(cdp, '#u-main')[:300]}")
+            problems.append(f"创建没有走到开始使用：{(await visible_text(cdp, '#u-main'))[:300]}")
         else:
             start_text = await visible_text(cdp, "#u-main")
             print("[开始使用]", json.dumps(start_text[:120], ensure_ascii=False))
@@ -174,7 +174,7 @@ async def main() -> None:
         await click_text(cdp, "#u-main button", "开始运行并联络")
         in_contact = await wait_true(cdp, "!!document.querySelector('#u-contact-input')", timeout=60.0)
         if not in_contact:
-            problems.append(f"没有进入角色联络：{await visible_text(cdp, '#u-main')[:300]}")
+            problems.append(f"没有进入角色联络：{(await visible_text(cdp, '#u-main'))[:300]}")
 
         # ---------------- 4) 联络真往返 ----------------
         header = await visible_text(cdp, ".u-contact-head")

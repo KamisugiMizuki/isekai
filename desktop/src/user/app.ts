@@ -210,6 +210,7 @@ export class App {
 
   async boot(): Promise<void> {
     (window as unknown as { __uiApp?: App }) .__uiApp = this;
+    openDirNotify = (text, kind) => this.toast(text, kind);
     this.build();
     this.prefs = await this.loadPrefs();
     this.applyAppearance();
@@ -641,6 +642,9 @@ function coreStatusText(status: CoreStatus): string {
   return `后台服务未就绪（${status.state}）`;
 }
 
+/** 目录打开失败的反馈通道：App 启动时接上（就近反馈，不用原生弹窗） */
+let openDirNotify: ((text: string, kind: "ok" | "bad" | "muted") => void) | null = null;
+
 export async function openDir(kind: "logs" | "data" | "backups" | "packages", api?: AppApi | null): Promise<void> {
   try {
     if (kind === "logs") {
@@ -653,13 +657,18 @@ export async function openDir(kind: "logs" | "data" | "backups" | "packages", ap
     const paths = ((readiness?.paths as Json | undefined) ?? {}) as Json;
     const path = String(paths[kind === "data" ? "data" : kind === "backups" ? "backups" : "packages"] ?? "");
     if (!path) {
-      window.alert("当前没有拿到这个位置（核心未连接）");
+      fail("当前没有拿到这个位置（核心没有连接）");
       return;
     }
     await invoke("open_dir", { path });
   } catch (error) {
-    window.alert(`打开目录失败：${String(error)}`);
+    fail(`打开目录失败：${String(error)}`);
   }
+}
+
+function fail(text: string): void {
+  if (openDirNotify) openDirNotify(text, "bad");
+  else window.alert(text);
 }
 
 export function errorBox(error: unknown, module: string, action: string): HTMLElement {

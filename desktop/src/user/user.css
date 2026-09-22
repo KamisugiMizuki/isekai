@@ -15,6 +15,9 @@
   --u-ok: #1f6f43;
   --u-bad: #9b1c1c;
   --u-warn: #8a5a00;
+  --u-border-soft: #d5d5d5;
+  /* 输入类控件的边界（≥3:1）；--u-border-soft 只做分隔线 / 装饰 */
+  --u-border-control: #808080;
   --u-radius: 12px;
   --u-font-size: 16px;
   --u-font: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
@@ -28,6 +31,11 @@ html[data-theme="dark"] {
   --u-sunken: #1f1f1f;
   --u-border: #f2f2f2;
   --u-border-soft: #3a3a3a;
+  --u-border-control: #787878;
+  /* 状态色各主题分别取值、分别实测（沿用浅色值在深色底上只有 2.0–3.2:1） */
+  --u-ok: #5fbf8a;
+  --u-bad: #ef8f8f;
+  --u-warn: #d9a54a;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -39,6 +47,10 @@ html[data-theme="dark"] {
     --u-sunken: #1f1f1f;
     --u-border: #f2f2f2;
     --u-border-soft: #3a3a3a;
+    --u-border-control: #787878;
+    --u-ok: #5fbf8a;
+    --u-bad: #ef8f8f;
+    --u-warn: #d9a54a;
   }
 }
 
@@ -313,12 +325,22 @@ body[data-mode="debug"] #debug-app {
 .u-textarea {
   font: inherit;
   padding: 7px 10px;
-  border: 1px solid var(--u-border-soft);
+  border: 1px solid var(--u-border-control);
   border-radius: 8px;
   background: var(--u-bg);
   color: inherit;
   min-height: 36px;
   min-width: 220px;
+}
+
+/* 只给读屏用：不占版面，也不从可访问树里消失 */
+.u-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .u-input-narrow {
@@ -614,6 +636,20 @@ body[data-mode="debug"] #debug-app {
 
 .u-col-center {
   height: 100%;
+  position: relative;
+}
+
+/* 「有新消息」提示：不在底部时才出现（§6.1 不强制拉到底部） */
+.u-new-hint {
+  position: absolute;
+  right: 12px;
+  bottom: 96px;
+  z-index: 5;
+  min-height: 32px;
+}
+
+.u-new-hint[hidden] {
+  display: none;
 }
 
 .u-contact-head {

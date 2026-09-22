@@ -64,7 +64,7 @@ export function uiError(error: unknown, ctx: ErrorContext): UiError {
     message: "",
     retryable: false,
     done: ctx.done ?? "没有任何改动",
-    unknown: ctx.unknown ?? "这次操作的结果",
+    unknown: ctx.unknown ?? "这次操作是否已生效",
     field: ctx.field ?? "",
     requestId: "",
   };

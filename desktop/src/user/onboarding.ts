@@ -299,7 +299,7 @@ export class OnboardingPane implements Pane {
       const card = el("article", { class: "u-card" });
       card.appendChild(el("h3", { text: task }));
       if (next) {
-        card.appendChild(primary("选这个", () => void this.goto(next)));
+        card.appendChild(primary("开始联络", () => void this.goto(next)));
       } else {
         card.appendChild(el("p", { class: "u-hint", text: reason }));
         card.appendChild(button("暂未开放", () => undefined, { disabled: true }));
