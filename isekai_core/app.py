@@ -19,6 +19,7 @@ from . import plugins as plugins_mod
 from .log import get_logger
 from .runtime.service import RuntimeService
 from .world import ops as world_ops
+from . import backup_pack
 from .session import SessionService
 from .story.service import StoryService
 from .runtime.service import from_config as runtime_service_from_config
@@ -240,6 +241,13 @@ async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | N
 
     try:
         await runtime.server.start()
+        # 先完成恢复判定（§9.2 最后一行）：上次切到一半就中断的话，这里回退，不让半套数据当成正常态
+        try:
+            pending = backup_pack.resume_pending(cfg, runtime.store)
+            if pending.get("action"):
+                log.warning("restore resume: %s", pending["action"])
+        except Exception:
+            log.exception("restore resume failed")
         # 启动后补做到期检查（§五）：先把「该备份的」补上，再对外就绪
         try:
             _backup_if_due(cfg, runtime.store, note="启动后补做")
@@ -307,16 +315,17 @@ def _backup_due(cfg: Any, store: Any) -> bool:
     hours = int(getattr(backup_cfg, "interval_hours", 24) or 0)
     if hours <= 0:
         return False
-    folder = Path(store.path).parent / str(getattr(backup_cfg, "dir", "backups") or "backups")
-    latest = max((item.stat().st_mtime for item in folder.glob("isekai-*.db")), default=0.0)
+    folder = backup_pack.packs_dir(cfg)
+    latest = max((item.stat().st_mtime for item in folder.glob("isekai-auto-*.zip")), default=0.0)
     return (time.time() - latest) >= hours * 3600
 
 
 def _backup_if_due(cfg: Any, store: Any, *, note: str) -> None:
     if not _backup_due(cfg, store):
         return
-    result = world_ops.backup_once(cfg, store, note=note)
-    log.info("backup due-check %s: ok=%s", note, result.get("ok"))
+    result = backup_pack.write_pack(cfg, store, kind="auto", note=note)
+    backup_pack.rotate(cfg, keep=int(getattr(getattr(cfg, "backup", None), "keep", 7) or 7))
+    log.info("backup due-check %s: parts=%s bytes=%s", note, result.get("parts"), result.get("bytes"))
 
 
 async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float = 5.0) -> None:
@@ -327,6 +336,9 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
             return
         except asyncio.TimeoutError:
             pass
+        if backup_pack.PAUSE.is_set():
+            # 打包 / 恢复切换期间世界先别动：素材与库要来自同一时点（§9.1）
+            continue
         if runtime.world is None:
             continue
         # 兼容性阻断的实例不进这一轮的推进与派生任务（§7.6：blocked 只读，等用户确认转换）

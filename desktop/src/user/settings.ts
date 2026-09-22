@@ -13,11 +13,13 @@ import {
   button,
   chip,
   el,
+  errorCard,
   facts,
   field,
   fill,
   paragraph,
   primary,
+  sizeText,
   section,
   setNote,
   stamp,
@@ -257,27 +259,81 @@ export class SettingsPane implements Pane {
   private async backupSection(): Promise<HTMLElement> {
     const backup = ((this.ctx.settings.backup as Json) ?? {}) as Json;
     const dir = el("input", { class: "u-input", value: String(backup.dir ?? "backups") }) as HTMLInputElement;
-    const interval = el("input", { class: "u-input", type: "number", min: "1", value: String(backup.interval_hours ?? 24) }) as HTMLInputElement;
+    const interval = el("input", { class: "u-input", type: "number", min: "0", value: String(backup.interval_hours ?? 24) }) as HTMLInputElement;
     const keep = el("input", { class: "u-input", type: "number", min: "1", value: String(backup.keep ?? 7) }) as HTMLInputElement;
     const note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
-    const list = el("ul", { class: "u-list" });
+    const list = el("div", { class: "u-rows" });
+    const restoreHost = el("div", { class: "u-restore" });
+
+    let packs: Json[] = [];
     try {
-      const result = await this.ctx.api.backups();
-      const items = (result.backups as Json[]) ?? [];
-      for (const item of items.slice(0, 10)) {
-        list.appendChild(
-          el("li", {
-            text: `${String(item.file ?? "")}｜${stamp(Number(item.created_at ?? 0))}｜${Math.round(Number(item.bytes ?? 0) / 1024)} KB`,
+      const result = await this.ctx.api.packList();
+      packs = (result.packs as Json[]) ?? [];
+      const record = (result.record as Json) ?? {};
+      if (String(record.state ?? "") === "rolled_back" || String(record.state ?? "") === "needs_attention") {
+        note.textContent= `上次恢复没有走完：${String(record.state) === "rolled_back" ? "已回退到恢复前的数据" : "需要人工确认数据状态"}`;
+        note.className = `u-note u-note-${String(record.state) === "rolled_back" ? "pending" : "bad"}`;
+      }
+    } catch (error) {
+      list.appendChild(errorCard(uiError(error, { module: "备份", action: "读取列表" })));
+    }
+
+    const renderList = (): void => {
+      fill(list);
+      if (!packs.length) {
+        list.appendChild(el("p", { class: "u-hint", text: "还没有备份文件。点「立即备份全部数据」会生成一份可以整个搬走的文件。" }));
+        return;
+      }
+      for (const item of packs) {
+        const status = String(item.status ?? "");
+        const row = el("div", { class: "u-row-line" });
+        row.appendChild(
+          el("span", {
+            class: "u-grow",
+            text: `${String(item.name)}｜${stamp(Number(item.created_at ?? 0))}｜${sizeText(Number(item.bytes ?? 0))}｜${String(
+              (item.counts as Json)?.instances ?? "?",
+            )} 个世界`,
           }),
         );
+        row.appendChild(
+          chip(
+            status === "ok" ? "完整" : status === "incompatible" ? "不兼容" : "不完整",
+            status === "ok" ? "ok" : "bad",
+          ),
+        );
+        row.appendChild(
+          button("校验", () => {
+            void (async () => {
+              setNote(note, "正在校验…", "pending");
+              try {
+                const report = await this.ctx.api.packVerify(String(item.name));
+                const problems = (report.problems as string[]) ?? [];
+                setNote(
+                  note,
+                  report.complete ? "这份备份完整：内容与清单一一对上" : `这份备份不完整：${problems.slice(0, 3).join("；")}`,
+                  report.complete ? "ok" : "bad",
+                );
+              } catch (error) {
+                setNote(note, uiError(error, { module: "备份", action: "校验" }).message, "bad");
+              }
+            })();
+          }),
+        );
+        row.appendChild(button("恢复…", () => void this.restoreFlow(String(item.name), note, restoreHost)));
+        list.appendChild(row);
+        const problems = (item.problems as string[]) ?? [];
+        if (problems.length && status !== "ok") {
+          list.appendChild(el("p", { class: "u-hint", text: `问题：${problems.slice(0, 2).join("；")}` }));
+        }
       }
-      if (!items.length) list.appendChild(el("li", { class: "u-hint", text: "还没有备份文件。" }));
-    } catch (error) {
-      list.appendChild(el("li", { class: "u-note u-note-bad", text: uiError(error, { module: "备份", action: "读取列表" }).message }));
-    }
+    };
+    renderList();
+
     return section(
       "数据与备份",
-      paragraph("数据默认放在当前用户的应用数据目录；备份目录可以改到外部磁盘（同盘备份不能防磁盘损坏）。"),
+      paragraph(
+        "备份是**一份文件**：整个数据目录（世界、会话、版本、素材、草稿）都装在里面，可以拷到别的磁盘或别的机器。密钥与通道凭据不进备份。",
+      ),
       el(
         "div",
         { class: "u-row" },
@@ -285,61 +341,117 @@ export class SettingsPane implements Pane {
         button("打开备份目录", () => void openDir("backups", this.ctx.api)),
       ),
       field("备份目录（相对数据根）", dir),
-      field("检查间隔（小时）", interval),
-      field("保留份数", keep),
+      field("自动备份间隔（小时，0 = 只在退出前补做）", interval),
+      field("自动备份保留份数", keep),
       el(
         "div",
         { class: "u-row" },
-        primary("保存备份设置", () => {
+        primary("立即备份全部数据", () => {
+          void (async () => {
+            setNote(note, "正在打包（世界先停一下，装完继续）…", "pending");
+            try {
+              const result = await this.ctx.api.packCreate("界面手动备份");
+              const record = (result.backup as Json) ?? result;
+              packs = ((await this.ctx.api.packList()).packs as Json[]) ?? packs;
+              renderList();
+              setNote(note, `备份完成：${String(record.name ?? "新文件")}（${sizeText(Number(record.bytes ?? 0))}）`, "ok");
+            } catch (error) {
+              setNote(note, uiError(error, { module: "备份", action: "备份全部数据" }).message, "bad");
+            }
+          })();
+        }),
+        button("保存备份设置", () => {
           void (async () => {
             try {
               await this.ctx.api.saveSettings({
-                backup: { dir: dir.value.trim(), interval_hours: Number(interval.value || 24), keep: Number(keep.value || 7) },
+                backup: { dir: dir.value.trim(), interval_hours: Number(interval.value || 0), keep: Number(keep.value || 7) },
               });
               await this.ctx.refresh();
-              setNote(note, "已保存", "ok");
+              setNote(note, "已保存（关闭自动备份不影响日常保存）", "ok");
             } catch (error) {
               setNote(note, uiError(error, { module: "设置", action: "保存备份设置" }).message, "bad");
             }
           })();
         }),
-        button("立即备份", () => {
-          void (async () => {
-            setNote(note, "正在备份…", "pending");
-            try {
-              const result = await this.ctx.api.backupNow("界面手动备份");
-              const saved = (result.backup as Json) ?? result;
-              setNote(note, `备份完成：${String(saved.file ?? "新的备份文件")}`, "ok");
-            } catch (error) {
-              setNote(note, uiError(error, { module: "备份", action: "立即备份" }).message, "bad");
-            }
-          })();
-        }),
-        button("恢复备份…", () => void this.restoreBackup(note)),
       ),
       note,
       list,
+      restoreHost,
     );
   }
 
-  private async restoreBackup(note: HTMLElement): Promise<void> {
+  /** 恢复全部数据（§9.2）：预检 → 说清替换范围 → 确认 → 切换（先留恢复前副本，失败回退） */
+  private async restoreFlow(name: string, note: HTMLElement, host: HTMLElement): Promise<void> {
+    fill(host);
+    const box = el("div", { class: "u-card" });
+    host.appendChild(box);
+    setNote(note, "正在预检这份备份…", "pending");
     try {
-      const picked = await invoke<string | null>("pick_file", {
-        dir: null,
-        title: "选择要恢复的备份",
-        filter: "备份文件 (*.db)|*.db|所有文件 (*.*)|*.*",
-      });
-      if (!picked) {
-        setNote(note, "已取消恢复", "muted");
+      const staged = await this.ctx.api.packStage(name);
+      if (staged.ok !== true) {
+        const problems = (staged.problems as string[]) ?? [];
+        box.appendChild(paragraph(`这份备份不能用来恢复：${problems.slice(0, 3).join("；")}`, "u-note-bad"));
+        box.appendChild(paragraph("当前数据没有被改动。可以换一份备份再试。", "u-hint"));
+        setNote(note, "预检没通过，当前数据没被改动", "bad");
         return;
       }
-      setNote(note, "正在校验并恢复…", "pending");
-      await this.ctx.api.call("backup.check", { path: picked });
-      await this.ctx.api.backupRestore(picked);
-      setNote(note, "已恢复：全部时间线处于暂停，请检查世界列表（恢复前的副本留在备份目录）", "ok");
-      await this.ctx.refresh();
+      const counts = (staged.counts as Json) ?? {};
+      const current = this.ctx.instances().length;
+      const confirmation = el("input", { class: "u-input", placeholder: "键入 RESTORE 确认" }) as HTMLInputElement;
+      box.appendChild(el("h3", { text: `用「${name}」替换当前数据？` }));
+      box.appendChild(
+        facts([
+          ["这份备份里有", `${String(counts.instances ?? "?")} 个世界、${String(counts.timelines ?? "?")} 条时间线`],
+          ["当前有", `${current} 个世界`],
+          ["展开后大小", sizeText(Number(staged.expanded_bytes ?? 0))],
+          ["恢复后会", "全部时间线暂停；需要时再逐条启动"],
+        ]),
+      );
+      box.appendChild(paragraph("会先留一份恢复前副本；切换失败会自动回退并说明。这一步之后没有「取消」，请确认要替换。"));
+      box.appendChild(field("确认", confirmation));
+      const confirmNote = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
+      box.appendChild(
+        el(
+          "div",
+          { class: "u-row" },
+          primary("保留当前数据并恢复", () => {
+            void (async () => {
+              if (confirmation.value.trim().toUpperCase() !== "RESTORE") {
+                setNote(confirmNote, "没有确认，已取消（当前数据没被改动）", "muted");
+                return;
+              }
+              setNote(confirmNote, "正在切换（世界先停一下）…", "pending");
+              try {
+                const done = await this.ctx.api.packApply(String(staged.staged), `恢复 ${name}`);
+                setNote(confirmNote, `恢复完成：全部时间线暂停，请到世界与素材里逐条启动（恢复前的数据留在备份目录）`, "ok");
+                await this.ctx.refresh();
+                void done;
+              } catch (error) {
+                setNote(
+                  confirmNote,
+                  uiError(error, {
+                    module: "备份",
+                    action: "恢复全部数据",
+                    done: "已经按记录回退或停在那里，请看备份目录里的恢复记录",
+                    unknown: "切换是否完成",
+                  }).message,
+                  "bad",
+                );
+              }
+            })();
+          }),
+          button("取消（不改动数据）", () => {
+            fill(host);
+            setNote(note, "已取消，当前数据没被改动", "muted");
+          }),
+        ),
+      );
+      box.appendChild(confirmNote);
+      setNote(note, "预检通过：确认前不会改动任何数据", "ok");
     } catch (error) {
-      setNote(note, uiError(error, { module: "备份", action: "恢复备份" }).message, "bad");
+      const info = uiError(error, { module: "备份", action: "预检", done: "当前数据没被改动" });
+      box.appendChild(errorCard(info, [{ label: "重新预检", run: () => void this.restoreFlow(name, note, host) }]));
+      setNote(note, info.message, "bad");
     }
   }
 

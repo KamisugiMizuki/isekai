@@ -358,6 +358,21 @@ export class AppApi {
     });
   }
 
+  /** 尝试世界变化的表单可选对象（已登记对象 + 可读名称；界面不要求填标识） */
+  eventTargets(instanceId: string, timelineId: string): Promise<Json> {
+    return this.call("world.event.targets", { instance_id: instanceId, timeline_id: timelineId });
+  }
+
+  /** 草案：只翻译与校验，确认前不产生任何世界变化 */
+  eventDraft(instanceId: string, timelineId: string, payload: Json): Promise<Json> {
+    return this.call("event.draft", { instance_id: instanceId, timeline_id: timelineId, payload }, 180000);
+  }
+
+  /** 确认：原子建一条新线并注入（新线先暂停） */
+  eventConfirm(instanceId: string, draftId: string, name: string): Promise<Json> {
+    return this.call("event.confirm", { instance_id: instanceId, draft_id: draftId, name }, 60000);
+  }
+
   /** 跨角色披露的候选：只把**她讲过**的片段挑出来摆着（默认隔离不变） */
   discloseSuggest(
     instanceId: string,
@@ -414,6 +429,27 @@ export class AppApi {
 
   backups(): Promise<Json> {
     return this.call("backup.list");
+  }
+
+  /** 单文件全量备份（§9.1）：列出、打包、校验、暂存、切换 */
+  packList(): Promise<Json> {
+    return this.call("backup.pack.list", {});
+  }
+
+  packCreate(note = ""): Promise<Json> {
+    return this.call("backup.pack.create", { kind: "manual", note }, 600000);
+  }
+
+  packVerify(path: string): Promise<Json> {
+    return this.call("backup.pack.verify", { path }, 600000);
+  }
+
+  packStage(path: string): Promise<Json> {
+    return this.call("backup.pack.stage", { path }, 600000);
+  }
+
+  packApply(staged: string, note = ""): Promise<Json> {
+    return this.call("backup.pack.apply", { staged, note }, 600000);
   }
 
   backupNow(note = ""): Promise<Json> {

@@ -20,7 +20,11 @@ from . import reaction
 from . import budget as budget_mod
 from ..world import instances
 from ..world.cards import region_of
-from ..world.validate import custom_index as _custom_index, office_index as _office_index
+from ..world.validate import (
+    custom_index as _custom_index,
+    office_index as _office_index,
+    SUPPORTED_EFFECTS as SUPPORTED_EFFECT_NAMES,
+)
 
 from . import (
     change as change_mod,
@@ -308,6 +312,58 @@ class RuntimeService:
         targets.update(channels)  # 世界级渠道也是已登记来源点（docstring：效果只能指向它们）
         targets.discard("")
         return targets, channels
+
+    def draft_targets(self, instance_id: str, timeline_id: str) -> dict[str, Any]:
+        """用户事件草案可选的对象（按类别分组，带可读名称）。
+
+        界面按名称选、不要求填标识（USER_INTERFACE_DESIGN §9.3「可选对象来自当前入口合法
+        可指涉集合」）；只给 id + 名称 + 类别，不给任何实情 / 史料正文（§3.5 黑箱）。
+        """
+        instance = self.store.instance_get(instance_id)
+        if instance is None:
+            raise RuntimeStateError(f"实例不存在：{instance_id}")
+        world_seconds = self.world_moment(instance_id, timeline_id)
+        package = self.setting(instance)["world_package"]
+        world = package.get("world") if isinstance(package.get("world"), dict) else {}
+        groups: dict[str, list[dict[str, str]]] = {}
+
+        def add(kind: str, ident: Any, label: Any) -> None:
+            text = str(ident or "").strip()
+            if not text:
+                return
+            groups.setdefault(kind, []).append({"id": text, "label": str(label or text)})
+
+        for card in self.cards(instance, timeline_id=timeline_id, world_seconds=world_seconds):
+            add("character", (card.get("meta") or {}).get("card_id"), (card.get("identity") or {}).get("name"))
+        for entity in package.get("entities") or []:
+            if isinstance(entity, dict):
+                add("entity", entity.get("id"), entity.get("name"))
+        for item in (package.get("environment") or {}).get("types") or []:
+            if isinstance(item, dict):
+                add("environment", item.get("id"), item.get("name"))
+        for item in world.get("institutions") or []:
+            if not isinstance(item, dict):
+                continue
+            for office in item.get("offices") or []:
+                if isinstance(office, dict):
+                    add("office", office.get("id"), f"{item.get('name') or item.get('id')} / {office.get('name') or office.get('id')}")
+        for item in world.get("customs") or []:
+            if isinstance(item, dict):
+                add("custom", item.get("id"), item.get("name"))
+        comms = package.get("comms") if isinstance(package.get("comms"), dict) else {}
+        for item in comms.get("sources") or []:
+            if isinstance(item, dict):
+                add("channel", item.get("id"), item.get("name"))
+        return {
+            "instance_id": instance_id,
+            "timeline_id": timeline_id,
+            "world_seconds": world_seconds,
+            "groups": groups,
+            "effect_kinds": [
+                {"id": kind, "label": label}
+                for kind, label in sorted(SUPPORTED_EFFECT_NAMES.items())
+            ],
+        }
 
     async def draft_user_event(
         self,

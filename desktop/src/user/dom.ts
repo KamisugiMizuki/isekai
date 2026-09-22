@@ -81,6 +81,19 @@ export function link(label: string, onClick: () => void, cls = "u-link"): HTMLBu
   return button(label, onClick, { class: cls });
 }
 
+/** 字节数给人看（备份大小这类） */
+export function sizeText(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}
+
 /** 常驻标签 + 控件（placeholder 不代替标签） */
 export function field(label: string, control: HTMLElement, hint = ""): HTMLElement {
   const labelNode = el("label", { class: "u-field" }, el("span", { class: "u-field-label", text: label }), control);

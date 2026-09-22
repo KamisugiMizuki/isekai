@@ -60,6 +60,7 @@ SYNC_OPS = frozenset(
         "disclose.suggest",
         "narrative.map",
         "event.confirm",
+        "world.event.targets",
         "runtime.timeline.rename",
         "runtime.timeline.archive",
         "runtime.timeline.delete",
@@ -128,6 +129,10 @@ SYNC_OPS = frozenset(
         "notice.resolve",
         "backup.restore",
         "backup.list",
+        # 单文件全量备份（ONBOARDING §9.1/§9.2）：用户搬运单位是一份 ZIP
+        "backup.pack.list",
+        "backup.pack.verify",
+        "backup.pack.stage",
         "proactive.list",
         # TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）：编排态读写 + 联合提交
         "trpg.campaign.create",
@@ -193,6 +198,8 @@ ASYNC_OPS = frozenset(
         "event.draft",
         "trpg.action.resolve",
         "trpg.client.act",
+        "backup.pack.create",
+        "backup.pack.apply",
         "trpg.client.retry",
         "trpg.campaign.migrate",
         "world.package.generate",
@@ -458,6 +465,16 @@ def dispatch(
             return _narrative_map(cfg, store, args)
         if op == "event.confirm":
             return _confirm_user_event(cfg, store, args)
+        if op == "world.event.targets":
+            # 界面表单的可选对象（按名称选，不要求填标识）：只给 id + 名称 + 类别
+            from ..runtime.service import RuntimeStateError
+
+            try:
+                return _world_service(cfg, store).draft_targets(
+                    str(args.get("instance_id") or ""), str(args.get("timeline_id") or "")
+                )
+            except RuntimeStateError as exc:
+                raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
         if op == "runtime.timeline.rename":
             return _timeline_rename(cfg, store, args)
         if op == "runtime.timeline.archive":
@@ -879,12 +896,53 @@ def dispatch(
             }
             return {"coverage": coverage, "claim": {"id": claim_id, "text": rows[0].get("text") or ""}}
         if op == "backup.create":
-            return {"backup": backup_once(cfg, store, note=str(args.get("note") or ""))}
+            # 手动备份与自动备份共用同一条路径（§9.1）：现在都产出单文件全量包
+            return {"backup": _pack_create(cfg, store, kind="manual", note=str(args.get("note") or ""))}
+        if op == "backup.pack.list":
+            from .. import backup_pack
+
+            return {
+                "packs": backup_pack.list_packs(cfg),
+                "dir": str(backup_pack.packs_dir(cfg)),
+                "keep": int(getattr(getattr(cfg, "backup", None), "keep", 7) or 7),
+                "interval_hours": int(getattr(getattr(cfg, "backup", None), "interval_hours", 0) or 0),
+                "record": backup_pack.read_record(cfg),
+            }
+        if op == "backup.pack.verify":
+            from .. import backup_pack
+
+            path = Path(str(args.get("path") or ""))
+            if not path.is_absolute():
+                path = backup_pack.packs_dir(cfg) / path
+            report = backup_pack.verify_pack(path)
+            return {
+                "complete": report["complete"],
+                "problems": report["problems"],
+                "bytes": report["bytes"],
+                "expanded_bytes": report.get("expanded_bytes", 0),
+                "counts": report.get("counts") or {},
+                "manifest": report.get("manifest") or {},
+            }
+        if op == "backup.pack.stage":
+            from .. import backup_pack
+
+            path = Path(str(args.get("path") or ""))
+            if not path.is_absolute():
+                path = backup_pack.packs_dir(cfg) / path
+            staged = backup_pack.stage_pack(cfg, path)
+            # 预检阶段不改变现行数据：失败只回报坏件，允许换件（§9.2）
+            return {
+                "ok": bool(staged["ok"]),
+                "problems": staged["problems"],
+                "staged": staged.get("staged", ""),
+                "counts": staged.get("counts") or {},
+                "expanded_bytes": staged.get("expanded_bytes", 0),
+            }
         if op == "app.shutdown":
             # 显式退出握手（DESKTOP_SPEC §五）：「先保存再停进程」的核心半边。
             # 保存 = 补做一次退出前备份（一致水位快照）；停进程 = 请求核心自行退出，
             # 由 app.py 的 finally 收尾（会话收尾 / 关服务 / 释放写库锁），不走 taskkill 硬杀。
-            saved = backup_once(cfg, store, note="退出前补做")
+            saved = _pack_create(cfg, store, kind="auto", note="退出前补做")
             _request_exit()
             return {"saved": saved}
         if op == "backup.restore":
@@ -2280,6 +2338,18 @@ async def dispatch_async(
             if store is None:
                 raise UmpError(Err.INTERNAL, "本次调用没有绑定数据库", retryable=False)
             return await _trpg_client_async(cfg, llm, store, runtime, op, args)
+        if op == "backup.pack.create":
+            # 单文件全量备份（§9.1）：与自动备份共用 _pack_create，手动件不参与自动轮换
+            return _pack_create(cfg, store, kind=str(args.get("kind") or "manual"), note=str(args.get("note") or ""))
+        if op == "backup.pack.apply":
+            from .. import backup_pack
+
+            staged = str(args.get("staged") or "")
+            result = backup_pack.apply_staged(cfg, store, staged, note=str(args.get("note") or ""))
+            if not result.get("ok"):
+                # 切换失败一律如实报：回退是否成功由 state 说清，不吞成 internal
+                raise UmpError(Err.INVALID, "；".join(result.get("problems") or ["切换失败"]), retryable=False)
+            return {"restore": result}
         if op == "world.package.generate":
             package, errors, usage = await generate_package(
                 llm,
@@ -2342,6 +2412,21 @@ async def dispatch_async(
 
 def describe_ops() -> dict[str, Any]:
     return {"sync": sorted(SYNC_OPS), "async_": sorted(ASYNC_OPS)}
+
+
+def _pack_create(cfg: Any, store: Any, *, kind: str, note: str) -> dict[str, Any]:
+    """单文件全量备份：失败给人话原因（界面直接显示），成功按保留数轮换自动件。"""
+    from .. import backup_pack
+
+    try:
+        record = backup_pack.write_pack(cfg, store, kind=kind, note=note)
+    except backup_pack.PackError as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=True) from exc
+    if kind == "auto":
+        record["rotated"] = backup_pack.rotate(
+            cfg, keep=int(getattr(getattr(cfg, "backup", None), "keep", 7) or 7)
+        )
+    return record
 
 
 def _backup_folder(cfg: Any, store: Any) -> Path:

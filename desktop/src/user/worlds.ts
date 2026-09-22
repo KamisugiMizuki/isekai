@@ -29,11 +29,21 @@ import {
   stamp,
 } from "./dom";
 
+/** 时间线状态的人话（核心给的是内部状态名） */
+const STATE_TEXT: Record<string, string> = {
+  active: "运行中",
+  frozen: "已暂停",
+  archived: "已归档",
+};
+
 export class WorldsPane implements Pane {
   readonly id = "worlds" as const;
-  private view: "list" | "detail" = "list";
+  private view: "list" | "detail" | "change" = "list";
   private current: InstanceEntry | null = null;
   private note: HTMLElement | null = null;
+  /** 动作结果：rerender 会重建反馈槽，先把话记下来，渲染完再写回 */
+  private pendingNote: { text: string; kind: "ok" | "bad" | "pending" | "muted" } | null = null;
+  private showArchived = false;
 
   constructor(private readonly ctx: AppContext) {}
 
@@ -55,7 +65,12 @@ export class WorldsPane implements Pane {
     this.note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
     page.appendChild(this.note);
     fill(host, page);
+    if (this.pendingNote) {
+      setNote(this.note, this.pendingNote.text, this.pendingNote.kind);
+      this.pendingNote = null;
+    }
     if (this.view === "detail" && this.current) await this.renderDetail(body);
+    else if (this.view === "change" && this.current) await this.renderChange(body);
     else await this.renderList(body);
   }
 
@@ -71,6 +86,12 @@ export class WorldsPane implements Pane {
       button("导入", () => void this.importFlow()),
       primary("从样例开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
     );
+  }
+
+  /** 写一条会活过这次重渲染的结果说明 */
+  private flash(text: string, kind: "ok" | "bad" | "pending" | "muted" = "ok"): void {
+    this.pendingNote = { text, kind };
+    setNote(this.note, text, kind);
   }
 
   private async rerender(): Promise<void> {
@@ -176,7 +197,7 @@ export class WorldsPane implements Pane {
           void (async () => {
             try {
               await this.ctx.api.renameInstance(instance.id, input.value.trim());
-              setNote(this.note, `已重命名为「${input.value.trim()}」`, "ok");
+              this.flash(`已重命名为「${input.value.trim()}」`);
               await this.rerender();
             } catch (error) {
               setNote(this.note, uiError(error, { module: "世界与素材", action: "重命名世界" }).message, "bad");
@@ -219,7 +240,7 @@ export class WorldsPane implements Pane {
               }
               try {
                 await this.ctx.api.deleteInstance(instance.id, true);
-                setNote(this.note, `已删除「${instance.name}」`, "ok");
+                this.flash(`已删除「${instance.name}」`);
                 this.view = "list";
                 this.current = null;
                 await this.rerender();
@@ -261,6 +282,10 @@ export class WorldsPane implements Pane {
           primary("联络角色", () => this.ctx.navigate({ pane: "contact" })),
           button("在此写作", () => this.ctx.navigate({ pane: "writing" })),
           button("在此跑团", () => this.ctx.navigate({ pane: "trpg" })),
+          button("尝试世界变化…", () => {
+            this.view = "change";
+            void this.rerender();
+          }),
         ),
         facts([
           ["来源设定", String(instance.original_name ?? "")],
@@ -300,28 +325,34 @@ export class WorldsPane implements Pane {
 
   private timelineSection(timelines: Json[]): HTMLElement {
     const rows = el("div", { class: "u-rows" });
-    for (const timeline of timelines) {
+    const archived = timelines.filter((item) => String(item.state) === "archived");
+    const visible = this.showArchived ? timelines : timelines.filter((item) => String(item.state) !== "archived");
+    if (!visible.length) rows.appendChild(el("p", { class: "u-hint", text: "没有可显示的时间线（已归档的可以点下面的开关查看）。" }));
+    for (const timeline of visible) {
       const id = String(timeline.id);
       const state = String(timeline.state ?? "");
       const row = el("div", { class: "u-row-line" });
       row.appendChild(el("span", { class: "u-grow", text: `${String(timeline.name ?? id)}` }));
-      row.appendChild(chip(state === "active" ? "运行中" : state === "frozen" ? "已暂停" : state, state === "active" ? "ok" : "pending"));
-      row.appendChild(
-        button(state === "active" ? "暂停" : "启动", () => {
-          void (async () => {
-            try {
-              if (state === "active") await this.ctx.api.freeze(this.current?.id ?? "", id);
-              else await this.ctx.api.activate(this.current?.id ?? "", id);
-              setNote(this.note, state === "active" ? "已暂停这条线（暂停不等于退出程序）" : "已启动这条线", "ok");
-              await this.rerender();
-            } catch (error) {
-              setNote(this.note, uiError(error, { module: "时间线", action: "运行 / 暂停" }).message, "bad");
-            }
-          })();
-        }),
-      );
-      row.appendChild(button("改名", () => void this.renameTimeline(id, String(timeline.name ?? ""))));
-      row.appendChild(button("归档", () => void this.archiveTimeline(id)));
+      row.appendChild(chip(STATE_TEXT[state] ?? state, state === "active" ? "ok" : "pending"));
+      if (state !== "archived") {
+        row.appendChild(
+          button(state === "active" ? "暂停" : "启动", () => {
+            void (async () => {
+              try {
+                if (state === "active") await this.ctx.api.freeze(this.current?.id ?? "", id);
+                else await this.ctx.api.activate(this.current?.id ?? "", id);
+                this.flash(state === "active" ? "已暂停这条线（暂停不等于退出程序）" : "已启动这条线");
+                await this.rerender();
+              } catch (error) {
+                setNote(this.note, uiError(error, { module: "时间线", action: "运行 / 暂停" }).message, "bad");
+              }
+            })();
+          }),
+        );
+        row.appendChild(button("改名", () => void this.renameTimeline(id, String(timeline.name ?? ""))));
+        row.appendChild(button("归档", () => void this.archiveTimeline(id)));
+      }
+      row.appendChild(button("删除…", () => void this.deleteTimeline(id, String(timeline.name ?? id))));
       rows.appendChild(row);
     }
     const rate = el("input", { class: "u-input u-input-narrow", type: "number", min: "1", value: "1" }) as HTMLInputElement;
@@ -338,14 +369,246 @@ export class WorldsPane implements Pane {
             const active = timelines.find((item) => String(item.state) === "active") ?? timelines[0];
             try {
               await this.ctx.api.setRate(this.current?.id ?? "", String(active?.id ?? ""), Number(rate.value || 1));
-              setNote(this.note, "速度已设定（生效以世界钟为准）", "ok");
+              this.flash("速度已设定（生效以世界钟为准）");
             } catch (error) {
               setNote(this.note, uiError(error, { module: "时间线", action: "设置速度" }).message, "bad");
             }
           })();
         }),
+        archived.length || this.showArchived
+          ? button(this.showArchived ? `隐藏已归档（${archived.length}）` : `显示已归档（${archived.length}）`, () => {
+              this.showArchived = !this.showArchived;
+              void this.rerender();
+            })
+          : null,
       ),
       paragraph("关闭窗口只是收起到托盘，世界会继续运行；想停下故事进展请点「暂停」。", "u-hint"),
+    );
+  }
+
+  /** 删除一条线（§四 / §9.2）：说明影响 + 键入名称确认；最后一条线删不掉时给实际原因 */
+  private async deleteTimeline(timelineId: string, name: string): Promise<void> {
+    const instanceId = this.current?.id ?? "";
+    const input = el("input", { class: "u-input", placeholder: name }) as HTMLInputElement;
+    const note = el("p", { class: "u-note" });
+    const body = el(
+      "div",
+      {},
+      paragraph("删除这条时间线：它的会话、记忆、版本点与派生素材一起消失，不能撤销。"),
+      paragraph("不受影响：世界设定、角色卡、其他时间线，以及被其他线引用的提交。", "u-hint"),
+      field(`键入名称确认（${name}）`, input),
+      note,
+    );
+    const modal = dialog(`删除时间线「${name}」？`, [body], [
+      {
+        label: "删除这条线",
+        run: () => {
+          void (async () => {
+            if (input.value.trim() !== name) {
+              setNote(this.note, "名称没有对上，删除已取消", "bad");
+              return;
+            }
+            try {
+              await this.ctx.api.deleteTimeline(instanceId, timelineId, true);
+              this.flash(`已删除时间线「${name}」`);
+              await this.rerender();
+            } catch (error) {
+              // 最后一条线删不掉：按核心给的实际原因说，不笼统报“失败”
+              setNote(this.note, uiError(error, { module: "时间线", action: "删除" }).message, "bad");
+            }
+          })();
+        },
+      },
+      { label: "取消", run: () => undefined },
+    ]);
+    document.body.appendChild(modal.node);
+  }
+
+  /** 尝试世界变化（§9.3）：描述 → 草案（不改世界）→ 确认后从来源版本另开一条新线 */
+  private async renderChange(host: HTMLElement): Promise<void> {
+    const instance = this.current;
+    if (!instance) {
+      this.view = "list";
+      await this.renderList(host);
+      return;
+    }
+    const info = await this.ctx.api.instanceInfo(instance.id);
+    const timelines = (info.timelines as Json[]) ?? [];
+    const timeline = timelines.find((item) => String(item.state) !== "archived") ?? timelines[0];
+    const timelineId = String(timeline?.id ?? "");
+    let targets: Json = {};
+    try {
+      targets = await this.ctx.api.eventTargets(instance.id, timelineId);
+    } catch (error) {
+      host.appendChild(errorCard(uiError(error, { module: "尝试世界变化", action: "读取可选对象" })));
+      return;
+    }
+    const groups = (targets.groups as Record<string, Json[]>) ?? {};
+    const kindLabels = new Map<string, string>(
+      ((targets.effect_kinds as Json[]) ?? []).map((item) => [String(item.id), String(item.label)]),
+    );
+    const targetLabels = new Map<string, string>();
+    for (const items of Object.values(groups)) {
+      for (const item of items) targetLabels.set(String(item.id), String(item.label));
+    }
+
+    const intent = el("textarea", { class: "u-textarea", id: "u-change-intent", rows: "3", placeholder: "想改变的局势，一句话说清（会写进这条线的记录）" }) as HTMLTextAreaElement;
+    const targetSelect = el("select", { class: "u-input", id: "u-change-target" }) as HTMLSelectElement;
+    const groupNames: Record<string, string> = {
+      character: "角色",
+      entity: "地点与实体",
+      environment: "环境类型",
+      office: "制度职位",
+      custom: "文化惯例",
+      channel: "信息来源",
+    };
+    for (const [kind, items] of Object.entries(groups)) {
+      if (!items.length) continue;
+      const box = el("optgroup", { label: groupNames[kind] ?? kind });
+      for (const item of items) box.appendChild(el("option", { value: String(item.id), text: String(item.label) }));
+      targetSelect.appendChild(box);
+    }
+    const kindSelect = el("select", { class: "u-input", id: "u-change-kind" }) as HTMLSelectElement;
+    for (const item of (targets.effect_kinds as Json[]) ?? []) {
+      kindSelect.appendChild(el("option", { value: String(item.id), text: `${String(item.label)}（${String(item.id)}）` }));
+    }
+    const value = el("input", { class: "u-input", id: "u-change-value", placeholder: "新状态，如：堤上事务缠身，这几日走不开" }) as HTMLInputElement;
+    const whenSelect = el("select", { class: "u-input" }) as HTMLSelectElement;
+    whenSelect.appendChild(el("option", { value: "now", text: "现在（来源点已完成的那一刻）" }));
+    whenSelect.appendChild(el("option", { value: "scheduled", text: "预约到以后的世界时刻" }));
+    const atWorld = el("input", { class: "u-input u-input-narrow", type: "number", min: "0", value: String(Number(targets.world_seconds ?? 0)) }) as HTMLInputElement;
+    atWorld.hidden = true;
+    whenSelect.addEventListener("change", () => {
+      atWorld.hidden = whenSelect.value !== "scheduled";
+    });
+    const expirySelect = el("select", { class: "u-input" }) as HTMLSelectElement;
+    expirySelect.appendChild(el("option", { value: "with_cause", text: "随原因解除（跨日后自然结束）" }));
+    expirySelect.appendChild(el("option", { value: "natural_recovery", text: "自行恢复（要写清恢复条件）" }));
+    expirySelect.appendChild(el("option", { value: "until_cleared", text: "保留到被明确解除" }));
+    const recovery = el("input", { class: "u-input", placeholder: "恢复条件，如：潮水退去" }) as HTMLInputElement;
+    recovery.hidden = true;
+    expirySelect.addEventListener("change", () => {
+      recovery.hidden = expirySelect.value !== "natural_recovery";
+    });
+    const draftNote = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
+    const result = el("div", {});
+    const name = el("input", { class: "u-input", id: "u-change-name", placeholder: "新时间线名称（可留空）" }) as HTMLInputElement;
+    let draftId = "";
+
+    const payload = (): Json => {
+      const effect: Json = {
+        kind: kindSelect.value,
+        target: targetSelect.value,
+        expiry: expirySelect.value,
+      };
+      if (value.value.trim()) effect.value = value.value.trim();
+      if (expirySelect.value === "natural_recovery" && recovery.value.trim()) effect.recovery = recovery.value.trim();
+      const body: Json = { intent: intent.value.trim(), when: whenSelect.value, effects: [effect] };
+      if (whenSelect.value === "scheduled") body.at_world = Number(atWorld.value || 0);
+      return body;
+    };
+
+    const viewDraft = async (): Promise<void> => {
+      fill(result);
+      draftId = "";
+      if (!intent.value.trim()) {
+        setNote(draftNote, "先写一句「想改变什么」", "bad");
+        return;
+      }
+      setNote(draftNote, "正在生成草案（只翻译与校验，不改世界）…", "pending");
+      try {
+        const outcome = await this.ctx.api.eventDraft(instance.id, timelineId, payload());
+        if (outcome.accepted !== true) {
+          setNote(draftNote, `这条变化目前无法表达成受支持的事件：${String(outcome.reason ?? "原因未给出")}`, "bad");
+          return;
+        }
+        const draft = (outcome.draft as Json) ?? {};
+        draftId = String(draft.draft_id ?? "");
+        const effects = (draft.effects as Json[]) ?? [];
+        fill(
+          result,
+          facts([
+            ["草案编号", draftId],
+            ["意图", String(draft.intent ?? "")],
+            ["生效", String(draft.when) === "scheduled" ? `预约到世界时刻 ${Number(draft.at_world ?? 0)}` : "现在"],
+          ]),
+          bulletList(
+            effects.map(
+              (item) =>
+                `${kindLabels.get(String(item.kind)) ?? String(item.kind)} → ${
+                  targetLabels.get(String(item.target)) ?? String(item.target)
+                }${item.value ? `：${String(item.value)}` : ""}（${String(item.expiry)}）`,
+            ),
+            "u-list",
+          ),
+          paragraph("确认后会从这条线的来源版本另开一条新线，新线默认暂停；原线保持原样。", "u-hint"),
+          field("新时间线名称", name),
+          el(
+            "div",
+            { class: "u-row" },
+            primary("确认并新建时间线", () => void confirm()),
+          ),
+        );
+        setNote(draftNote, "草案已生成：确认前世界没有任何变化", "ok");
+      } catch (error) {
+        const info = uiError(error, { module: "尝试世界变化", action: "生成草案", done: "没有改动世界" });
+        setNote(draftNote, info.message, "bad");
+        result.appendChild(errorCard(info, [{ label: "重新生成草案", run: () => void viewDraft() }]));
+      }
+    };
+
+    const confirm = async (): Promise<void> => {
+      if (!draftId) return;
+      setNote(draftNote, "正在新建时间线…", "pending");
+      try {
+        const done = await this.ctx.api.eventConfirm(instance.id, draftId, name.value.trim());
+        const lineId = String(done.timeline_id ?? "");
+        setNote(
+          draftNote,
+          `已建立新线（${lineId.slice(-6)}，暂停中）：原线保留，要试演先在上面「启动」这条新线`,
+          "ok",
+        );
+        fill(result);
+        this.view = "detail";
+        this.flash(`已建立新线（${lineId.slice(-6)}，暂停中）：原线保留，要试演先在上面「启动」这条新线`);
+        await this.rerender();
+      } catch (error) {
+        const info = uiError(error, {
+          module: "尝试世界变化",
+          action: "确认草案",
+          done: "草案仍留着，可以重新确认",
+          unknown: "新时间线是否已经建立",
+        });
+        result.appendChild(errorCard(info, [{ label: "重新确认", run: () => void confirm() }]));
+      }
+    };
+
+    host.appendChild(
+      section(
+        "尝试世界变化",
+        paragraph(
+          "只在当前局势内改变事实：不能改写过去、也不能改世界公理（那些要改世界设定并新建世界）。表单里的对象都来自这个世界已经登记的内容。",
+        ),
+        field("想改变什么", intent),
+        field("改变对象", targetSelect),
+        field("变化种类", kindSelect),
+        field("新状态", value),
+        field("何时生效", whenSelect),
+        field("世界时刻（预约用）", atWorld),
+        field("持续到何时", expirySelect),
+        field("恢复条件（自行恢复用）", recovery),
+        el(
+          "div",
+          { class: "u-row" },
+          primary("查看草案", () => void viewDraft()),
+          button("返回世界详情", () => {
+            this.view = "detail";
+            void this.rerender();
+          }),
+        ),
+        draftNote,
+        result,
+      ),
     );
   }
 
@@ -359,7 +622,7 @@ export class WorldsPane implements Pane {
           void (async () => {
             try {
               await this.ctx.api.renameTimeline(this.current?.id ?? "", timelineId, input.value.trim());
-              setNote(this.note, "名称已更新", "ok");
+              this.flash("名称已更新");
               await this.rerender();
             } catch (error) {
               setNote(this.note, uiError(error, { module: "时间线", action: "改名" }).message, "bad");
@@ -375,7 +638,7 @@ export class WorldsPane implements Pane {
   private async archiveTimeline(timelineId: string): Promise<void> {
     try {
       await this.ctx.api.archiveTimeline(this.current?.id ?? "", timelineId);
-      setNote(this.note, "已归档（先暂停，数据保留；要继续这条路线可以从它的版本另开分支）", "ok");
+      this.flash("已归档（先暂停，数据保留；要继续这条路线可以从它的版本另开分支）");
       await this.rerender();
     } catch (error) {
       setNote(this.note, uiError(error, { module: "时间线", action: "归档" }).message, "bad");
@@ -421,7 +684,7 @@ export class WorldsPane implements Pane {
             const timeline = await this.firstTimeline();
             try {
               await this.ctx.api.saveVersion(this.current?.id ?? "", timeline, note.value.trim());
-              setNote(this.note, "已保存一个版本点", "ok");
+              this.flash("已保存一个版本点");
               await this.rerender();
             } catch (error) {
               setNote(this.note, uiError(error, { module: "版本", action: "保存版本" }).message, "bad");
@@ -461,7 +724,7 @@ export class WorldsPane implements Pane {
                   String(commit.id ?? ""),
                   name.value.trim() || `分支 ${stamp(Number(commit.created_at ?? 0))}`,
                 );
-                setNote(this.note, "已建立分支（新线先处于暂停；要试演时再启动它）", "ok");
+                this.flash("已建立分支（新线先处于暂停；要试演时再启动它）");
                 await this.rerender();
               } catch (error) {
                 setNote(this.note, uiError(error, { module: "版本", action: "另开分支" }).message, "bad");
@@ -581,7 +844,7 @@ export class WorldsPane implements Pane {
       if (name.endsWith(".isekai.json")) {
         const result = await this.ctx.api.importInstance(picked);
         const instance = result.instance as Json;
-        setNote(this.note, `已导入为「${String(instance.name ?? "")}」（新的独立副本，默认暂停）`, "ok");
+        this.flash(`已导入为「${String(instance.name ?? "")}」（新的独立副本，默认暂停）`);
         await this.ctx.refresh();
         await this.rerender();
         return;
@@ -608,7 +871,7 @@ export class WorldsPane implements Pane {
                       source_path: picked,
                       package_path: options.value,
                     });
-                    setNote(this.note, `已导入角色卡「${String(result.name ?? result.imported ?? "")}」（未审定，需确认后才能用于创建）`, "ok");
+                    this.flash(`已导入角色卡「${String(result.name ?? result.imported ?? "")}」（未审定，需确认后才能用于创建）`);
                   } catch (error) {
                     setNote(this.note, uiError(error, { module: "导入", action: "导入角色卡" }).message, "bad");
                   }
@@ -622,7 +885,7 @@ export class WorldsPane implements Pane {
         return;
       }
       const result = await this.ctx.api.call("world.package.import", { source_path: picked });
-      setNote(this.note, `已导入世界设定「${String(result.name || result.imported || "")}」`, "ok");
+      this.flash(`已导入世界设定「${String(result.name || result.imported || "")}」`);
     } catch (error) {
       setNote(this.note, uiError(error, { module: "导入", action: "导入文件" }).message, "bad");
     }

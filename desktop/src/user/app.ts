@@ -370,6 +370,17 @@ export class App {
     this.renderTop();
   }
 
+  /** 只重读世界列表（切页时用；读不到就保留已有缓存，页面自己会给出错误卡） */
+  private async refreshInstances(): Promise<void> {
+    if (!this.apiRef) return;
+    try {
+      const instances = await this.apiRef.instances();
+      this.instanceCache = ((instances.instances as InstanceEntry[]) ?? []).slice();
+    } catch {
+      /* 保留已有缓存 */
+    }
+  }
+
   /* ---------------------------------------------------------------- 路由 */
 
   /** 导航串行化：并发点两个入口时不能交错（交错会留下「路由是新的、内容还是旧的」） */
@@ -394,6 +405,9 @@ export class App {
     if (this.navLog.length > 50) this.navLog.shift();
     await this.drafts.flush(); // 切页触发一次立即保存（§3.5）
     if (token !== this.navToken) return; // 已经有更新的导航接管这次切换
+    // 世界列表不靠启动时那一份缓存：本程序之外也可能改过数据（重开一页就重新读一次）
+    await this.refreshInstances();
+    if (token !== this.navToken) return;
     this.current?.unmount?.();
     this.current = null;
     this.route = target;

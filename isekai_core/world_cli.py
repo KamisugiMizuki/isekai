@@ -52,6 +52,11 @@ OP_BY_COMMAND = {
     ("backup", "create"): "backup.create",
     ("backup", "restore"): "backup.restore",
     ("backup", "list"): "backup.list",
+    ("backup", "pack"): "backup.pack.create",
+    ("backup", "packs"): "backup.pack.list",
+    ("backup", "verify"): "backup.pack.verify",
+    ("backup", "stage"): "backup.pack.stage",
+    ("backup", "apply"): "backup.pack.apply",
     ("runtime", "proactive"): "runtime.proactive",
     ("runtime", "first-contact"): "runtime.first_contact",
     ("proactive", "list"): "proactive.list",
@@ -209,6 +214,14 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
     if group == "backup":
         args = {}
         if cmd == "create":
+            args["note"] = ns.note or ""
+        if cmd == "pack":
+            args["kind"] = "manual"
+            args["note"] = ns.note or ""
+        if cmd in ("verify", "stage"):
+            args["path"] = ns.file or ns.package
+        if cmd == "apply":
+            args["staged"] = ns.file or ns.package
             args["note"] = ns.note or ""
         if cmd == "restore":
             args["path"] = ns.file or ns.package
