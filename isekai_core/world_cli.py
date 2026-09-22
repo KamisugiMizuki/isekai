@@ -142,6 +142,10 @@ OP_BY_COMMAND = {
     ("client", "retry"): "trpg.client.retry",
     ("client", "gm-change"): "trpg.client.gm_change",
     ("client", "review"): "trpg.client.review",
+    ("client", "switch"): "trpg.client.switch",
+    ("client", "branch"): "trpg.client.branch",
+    ("client", "rollback"): "trpg.client.rollback",
+    ("client", "express"): "trpg.client.express",
     ("runtime", "backfill"): "runtime.backfill",
     ("event", "render"): "event.render",
     ("event", "expand"): "event.expand",
@@ -326,6 +330,17 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args["preview_only"] = bool(getattr(ns, "preview_only", False))
         if cmd == "review":
             args.update({"action_id": ns.action or "", "decision": ns.decision or ""})
+        if cmd == "switch":
+            args.update({"character_id": ns.card or "", "mode": ns.mode or "player"})
+        if cmd == "branch":
+            args.update({"commit_id": ns.commit or "", "name": ns.display_name or "",
+                         "activate": bool(ns.activate), "confirm": bool(ns.confirm)})
+        if cmd == "rollback":
+            args.update({"commit_id": ns.commit or "", "confirm": bool(ns.confirm),
+                         "saved": bool(ns.saved)})
+        if cmd == "express":
+            args.update({"text": ns.text or "", "action_id": ns.action or "",
+                         "audience": ns.audience or "public_party", "as_frame": bool(ns.as_frame)})
         return args
     if group == "story":
         args: dict[str, Any] = {}
@@ -701,6 +716,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--retry-kind", dest="retry_kind", default=None,
                         help="客户端：重试类型 resume_submit / retry_resolve / reroll")
     parser.add_argument("--abandon", action="store_true", help="客户端：放弃指定行动（不调插件、不写世界）")
+    parser.add_argument("--as-frame", dest="as_frame", action="store_true",
+                        help="客户端：人工表达写成事件帧（进事件正文，只许公开材料）")
     parser.add_argument("--preview-only", dest="preview_only", action="store_true",
                         help="客户端：GM 直接变化只预览玩家视角，不提交")
     parser.add_argument("--value", default=None, help="客户端：GM 直接变化的值（内联 JSON 或文本）")

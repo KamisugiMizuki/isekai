@@ -1,9 +1,9 @@
-"""TRPG 客户端（TRPG_CLIENT_SPEC C0–C3）：真 WS + 真 SQLite + 真插件子进程。
+"""TRPG 客户端（TRPG_CLIENT_SPEC C0–C5）：真 WS + 真 SQLite + 真插件子进程。
 
-客户端层是**产品语义**（四个面 / 行动闭环 / 用户可见状态 / 结果表达 / 显示闸门），
-不是把管理面操作换个名字：这些用例盯 §十九 行为验收里属于客户端的行。
+客户端层是**产品语义**（四个面 / 行动闭环 / 用户可见状态 / 结果表达 / 显示闸门 /
+多角色与主持创作），不是把管理面操作换个名字：这些用例盯 §十九 行为验收里属于客户端的行。
 
-完整分段审计（A~F，共 78 项读数）在 `scripts/_audit2_trpgclient.py`；这里留最小回归网。
+完整分段审计（A~H，共 90 项读数）在 `scripts/_audit2_trpgclient.py`；这里留最小回归网。
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -18,7 +19,8 @@ from conftest import open_mgmt, running_core
 from isekai_core.trpg_client import draft as draft_mod
 from isekai_core.trpg_client import states, views
 from isekai_core.ump import UmpError
-from samples import DAY
+from isekai_core.world.instances import create_instance
+from samples import DAY, sample_card, sample_package
 from test_runtime import make_instance, store, world  # noqa: F401
 from test_trpg_campaign import make_plugin
 
@@ -301,5 +303,173 @@ async def test_interrupted_action_can_be_explicitly_rerun(tmp_path) -> None:
                 await _call(mgmt, "trpg.client.retry", **scope, kind="resume_submit",
                                 action_id="act-404")
             assert "act-404" in str(err.value) or "没有" in str(err.value)
+        finally:
+            await mgmt.close()
+
+async def _multi_campaign(mgmt, info, timeline_id, plugin, actors) -> str:
+    """一个实例、一份战役、两个角色：多角色切换要在这上面验。"""
+    actor_a, actor_b = actors
+    created = await _call(
+        mgmt, "trpg.campaign.create", instance_id=info["id"], timeline_id=timeline_id,
+        ruleset_id="fake-rules", ruleset_version="1.0", plugin_manifest=plugin,
+        host_mode="autonomous", participants=[actor_a, actor_b],
+        scene={"kind": "conflict", "location_refs": ["rl-1"],
+               "public_facts": [{"text": "岗位的门半掩着"}],
+               "private_views": {f"character:{actor_a}": [{"text": "堤禾认得墙上的划痕"}],
+                                 f"character:{actor_b}": [{"text": "渡舟听见水声"}]},
+               "available_actions": ["查岗"]},
+    )
+    return str(created["campaign_id"])
+
+
+@pytest.mark.asyncio
+async def test_switch_actor_keeps_private_views_apart(tmp_path) -> None:
+    """C4：同一用户控制多个角色时，切换只换 actor / audience，私密认知不合并。"""
+    plugin = make_plugin(tmp_path, source=CLIENT_PLUGIN_SOURCE)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            package = sample_package(moment=DAY * 1500)
+            card_a = sample_card(package, name="堤禾")
+            card_b = sample_card(package, name="渡舟")
+            info = create_instance(harness.store, package, [card_a, card_b])
+            timeline_id = str(harness.store.timeline_list(info["id"])[0]["id"])
+            harness.runtime.world.ensure_instance(info["id"], now_real=time.time())
+            harness.runtime.world.activate(info["id"], timeline_id, now_real=time.time())
+            actor_a = str(card_a["meta"]["card_id"])
+            actor_b = str(card_b["meta"]["card_id"])
+            campaign_id = await _multi_campaign(mgmt, info, timeline_id, plugin, (actor_a, actor_b))
+            scope = _scope(info, timeline_id, campaign_id)
+            entered = await _call(mgmt, "trpg.client.enter", **scope, character_id=actor_a)
+            # 切换只给作用域与角色：受众由客户端从角色推导（不给就是 character:<id>）
+            base = {key: value for key, value in scope.items() if key not in ("mode", "audience")}
+            first = await _call(mgmt, "trpg.client.switch", **base, workspace=entered["workspace"],
+                                character_id=actor_a)
+            second = await _call(mgmt, "trpg.client.switch", **base, workspace=first["workspace"],
+                                 character_id=actor_b)
+            seen_a = json.dumps(first["faces"]["party"], ensure_ascii=False)
+            seen_b = json.dumps(second["faces"]["party"], ensure_ascii=False)
+            assert "堤禾认得墙上的划痕" in seen_a and "渡舟听见水声" not in seen_a
+            assert "渡舟听见水声" in seen_b and "堤禾认得墙上的划痕" not in seen_b
+            assert second["workspace"]["audience"] == f"character:{actor_b}"
+            assert second["faces"]["gates"]["violations"] == []
+            with pytest.raises(UmpError) as err:
+                await _call(mgmt, "trpg.client.switch", **base, character_id=actor_b,
+                            audience="gm_only")
+            assert "gm_only" in str(err.value)
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_second_plugin_runs_the_same_client_flow(tmp_path) -> None:
+    """C4：换第二个真实规则插件（潮汐骰池）跑同一套客户端流程——不读第一套规则的字段。"""
+    tide = Path(__file__).resolve().parents[1] / "examples" / "tide_rules_plugin" / "manifest.json"
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, card_id = make_instance(harness.store, harness.runtime.world,
+                                                      moment=DAY * 1500)
+            harness.runtime.world.activate(info["id"], timeline_id, now_real=time.time())
+            created = await _call(
+                mgmt, "trpg.campaign.create", instance_id=info["id"], timeline_id=timeline_id,
+                ruleset_id="tide", ruleset_version="0.1.0", plugin_manifest=str(tide),
+                host_mode="autonomous", participants=[card_id],
+                scene={"kind": "conflict", "location_refs": ["rl-1"]},
+            )
+            scope = _scope(info, timeline_id, str(created["campaign_id"]))
+            await _call(mgmt, "trpg.client.enter", **scope, character_id=card_id)
+            # 潮汐插件会把「被压制」压在行动者身上：行动者必须是已登记目标（真实角色卡标识）
+            done = await _call(
+                mgmt, "trpg.client.act", **scope, character_id=card_id,
+                text="沿墙摸过去查岗", confirm=True,
+                fields={"target": "off-1", "intent": "沿墙摸过去查岗", "method": "沿墙摸过去"},
+            )
+            surface = json.dumps({"result": done.get("result"), "faces": done.get("faces")},
+                                 ensure_ascii=False)
+            assert done["committed"] is True, (done.get("resolved_status"), done.get("errors"))
+            for name in ('"hp"', '"sp"', "edge", '"pool"', '"stress"'):
+                assert name not in surface, f"客户端面不该出现第一套 / 第二套规则的私有字段：{name}"
+            gm_scope = _scope(info, timeline_id, str(created["campaign_id"]), mode="gm",
+                              audience="gm_only")
+            gm = await _call(mgmt, "trpg.client.retry", **gm_scope, kind="resume_submit",
+                             action_id=str(done["action_id"]))
+            assert (gm.get("audit") or {}).get("level", {}).get("outcome"), gm.get("audit")
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_branch_and_rollback_need_explicit_confirmation(tmp_path) -> None:
+    """C5：分支与回滚先给风险说明；确认后才执行；回滚清空本地状态并让规则状态退回去。"""
+    plugin = make_plugin(tmp_path, source=CLIENT_PLUGIN_SOURCE)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, _card = make_instance(harness.store, harness.runtime.world,
+                                                     moment=DAY * 1500)
+            harness.runtime.world.activate(info["id"], timeline_id, now_real=time.time())
+            campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
+            scope = _scope(info, timeline_id, campaign_id)
+            gm = _scope(info, timeline_id, campaign_id, mode="gm", audience="gm_only")
+            entered = await _call(mgmt, "trpg.client.enter", **scope, character_id="card-1")
+            await _call(mgmt, "trpg.client.act", **scope, workspace=entered["workspace"],
+                        text="揭开封条", confirm=True,
+                        fields={"target": "off-1", "intent": "ok", "method": "徒手"})
+            commit_id = str(harness.runtime.world.commit(info["id"], timeline_id, kind="manual",
+                                                          note="分支点")["id"])
+            lines_before = len(harness.store.timeline_list(info["id"]))
+            brief = await _call(mgmt, "trpg.client.branch", **gm, commit_id=commit_id)
+            assert brief["stage"] == "branch_confirm" and len(brief["brief"]["lines"]) >= 4
+            assert len(harness.store.timeline_list(info["id"])) == lines_before, "未确认不建线"
+            made = await _call(mgmt, "trpg.client.branch", **gm, workspace=brief["workspace"],
+                               commit_id=commit_id, name="试演线", confirm=True)
+            assert made["new_timeline_id"] and made["original_timeline_kept"] is True
+            assert len(harness.store.timeline_list(info["id"])) == lines_before + 1
+            await _call(mgmt, "trpg.client.act", **scope, text="再来一次", confirm=True,
+                        character_id="card-1",
+                        fields={"target": "off-1", "intent": "ok", "method": "徒手"})
+            risky = await _call(mgmt, "trpg.client.rollback", **(gm | {"timeline_id": timeline_id}),
+                                workspace={**made["workspace"], "timeline_id": timeline_id},
+                                commit_id=commit_id)
+            assert risky["stage"] == "rollback_confirm" and len(risky["brief"]["lines"]) >= 5
+            rolled = await _call(mgmt, "trpg.client.rollback", **gm,
+                                 workspace=risky["workspace"], commit_id=commit_id, confirm=True,
+                                 saved=True)
+            state = harness.store.trpg_get("rule_state", instance_id=info["id"],
+                                           timeline_id=timeline_id, campaign_id=campaign_id,
+                                           ruleset_id="fake-rules") or {}
+            assert int(state.get("state_revision") or 0) == 1, state.get("state_revision")
+            assert len(rolled["discarded"]) >= 4 and rolled["workspace"]["draft_text"] == ""
+            assert rolled["faces"]["gates"]["violations"] == []
+        finally:
+            await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_express_writes_an_audience_tagged_claim(tmp_path) -> None:
+    """C5：主持写的人工表达落成带受众的说法；事件帧只许公开材料。"""
+    plugin = make_plugin(tmp_path, source=CLIENT_PLUGIN_SOURCE)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, _card = make_instance(harness.store, harness.runtime.world,
+                                                     moment=DAY * 1500)
+            harness.runtime.world.activate(info["id"], timeline_id, now_real=time.time())
+            campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
+            gm = _scope(info, timeline_id, campaign_id, mode="gm", audience="gm_only")
+            entered = await _call(mgmt, "trpg.client.enter", **gm, character_id="card-1")
+            tell_scope = {k: v for k, v in gm.items() if k != "audience"}
+            told = await _call(mgmt, "trpg.client.express", **tell_scope,
+                               workspace=entered["workspace"], text="主持补叙：夜里换了岗",
+                               audience="public_party")
+            assert told["committed"] is True
+            claims = [item for item in harness.store.claim_list(info["id"], timeline_id)
+                      if "补叙" in str(item.get("text") or "")]
+            assert claims and str(claims[0]["audience"]) == "public_party"
+            with pytest.raises(UmpError) as err:
+                await _call(mgmt, "trpg.client.express", **tell_scope, text="私下安排",
+                            audience="gm_only", as_frame=True)
+            assert "事件正文" in str(err.value)
         finally:
             await mgmt.close()

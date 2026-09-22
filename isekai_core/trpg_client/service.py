@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from ..log import get_logger
@@ -592,6 +593,130 @@ class TrpgClient:
         bundle["committed"] = status in ("committed", "duplicate")
         bundle["commit_status"] = status
         bundle["errors"] = list(result.get("errors") or [])
+        return bundle
+
+    # ------------------------------------------------------------------ C4 / C5：多角色与主持创作
+
+    def switch_actor(self, *, workspace: Any, character_id: str, audience: str = "",
+                     mode: str = "") -> dict[str, Any]:
+        """切换当前查看的角色 / 受众（§6 / C4）：只换 actor 与 audience，私密认知不合并。
+
+        同一用户控制多个角色时，切换后的面只带**当前那个角色**的私密材料（others 只列受众名）。
+        """
+        ws = merge_workspace(
+            workspace, mode=mode or None, active_character_id=character_id or None,
+            audience=(audience or (f"character:{character_id}" if character_id else None)),
+            selected_action_id="", selected_choice_id="",
+        )
+        if ws["audience"] == "gm_only" and ws["mode"] != "gm":
+            raise TrpgClientError("gm_only 受众只能在主持模式里看（§十二：不凭身份提升受众）")
+        if not (ws["instance_id"] and ws["timeline_id"] and ws["campaign_id"]):
+            raise TrpgClientError("切换角色要求工作区里已有战役作用域")
+        return self._bundle(ws, stage="switch", plugin=self._plugin_for(ws))
+
+    def branch(self, *, workspace: Any, commit_id: str = "", name: str = "", activate: bool = False,
+               confirm: bool = False) -> dict[str, Any]:
+        """从提交创建分支（§14.2）：先给风险说明，确认后才建；客户端不复制场景或规则状态。"""
+        ws = merge_workspace(workspace)
+        if not ws["instance_id"] or not ws["timeline_id"]:
+            raise TrpgClientError("分支要求工作区里已有实例与时间线")
+        if not commit_id:
+            raise TrpgClientError("分支要指明来源提交（commit_id）")
+        brief: dict[str, Any] = {
+            "commit_id": commit_id,
+            "confirm_required": True,
+            "will_activate": bool(activate),
+            "lines": [
+                "新时间线不会接收源线之后的行动、选择与规则状态",
+                "未提交的行动、开放待选择与插件进程不会被带入",
+                "需要明确选择新线是否激活（activate）",
+                "原线仍然保留",
+                "分支建好后要重新读取（客户端不复制场景或规则状态）",
+            ],
+        }
+        if not confirm:
+            return self._bundle(ws, stage="branch_confirm", brief=brief)
+        result = self._world().fork(ws["instance_id"], ws["timeline_id"], commit_id=commit_id,
+                                    name=name, activate=activate)
+        new_timeline = str((result.get("timeline") or {}).get("id") or "")
+        discarded: list[str] = []
+        if activate and new_timeline:
+            # 换了线就是换了局面：旧选中项与旧投影版本全部作废（§14.2）
+            ws = merge_workspace(ws, timeline_id=new_timeline, scene_revision=0, selected_scene_id="",
+                                 selected_action_id="", selected_choice_id="")
+            discarded = ["场景缓存", "待选择", "行动草稿", "结果展开状态", "选中行动"]
+        return self._bundle(ws, stage="branch", brief={**brief, "confirm_required": False},
+                            fork={key: value for key, value in result.items() if key != "timeline"},
+                            new_timeline_id=new_timeline, original_timeline_kept=True,
+                            discarded=discarded)
+
+    def rollback(self, *, workspace: Any, commit_id: str = "", confirm: bool = False,
+                 saved: bool = False) -> dict[str, Any]:
+        """回滚（§14.3）：破坏性、覆盖历史；先说明会失效什么，完成后清空本地状态并重读。"""
+        ws = merge_workspace(workspace)
+        if not ws["instance_id"] or not ws["timeline_id"]:
+            raise TrpgClientError("回滚要求工作区里已有实例与时间线")
+        if not commit_id:
+            raise TrpgClientError("回滚要指明目标提交（commit_id）")
+        brief: dict[str, Any] = {
+            "commit_id": commit_id,
+            "confirm_required": True,
+            "saved_acknowledged": bool(saved),
+            "lines": [
+                "哪些行动、选择、规则状态与场景派生会失效",
+                "已投递的外部表达不能保证消失",
+                "运行世代会变化，迟到的裁定会失效",
+                "回滚后需要重新读取当前场景",
+                "若跨过战役创建点，战役可能进入 orphaned / blocked",
+            ],
+        }
+        if not confirm:
+            return self._bundle(ws, stage="rollback_confirm", brief=brief)
+        result = self._world().rollback(ws["instance_id"], ws["timeline_id"], commit_id=commit_id)
+        # 清空旧场景缓存、旧待选择、旧行动草稿与结果展开状态（§14.3）
+        ws = merge_workspace(ws, scene_revision=0, selected_scene_id="", selected_action_id="",
+                             selected_choice_id="", draft_text="", draft_revision=0)
+        return self._bundle(ws, stage="rollback", brief={**brief, "confirm_required": False},
+                            rollback={key: value for key, value in result.items() if key != "snapshot"},
+                            discarded=["场景缓存", "待选择", "行动草稿", "结果展开状态", "选中行动"])
+
+    def express(self, *, workspace: Any, text: str, action_id: str = "", audience: str = "public_party",
+                as_frame: bool = False, idempotency_key: str = "") -> dict[str, Any]:
+        """结构化结果的人工表达入口（§C5）：主持写的正文按受众落成说法（或事件帧）。
+
+        - 说法（claim）：受众闭集内可定向，玩家面只在允许时看到；
+        - 事件帧（frame）：进事件正文，**不按受众裁剪**，所以只许写公开材料。
+        """
+        ws = merge_workspace(workspace)
+        if ws["mode"] != "gm":
+            raise TrpgClientError("人工表达入口属于主持操作（§C5 / §十五）")
+        text = str(text or "").strip()
+        if not text:
+            raise TrpgClientError("人工表达要有正文")
+        if not views.audience_valid(audience):
+            raise TrpgClientError(f"受众要落在闭集里：{audience}")
+        if as_frame and audience != "public_party":
+            raise TrpgClientError(
+                "事件帧进的是事件正文（不按受众裁剪）：只能写公开材料；私下材料用说法（claim）"
+            )
+        key = idempotency_key or (
+            f"trpg-client-express:{action_id or 'note'}:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]}"
+        )
+        changes: dict[str, Any] = (
+            {"consequences": [{"kind": "world_event", "operation": "create", "value": text,
+                               "visibility": audience}]}
+            if as_frame else {"claims": [{"text": text, "audience": audience}]}
+        )
+        result = self.campaign.gm_change(
+            ws["instance_id"], ws["timeline_id"], ws["campaign_id"],
+            changes=changes, idempotency_key=key, audience=ws["audience"],
+        )
+        status = str(result.get("status") or "")
+        bundle = self._bundle(ws, stage="express",
+                              express={"action_id": action_id, "as_frame": bool(as_frame),
+                                       "audience": audience, "idempotency_key": key},
+                              commit_status=status, committed=status in ("committed", "duplicate"),
+                              errors=list(result.get("errors") or []))
         return bundle
 
     def review(self, *, workspace: Any, action_id: str, decision: str, reason: str = "",

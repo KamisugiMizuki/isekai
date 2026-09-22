@@ -906,11 +906,12 @@ TRPG 行动造成的世界后果可以被 OC 角色之后通过合法认知路�
 
 ## 二十一、实施状态与边界
 
-本规范定稿时的判断是「客户端实现尚未开始」。**2026-09-22 C0–C3 已落地**，实现面与判据如下。
+本规范定稿时的判断是「客户端实现尚未开始」。**2026-09-22 C0–C5 已落地**，实现面与判据如下。
 
 客户端产品语义住在 `isekai_core/trpg_client/`（`states` 状态表 / `views` 四个面与显示闸门 /
 `expression` 结果四层与双轨时间 / `draft` 行动草稿 / `service` 编排），由管理面 `trpg.client.*`
-（`enter` / `refresh` / `act` / `choice` / `retry` / `gm_change` / `review`）与 CLI 同名命令组承载。
+（`enter` / `refresh` / `act` / `choice` / `retry` / `gm_change` / `review` / `switch` / `branch` /
+`rollback` / `express`，共 11 个）与 CLI 同名命令组承载。
 产品语义只实现一份：任何壳（桌面 / 浏览器 / CLI）渲染同一批面，不各自重写状态文案与闸门
 （§18.17 连接方式可替换）。工作区（§4.1）由调用方持有并传进传出，权威永远在运行时。
 
@@ -920,17 +921,20 @@ TRPG 行动造成的世界后果可以被 OC 角色之后通过合法认知路�
 | C1 单玩家行动闭环 | 确认卡（模型只补空缺、缺口不放行）、声明·确认·修改·放弃、真插件裁定、玩家模式自动提交 / GM 停 `reviewing`、幂等重放与重新裁定分离 | 探针 C01–C11b；`test_action_card_then_player_auto_commit` |
 | C2 待选择·时间·恢复 | waiting 闸与待选择卡置首、规则时间与世界时间双轨、时间消耗结果、重启恢复与显式重试、版本阻断与人工接受 | 探针 D01–D09；`test_waiting_locks_and_choice_round_trip`、`test_interrupted_action_can_be_explicitly_rerun` |
 | C3 GM 辅助 | GM 受众与四层材料、玩家视角预览、GM 直接变化（`gm_declaration`）、待审工作区（hold / approve / reject）、版本阻断出口 | 探针 E01–E05；`test_gm_mode_stops_at_reviewing_and_private_stays_private` |
+| C4 队伍与差异化规则视图 | 单用户多角色切换（只换 actor / audience，私密认知不合并）、`character:` 受众隔离、第二个真实规则插件跑同一套流程、跨应用共用世界（同实例 / 同时间线的历史与角色认知投影） | 探针 G01–G03；`test_switch_actor_keeps_private_views_apart`、`test_second_plugin_runs_the_same_client_flow` |
+| C5 主持创作与分支 | 分支（来源提交 / 不带入什么 / 明确选是否激活 / 原线保留）、回滚（风险说明 + 完成后清空本地状态并重读）、结构化结果的人工表达入口（说法按受众 / 事件帧只许公开材料） | 探针 H01–H06；`test_branch_and_rollback_need_explicit_confirmation`、`test_express_writes_an_audience_tagged_claim` |
 
-读数：`scripts/_audit2_trpgclient.py` **78/78**（A 规范⇄常数 / B C0 / C C1 / D C2 / E C3 / F §十八 不变量），
-`tests/test_trpg_client.py` 8 项；`scripts/_probe_trpg_cli.py` 用真 CLI（spawn 核心）走通
-`client enter` → `client act`（草稿 → 确认 → 自动提交）→ `client enter --mode gm`。
+读数：`scripts/_audit2_trpgclient.py` **90/90**（A 规范⇄常数 / B C0 / C C1 / D C2 / E C3 / G C4 /
+H C5 / F §十八 不变量），`tests/test_trpg_client.py` 12 项；`scripts/_probe_trpg_cli.py` 用真 CLI
+（spawn 核心）走通 `client enter` → `client act`（草稿 → 确认 → 自动提交）→ `client enter --mode gm`。
 
 ### 明确没做（不充数）
 
-- **C4 队伍与差异化规则视图**：多角色切换与 `character:` 受众的界面流程、以第二个真实插件（CoC）
-  验收「基础流程不写死第一套规则的字段」——客户端材料本身不带规则字段名，但这两条客户端验收还没跑；
-- **C5 主持创作与分支**：从提交创建分支、回滚 / 导出前的风险确认、场景草稿与结构化结果的人工表达入口。
-  底层能力（`runtime.fork` / `runtime.rollback` / `trpg.campaign.migrate`）已在，客户端只做到版本阻断的**出口提示**；
+- **CoC 插件本身不在本规范范围**：C4 要的是「客户端不写死第一套规则的字段」，验收用的是仓库里的
+  第二个真实插件—潮汐骰池（成功的骰池制：骰池 / 压力 / 际遇，`examples/tide_rules_plugin`）✓
+  规则专属表单 / 能力声明协议按 §20.5 仍是「真实需要再加」，客户端只提供通用五字段确认卡与通用结果层；
+- **地图、战斗网格、自动主持、模型生成 GM 文本**：§C5 已写「只在真实使用中证明有需求后再增加」——不做；
+  主持候选与场景草稿沿用已落地的 Writing Assistant 候选路径（`wa.candidate.*` / `wa.gm.*`），客户端不再造第二套；
 - **承载适配**：窗口、输入控件、视觉设计与桌面 / 移动承载（本规范 §2.2 明确排除）；客户端语义与连接方式解耦，
   壳只需渲染四个面。当前桌面前端仍没有 `trpg.*` 消费者。
 

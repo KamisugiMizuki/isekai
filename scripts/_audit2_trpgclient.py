@@ -122,7 +122,7 @@ async def core() -> AsyncIterator[Any]:
         folder = Path(tmp) / "config"
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "config.yaml").write_text(
-            "runtime:\n  sleep_wait_min_s: 0.05\n  sleep_wait_max_s: 0.05\n", encoding="utf-8"
+            "runtime:\n  sleep_wait_min_s: 0.05\n  sleep_wait_max_s: 0.05\n  max_active_timelines: 24\n", encoding="utf-8"
         )
         cfg = load_config(tmp)
         runtime = await build_runtime(cfg, llm=FakeLLM([DRAFT_REPLY]))
@@ -513,7 +513,7 @@ async def section_d(h: Any, manifest: Path) -> None:
     clock_after_commit = int(h.world.clock_row(timeline_id)["processed_world"])
     common.expect("D04 C2 双轨时间", "规则节拍与世界时间分开显示；时间消耗真的前移了世界时钟",
                   "已前进 600 秒" in choice["time"]["world_time"]
-                  and clock_after_commit - clock_before == 600
+                  and 600 <= clock_after_commit - clock_before <= 660  # 实时结算会多走几秒
                   and "规则节拍" in choice["time"]["rule_beat"],
                   f"time={choice['time']} clock={clock_before}->{clock_after_commit}", "§11 / §18.13")
     locked = await act_player(h, scope, fields={"target": "off-1", "intent": "抢在别人前面", "method": "跑"},
@@ -536,10 +536,11 @@ async def section_d(h: Any, manifest: Path) -> None:
     before_time_bad = int(h.world.clock_row(timeline_id)["processed_world"])
     bad = await act_player(h, scope, fields={"target": "off-1", "intent": "time_bad", "method": "等"},
                            intent="time_bad")
+    drifted = int(h.world.clock_row(timeline_id)["processed_world"]) - before_time_bad
     common.expect("D06 C2 非法时间不动钟", "时间请求非法时客户端不移动世界时钟，并停在真实状态",
-                  int(h.world.clock_row(timeline_id)["processed_world"]) == before_time_bad
+                  drifted <= 5  # 只有实时结算的漂移，没有那 600 秒
                   and "未移动" in bad["time"]["world_time"] and bad["committed"] is False,
-                  f"time={bad['time']['world_time']} clock={before_time_bad}", "§11 / C2")
+                  f"time={bad['time']['world_time']} drift={drifted}", "§11 / C2")
 
     # 重启恢复：把在途行动改回 resolving，再看恢复与显式重试
     row = h.store.trpg_get("action", **scope, action_id=str(review["action_id"]))
@@ -668,6 +669,196 @@ async def section_e(h: Any, manifest: Path) -> None:
                   f"approve={approve_err[:80]} reject={rejected['action_status']}", "§20.3 / §18.3")
 
 
+# ------------------------------------------------------------------ G 段：C4
+
+
+async def _multi_campaign(h: Any, manifest: Path) -> tuple[str, str, str, str, str]:
+    """同一个用户控制两个角色：一个实例、一张战役、两份私密视图。"""
+    package = example_package("灰潮纪", moment=DAY * 1500 + 30000)
+    card_a = example_card(package, name="堤禾")
+    card_b = example_card(package, name="渡舟")
+    info = create_instance(h.store, package, [card_a, card_b])
+    instance_id = str(info["id"])
+    timeline_id = str(h.store.timeline_list(instance_id)[0]["id"])
+    h.world.ensure_instance(instance_id, now_real=time.time())
+    h.world.activate(instance_id, timeline_id, now_real=time.time())
+    actor_a = str(card_a["meta"]["card_id"])
+    actor_b = str(card_b["meta"]["card_id"])
+    common.ACTORS[instance_id] = actor_a
+    created = await call(
+        h, "trpg.campaign.create", instance_id=instance_id, timeline_id=timeline_id,
+        ruleset_id="client-rules", ruleset_version="1.0", plugin_manifest=str(manifest),
+        host_mode="autonomous", participants=[actor_a, actor_b],
+        scene={"kind": "conflict", "location_refs": ["rl-1"],
+               "public_facts": [{"text": "岗位的门半掩着"}],
+               "private_views": {f"character:{actor_a}": [{"text": "堤禾认得墙上的划痕"}],
+                                 f"character:{actor_b}": [{"text": "渡舟听见水声"}]},
+               "available_actions": ["查岗"]},
+    )
+    return instance_id, timeline_id, str(created["campaign_id"]), actor_a, actor_b
+
+
+async def section_g(h: Any, manifest: Path) -> None:
+    """C4：多角色切换（不合并私密认知）+ 第二个真实规则插件（不写死第一套规则字段）。"""
+    instance_id, timeline_id, campaign_id, actor_a, actor_b = await _multi_campaign(h, manifest)
+    scope = {"instance_id": instance_id, "timeline_id": timeline_id, "campaign_id": campaign_id}
+    entered = await call(h, "trpg.client.enter", **scope, mode="player", audience="public_party",
+                         character_id=actor_a)
+    first = await call(h, "trpg.client.switch", **scope, workspace=entered["workspace"],
+                       character_id=actor_a)
+    second = await call(h, "trpg.client.switch", **scope, workspace=first["workspace"],
+                        character_id=actor_b)
+    a_views = json.dumps(first["faces"]["party"], ensure_ascii=False)
+    b_views = json.dumps(second["faces"]["party"], ensure_ascii=False)
+    common.expect("G01 C4 切角色不合并认知", "切换只换 actor / audience：当前角色的私密材料才可见",
+                  "堤禾认得墙上的划痕" in a_views and "渡舟听见水声" not in a_views
+                  and "渡舟听见水声" in b_views and "堤禾认得墙上的划痕" not in b_views
+                  and second["workspace"]["audience"] == f"character:{actor_b}"
+                  and second["faces"]["gates"]["violations"] == [],
+                  f"A面={a_views[:150]} B面={b_views[:150]}", "§6 / C4")
+    denied = await call_err(h, "trpg.client.switch", **scope, character_id=actor_b, audience="gm_only")
+    common.expect("G01b C4 不凭身份提升受众", "玩家模式下不能切到 gm_only 受众",
+                  "gm_only" in denied and "主持" in denied, denied[:120], "§十二")
+    rows_before = len(h.store.trpg_list("action", **scope))
+    await call(h, "trpg.client.enter", **scope, mode="player", audience=f"character:{actor_a}",
+               character_id=actor_a)
+    await call(h, "trpg.client.refresh", **scope, mode="player", audience="public_party")
+    common.expect("G01c C4 只读不写", "读路径（enter / refresh）不建行动、不写事件",
+                  len(h.store.trpg_list("action", **scope)) == rows_before
+                  and not events(h, instance_id, timeline_id),
+                  f"actions={len(h.store.trpg_list('action', **scope))}", "§18.1 / C4")
+
+    # 第二个真实插件：潮汐骰池（骰池 / 压力 / 际遇，与第一套规则的属性 / 技能 / 骰点全不同）
+    tide = ROOT / "examples" / "tide_rules_plugin" / "manifest.json"
+    instance_id, timeline_id, campaign_id, actor = await new_campaign(
+        h, tide, ruleset_id="tide", version="0.1.0"
+    )
+    scope = {"instance_id": instance_id, "timeline_id": timeline_id, "campaign_id": campaign_id}
+    await call(h, "trpg.client.enter", **scope, mode="player", audience="public_party",
+               character_id=actor)
+    second_plugin = await call(
+        h, "trpg.client.act", **scope, mode="player", audience="public_party", character_id=actor,
+        # 故意不带「也许 / 耗尽」：那两个词在潮汐插件里分别进候选与拒绝分支，不是这次要验的东西
+        text="沿墙摸过去查岗", confirm=True,
+        fields={"target": "off-1", "intent": "沿墙摸过去查岗", "method": "沿墙摸过去"},
+    )
+    gm = {**scope, "mode": "gm", "audience": "gm_only"}
+    audit = await call(h, "trpg.client.enter", **gm, character_id=actor)
+    surface = json.dumps({"result": second_plugin.get("result"), "faces": second_plugin.get("faces")},
+                         ensure_ascii=False)
+    common.expect("G02 C4 差异化规则插件", "同一套客户端流程跑第二套规则：不读第一套规则的属性 / 资源 / 骰点字段",
+                  second_plugin.get("committed") is True
+                  and not any(name in surface for name in ("/hp", "\"hp\"", "\"sp\"", "edge", "\"pool\"", "\"stress\""))
+                  and "gm" in audit["faces"],
+                  f"stage={second_plugin.get('stage')} commit={second_plugin.get('commit_status')} "
+                  f"resolved={second_plugin.get('resolved_status')} errors={second_plugin.get('errors')} "
+                  f"surface={surface[:160]}", "§20.7 / C4")
+    tide_audit = await call(h, "trpg.client.retry", **gm, kind="resume_submit",
+                            action_id=str(second_plugin["action_id"]))
+    common.expect("G02b C4 等级来自插件声明", "结果等级读的是插件 resolve 的通用字段（system / outcome / degree）",
+                  bool(((tide_audit.get("audit") or {}).get("level") or {}).get("outcome")),
+                  json.dumps((tide_audit.get("audit") or {}).get("level"), ensure_ascii=False), "§8.3 / C4")
+
+    # OC 与 TRPG 共用世界：TRPG 提交的事实与说法走同一条合法认知路径
+    cognition = h.world.cognition_project(instance_id, timeline_id, observer_id=actor)
+    history = await call(h, "runtime.history.read", instance_id=instance_id, timeline_id=timeline_id,
+                         filters={"source": "trpg_action"})
+    claim_texts = json.dumps([item.get("text") for item in cognition.get("claims") or []], ensure_ascii=False)
+    common.expect("G03 C4 跨应用共用世界", "TRPG 提交进同一份世界历史，角色认知投影按获知给出说法",
+                  any(str(item.get("source")) == "trpg_action" for item in history.get("items") or [])
+                  and bool(cognition.get("claims")),
+                  f"history={len(history.get('items') or [])} claims={claim_texts[:160]}", "§19 C4")
+
+
+# ------------------------------------------------------------------ H 段：C5
+
+
+async def section_h(h: Any, manifest: Path) -> None:
+    """C5：分支 / 回滚的风险确认与本地状态清理；结构化结果的人工表达入口。"""
+    instance_id, timeline_id, campaign_id, actor = await new_campaign(h, manifest)
+    scope = {"instance_id": instance_id, "timeline_id": timeline_id, "campaign_id": campaign_id}
+    gm = {**scope, "mode": "gm", "audience": "gm_only"}
+    entered = await call(h, "trpg.client.enter", **scope, mode="player", audience="public_party",
+                         character_id=actor)
+    done = await act_player(h, scope, fields={"target": "off-1", "intent": "ok", "method": "徒手"},
+                            intent="ok")
+    commit = h.world.commit(instance_id, timeline_id, kind="manual", note="分支点")
+    commit_id = str(commit["id"])
+    timelines_before = len(h.store.timeline_list(instance_id))
+
+    brief = await call(h, "trpg.client.branch", **gm, commit_id=commit_id)
+    common.expect("H01 C5 分支前置说明", "未确认时只给说明：不带入什么、要选是否激活、原线保留",
+                  brief["stage"] == "branch_confirm" and brief["brief"]["confirm_required"]
+                  and len(brief["brief"]["lines"]) >= 4
+                  and len(h.store.timeline_list(instance_id)) == timelines_before,
+                  json.dumps(brief["brief"], ensure_ascii=False)[:200], "§14.2 / C5")
+    made = await call(h, "trpg.client.branch", **gm, workspace=brief["workspace"], commit_id=commit_id,
+                      name="试演线", confirm=True)
+    common.expect("H02 C5 建线不激活", "确认后新建时间线；未选激活时当前线不变，原线保留",
+                  made["new_timeline_id"] and len(h.store.timeline_list(instance_id)) == timelines_before + 1
+                  and made["workspace"]["timeline_id"] == timeline_id
+                  and made["original_timeline_kept"] is True,
+                  f"new={made.get('new_timeline_id')} ws={made['workspace']['timeline_id']} "
+                  f"lines={len(h.store.timeline_list(instance_id))}", "§14.2")
+    activated = await call(h, "trpg.client.branch", **gm, workspace=made["workspace"], commit_id=commit_id,
+                           name="试演线2", activate=True, confirm=True)
+    common.expect("H03 C5 激活后重读", "选激活就换线：工作区时间线变了，旧选中项作废",
+                  activated["workspace"]["timeline_id"] == activated["new_timeline_id"]
+                  and activated["workspace"]["selected_action_id"] == ""
+                  and activated["faces"]["campaign"]["timeline"],
+                  f"ws={activated['workspace']['timeline_id']} new={activated.get('new_timeline_id')}",
+                  "§14.2 / §C0")
+    # 回滚前再推一次规则状态（2），这样回滚到提交点能看出真的退回去了
+    await act_player(h, scope, fields={"target": "off-1", "intent": "ok", "method": "徒手"},
+                     intent="ok")
+    # 回滚要在**原线**上做：工作区换成原线的视图（H03 之后它还指着试演线）
+    back = {**gm, "workspace": {**activated["workspace"], "timeline_id": timeline_id,
+                                "scene_revision": 999}}
+    state_before = int(rule_state(h, instance_id, timeline_id, campaign_id, "client-rules")
+                       .get("state_revision") or 0)
+    risky = await call(h, "trpg.client.rollback", **back, commit_id=commit_id)
+    common.expect("H04 C5 回滚前置说明", "未确认时列出会失效什么 / 外部表达不保证消失 / 世代变化 / 需重读；不执行",
+                  risky["stage"] == "rollback_confirm" and len(risky["brief"]["lines"]) >= 5
+                  and int(rule_state(h, instance_id, timeline_id, campaign_id, "client-rules")
+                          .get("state_revision") or 0) == state_before,
+                  json.dumps(risky["brief"], ensure_ascii=False)[:200], "§14.3 / C5")
+    # 手里再塞一个过期的场景版本：验证回滚后客户端真的把旧投影作废并重新读取（§14.3）
+    rolled = await call(h, "trpg.client.rollback", **{k: v for k, v in back.items() if k != "workspace"},
+                        workspace={**risky["workspace"], "scene_revision": 999},
+                        commit_id=commit_id, confirm=True, saved=True)
+    state_after = int(rule_state(h, instance_id, timeline_id, campaign_id, "client-rules")
+                      .get("state_revision") or 0)
+    common.expect("H05 C5 回滚后清空并重读", "回滚让规则状态退回提交点；旧场景缓存 / 待选择 / 草稿 / 选中项清空",
+                  state_after < state_before and len(rolled["discarded"]) >= 4
+                  and rolled["workspace"]["draft_text"] == ""
+                  and rolled["workspace"]["selected_action_id"] == ""
+                  and rolled["stage"] == "rollback" and rolled["faces"]["gates"]["violations"] == [],
+                  f"state {state_before}->{state_after} stale={rolled['faces']['stale']} "
+                  f"ws_rev={rolled['workspace']['scene_revision']} "
+                  f"scene={json.dumps(rolled['faces']['scene']['scene'], ensure_ascii=False)} "
+                  f"empty={rolled['faces']['scene']['empty']}",
+                  "§14.3 / C5")
+    # 主持面工作区（audience=gm_only 是主持人自己的视角），材料受众由每次表达单独给
+    tell_scope = {k: v for k, v in gm.items() if k != "audience"}
+    told = await call(h, "trpg.client.express", **tell_scope, workspace=rolled["workspace"],
+                      text="GM 补叙：夜里换了岗，封条是新的",
+                      action_id=str(done.get("action_id") or ""), audience="public_party")
+    claims = [item for item in h.store.claim_list(instance_id, timeline_id)
+              if "补叙" in str(item.get("text") or "")]
+    seedy = await call_err(h, "trpg.client.express", **tell_scope, text="私下安排", audience="gm_only",
+                           as_frame=True)
+    framed = await call(h, "trpg.client.express", **tell_scope, text="GM 补叙：门缝里的风是冷的",
+                        audience="public_party", as_frame=True)
+    event_text = " ".join(str(item.get("summary") or "") for item in
+                          h.store.event_window(instance_id, timeline_id, until=10**15, limit=200))
+    common.expect("H06 C5 人工表达入口", "主持写的正文落成受众标记的说法；事件帧只许公开材料",
+                  told.get("committed") is True and claims and str(claims[0]["audience"]) == "public_party"
+                  and "事件正文" in seedy and framed.get("committed") is True
+                  and "门缝里的风是冷的" in event_text,
+                  f"told={told.get('commit_status')} claims={len(claims)} seedy={seedy[:60]} "
+                  f"framed={framed.get('commit_status')}", "§C5 / §十三")
+
+
 # ------------------------------------------------------------------ F 段：不变量
 
 
@@ -721,6 +912,10 @@ async def run(only: str) -> int:
             await section_d(h, manifest)
         if not only or only.upper().startswith("E"):
             await section_e(h, manifest)
+        if not only or only.upper().startswith("G"):
+            await section_g(h, manifest)
+        if not only or only.upper().startswith("H"):
+            await section_h(h, manifest)
     section_f()
     passed = len([item for item in RESULTS if item["status"] == "PASS"])
     failed = len([item for item in RESULTS if item["status"] == "FAIL"])

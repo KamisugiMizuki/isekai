@@ -160,7 +160,7 @@ async def core() -> AsyncIterator[Any]:
     with tempfile.TemporaryDirectory(prefix="rulecommon-audit-") as tmp:
         folder = Path(tmp) / "config"
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / "config.yaml").write_text("runtime:\n  sleep_wait_min_s: 0.05\n  sleep_wait_max_s: 0.05\n",
+        (folder / "config.yaml").write_text("runtime:\n  sleep_wait_min_s: 0.05\n  sleep_wait_max_s: 0.05\n  max_active_timelines: 24\n",
                                             encoding="utf-8")
         cfg = load_config(tmp)
         runtime = await build_runtime(cfg, llm=FakeLLM(["收到。"]))

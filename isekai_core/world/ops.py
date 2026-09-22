@@ -142,6 +142,10 @@ SYNC_OPS = frozenset(
         "trpg.client.choice",
         "trpg.client.gm_change",
         "trpg.client.review",
+        "trpg.client.switch",
+        "trpg.client.branch",
+        "trpg.client.rollback",
+        "trpg.client.express",
         # OC 故事层（OC_STORY_LAYER_SPEC）：产品状态 / 用户可见面 / 版本编排
         "story.enter",
         "story.scene",
@@ -1997,6 +2001,10 @@ TRPG_CLIENT_SYNC_OPS = frozenset(
         "trpg.client.choice",
         "trpg.client.gm_change",
         "trpg.client.review",
+        "trpg.client.switch",
+        "trpg.client.branch",
+        "trpg.client.rollback",
+        "trpg.client.express",
     }
 )
 
@@ -2028,13 +2036,14 @@ def _workspace_arg(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _client_call(fn: Any, *positional: Any, **kwargs: Any) -> dict[str, Any]:
-    """客户端层与战役运行时的可预期错误都翻成 invalid_input（别落成 internal: TrpgClientError）。"""
+    """客户端层、战役运行时与运行层的可预期错误都翻成 invalid_input（别落成 internal）。"""
     from ..runtime import campaign as campaign_mod
+    from ..runtime.service import RuntimeStateError
     from ..trpg_client.service import TrpgClientError
 
     try:
         return fn(*positional, **kwargs)
-    except (campaign_mod.CampaignError, TrpgClientError) as exc:
+    except (campaign_mod.CampaignError, TrpgClientError, RuntimeStateError) as exc:
         raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
 
 
@@ -2070,6 +2079,30 @@ def _trpg_client_op(cfg: Config, store: Store, runtime: Any, op: str, args: dict
             decision=str(args.get("decision") or ""), reason=str(args.get("reason") or ""),
             idempotency_key=str(args.get("idempotency_key") or ""),
         )
+    if op == "trpg.client.switch":
+        return _client_call(
+            client.switch_actor, workspace=ws, character_id=str(args.get("character_id") or ""),
+            audience=str(args.get("audience") or ""), mode=str(args.get("mode") or ""),
+        )
+    if op == "trpg.client.branch":
+        return _client_call(
+            client.branch, workspace=ws, commit_id=str(args.get("commit_id") or ""),
+            name=str(args.get("name") or ""), activate=bool(args.get("activate")),
+            confirm=bool(args.get("confirm")),
+        )
+    if op == "trpg.client.rollback":
+        return _client_call(
+            client.rollback, workspace=ws, commit_id=str(args.get("commit_id") or ""),
+            confirm=bool(args.get("confirm")), saved=bool(args.get("saved")),
+        )
+    if op == "trpg.client.express":
+        return _client_call(
+            client.express, workspace=ws, text=str(args.get("text") or ""),
+            action_id=str(args.get("action_id") or ""),
+            audience=str(args.get("audience") or "public_party"),
+            as_frame=bool(args.get("as_frame")),
+            idempotency_key=str(args.get("idempotency_key") or ""),
+        )
     raise UmpError(Err.UNSUPPORTED_TYPE, f"未知客户端操作 {op}", retryable=False)
 
 
@@ -2077,6 +2110,7 @@ async def _trpg_client_async(cfg: Config, llm: Any, store: Store, runtime: Any, 
                              args: dict[str, Any]) -> dict[str, Any]:
     """客户端异步操作：行动闭环（草稿要调模型）与重试语义。"""
     from ..runtime import campaign as campaign_mod
+    from ..runtime.service import RuntimeStateError
     from ..trpg_client.service import TrpgClientError
 
     client = _trpg_client_service(cfg=cfg, store=store, runtime=runtime, llm=llm)
@@ -2094,7 +2128,7 @@ async def _trpg_client_async(cfg: Config, llm: Any, store: Store, runtime: Any, 
                 workspace=ws, kind=str(args.get("kind") or ""), action_id=str(args.get("action_id") or ""),
                 idempotency_key=str(args.get("idempotency_key") or ""),
             )
-    except (campaign_mod.CampaignError, TrpgClientError) as exc:
+    except (campaign_mod.CampaignError, TrpgClientError, RuntimeStateError) as exc:
         raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
     raise UmpError(Err.UNSUPPORTED_TYPE, f"未知客户端操作 {op}", retryable=False)
 
