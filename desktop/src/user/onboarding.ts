@@ -9,6 +9,7 @@
 import type { AppContext, Pane } from "./app";
 import type { Json } from "./api";
 import { uiError } from "./api";
+import { migrateCard } from "./migrate";
 import { button, el, errorCard, facts, field, fill, paragraph, primary, section, setNote, stamp } from "./dom";
 
 type StepId = "check" | "ai" | "task" | "material" | "start";
@@ -133,6 +134,8 @@ export class OnboardingPane implements Pane {
         button("重新检查", () => void this.recheck()),
       ),
     );
+    // 已有开发版数据的用户（§3.2）：从旧目录整份搬过来，而不是手动拷文件
+    host.appendChild(migrateCard(this.ctx));
   }
 
   private async recheck(): Promise<void> {

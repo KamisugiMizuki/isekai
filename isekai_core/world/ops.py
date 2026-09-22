@@ -133,6 +133,8 @@ SYNC_OPS = frozenset(
         "backup.pack.list",
         "backup.pack.verify",
         "backup.pack.stage",
+        # 从旧的开发目录迁移（ONBOARDING §3.2）：检查是只读的，跑迁移在异步表里
+        "migrate.inspect",
         "proactive.list",
         # TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）：编排态读写 + 联合提交
         "trpg.campaign.create",
@@ -199,6 +201,7 @@ ASYNC_OPS = frozenset(
         "trpg.action.resolve",
         "trpg.client.act",
         "backup.pack.create",
+        "migrate.run",
         "backup.pack.apply",
         "trpg.client.retry",
         "trpg.campaign.migrate",
@@ -922,6 +925,13 @@ def dispatch(
                 "expanded_bytes": report.get("expanded_bytes", 0),
                 "counts": report.get("counts") or {},
                 "manifest": report.get("manifest") or {},
+            }
+        if op == "migrate.inspect":
+            from .. import migrate
+
+            return {
+                "inspect": migrate.inspect(cfg, args.get("path")),
+                "target": migrate.target_state(cfg, store),
             }
         if op == "backup.pack.stage":
             from .. import backup_pack
@@ -2341,6 +2351,22 @@ async def dispatch_async(
         if op == "backup.pack.create":
             # 单文件全量备份（§9.1）：与自动备份共用 _pack_create，手动件不参与自动轮换
             return _pack_create(cfg, store, kind=str(args.get("kind") or "manual"), note=str(args.get("note") or ""))
+        if op == "migrate.run":
+            from .. import migrate
+
+            result = migrate.run(
+                cfg,
+                store,
+                str(args.get("path") or ""),
+                note=str(args.get("note") or "从旧开发目录迁移"),
+            )
+            if not result.get("ok"):
+                raise UmpError(
+                    Err.INVALID,
+                    "；".join(result.get("problems") or ["迁移没有完成"]),
+                    retryable=False,
+                )
+            return {"migration": result}
         if op == "backup.pack.apply":
             from .. import backup_pack
 

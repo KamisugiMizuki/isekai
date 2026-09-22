@@ -6,6 +6,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { AppContext, Pane } from "./app";
 import { openDir } from "./app";
+import { migrateCard } from "./migrate";
 import type { Json } from "./api";
 import { uiError } from "./api";
 import {
@@ -377,6 +378,7 @@ export class SettingsPane implements Pane {
       note,
       list,
       restoreHost,
+      migrateCard(this.ctx),
     );
   }
 

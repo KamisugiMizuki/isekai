@@ -54,6 +54,8 @@ OP_BY_COMMAND = {
     ("backup", "list"): "backup.list",
     ("backup", "pack"): "backup.pack.create",
     ("backup", "packs"): "backup.pack.list",
+    ("setup", "migrate-check"): "migrate.inspect",
+    ("setup", "migrate"): "migrate.run",
     ("backup", "verify"): "backup.pack.verify",
     ("backup", "stage"): "backup.pack.stage",
     ("backup", "apply"): "backup.pack.apply",
@@ -211,6 +213,13 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
         if cmd == "install":
             return {"archive": ns.archive or ns.file or "", "replace": bool(ns.replace)}
         return {}
+    if group == "setup":
+        args = {}
+        if cmd in ("migrate-check", "migrate"):
+            args["path"] = ns.file or ns.package
+        if cmd == "migrate":
+            args["note"] = ns.note or "从旧开发目录迁移"
+        return args
     if group == "backup":
         args = {}
         if cmd == "create":

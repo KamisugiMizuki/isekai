@@ -196,6 +196,24 @@ export class AppApi {
     return this.call("world.package.fill", payload, 900000);
   }
 
+  // 角色卡这类 op 的路径参数名是 card_path（不是 path）：两处都用错会拿「缺少路径」
+  cardLoad(path: string): Promise<Json> {
+    return this.call("world.card.load", { card_path: path }, 60000);
+  }
+
+  cardSave(path: string, card: Json): Promise<Json> {
+    return this.call("world.card.save", { card_path: path, card }, 120000);
+  }
+
+  cardValidate(args: Json): Promise<Json> {
+    return this.call("world.card.validate", args, 120000);
+  }
+
+  /** 角色卡起草：base 给定时是「整卡重跑」，sections 给定时是字段级重跑 */
+  cardGenerate(payload: Json): Promise<Json> {
+    return this.call("world.card.generate", payload, 900000);
+  }
+
   cardConfirm(args: Json): Promise<Json> {
     return this.call("world.card.confirm", args, 120000);
   }
@@ -479,6 +497,15 @@ export class AppApi {
 
   packStage(path: string): Promise<Json> {
     return this.call("backup.pack.stage", { path }, 600000);
+  }
+
+  /** 从旧的开发目录迁移（§3.2）：检查是只读的 */
+  migrateInspect(path: string): Promise<Json> {
+    return this.call("migrate.inspect", { path }, 120000);
+  }
+
+  migrateRun(path: string, note = "从旧开发目录迁移"): Promise<Json> {
+    return this.call("migrate.run", { path, note }, 900000);
   }
 
   packApply(staged: string, note = ""): Promise<Json> {

@@ -11,6 +11,7 @@ import type { AppContext, Pane } from "./app";
 import type { Json } from "./api";
 import { uiError } from "./api";
 import {
+  bulletList,
   button,
   chip,
   dialog,
@@ -111,6 +112,28 @@ const FIELD_LABELS: Record<string, string> = {
   policy: "处理方式",
   min_years: "最短",
   max_years: "最长",
+  // 角色卡
+  self_identity: "自我认同",
+  gender: "性别",
+  occupation: "职业",
+  creator: "由谁创造",
+  self_knowledge: "自知程度",
+  ref_type: "引用类型",
+  ref_id: "引用对象",
+  obtained_at: "何时知道",
+  mechanism_id: "联络方式",
+  note: "备注",
+  intent: "意图",
+  semantic: "语义",
+  driver: "驱动",
+  strength: "强度",
+  window: "窗口",
+  preconditions: "前提",
+  effect: "效果",
+  mode: "认知模式",
+  sources: "依据来源",
+  routine_note: "作息说明",
+  appearance: "外貌",
 };
 
 const LONG_KEYS = new Set([
@@ -189,8 +212,24 @@ interface Section {
 }
 
 function label(key: string): string {
-  return FIELD_LABELS[key] ?? key;
+  const short = key.split(".").pop() ?? key;
+  return FIELD_LABELS[short] ?? short;
 }
+
+/** 角色卡的分组标题（顶层键 → 用户说法） */
+const GROUP_LABELS: Record<string, string> = {
+  identity: "身份",
+  background: "来历",
+  first_contact: "初次接触",
+  cognition: "认知",
+  life_template: "作息",
+  meta: "状态",
+  channels: "信息来源",
+  initial_knowledge: "初始知道的事",
+  comms: "联络方式",
+  initial_units: "性格单元",
+  intents: "当前意图",
+};
 
 /** 分区目录：段内所有「有 id 的条目列表」（按路径升序，标签用用户说法） */
 export function sectionsOf(pkg: Json): Section[] {
@@ -240,6 +279,7 @@ function refCandidates(key: string, refs: Record<string, Array<{ id: string; lab
     family: "events.families",
     refs: "entities",
     channel: "comms.mechanisms",
+    mechanism_id: "comms.mechanisms",
   };
   return refs[pairs[key] ?? key] ?? [];
 }
@@ -380,6 +420,13 @@ export class CreatePane implements Pane {
   private section = "";
   private entryId = "";
   private cardFiles: string[] = [];
+  /** 角色卡工作区：列表 / 起草编辑 */
+  private cardStep: "list" | "draft" = "list";
+  private card: Json | null = null;
+  private cardName = "";
+  private cardBrief = "";
+  private cardLocks: string[] = [];
+  private cardErrors: string[] = [];
   private worldName = "";
   private created: Json | null = null;
   private busy = false;
@@ -485,7 +532,10 @@ export class CreatePane implements Pane {
     try {
       if (this.step === "source") this.renderSource();
       else if (this.step === "world") this.renderWorld();
-      else if (this.step === "cards") await this.renderCards();
+      else if (this.step === "cards") {
+        if (this.cardStep === "draft") this.renderCardEditor();
+        else await this.renderCards();
+      }
       else if (this.step === "review") this.renderReview();
       else if (this.step === "create") this.renderCreate();
       else this.renderStart();
@@ -1112,13 +1162,22 @@ export class CreatePane implements Pane {
     );
     const cards = await this.ctx.api.cards();
     const items = (cards.cards as Json[]) ?? [];
-    host.appendChild(paragraph("角色卡必须在创建前确认过；未确认的先点「确认角色卡」（它会按世界设定检查一遍）。"));
+    host.appendChild(
+      paragraph("角色卡必须在创建前确认过；未确认的先点「确认角色卡」（它会按世界设定检查一遍）。"),
+    );
+    host.appendChild(
+      el(
+        "div",
+        { class: "u-row" },
+        primary("新建角色卡（AI 起草）", () => this.openCardDraft()),
+        button("从文件导入角色卡", () => this.ctx.navigate({ pane: "worlds" })),
+      ),
+    );
     if (!items.length) {
       host.appendChild(
         section(
           "还没有角色卡",
-          paragraph("可以导入一张角色卡，或者在世界设定里先确认设定后由 AI 起草（角色起草在「世界与素材」的角色卡列表里）。"),
-          el("div", { class: "u-row" }, button("去世界与素材", () => this.ctx.navigate({ pane: "worlds" }))),
+          paragraph("可以在这里起草一张，或到「世界与素材 → 导入」带一张进来。"),
         ),
       );
       return;
@@ -1139,6 +1198,7 @@ export class CreatePane implements Pane {
       row.appendChild(tick);
       row.appendChild(el("span", { class: "u-grow", text: String(item.name ?? file) }));
       row.appendChild(chip(item.confirmed ? "可用于创建" : "未确认", item.confirmed ? "ok" : "pending"));
+      row.appendChild(button("编辑", () => void this.openCardFile(file)));
       if (!item.confirmed) {
         row.appendChild(button("确认角色卡", () => void this.confirmCard(file)));
       }
@@ -1148,6 +1208,262 @@ export class CreatePane implements Pane {
     if (this.cardFiles.length) {
       host.appendChild(paragraph(`已选 ${this.cardFiles.length} 张：${this.cardFiles.join("、")}`, "u-hint"));
     }
+  }
+
+  /** 角色卡工作区（§5.3）：起草 → 逐字段改/锁定 → 保存草稿或确认角色卡 */
+  private async openCardDraft(): Promise<void> {
+    this.cardStep = "draft";
+    this.card = null;
+    this.cardName = "";
+    this.cardBrief = "";
+    this.cardLocks = [];
+    this.cardErrors = [];
+    await this.render();
+  }
+
+  private async openCardFile(file: string): Promise<void> {
+    setNote(this.note, "正在打开这张角色卡…", "pending");
+    try {
+      const loaded = await this.ctx.api.cardLoad(file);
+      this.card = (loaded.card as Json) ?? {};
+      const meta = (this.card.meta as Json) ?? {};
+      this.cardName = String((this.card.identity as Json)?.name ?? file);
+      this.cardErrors = [];
+      this.cardStep = "draft";
+      setNote(this.note, `正在编辑「${this.cardName}」：确认后修改才生效（${meta.confirmed ? "这张卡已经确认过" : "还没确认"}）`, "ok");
+      await this.render();
+    } catch (error) {
+      setNote(this.note, uiError(error, { module: "角色卡", action: "打开" }).message, "bad");
+    }
+  }
+
+  private renderCardEditor(): void {
+    const host = this.root!;
+    host.appendChild(
+      el(
+        "div",
+        { class: "u-row" },
+        button("返回角色列表", () => {
+          this.cardStep = "list";
+          void this.render();
+        }),
+        button("保存草稿", () => void this.saveCardDraft()),
+        primary("确认角色卡", () => void this.confirmCardDraft()),
+      ),
+    );
+    const name = el("input", { class: "u-input", id: "u-card-name", value: this.cardName }) as HTMLInputElement;
+    name.addEventListener("input", () => {
+      this.cardName = name.value;
+    });
+    const brief = el("textarea", { class: "u-textarea", rows: "3", id: "u-card-brief", placeholder: "她是谁、和这个世界什么关系（起草用）" }) as HTMLTextAreaElement;
+    brief.value = this.cardBrief;
+    brief.addEventListener("input", () => {
+      this.cardBrief = brief.value;
+    });
+    host.appendChild(field("角色名", name));
+    host.appendChild(field("一句话描述（起草用）", brief));
+    host.appendChild(
+      el(
+        "div",
+        { class: "u-row" },
+        primary(this.card ? "重新起草（整卡）" : "让 AI 起草", () => void this.draftCard()),
+        paragraph("起草会带着当前世界设定：角色卡里的来源、史料与联络方式都从这份设定里选。", "u-hint"),
+      ),
+    );
+    if (!this.card) {
+      host.appendChild(paragraph("还没有草稿：先写一句描述再起草，或者直接点「让 AI 起草」用世界设定补一份。"));
+      return;
+    }
+    host.appendChild(this.cardForm());
+    host.appendChild(this.cardLockPanel());
+    const check = el("div", { class: "u-card" });
+    check.appendChild(el("h3", { text: "检查" }));
+    if (this.cardErrors.length) {
+      check.appendChild(paragraph(`还有 ${this.cardErrors.length} 项要处理：`));
+      check.appendChild(bulletList(this.cardErrors.slice(0, 12), "u-list"));
+      check.appendChild(primary("重新检查", () => void this.validateCard()));
+    } else {
+      check.appendChild(paragraph("这张卡目前没有校验问题。", "u-hint"));
+      check.appendChild(button("重新检查", () => void this.validateCard()));
+    }
+    host.appendChild(check);
+  }
+
+  /** 卡片表单：顶层标量 / 分组对象 / 列表（一层深）都渲染成控件 */
+  private cardForm(): HTMLElement {
+    const box = el("div", { class: "u-card u-card-form" });
+    const card = this.card!;
+    const refs = refIndex(this.candidate ?? {});
+    const entries = Object.entries(card);
+    box.appendChild(el("h3", { text: "角色内容" }));
+    for (const [key, value] of entries) {
+      if (key === "meta") continue;
+      if (Array.isArray(value)) {
+        box.appendChild(el("h4", { text: GROUP_LABELS[key] ?? label(key) }));
+        box.appendChild(controlFor(key, value, refs, (next) => {
+          card[key] = next;
+        }));
+        continue;
+      }
+      if (value && typeof value === "object") {
+        const group = el("div", { class: "u-field-group" });
+        group.appendChild(el("h4", { text: GROUP_LABELS[key] ?? label(key) }));
+        for (const [sub, subValue] of Object.entries(value as Json)) {
+          group.appendChild(
+            field(
+              label(sub),
+              controlFor(`${key}.${sub}`, subValue, refs, (next) => {
+                (card[key] as Json)[sub] = next;
+              }),
+            ),
+          );
+        }
+        box.appendChild(group);
+        continue;
+      }
+      box.appendChild(
+        field(
+          label(key),
+          controlFor(key, value, refs, (next) => {
+            card[key] = next;
+          }),
+        ),
+      );
+    }
+    return box;
+  }
+
+  /** 字段级锁定：重跑时这些字段原样保留（核心的 locked_fields） */
+  private cardLockPanel(): HTMLElement {
+    const box = el("details", { class: "u-knobs" });
+    box.appendChild(el("summary", { text: `锁定字段（重跑时不覆盖，已锁 ${this.cardLocks.length} 个）` }));
+    const grid = el("div", { class: "u-knob-grid" });
+    const paths: string[] = [];
+    for (const [key, value] of Object.entries(this.card ?? {})) {
+      if (key === "meta") continue;
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        for (const sub of Object.keys(value as Json)) paths.push(`${key}.${sub}`);
+      } else {
+        paths.push(key);
+      }
+    }
+    for (const path of paths) {
+      const line = el("label", { class: "u-check" });
+      const tick = el("input", { type: "checkbox" }) as HTMLInputElement;
+      tick.checked = this.cardLocks.includes(path);
+      tick.addEventListener("change", () => {
+        this.cardLocks = tick.checked
+          ? [...new Set([...this.cardLocks, path])]
+          : this.cardLocks.filter((item) => item !== path);
+      });
+      line.appendChild(tick);
+      line.appendChild(el("span", { text: label(path) }));
+      grid.appendChild(line);
+    }
+    box.appendChild(grid);
+    box.appendChild(paragraph("锁定的字段在「重新起草」与重跑时保持原样；要改先在这里解锁。", "u-hint"));
+    return box;
+  }
+
+  private async draftCard(): Promise<void> {
+    if (!this.base) {
+      setNote(this.note, "先确认世界设定：角色卡要按那份设定来写", "bad");
+      return;
+    }
+    if (!this.cardBrief.trim() && !this.card) {
+      setNote(this.note, "先写一句她是谁", "bad");
+      return;
+    }
+    setNote(this.note, "正在起草角色卡…", "pending");
+    try {
+      const payload: Json = {
+        package_path: String(this.base).split(/[\\/]/).pop() ?? this.base,
+        brief: this.cardBrief.trim(),
+        locked_fields: this.cardLocks,
+      };
+      if (this.card) payload.base = this.card;
+      const result = await this.ctx.api.cardGenerate(payload);
+      if (result.candidate) this.card = result.candidate as Json;
+      this.cardErrors = ((result.errors as string[]) ?? []).slice();
+      if (!this.cardName) this.cardName = String((this.card?.identity as Json)?.name ?? "");
+      setNote(
+        this.note,
+        this.cardErrors.length ? `起草完成，还有 ${this.cardErrors.length} 项要处理` : "起草完成：逐项看看，改完再确认",
+        this.cardErrors.length ? "pending" : "ok",
+      );
+      void this.render();
+    } catch (error) {
+      setNote(this.note, uiError(error, { module: "角色卡", action: "起草", done: "没有改动已保存的材料" }).message, "bad");
+    }
+  }
+
+  private async validateCard(): Promise<void> {
+    if (!this.card || !this.base) return;
+    try {
+      const result = await this.ctx.api.cardValidate({
+        card: this.card,
+        package_path: String(this.base).split(/[\\/]/).pop() ?? this.base,
+      });
+      this.cardErrors = ((result.errors as string[]) ?? []).slice();
+      setNote(this.note, this.cardErrors.length ? `还有 ${this.cardErrors.length} 项要处理` : "检查通过", this.cardErrors.length ? "pending" : "ok");
+      void this.render();
+    } catch (error) {
+      setNote(this.note, uiError(error, { module: "角色卡", action: "检查" }).message, "bad");
+    }
+  }
+
+  private async saveCardDraft(): Promise<void> {
+    if (!this.card) return;
+    try {
+      await this.ctx.api.draftSave(`card:${this.cardName || "未命名"}`, "create", this.cardName, this.cardName, {
+        card: this.card,
+        errors: this.cardErrors,
+        brief: this.cardBrief,
+        locks: this.cardLocks,
+      });
+      setNote(this.note, "草稿已保存：草稿不是正式角色卡，确认后才生效", "ok");
+    } catch (error) {
+      setNote(this.note, uiError(error, { module: "角色卡", action: "保存草稿" }).message, "bad");
+    }
+  }
+
+  /** 确认角色卡：先落盘到创作目录，再按世界设定校验并标记「可用于创建」 */
+  private async confirmCardDraft(): Promise<void> {
+    if (!this.card || !this.base) return;
+    const name = this.cardName.trim();
+    if (!name) {
+      setNote(this.note, "先给这张卡起个名字", "bad");
+      return;
+    }
+    setNote(this.note, "正在检查并确认这张角色卡…", "pending");
+    try {
+      const file = await this.uniqueCardFile(name);
+      await this.ctx.api.cardSave(file, this.card);
+      await this.ctx.api.cardConfirm({
+        card_path: file,
+        package_path: String(this.base).split(/[\\/]/).pop() ?? this.base,
+      });
+      this.cardStep = "list";
+      this.cardFiles = [...new Set([...this.cardFiles, file])];
+      setNote(this.note, `角色卡「${name}」已确认：可以用于创建`, "ok");
+      await this.render();
+    } catch (error) {
+      setNote(
+        this.note,
+        uiError(error, { module: "角色卡", action: "确认", done: "草稿还在，改完可以再试" }).message,
+        "bad",
+      );
+    }
+  }
+
+  private async uniqueCardFile(name: string): Promise<string> {
+    const base = name.replace(/[^\w\u4e00-\u9fa5-]/g, "_").slice(0, 40) || "card";
+    const list = await this.ctx.api.cards();
+    const taken = new Set(((list.cards as Json[]) ?? []).map((item) => String(item.file ?? "")));
+    let candidate = `${base}.card.json`;
+    let index = 2;
+    while (taken.has(candidate)) candidate = `${base}-${index++}.card.json`;
+    return candidate;
   }
 
   private async confirmCard(file: string): Promise<void> {

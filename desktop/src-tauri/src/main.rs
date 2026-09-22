@@ -464,6 +464,39 @@ fn pick_file_blocking(
     Ok(if picked.is_empty() { None } else { Some(picked) })
 }
 
+/// FolderBrowserDialog：选一个已有目录（迁移旧数据时用；同样不引新依赖）。
+#[tauri::command]
+async fn pick_dir(dir: Option<String>, title: Option<String>) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || pick_dir_blocking(dir, title))
+        .await
+        .map_err(|error| format!("目录对话框任务失败：{error}"))?
+}
+
+fn pick_dir_blocking(dir: Option<String>, title: Option<String>) -> Result<Option<String>, String> {
+    let script = concat!(
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
+        "Add-Type -AssemblyName System.Windows.Forms;",
+        "$d=New-Object System.Windows.Forms.FolderBrowserDialog;",
+        "if($env:ISEKAI_PICK_TITLE){$d.Description=$env:ISEKAI_PICK_TITLE};",
+        "if(-not $d.Description){$d.Description='选择目录'};",
+        "$d.ShowNewFolderButton=$false;",
+        "if($env:ISEKAI_PICK_DIR -and (Test-Path $env:ISEKAI_PICK_DIR)){$d.SelectedPath=$env:ISEKAI_PICK_DIR};",
+        "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($d.SelectedPath)}"
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .env("ISEKAI_PICK_DIR", dir.unwrap_or_default())
+        .env(
+            "ISEKAI_PICK_TITLE",
+            title.unwrap_or_else(|| "选择旧的数据目录".to_string()),
+        )
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("打开目录对话框失败：{error}"))?;
+    let picked = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if picked.is_empty() { None } else { Some(picked) })
+}
+
 /// 只读文本文件（导入时用户显式选中的那份）：限额 + UTF-8，不做任何解析。
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
@@ -587,6 +620,7 @@ fn main() {
             open_dir,
             config_facts,
             pick_file,
+            pick_dir,
             read_text_file,
             exit_ready,
             quit_app

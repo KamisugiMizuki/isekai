@@ -139,6 +139,11 @@ def _clean_config(cfg: Any) -> str:
     """非敏感偏好：密钥 / 令牌整条剔除（凭据不随备份传播）。"""
     path = Path(cfg.paths.config_file)
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    return clean_config_text(text)
+
+
+def clean_config_text(text: str) -> str:
+    """剔掉密钥 / 令牌这类键（备份与迁移共用：凭据不随数据走）。"""
     try:
         import yaml
 
@@ -163,6 +168,110 @@ def _clean_config(cfg: Any) -> str:
         return yaml.safe_dump(prune(data), allow_unicode=True, sort_keys=False)
     except Exception:  # noqa: BLE001
         return text
+
+
+def snapshot_db(db_path: Path, target: Path, *, note: str = "") -> dict[str, Any]:
+    """任意一个数据库文件的一致快照（SQLite 在线备份 API）：备份与迁移共用。
+
+    顺带做整理：清掉明文绑定令牌（副本不该带着可重放的连接凭据），抬一次版本，
+    写 `backup_at` / `backup_note`，再做一次完整性检查。
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    dest = sqlite3.connect(str(target))
+    try:
+        source.backup(dest)
+        dest.execute("UPDATE thread SET binding_token='', binding_version=binding_version+1")
+        dest.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('backup_at', ?)", (str(time.time()),)
+        )
+        if note:
+            dest.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('backup_note', ?)", (note,))
+        dest.commit()
+        check = dest.execute("PRAGMA integrity_check").fetchone()
+    finally:
+        source.close()
+        dest.close()
+    ok = bool(check) and str(check[0]) == "ok"
+    return {
+        "file": str(target),
+        "bytes": target.stat().st_size if target.exists() else 0,
+        "created_at": time.time(),
+        "ok": ok,
+    }
+
+
+def write_pack_from(
+    source_root: Path,
+    dest_dir: Path,
+    *,
+    kind: str = "migrate",
+    note: str = "",
+) -> dict[str, Any]:
+    """把**另一个数据根**打成一个标准备份包（迁移用：不走现行 store，只读那份数据）。
+
+    与 `write_pack` 同一套容器与清单，所以迁移的「启用」可以直接复用恢复的暂存与切换路径。
+    """
+    source_root = Path(source_root)
+    db_path = source_root / "data" / "isekai.db"
+    if not db_path.is_file():
+        raise PackError("这份目录里没有 data/isekai.db：看着不像 isekai 的数据目录")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    name = f"isekai-{kind}-{stamp}.zip"
+    target = dest_dir / name
+    tmp = dest_dir / f".{name}.part"
+    parts: list[dict[str, Any]] = []
+    with quiet():
+        snap = dest_dir / f".{name}.db"
+        try:
+            snapshot = snapshot_db(db_path, snap, note=note or kind)
+            if not snapshot.get("ok"):
+                raise PackError("旧目录里的数据库没通过完整性检查，先别迁移")
+            counts = _snapshot_counts(snap)
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+                _add_file(zf, snap, DB_PART, parts)
+                for folder in ("packages", "exports"):
+                    root = source_root / folder
+                    if not root.is_dir():
+                        continue
+                    for path in sorted(root.rglob("*")):
+                        if path.is_file() and not _skip(path):
+                            _add_file(zf, path, f"assets/{folder}/{path.relative_to(root).as_posix()}", parts)
+                config_text = ""
+                config_path = source_root / "config" / "config.yaml"
+                if config_path.is_file():
+                    config_text = clean_config_text(config_path.read_text(encoding="utf-8"))
+                _add_bytes(zf, CONFIG_PART, config_text.encode("utf-8"), parts)
+                manifest = {
+                    "format": FORMAT,
+                    "kind": kind,
+                    "note": note,
+                    "created_at": time.time(),
+                    "app_version": "0.1.0",
+                    "schema_version": 1,
+                    "counts": counts,
+                    "parts": parts,
+                    "source_root": str(source_root),
+                    "excluded": ["API 密钥与通道凭据", "进程锁与运行句柄", "日志与缓存", "可执行插件"],
+                }
+                zf.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=2))
+        except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
+            tmp.unlink(missing_ok=True)
+            raise PackError(f"打包旧目录失败：{exc}") from exc
+        finally:
+            snap.unlink(missing_ok=True)
+    os.replace(tmp, target)
+    return {
+        "name": target.name,
+        "path": str(target),
+        "bytes": target.stat().st_size,
+        "parts": len(parts),
+        "counts": counts,
+        "kind": kind,
+        "source_root": str(source_root),
+        "complete": True,
+    }
 
 
 def _snapshot_counts(db_path: Path) -> dict[str, int]:
