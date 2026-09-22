@@ -125,6 +125,10 @@ function traceOps(client: MgmtClient): void {
 
 let ump: UmpClient | null = null;
 let mgmt: MgmtClient | null = null;
+/// 正式界面已经把管理连接建好了：调试壳复用同一份（管理凭据一次性，不能各连一条）
+let injectedMgmt: MgmtClient | null = null;
+let debugInited = false;
+let debugExit: (() => void) | null = null;
 let shellStatus: CoreStatus | null = null;
 let reconnectAttempt = 0;
 let reconnectToken = 0; // 递增即作废在途的重连链（例如同时发生了核心重启）
@@ -606,13 +610,20 @@ async function connectChat(status: CoreStatus): Promise<void> {
     showRestart();
     return;
   }
-  mgmt?.close(); // 旧连接（若有）先关：重建时别把旧 socket 挂在那里
-  mgmt = new MgmtClient(status.endpoint, status.mgmt);
-  traceOps(mgmt);
-  await mgmt.connect();
-  mgmtTokenUsed = String(status.mgmt ?? ""); // 记下这次用掉的一次性令牌：没换令牌就没有可重建的凭据
-  state.endpoint = status.endpoint;
-  state.bootstrap = status.bootstrap ?? null;
+  if (injectedMgmt) {
+    // 复用正式界面的管理连接（凭据一次性）：只在界面上补读写，不再拨一条
+    mgmt = injectedMgmt;
+    state.endpoint = status.endpoint;
+    state.bootstrap = status.bootstrap ?? null;
+  } else {
+    mgmt?.close(); // 旧连接（若有）先关：重建时别把旧 socket 挂在那里
+    mgmt = new MgmtClient(status.endpoint, status.mgmt);
+    traceOps(mgmt);
+    await mgmt.connect();
+    mgmtTokenUsed = String(status.mgmt ?? ""); // 记下这次用掉的一次性令牌：没换令牌就没有可重建的凭据
+    state.endpoint = status.endpoint;
+    state.bootstrap = status.bootstrap ?? null;
+  }
 
   const overview = await mgmt.call("status");
   //: 阶段 0 的占位会话继续存在（老数据 / 老入口还在用），也是「线还没激活」时的内建会话
@@ -4232,20 +4243,23 @@ async function boot(): Promise<void> {
     if (!next.done) void openNotice(String(next.value));
   });
   renderNotices();
-  // 通知被点击：壳把窗口带到前台后把提醒交给这里定位（隐藏到托盘时事件送不到，另有标志位轮询兜底）
-  await listen<string>("notice-open", (event) => void openNotice(String(event.payload)));
-  setInterval(() => {
-    void invoke<string | null>("take_pending_notice")
-      .then((pending) => (pending ? openNotice(pending) : undefined))
-      .catch(() => undefined);
-  }, 1000);
+  if (!debugExit) {
+    // 通知被点击：壳把窗口带到前台后把提醒交给这里定位（隐藏到托盘时事件送不到，另有标志位轮询兜底）。
+    // 从正式界面进来的调试模式由正式界面负责提醒定位，这里不再抢同一份待定位标志。
+    await listen<string>("notice-open", (event) => void openNotice(String(event.payload)));
+    setInterval(() => {
+      void invoke<string | null>("take_pending_notice")
+        .then((pending) => (pending ? openNotice(pending) : undefined))
+        .catch(() => undefined);
+    }, 1000);
+  }
   renderComposeGate();
   await loadLocalFacts(); // 顶栏的语义召回降级标识来自本地配置事实（§六）
   // 壳的退出请求：先保存再让它停核心（有上限，超时由壳硬杀）。
   // 隐藏到托盘时壳叫不动页面（tauri emit / eval / show 全报 failed to send message to the webview，
   // 2026-09 实测），而页面自己的定时器与 invoke 照常 —— 所以这里轮询壳的 exit_pending 取退出请求。
   setInterval(() => {
-    if (exitHandshakeDone) return;
+    if (exitHandshakeDone || debugExit) return; // 从正式界面进来时，退出前保存由它负责
     void invoke<boolean>("exit_pending")
       .then((pending) => (pending ? flushBeforeExit() : undefined))
       .catch(() => undefined);
@@ -4274,4 +4288,22 @@ async function boot(): Promise<void> {
   showRestart();
 }
 
-void boot();
+/// 从正式界面进入高级调试：复用它的管理连接（管理凭据一次性）；退出前保存仍由它负责。
+export interface DebugDeps {
+  mgmt: MgmtClient | null;
+  onExit: () => void;
+}
+
+export async function initDebugShell(deps: DebugDeps): Promise<void> {
+  injectedMgmt = deps.mgmt;
+  debugExit = deps.onExit;
+  $("back-to-user").addEventListener("click", () => debugExit?.());
+  if (!debugInited) {
+    debugInited = true;
+    await boot();
+    return;
+  }
+  // 已经初始化过：只把连接接上，界面按当前核心状态重读一遍
+  const status = await waitForCore();
+  await connectChat(status);
+}

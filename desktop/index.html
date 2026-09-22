@@ -5,7 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>isekai</title>
   </head>
-  <body>
+  <body data-mode="user">
+    <div id="user-root" class="u-app"></div>
+    <div id="debug-app">
     <div id="app">
       <aside id="sidebar">
         <div class="brand">isekai</div>
@@ -32,6 +34,7 @@
                     title="去设置面调整记忆向量化（语义召回）">召回：全文</button>
             <span id="degrade-live" class="sr-only" role="status" aria-live="polite"></span>
             <button id="restart" class="hidden">重启核心</button>
+            <button id="back-to-user">回到正式界面</button>
             <div id="status" class="chip pending" role="status" aria-live="polite">启动中…</div>
           </div>
         </header>
@@ -404,6 +407,7 @@
         </section>
       </main>
     </div>
-    <script type="module" src="/src/main.ts"></script>
+    </div>
+    <script type="module" src="/src/user/main.ts"></script>
   </body>
 </html>

@@ -825,6 +825,30 @@ CREATE TABLE IF NOT EXISTS wa_candidate(
   updated_real REAL NOT NULL DEFAULT 0,
   PRIMARY KEY(instance_id, timeline_id, id)
 );
+
+-- 界面草稿（ONBOARDING_AND_RECOVERY §3.5）：未发送输入 / 未发布编辑副本的本地持久化。
+-- 只服务界面：按「模块 + 目标对象」存一份当前编辑副本，不建编辑历史树。
+CREATE TABLE IF NOT EXISTS ui_draft(
+  key TEXT PRIMARY KEY,
+  module TEXT NOT NULL,
+  target TEXT NOT NULL,
+  text TEXT NOT NULL DEFAULT '',
+  payload TEXT,
+  state TEXT NOT NULL DEFAULT 'saved',
+  updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_ui_draft_module ON ui_draft(module, updated_at);
+
+-- 请求身份（ONBOARDING_AND_RECOVERY §7.1）：受理前先留住「原操作身份」，
+-- 重复点击 / 断线重试按同一身份回到同一结果，不分配新身份重做。
+CREATE TABLE IF NOT EXISTS request_log(
+  request_id TEXT PRIMARY KEY,
+  op TEXT NOT NULL,
+  instance_id TEXT NOT NULL DEFAULT '',
+  result TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
 """
 
 
@@ -2457,6 +2481,12 @@ class Store:
                 "claim_coverage",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
+            # 界面草稿与请求身份也随实例走（§3.5「实例删除会删除随实例管理的草稿」）
+            self._conn.execute("DELETE FROM request_log WHERE instance_id=?", (instance_id,))
+            self._conn.execute(
+                "DELETE FROM ui_draft WHERE target=? OR target LIKE ?",
+                (instance_id, f"{instance_id}:%"),
+            )
             self._conn.execute(
                 "DELETE FROM memory_citation WHERE timeline_id IN (SELECT id FROM timeline WHERE instance_id=?)",
                 (instance_id,),
@@ -4943,3 +4973,89 @@ class Store:
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('write_probe', ?)", (str(time.time()),)
             )
+
+    # ---------------------------------------------------------------- 界面草稿与请求身份
+
+    def ui_draft_put(
+        self,
+        *,
+        key: str,
+        module: str,
+        target: str,
+        text: str = "",
+        payload: Any = None,
+        state: str = "saved",
+        updated_at: float | None = None,
+    ) -> dict[str, Any]:
+        """写一份界面草稿（同键覆盖：每个对象只保留当前编辑副本，§3.5）。"""
+        row = {
+            "key": str(key),
+            "module": str(module),
+            "target": str(target),
+            "text": str(text or ""),
+            "payload": json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+            "state": str(state or "saved"),
+            "updated_at": float(updated_at if updated_at is not None else time.time()),
+        }
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO ui_draft(key, module, target, text, payload, state, updated_at)
+                   VALUES(:key, :module, :target, :text, :payload, :state, :updated_at)
+                   ON CONFLICT(key) DO UPDATE SET
+                     module=excluded.module, target=excluded.target, text=excluded.text,
+                     payload=excluded.payload, state=excluded.state, updated_at=excluded.updated_at""",
+                row,
+            )
+        return row
+
+    def ui_draft_get(self, key: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM ui_draft WHERE key=?", (str(key),)).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def ui_draft_list(self, module: str = "") -> list[dict[str, Any]]:
+        if module:
+            rows = self._conn.execute(
+                "SELECT * FROM ui_draft WHERE module=? ORDER BY updated_at DESC", (str(module),)
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM ui_draft ORDER BY updated_at DESC").fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def ui_draft_delete(self, key: str) -> bool:
+        with self._lock, self._conn:
+            cursor = self._conn.execute("DELETE FROM ui_draft WHERE key=?", (str(key),))
+        return bool(cursor.rowcount)
+
+    def request_log_get(self, request_id: str) -> dict[str, Any] | None:
+        if not request_id:
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM request_log WHERE request_id=?", (str(request_id),)
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def request_log_put(
+        self, request_id: str, op: str, result: dict[str, Any], *, instance_id: str = ""
+    ) -> None:
+        """记下一次已完成的请求身份：同身份的重复提交据此回到同一结果（§7.1）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO request_log(request_id, op, instance_id, result, created_at)
+                   VALUES(?, ?, ?, ?, ?)""",
+                (
+                    str(request_id),
+                    str(op),
+                    str(instance_id),
+                    json.dumps(result, ensure_ascii=False),
+                    time.time(),
+                ),
+            )
+
+    def request_log_list(self, instance_id: str = "") -> list[dict[str, Any]]:
+        if instance_id:
+            rows = self._conn.execute(
+                "SELECT * FROM request_log WHERE instance_id=? ORDER BY created_at DESC", (instance_id,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM request_log ORDER BY created_at DESC").fetchall()
+        return [_row_to_dict(row) for row in rows]

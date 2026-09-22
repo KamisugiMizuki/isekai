@@ -172,6 +172,7 @@ V1.9 时代的 34 条收敛条款（含大量模块级细则）不再在总纲�
 
 | 模块 | 职责（总设计层面） | 文档 |
 |---|---|---|
+| 正式用户界面 | 统一桌面入口、联络 / 写作 / 跑团工作区、首次配置与错误恢复；设计已定稿 v1.0，尚未实施 | [用户界面定案](../user-interface/README.md) |
 | 通道插件层 | 统一消息协议、插件式通道、第三方插件开放与进程隔离、内建聊天窗口 | [`CHANNEL_PLUGIN_SPEC.md`](CHANNEL_PLUGIN_SPEC.md) |
 | Core Debugging 桌面壳 | 窗口与界面（聊天 / 管理 / 设置）、核心进程监督、托盘常驻与退出补算 | [`../core%20debugging/DESKTOP_SPEC.md`](../core%20debugging/DESKTOP_SPEC.md) |
 | Core Debugging 生成工作区 | 生成与导入的界面排布（世界包 / 角色卡工作区、参数层与条目层、导入与转换入口） | [`../core%20debugging/DESKTOP_GENERATION_WORKSPACE_SPEC.md`](../core%20debugging/DESKTOP_GENERATION_WORKSPACE_SPEC.md) |

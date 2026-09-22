@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ..config import Config
-from ..llm import LLMError
+from ..llm import LLMClient, LLMError
 from ..log import get_logger
 from ..store import Store
 from ..ump import Err, UmpError
@@ -37,6 +37,7 @@ from .instances import (
 from .package import MAX_PACKAGE_BYTES, PackageError, load_package, save_package, template_package
 from .portable import import_instance, read_container, write_export
 from .validate import validate_package
+from .. import onboarding as onboarding_mod
 
 SYNC_OPS = frozenset(
     {
@@ -105,6 +106,14 @@ SYNC_OPS = frozenset(
         "instance.import",
         "instance.setting",
         "app.shutdown",
+        # 首次使用支撑（ONBOARDING_AND_RECOVERY）：本机检查 / 随发行样例 / 界面草稿
+        "app.readiness",
+        "world.sample.list",
+        "world.sample.install",
+        "ui.draft.save",
+        "ui.draft.load",
+        "ui.draft.list",
+        "ui.draft.discard",
         "backup.create",
         "claim.coverage",
         "world.backfill.plan",
@@ -192,6 +201,8 @@ ASYNC_OPS = frozenset(
         "world.card.generate",
         "story.classify",
         "wa.suggest",
+        # 首次使用支撑：AI 连接测试用**正在编辑的值**试调用，不保存配置（§4.2）
+        "settings.test",
     }
 )
 
@@ -423,7 +434,14 @@ def _log_runtime_failure(instance_id: str) -> None:
     get_logger("isekai.world.ops").exception("ensure runtime failed instance=%s", instance_id)
 
 
-def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: Any = None) -> dict[str, Any]:
+def dispatch(
+    cfg: Config,
+    store: Store,
+    op: str,
+    args: dict[str, Any],
+    runtime: Any = None,
+    server: Any = None,
+) -> dict[str, Any]:
     """同步操作：只读写文件与库，不调用模型。"""
     # 规范名先归位（WORLD_RUNTIME_INTERFACE_SPEC §十二）：别名必须在任何 op 分支之前
     # 改写，否则改完的实名会落到后面的前缀兜底里，报「未知运行层操作」
@@ -508,6 +526,49 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
         if op.startswith("runtime."):
             return _runtime_op(runtime, op, args, cfg=cfg)
 
+        # 首次使用支撑（ONBOARDING_AND_RECOVERY）：本机检查 / 随发行样例 / 界面草稿
+        if op == "app.readiness":
+            return onboarding_mod.readiness(cfg, server=server, store=store)
+        if op == "world.sample.list":
+            return {
+                "samples": onboarding_mod.list_samples(cfg),
+                "dir": str(cfg.paths.root / onboarding_mod.SAMPLE_DIR_NAME),
+            }
+        if op == "world.sample.install":
+            return onboarding_mod.install_sample(
+                cfg,
+                str(args.get("sample") or args.get("id") or ""),
+                store=store,
+                request_id=str(args.get("request_id") or ""),
+            )
+        if op == "ui.draft.save":
+            key = str(args.get("key") or "")
+            if not key:
+                raise UmpError(Err.INVALID, "ui.draft.save 需要 key", retryable=False)
+            row = store.ui_draft_put(
+                key=key,
+                module=str(args.get("module") or "misc"),
+                target=str(args.get("target") or ""),
+                text=str(args.get("text") or ""),
+                payload=args.get("payload"),
+                state=str(args.get("state") or "saved"),
+            )
+            return {"draft": {**row, "payload": args.get("payload")}}
+        if op == "ui.draft.load":
+            row = store.ui_draft_get(str(args.get("key") or ""))
+            if row is None:
+                raise UmpError(Err.NOT_FOUND, "没有这份草稿", retryable=False)
+            return {"draft": {**row, "payload": json.loads(row["payload"]) if row.get("payload") else None}}
+        if op == "ui.draft.list":
+            rows = store.ui_draft_list(str(args.get("module") or ""))
+            return {
+                "drafts": [
+                    {**row, "payload": json.loads(row["payload"]) if row.get("payload") else None}
+                    for row in rows
+                ]
+            }
+        if op == "ui.draft.discard":
+            return {"ok": store.ui_draft_delete(str(args.get("key") or ""))}
         if op == "world.package.template":
             return {
                 "package": template_package(
@@ -659,6 +720,12 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
         if op == "instance.list":
             return {"instances": list_instances(store)}
         if op == "instance.create":
+            # 请求身份（§7.1）：开始确认时固定本次创建身份，重复点击 / 重试回到同一结果
+            identity = str(args.get("request_id") or "")
+            cached = onboarding_mod.cached_request(store, identity, "instance.create")
+            if cached is not None:
+                cached["reused"] = True
+                return cached
             package = _package_arg(args, cfg)
             cards = args.get("cards")
             if not isinstance(cards, list):
@@ -672,7 +739,10 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
                 store, package, cards, display_name=args.get("display_name") or None
             )
             _ensure_runtime(runtime, info["id"])
-            return {"instance": info}
+            result = {"instance": info}
+            if identity:
+                store.request_log_put(identity, "instance.create", result, instance_id=str(info["id"]))
+            return result
         if op == "instance.info":
             row = store.instance_get(str(args.get("id") or ""))
             if row is None:
@@ -2163,6 +2233,13 @@ async def dispatch_async(
             if op == "plugin.disable":
                 return {"disable": await host.disable(ident, note=str(args.get("note") or ""))}
             return {"uninstall": await host.uninstall(ident)}
+        if op == "settings.test":
+            # 用正在编辑的值试一次：只发固定测试文字，**不写配置**（保存仍走 settings.set）
+            return await onboarding_mod.test_llm(
+                getattr(llm, "cfg", None) or cfg.llm,
+                args.get("llm") if isinstance(args.get("llm"), dict) else {},
+                client_factory=_probe_client_factory(llm),
+            )
         if op == "event.render":
             return await _render_event(cfg, llm, store, args)
         if op == "event.expand":
@@ -2347,6 +2424,13 @@ def _request_exit(delay: float = 0.5) -> None:
         raise SystemExit(0)
 
     asyncio.get_running_loop().call_later(delay, raise_exit)
+
+
+def _probe_client_factory(llm: Any) -> Any:
+    """连接测试的客户端来源：真实客户端按编辑值新建；测试替身直接复用（探测路径也能离线跑）。"""
+    if llm is None or isinstance(llm, LLMClient):
+        return None
+    return lambda probe_cfg: llm  # noqa: ARG005 —— 替身不关心编辑值，只验证编排
 
 
 def _channel_ref(store: Store | None, args: dict[str, Any]) -> str:

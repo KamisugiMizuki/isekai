@@ -149,6 +149,15 @@ OP_BY_COMMAND = {
     ("runtime", "backfill"): "runtime.backfill",
     ("event", "render"): "event.render",
     ("event", "expand"): "event.expand",
+    # 首次使用支撑（ONBOARDING_AND_RECOVERY §3 / §4）：本机检查 / 随发行样例 / 界面草稿 / 连接测试
+    ("setup", "readiness"): "app.readiness",
+    ("setup", "sample-list"): "world.sample.list",
+    ("setup", "sample-install"): "world.sample.install",
+    ("setup", "ai-test"): "settings.test",
+    ("setup", "draft-save"): "ui.draft.save",
+    ("setup", "draft-list"): "ui.draft.list",
+    ("setup", "draft-load"): "ui.draft.load",
+    ("setup", "draft-discard"): "ui.draft.discard",
 }
 
 
@@ -286,6 +295,34 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
         if cmd == "choose":
             args.update({"choice_id": ns.choice or "", "selection": ns.selection or ""})
         return args
+    if group == "setup":
+        if cmd == "sample-install":
+            return {"sample": ns.name or ns.file or "", "request_id": ns.request or ""}
+        if cmd == "ai-test":
+            overrides = {
+                "base_url": ns.base_url,
+                "model": ns.model,
+                "api_key": ns.api_key,
+                "timeout_s": float(ns.timeout) if ns.timeout else None,
+                "max_tokens": int(ns.max_tokens) if ns.max_tokens else None,
+                "temperature": float(ns.temperature) if ns.temperature is not None else None,
+            }
+            llm = {key: value for key, value in overrides.items() if value is not None}
+            return {"llm": llm} if llm else {}
+        if cmd == "draft-save":
+            payload = json.loads(ns.payload) if ns.payload else None
+            return {
+                "key": ns.key or "",
+                "module": ns.module or "cli",
+                "target": ns.target or "",
+                "text": ns.text or "",
+                "payload": payload,
+            }
+        if cmd in ("draft-load", "draft-discard"):
+            return {"key": ns.key or ""}
+        if cmd == "draft-list":
+            return {"module": ns.module or ""}
+        return {}
     if group == "client":
         args: dict[str, Any] = {
             "instance_id": ns.id, "timeline_id": ns.timeline, "campaign_id": ns.campaign or "",
@@ -631,7 +668,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "group",
         choices=[
             "package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive", "narrative",
-            "trpg", "plugin", "story", "wa", "client",
+            "trpg", "plugin", "story", "wa", "client", "setup",
         ],
     )
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
@@ -758,6 +795,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--unsolved", default=None, action="append", help="编剧层：未解决问题（可重复）")
     parser.add_argument("--gm-changes", dest="gm_changes", default=None, help="编剧层：GM 直接变化载荷（内联 JSON 或文件）")
     parser.add_argument("--goal", default=None, help="编剧层：章节目标（情节提议用）")
+    # 首次使用支撑（setup 组）：AI 连接测试用正在编辑的值，草稿是界面输入的本机持久化
+    parser.add_argument("--base-url", dest="base_url", default=None, help="setup：测试用的服务地址")
+    parser.add_argument("--model", default=None, help="setup：测试用的模型名")
+    parser.add_argument("--api-key", dest="api_key", default=None, help="setup：测试用的访问密钥（不写入配置）")
+    parser.add_argument("--timeout", default=None, help="setup：测试用的等待时间（秒）")
+    parser.add_argument("--max-tokens", dest="max_tokens", default=None, help="setup：测试用的单次输出长度")
+    parser.add_argument("--temperature", default=None, help="setup：测试用的生成随机程度")
+    parser.add_argument("--key", default=None, help="setup：草稿键（如 contact:builtin）")
+    parser.add_argument("--module", default=None, help="setup：草稿所属模块（contact / writing / world）")
+    parser.add_argument("--target", default=None, help="setup：草稿目标对象")
+    parser.add_argument("--payload", default=None, help="setup：草稿附带数据（内联 JSON）")
     ns = parser.parse_args(argv)
     if (ns.group, ns.command) not in OP_BY_COMMAND:
         parser.error(f"未知命令 {ns.group} {ns.command}")

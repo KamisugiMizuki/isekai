@@ -695,7 +695,9 @@ class CoreServer:
         if op == "settings.get":
             return self._settings_get()
         if op in world_ops.SYNC_OPS:
-            return world_ops.dispatch(self.cfg, self.store, op, args, runtime=getattr(self.service, "runtime", None))
+            return world_ops.dispatch(
+                self.cfg, self.store, op, args, runtime=getattr(self.service, "runtime", None), server=self
+            )
         if op == "history.page":
             session = self.store.session_get(str(args.get("session_id") or ""))
             if session is None:

@@ -1,0 +1,616 @@
+/*
+ * 正式界面的数据访问层：只调核心契约（管理面 op + UMP），不自己持有世界状态。
+ *
+ * 两条约定（读一次就够，后面所有面板都靠它）：
+ * - 业务拒绝不是异常：`status: "rejected"/"waiting"/"conflict"` 原样回给界面，由面板翻译；
+ *   只有结构缺失与真失败才抛 `UiError`。
+ * - 错误信息按 ONBOARDING §5.1 的最小返回信息构造：所属模块、目标身份、发生阶段、
+ *   稳定原因码、可重试、已完成、尚未确认、可定位字段。
+ */
+
+import { MgmtClient, MgmtError, UmpClient, newId, type Envelope } from "../ump";
+
+export type Json = Record<string, unknown>;
+
+export interface UiError {
+  module: string;
+  action: string;
+  target: string;
+  stage: string;
+  code: string;
+  message: string;
+  retryable: boolean;
+  done: string;
+  unknown: string;
+  field: string;
+  requestId: string;
+}
+
+export interface ErrorContext {
+  module: string;
+  action: string;
+  target?: string;
+  field?: string;
+  done?: string;
+  unknown?: string;
+}
+
+const CODE_TEXT: Record<string, string> = {
+  invalid_input: "这一步的输入没有通过检查",
+  not_found: "找不到这个对象（可能已被删除或改动）",
+  state_blocked: "当前状态不允许做这件事",
+  conflict: "与当前进度冲突",
+  unsupported_type: "当前版本不支持这个操作",
+  generation_failed: "这次生成没有成功",
+  llm_not_configured: "还没有配置 AI 服务",
+  llm_rejected: "AI 服务拒绝了这次调用",
+  llm_unreachable: "连不上 AI 服务地址",
+  empty_completion: "模型没有返回可用内容",
+  truncated_completion: "模型输出被截断",
+  internal: "程序内部处理失败，已记录诊断信息",
+  overloaded: "核心正忙，稍后重试",
+  rate_limited: "操作太快，稍后再试",
+  auth_failed: "核心拒绝了这次连接凭据",
+  auth_required: "需要先完成认证",
+};
+
+export function uiError(error: unknown, ctx: ErrorContext): UiError {
+  const base: UiError = {
+    module: ctx.module,
+    action: ctx.action,
+    target: ctx.target ?? "",
+    stage: "",
+    code: "",
+    message: "",
+    retryable: false,
+    done: ctx.done ?? "没有任何改动",
+    unknown: ctx.unknown ?? "这次操作的结果",
+    field: ctx.field ?? "",
+    requestId: "",
+  };
+  if (error instanceof MgmtError) {
+    base.code = error.code;
+    base.retryable = error.retryable;
+    const known = CODE_TEXT[error.code] ?? "这一步没有完成";
+    // 底层自由文本照实带上（不臆猜），只在前面加一句能看懂的定性
+    base.message = error.message && !error.message.startsWith(error.code)
+      ? `${known}：${error.message}`
+      : known;
+    return base;
+  }
+  if (error instanceof Error) {
+    base.code = "ui_failure";
+    base.message = error.message || "这一步没有完成";
+    return base;
+  }
+  base.code = "ui_failure";
+  base.message = String(error);
+  return base;
+}
+
+/** 业务拒绝信封与真失败分开：拒绝原样给面板处理，不当作错误 */
+export function rejected(result: Json): boolean {
+  const status = String(result.status ?? "");
+  return status === "rejected" || status === "waiting" || status === "conflict" || status === "duplicate";
+}
+
+export interface InstanceEntry {
+  id: string;
+  name: string;
+  package?: string;
+  original_name?: string;
+  created_at?: number;
+  timelines?: Array<{ id: string; name: string; state: string }>;
+  [key: string]: unknown;
+}
+
+export interface TimelineEntry {
+  id: string;
+  name: string;
+  state: string;
+  [key: string]: unknown;
+}
+
+export interface ClockView {
+  state: string;
+  rate?: number;
+  processed_world?: number;
+  target_world?: number;
+  [key: string]: unknown;
+}
+
+export class AppApi {
+  constructor(readonly mgmt: MgmtClient) {}
+
+  call(op: string, args: Json = {}, timeoutMs = 30000): Promise<Json> {
+    return this.mgmt.call(op, args, timeoutMs) as Promise<Json>;
+  }
+
+  /* ---------------- 本机与设置 ---------------- */
+
+  readiness(): Promise<Json> {
+    return this.call("app.readiness");
+  }
+
+  status(): Promise<Json> {
+    return this.call("status");
+  }
+
+  settings(): Promise<Json> {
+    return this.call("settings.get");
+  }
+
+  saveSettings(payload: Json): Promise<Json> {
+    return this.call("settings.set", payload, 30000);
+  }
+
+  testAi(llm: Json): Promise<Json> {
+    // 测试要真发请求：给足上限（两层小请求 + 内部重试）
+    return this.call("settings.test", { llm }, 180000);
+  }
+
+  /* ---------------- 样例与世界 ---------------- */
+
+  samples(): Promise<Json> {
+    return this.call("world.sample.list");
+  }
+
+  installSample(sample: string, requestId: string): Promise<Json> {
+    return this.call("world.sample.install", { sample, request_id: requestId }, 60000);
+  }
+
+  packages(): Promise<Json> {
+    return this.call("world.package.list");
+  }
+
+  cards(): Promise<Json> {
+    return this.call("world.card.list");
+  }
+
+  instances(): Promise<Json> {
+    return this.call("instance.list");
+  }
+
+  instanceInfo(id: string): Promise<Json> {
+    return this.call("instance.info", { id });
+  }
+
+  createInstance(args: {
+    package_path?: string;
+    card_paths?: string[];
+    display_name?: string;
+    request_id?: string;
+  }): Promise<Json> {
+    return this.call("instance.create", args, 60000);
+  }
+
+  renameInstance(id: string, name: string): Promise<Json> {
+    return this.call("instance.rename", { id, name });
+  }
+
+  deleteInstance(id: string, confirm: boolean): Promise<Json> {
+    return this.call("instance.delete", { id, confirm }, 60000);
+  }
+
+  exportInstance(id: string, path: string): Promise<Json> {
+    return this.call("instance.export", { id, path }, 60000);
+  }
+
+  importInstance(path: string): Promise<Json> {
+    return this.call("instance.import", { path }, 60000);
+  }
+
+  /* ---------------- 运行与版本 ---------------- */
+
+  clock(instanceId: string, timelineId: string): Promise<Json> {
+    return this.call("runtime.clock", { instance_id: instanceId, timeline_id: timelineId });
+  }
+
+  activate(instanceId: string, timelineId: string, rate?: number): Promise<Json> {
+    return this.call("runtime.activate", { instance_id: instanceId, timeline_id: timelineId, rate }, 60000);
+  }
+
+  freeze(instanceId: string, timelineId: string): Promise<Json> {
+    return this.call("runtime.freeze", { instance_id: instanceId, timeline_id: timelineId }, 60000);
+  }
+
+  setRate(instanceId: string, timelineId: string, rate: number): Promise<Json> {
+    return this.call("runtime.rate", { instance_id: instanceId, timeline_id: timelineId, rate });
+  }
+
+  advances(instanceId: string, timelineId: string): Promise<Json> {
+    return this.call("runtime.advance", { instance_id: instanceId, timeline_id: timelineId }, 60000);
+  }
+
+  commits(instanceId: string, timelineId: string): Promise<Json> {
+    return this.call("runtime.commits", { instance_id: instanceId, timeline_id: timelineId });
+  }
+
+  saveVersion(instanceId: string, timelineId: string, note: string): Promise<Json> {
+    return this.call("runtime.commit", { instance_id: instanceId, timeline_id: timelineId, note }, 60000);
+  }
+
+  forkTimeline(instanceId: string, timelineId: string, commitId: string, name: string): Promise<Json> {
+    return this.call(
+      "runtime.fork",
+      { instance_id: instanceId, timeline_id: timelineId, commit_id: commitId, name },
+      60000,
+    );
+  }
+
+  rollback(instanceId: string, timelineId: string, commitId: string): Promise<Json> {
+    return this.call(
+      "runtime.rollback",
+      { instance_id: instanceId, timeline_id: timelineId, commit_id: commitId, confirm: true },
+      60000,
+    );
+  }
+
+  renameTimeline(instanceId: string, timelineId: string, name: string): Promise<Json> {
+    return this.call("runtime.timeline.rename", { instance_id: instanceId, timeline_id: timelineId, name });
+  }
+
+  archiveTimeline(instanceId: string, timelineId: string): Promise<Json> {
+    return this.call("runtime.timeline.archive", { instance_id: instanceId, timeline_id: timelineId }, 60000);
+  }
+
+  deleteTimeline(instanceId: string, timelineId: string, confirm: boolean): Promise<Json> {
+    return this.call(
+      "runtime.timeline.delete",
+      { instance_id: instanceId, timeline_id: timelineId, confirm },
+      60000,
+    );
+  }
+
+  budget(instanceId: string): Promise<Json> {
+    return this.call("runtime.budget", { instance_id: instanceId });
+  }
+
+  /* ---------------- 会话与历史 ---------------- */
+
+  sessionEnsure(instanceId: string, timelineId: string, characterId: string): Promise<Json> {
+    return this.call("session.ensure", {
+      instance_id: instanceId,
+      timeline_id: timelineId,
+      character_id: characterId,
+    });
+  }
+
+  sessions(): Promise<Json> {
+    return this.call("session.list");
+  }
+
+  ensureChannel(name: string, displayName: string, rotate = false): Promise<Json> {
+    return this.call("channel.ensure", {
+      name,
+      display_name: displayName,
+      version: "0.1.0",
+      rotate,
+    });
+  }
+
+  bindThread(channel: string, threadId: string, sessionId: string): Promise<Json> {
+    return this.call("thread.bind", { channel, thread_id: threadId, session_id: sessionId });
+  }
+
+  history(sessionId: string, beforeSeq?: number, limit = 50): Promise<Json> {
+    return this.call("history.page", {
+      session_id: sessionId,
+      limit,
+      ...(beforeSeq ? { before_seq: beforeSeq } : {}),
+    });
+  }
+
+  /* ---------------- OC 故事层 ---------------- */
+
+  storyEnter(args: { instance_id?: string; timeline_id?: string; character_id?: string }): Promise<Json> {
+    return this.call("story.enter", args);
+  }
+
+  storyHome(instanceId: string, timelineId: string, characterId: string): Promise<Json> {
+    return this.call("story.home", {
+      instance_id: instanceId,
+      timeline_id: timelineId,
+      character_id: characterId,
+    });
+  }
+
+  storyScene(instanceId: string, timelineId: string, characterId: string): Promise<Json> {
+    return this.call("story.scene", {
+      instance_id: instanceId,
+      timeline_id: timelineId,
+      character_id: characterId,
+    });
+  }
+
+  storyTurn(instanceId: string, timelineId: string, characterId: string, seq?: number): Promise<Json> {
+    return this.call("story.turn", {
+      instance_id: instanceId,
+      timeline_id: timelineId,
+      character_id: characterId,
+      ...(seq ? { seq } : {}),
+    });
+  }
+
+  storyBranch(instanceId: string, timelineId: string, commitId: string, name: string): Promise<Json> {
+    return this.call(
+      "story.branch",
+      { instance_id: instanceId, timeline_id: timelineId, commit_id: commitId, name },
+      60000,
+    );
+  }
+
+  storyRestore(instanceId: string, timelineId: string, commitId: string, confirm: boolean, saved: boolean): Promise<Json> {
+    return this.call(
+      "story.restore",
+      { instance_id: instanceId, timeline_id: timelineId, commit_id: commitId, confirm, saved },
+      60000,
+    );
+  }
+
+  /* ---------------- 线索与转述 ---------------- */
+
+  narrativeMap(instanceId: string, timelineId: string, characterId: string): Promise<Json> {
+    return this.call("narrative.map", {
+      instance_id: instanceId,
+      timeline_id: timelineId,
+      card_id: characterId,
+    });
+  }
+
+  /** 跨角色披露的候选：只把**她讲过**的片段挑出来摆着（默认隔离不变） */
+  discloseSuggest(
+    instanceId: string,
+    timelineId: string,
+    fromCharacter: string,
+    toCharacter: string,
+    limit = 5,
+  ): Promise<Json> {
+    return this.call("disclose.suggest", {
+      instance_id: instanceId,
+      timeline_id: timelineId,
+      from_character: fromCharacter,
+      to_character: toCharacter,
+      limit,
+    });
+  }
+
+  /** 授权必须明确到具体消息（refs = 已经显示过的整条消息），不做截短授权 */
+  discloseConfirm(
+    instanceId: string,
+    timelineId: string,
+    fromCharacter: string,
+    toCharacter: string,
+    refs: string[],
+    note = "",
+  ): Promise<Json> {
+    return this.call("disclose.confirm", {
+      instance_id: instanceId,
+      timeline_id: timelineId,
+      from_character: fromCharacter,
+      to_character: toCharacter,
+      refs,
+      note,
+    });
+  }
+
+  discloseList(instanceId: string, timelineId: string, toCharacter = ""): Promise<Json> {
+    return this.call("disclose.list", {
+      instance_id: instanceId,
+      timeline_id: timelineId,
+      ...(toCharacter ? { to_character: toCharacter } : {}),
+    });
+  }
+
+  /* ---------------- 提醒与备份 ---------------- */
+
+  notices(instanceId?: string): Promise<Json> {
+    return this.call("notice.list", instanceId ? { instance_id: instanceId } : {});
+  }
+
+  resolveNotice(id: string): Promise<Json> {
+    return this.call("notice.resolve", { id });
+  }
+
+  backups(): Promise<Json> {
+    return this.call("backup.list");
+  }
+
+  backupNow(note = ""): Promise<Json> {
+    return this.call("backup.create", { note }, 120000);
+  }
+
+  backupRestore(path: string): Promise<Json> {
+    return this.call("backup.restore", { path, confirm: true }, 180000);
+  }
+
+  /* ---------------- 界面草稿（§3.5） ---------------- */
+
+  draftSave(key: string, module: string, target: string, textValue: string, payload?: unknown): Promise<Json> {
+    return this.call("ui.draft.save", { key, module, target, text: textValue, payload, state: "saved" });
+  }
+
+  draftLoad(key: string): Promise<Json> {
+    return this.call("ui.draft.load", { key });
+  }
+
+  draftList(module?: string): Promise<Json> {
+    return this.call("ui.draft.list", module ? { module } : {});
+  }
+
+  draftDiscard(key: string): Promise<Json> {
+    return this.call("ui.draft.discard", { key });
+  }
+}
+
+/* ------------------------------------------------------------------ UMP 通道 */
+
+export type ChannelEvent =
+  | {
+      kind: "reply";
+      messageId: string;
+      parts: string[];
+      batchIndex: number;
+      batchCount: number;
+      replyTo: string;
+      at: number;
+    }
+  | { kind: "notice"; text: string; messageId: string; at: number }
+  | { kind: "accepted"; ref: string; state: string; messageId: string }
+  | { kind: "status"; state: string }
+  | { kind: "error"; code: string; message: string; ref: string; retryable: boolean; stage: string }
+  | { kind: "binding"; state: string };
+
+export interface ThreadLink {
+  channel: string;
+  threadId: string;
+  token: string;
+  sessionId: string;
+}
+
+/**
+ * 一个角色的联络连接：通道登记 → 会话 → 线程绑定 → UMP 握手。
+ *
+ * 只服务「角色联络」工作区：发送、收回复、投递回执。切换角色 / 时间线时重建，
+ * 不让上一条连接的回执落进新会话（§3.3「不把旧请求返回结果画到新对象下」）。
+ */
+export class ChannelLink {
+  private client: UmpClient | null = null;
+  private listeners = new Set<(event: ChannelEvent) => void>();
+  link: ThreadLink | null = null;
+
+  constructor(private readonly endpoint: string, private readonly channelName = "builtin") {}
+
+  onEvent(fn: (event: ChannelEvent) => void): void {
+    this.listeners.add(fn);
+  }
+
+  private emit(event: ChannelEvent): void {
+    for (const listener of [...this.listeners]) listener(event);
+  }
+
+  async open(api: AppApi, instanceId: string, timelineId: string, characterId: string): Promise<ThreadLink> {
+    this.close();
+    const issued = await api.ensureChannel(this.channelName, "isekai 桌面");
+    let credential = (issued.credential as string | null) ?? localStorage.getItem(`isekai.credential.${this.channelName}`);
+    if (!credential) {
+      // 持久凭据丢了：显式轮换一次（界面是这条通道的唯一使用者）
+      const again = await api.ensureChannel(this.channelName, "isekai 桌面", true);
+      credential = String(again.credential ?? "");
+    }
+    localStorage.setItem(`isekai.credential.${this.channelName}`, credential);
+    const session = (await api.sessionEnsure(instanceId, timelineId, characterId)).session as Json;
+    const sessionId = String(session.id);
+    const bound = (await api.bindThread(this.channelName, this.threadId(instanceId, timelineId, characterId), sessionId))
+      .thread as Json;
+    const client = new UmpClient(this.endpoint, this.channelName, "isekai 桌面");
+    client.onMessage((env) => this.onEnvelope(env));
+    const ack = await client.connect({ credential, bootstrap: null });
+    const threads = (ack.threads as Array<{ id: string; binding_token: string }>) ?? [];
+    const mine = threads.find((item) => item.id === String(bound.thread_id));
+    this.client = client;
+    this.link = {
+      channel: this.channelName,
+      threadId: String(bound.thread_id),
+      token: mine?.binding_token ?? String(bound.binding_token ?? ""),
+      sessionId,
+    };
+    return this.link;
+  }
+
+  private threadId(instanceId: string, timelineId: string, characterId: string): string {
+    // 线程标识按「角色」固定：一个角色一条会话（不跟时间线走，换线要重新绑定）
+    return `${instanceId}:${timelineId}:${characterId}`.slice(0, 120) || "main";
+  }
+
+  private onEnvelope(env: Envelope): void {
+    const payload = (env.payload ?? {}) as Json;
+    if (env.type === "reply") {
+      const parts = ((payload.parts as Array<{ text?: string }>) ?? []).map((part) => String(part.text ?? ""));
+      this.emit({
+        kind: "reply",
+        messageId: String(payload.message_id ?? ""),
+        parts,
+        batchIndex: Number(payload.batch_index ?? 0),
+        batchCount: Number(payload.batch_count ?? 1),
+        replyTo: String(payload.reply_to ?? ""),
+        at: Number(env.ts ?? Date.now() / 1000),
+      });
+      return;
+    }
+    if (env.type === "system_notice") {
+      this.emit({
+        kind: "notice",
+        text: String(payload.text ?? ""),
+        messageId: String(payload.message_id ?? ""),
+        at: Number(env.ts ?? Date.now() / 1000),
+      });
+      return;
+    }
+    if (env.type === "accepted") {
+      this.emit({
+        kind: "accepted",
+        ref: String(payload.ref ?? ""),
+        state: String(payload.state ?? ""),
+        messageId: String(payload.message_id ?? ""),
+      });
+      return;
+    }
+    if (env.type === "status") {
+      this.emit({ kind: "status", state: String(payload.state ?? "") });
+      return;
+    }
+    if (env.type === "binding") {
+      if (this.link && String(payload.thread_id ?? "") === this.link.threadId && String(payload.state) === "active") {
+        this.link = { ...this.link, token: String(payload.binding_token ?? this.link.token) };
+      }
+      this.emit({ kind: "binding", state: String(payload.state ?? "") });
+      return;
+    }
+    if (env.type === "error") {
+      this.emit({
+        kind: "error",
+        code: String(payload.code ?? ""),
+        message: String(payload.message ?? ""),
+        ref: String(payload.ref ?? env.id ?? ""),
+        retryable: Boolean(payload.retryable ?? false),
+        stage: String(payload.stage ?? ""),
+      });
+    }
+  }
+
+  /** 发送一条联络：返回这次请求的身份（界面按它查询结果，不重复发） */
+  send(textValue: string): string {
+    if (!this.client || !this.link) throw new Error("还没有连上这个角色");
+    return this.client.userMessage(this.link.threadId, this.link.token, textValue);
+  }
+
+  confirmDelivery(messageId: string, batchIndex: number, state: string): void {
+    if (!this.client || !this.link) return;
+    this.client.reportDelivery(this.link.threadId, this.link.token, messageId, batchIndex, state);
+  }
+
+  retry(ref: string, kindName?: string): void {
+    if (!this.client || !this.link) return;
+    this.client.retry(this.link.threadId, this.link.token, ref, kindName);
+  }
+
+  close(): void {
+    this.client?.close();
+    this.client = null;
+    this.link = null;
+  }
+}
+
+export function newRequestId(prefix: string): string {
+  return newId(prefix);
+}
+
+/** 消息节（面板共用的重试/查询身份） */
+export interface PendingRequest {
+  id: string;
+  text: string;
+  startedAt: number;
+  state: "submitting" | "accepted" | "unknown" | "failed";
+  error?: UiError;
+}

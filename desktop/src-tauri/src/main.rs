@@ -464,6 +464,18 @@ fn pick_file_blocking(
     Ok(if picked.is_empty() { None } else { Some(picked) })
 }
 
+/// 只读文本文件（导入时用户显式选中的那份）：限额 + UTF-8，不做任何解析。
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    const LIMIT: u64 = 8 * 1024 * 1024;
+    let target = PathBuf::from(path.trim());
+    let meta = fs::metadata(&target).map_err(|error| format!("读取失败：{error}"))?;
+    if meta.len() > LIMIT {
+        return Err(format!("这个文件太大（{} 字节，上限 {LIMIT}）", meta.len()));
+    }
+    fs::read_to_string(&target).map_err(|error| format!("读取失败：{error}"))
+}
+
 /// 界面完成「退出前保存」后的确认（DESKTOP_SPEC §五 第②步）。
 #[tauri::command]
 fn exit_ready(state: State<AppState>, detail: String, saved: bool) {
@@ -575,6 +587,7 @@ fn main() {
             open_dir,
             config_facts,
             pick_file,
+            read_text_file,
             exit_ready,
             quit_app
         ])

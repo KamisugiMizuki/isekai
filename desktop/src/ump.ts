@@ -31,6 +31,19 @@ export function makeEnvelope(
 
 type Waiter = { predicate: (env: Envelope) => boolean; resolve: (env: Envelope) => void };
 
+/** 管理面错误：把「稳定原因码 + 安全短说明 + 是否可重试」带到界面层（ONBOARDING §5.1）。 */
+export class MgmtError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+
+  constructor(code: string, message: string, retryable = false) {
+    super(message);
+    this.name = "MgmtError";
+    this.code = code;
+    this.retryable = retryable;
+  }
+}
+
 export class UmpClient {
   private ws: WebSocket | null = null;
   private waiters: Waiter[] = [];
@@ -197,8 +210,12 @@ export class MgmtClient {
     this.counter += 1;
     const reply = await this.send({ mgmt: "1", op, id: `r-${this.counter}`, args }, timeoutMs);
     if (!reply.ok) {
-      const error = reply.error as { code?: string; message?: string } | undefined;
-      throw new Error(`${error?.code ?? "mgmt_error"}：${error?.message ?? "管理操作失败"}`);
+      const error = reply.error as { code?: string; message?: string; retryable?: boolean } | undefined;
+      throw new MgmtError(
+        error?.code ?? "mgmt_error",
+        error?.message ?? "管理操作失败",
+        Boolean(error?.retryable),
+      );
     }
     return (reply.result ?? {}) as Record<string, unknown>;
   }
