@@ -13,6 +13,8 @@
 
 只读项目代码；数据写临时目录；不需要联网（FakeLLM）。
 用法：`.venv/Scripts/python.exe scripts/_audit2_trpgclient.py [--only 关键字] [--json]`
+段间依赖：**F 段（§十八 不变量）读的是前面各段的读数**（如 F03 读 C07、F12 读 E03）——
+分段跑时它必然报「缺该条读数」。要 F 段的真读数就整跑（不要 `--only`）。
 """
 
 from __future__ import annotations
@@ -759,15 +761,21 @@ async def section_g(h: Any, manifest: Path) -> None:
                   bool(((tide_audit.get("audit") or {}).get("level") or {}).get("outcome")),
                   json.dumps((tide_audit.get("audit") or {}).get("level"), ensure_ascii=False), "§8.3 / C4")
 
-    # OC 与 TRPG 共用世界：TRPG 提交的事实与说法走同一条合法认知路径
+    # OC 与 TRPG 共用世界：TRPG 提交的事实与说法走同一条合法认知路径。
+    # 潮汐骰子按 action_id 定种子，**失败分支不申报说法** —— 所以「认知里有没有说法」不能写死：
+    # 判据按这次的真实结果分档（失败 ⇒ 不许出现这条说法；其余 ⇒ 必须出现）。
     cognition = h.world.cognition_project(instance_id, timeline_id, observer_id=actor)
     history = await call(h, "runtime.history.read", instance_id=instance_id, timeline_id=timeline_id,
                          filters={"source": "trpg_action"})
-    claim_texts = json.dumps([item.get("text") for item in cognition.get("claims") or []], ensure_ascii=False)
-    common.expect("G03 C4 跨应用共用世界", "TRPG 提交进同一份世界历史，角色认知投影按获知给出说法",
+    outcome = ((tide_audit.get("audit") or {}).get("level") or {}).get("outcome")
+    claim_texts = [str(item.get("text") or "") for item in cognition.get("claims") or []]
+    mine = [text for text in claim_texts if text.startswith("潮线记下")]
+    expects_claim = outcome != "失败"
+    common.expect("G03 C4 跨应用共用世界", "TRPG 提交进同一份世界历史；认知里有没有这条说法按插件申报的结果分档",
                   any(str(item.get("source")) == "trpg_action" for item in history.get("items") or [])
-                  and bool(cognition.get("claims")),
-                  f"history={len(history.get('items') or [])} claims={claim_texts[:160]}", "§19 C4")
+                  and bool(mine) == expects_claim,
+                  f"history={len(history.get('items') or [])} outcome={outcome} 潮线说法={mine} "
+                  f"claims={json.dumps(claim_texts, ensure_ascii=False)[:120]}", "§19 C4")
 
 
 # ------------------------------------------------------------------ H 段：C5
