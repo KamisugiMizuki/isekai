@@ -1678,7 +1678,15 @@ class Store:
         return _row_to_dict(row)  # type: ignore[arg-type]
 
     def session_get(self, session_id: str) -> dict[str, Any] | None:
-        row = self._conn.execute("SELECT * FROM session WHERE id=?", (session_id,)).fetchone()
+        row = self._conn.execute("SELECT * FROM session WHERE id=?", (str(session_id),)).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def session_find(self, instance_id: str, timeline_id: str, character_id: str) -> dict[str, Any] | None:
+        """按三元组找会话（只读；没有就返回 None——建会话仍走 `session_ensure`）。"""
+        row = self._conn.execute(
+            "SELECT * FROM session WHERE instance_id=? AND timeline_id=? AND character_id=? LIMIT 1",
+            (str(instance_id), str(timeline_id), str(character_id)),
+        ).fetchone()
         return _row_to_dict(row) if row else None
 
     def session_list(self) -> list[dict[str, Any]]:
@@ -1770,6 +1778,14 @@ class Store:
         row = self._conn.execute(
             "SELECT * FROM message WHERE channel_id=? AND thread_id=? AND env_id=?",
             (channel_id, thread_id, env_id),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def last_inbound(self, session_id: str) -> dict[str, Any] | None:
+        """该会话最近一条入站（只读）：产品状态投影按它算「这一轮到哪了」。"""
+        row = self._conn.execute(
+            "SELECT * FROM message WHERE session_id=? AND role='user' ORDER BY seq DESC LIMIT 1",
+            (str(session_id),),
         ).fetchone()
         return _row_to_dict(row) if row else None
 
@@ -2671,13 +2687,19 @@ class Store:
         return len(rows)
 
     def timeline_delivered_replies(self, timeline_id: str) -> int:
-        """该线已经投递出去（外部平台确认收到）的回复条数：回滚抹不掉它们（§7.2）。"""
+        """该线已经投递出去（外部平台确认收到）的回复条数：回滚抹不掉它们（§7.2）。
+
+        判据是**投递批次全部 accepted**：出站行的 `state` 固化后就是 `fixed`（不会被投递改写），
+        拿它当「已送达」的条件会让这个计数永远是 0——那句「外部已显示的内容不保证撤回」
+        也就永远发不出来。
+        """
         row = self._conn.execute(
             """SELECT COUNT(*) n FROM message
-               WHERE role='character' AND state IN ('done','sent')
+               WHERE role='character' AND state NOT IN ('cancelled')
                  AND session_id IN (SELECT id FROM session WHERE timeline_id=?)
                  AND seq IN (SELECT msg_seq FROM delivery GROUP BY msg_seq
-                             HAVING SUM(CASE WHEN state='accepted' THEN 0 ELSE 1 END) = 0)""",
+                             HAVING COUNT(*) > 0
+                                AND SUM(CASE WHEN state='accepted' THEN 0 ELSE 1 END) = 0)""",
             (timeline_id,),
         ).fetchone()
         return int(row["n"] if row is not None else 0)

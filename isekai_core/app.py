@@ -20,6 +20,7 @@ from .log import get_logger
 from .runtime.service import RuntimeService
 from .world import ops as world_ops
 from .session import SessionService
+from .story.service import StoryService
 from .runtime.service import from_config as runtime_service_from_config
 from .store import Store
 from .world import instances
@@ -144,9 +145,13 @@ async def build_runtime(
     service = SessionService(store=store, cfg=cfg, llm=llm, deliver=deliver)
     world = runtime_service_from_config(cfg, store)
     service.runtime = world  # 会话层经运行层构造扮演定义
+    # OC 故事层（OC_STORY_LAYER_SPEC）：分类闸与表达契约在会话链路里，产品投影在管理面上
+    story = StoryService(store=store, cfg=cfg, runtime=world)
+    service.story = story
     for row in store.instance_list():
         world.ensure_instance(row["id"], now_real=time.time())
     server = CoreServer(cfg=cfg, store=store, service=service, state=state, generation=generation)
+    story.server = server  # 读核心状态判断「存储不可用」这类阻断（§4.4 被阻断）
     holder["server"] = server
     # 插件宿主（CHANNEL_PLUGIN_SPEC §三）：登记表在库里，进程按需起停；没挂上时相关 op 明确拒绝
     plugins_mod.install(plugins_mod.PluginHost(cfg=cfg, store=store, server=server))

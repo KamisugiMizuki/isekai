@@ -22,6 +22,11 @@ log = get_logger("isekai.llm")
 #: 重试时按倍加预算（生成世界包这类长产物需要 ≥8K 预算）。
 MAX_COMPLETION_BUDGET = 32768
 
+#: 「判断点」调用的提示词前缀（分类 / 审计这类一次一问的小判断）。
+#: 生产路径无差别——真实模型照提示词作答；测试替身（FakeLLM）据此把判断点与
+#: 回复生成分开，不占用回复脚本，否则每加一个判断点就要把既有测试的回复整体后移一位。
+JUDGEMENT_MARK = "【判断点】"
+
 
 class LLMError(Exception):
     def __init__(self, code: str, message: str, *, retryable: bool = True) -> None:
@@ -204,6 +209,11 @@ class FakeLLM:
         #: 流式：每次产出多少字符；`stream_fail_after` 给「吐了一半才坏」的场景
         self.stream_chunk = 4
         self.stream_fail_after: int | None = None
+        #: 判断点脚本：提示词首条含某个键就返回对应值（命中项之间按注册顺序取第一个）。
+        #: 这类调用记在 `judgement_calls`，**不占 `replies` 索引**——判断点不该打乱回复脚本；
+        #: 没注册命中键时返回空串，等同于「判不出来」，调用方按兜底处理。
+        self.judgements: dict[str, str] = {}
+        self.judgement_calls: list[list[dict[str, Any]]] = []
 
     async def chat(
         self,
@@ -213,6 +223,13 @@ class FakeLLM:
         timeout: float | None = None,
         temperature: float | None = None,
     ) -> str:
+        head = str((messages[0] if messages else {}).get("content") or "")
+        if head.startswith(JUDGEMENT_MARK):
+            self.judgement_calls.append(messages)
+            for key, value in self.judgements.items():
+                if key in head:
+                    return value
+            return ""
         self.calls.append(messages)
         if self.delay_s:
             await asyncio.sleep(self.delay_s)

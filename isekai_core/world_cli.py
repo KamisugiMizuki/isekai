@@ -81,6 +81,14 @@ OP_BY_COMMAND = {
     ("runtime", "rollback"): "runtime.rollback",
     ("runtime", "budget-set"): "runtime.budget.set",
     ("runtime", "consume-time"): "runtime.time.consume",
+    # OC 故事层（OC_STORY_LAYER_SPEC §四 ~ §八）
+    ("story", "enter"): "story.enter",
+    ("story", "scene"): "story.scene",
+    ("story", "home"): "story.home",
+    ("story", "turn"): "story.turn",
+    ("story", "classify"): "story.classify",
+    ("story", "branch"): "story.branch",
+    ("story", "restore"): "story.restore",
     # 对外接口（WORLD_RUNTIME_INTERFACE_SPEC §四~§六）
     ("runtime", "scope"): "runtime.scope.inspect",
     ("runtime", "snapshot"): "runtime.snapshot.read",
@@ -241,6 +249,27 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             })
         if cmd == "choose":
             args.update({"choice_id": ns.choice or "", "selection": ns.selection or ""})
+        return args
+    if group == "story":
+        args: dict[str, Any] = {}
+        if ns.id:
+            args["instance_id"] = ns.id
+        if ns.timeline:
+            args["timeline_id"] = ns.timeline
+        if ns.card:
+            args["character_id"] = ns.card
+        if cmd == "turn" and ns.seq is not None:
+            args["seq"] = int(ns.seq)
+        if cmd == "classify":
+            args["text"] = ns.text or ""
+        if cmd in ("branch", "restore"):
+            args["commit_id"] = ns.commit or ns.file or ""
+        if cmd == "branch" and ns.display_name:
+            args["name"] = ns.display_name
+        if cmd == "restore":
+            args["confirm"] = bool(ns.confirm)
+            args["saved"] = bool(ns.saved)
+            args["acknowledge_unsaved"] = bool(ns.acknowledge_unsaved)
         return args
     if group == "event":
         args = {"instance_id": ns.id, "timeline_id": ns.timeline}
@@ -433,7 +462,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "group",
         choices=[
             "package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive", "narrative",
-            "trpg", "plugin",
+            "trpg", "plugin", "story",
         ],
     )
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
@@ -522,6 +551,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="接口：规则状态 patch（内联 JSON 数组）")
     parser.add_argument("--source-mode", dest="source_mode", default=None,
                         help="TRPG：后果来源 action（角色行动）/ gm_declaration（GM 直接裁定）")
+    parser.add_argument("--seq", type=int, default=None, help="故事层：要看哪一轮（缺省=最近一轮）")
+    parser.add_argument("--text", default=None, help="故事层：要分类的输入原文")
+    parser.add_argument("--saved", action="store_true", help="故事层：已先保存当前进展（分支或导出）")
+    parser.add_argument("--acknowledge-unsaved", dest="acknowledge_unsaved", action="store_true",
+                        help="故事层：显式接受「不先保存就恢复」")
     ns = parser.parse_args(argv)
     if (ns.group, ns.command) not in OP_BY_COMMAND:
         parser.error(f"未知命令 {ns.group} {ns.command}")

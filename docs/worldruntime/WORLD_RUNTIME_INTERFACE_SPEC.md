@@ -1,8 +1,9 @@
 # WorldRuntime 对外接口设计
 
-> 状态：**接口已接线**（2026-09-22 落地）。探针 `scripts/_audit2_iface.py`：17 检查 / 16 PASS / 0 FAIL / 1 DEFERRED，
-> 读数存于 `.hermes/audits/iface_wiring_*`。唯一 DEFERRED 是 §7 的消费方：OC 故事层与 Writing Assistant
-> 目前只有规范、没有代码，没有第二类真实调用方可供消费端验收。
+> 状态：**接口已接线**（2026-09-22 落地）。探针 `scripts/_audit2_iface.py`：18 检查 / 17 PASS / 0 FAIL / 1 DEFERRED，
+> 读数存于 `.hermes/audits/iface_wiring_*`。唯一 DEFERRED 是 §7 的 Writing Assistant 消费方（仍只有规范、
+> 没有代码）。**§7 的 OC 故事层消费方已收口**：`isekai_core/story/` 经 `scope_inspect` / `fork` / `rollback`
+> 等接口读世界与做版本操作、不旁路写库；消费端行为读数另见 `scripts/_audit2_ocstory.py` 的 C 段。
 >
 > 落地口径：14 个 op 全部在管理面注册；5 个规范名走别名表（`world_ops.IFACE_ALIASES`，在 dispatch 入口统一改写）、
 > 9 个按本文语义原生实现（`runtime/change.py` + `RuntimeService` 的接口段）。所有响应带 §3.2 返回信封。

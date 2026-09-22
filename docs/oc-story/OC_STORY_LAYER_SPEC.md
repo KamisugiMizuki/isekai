@@ -1,6 +1,6 @@
 # OC 故事层模块设计
 
-> 状态：已定稿 v1.0（产品设计）；实现状态：未实现声明。
+> 状态：已定稿 v1.0（产品设计）；实现状态：应用层语义与管理面已落地（对照见 §十三），OC 客户端表达层（窗口与交互）未实现。
 > 产品所有者：普通 OC 用户体验与角色联络应用层。
 > 上游契约：[`../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md`](../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md)、[`../worldruntime/SESSION_CORE_SPEC.md`](../worldruntime/SESSION_CORE_SPEC.md)、[`../worldruntime/NARRATIVE_LAYER_SPEC.md`](../worldruntime/NARRATIVE_LAYER_SPEC.md)。
 > 评价依据：[`USER_PERSPECTIVE_EVALUATION_DRAFT.md`](USER_PERSPECTIVE_EVALUATION_DRAFT.md)。
@@ -247,3 +247,30 @@ OC 故事层向会话核心提供的是用户场景和联络意图，不直接�
 | 世界冻结 / 版本阻断 | 只读或显示可操作恢复入口；不靠普通重试绕过阻断 |
 
 以上场景必须通过真实会话核心、真实 WorldRuntime 接口和真实持久化链路验收；设计文本本身不算实现证据。
+
+## 十三、实现对照（2026-09-22）
+
+> 本节只记**落地口径与读数来源**，不改变本文任何产品语义。判据全部是行为读数：真 WebSocket +
+> 真 SQLite + 真实例，只把 LLM 换成替身。读数：`scripts/_audit2_ocstory.py` 23/23 PASS
+> （存档 `.hermes/audits/ocstory_*.txt`）、`tests/test_oc_story.py` 14 项、
+> CLI 端到端 `scripts/_probe_oc_story_cli.py`（FAIL=0）。
+
+| 本文的设计名 | 实现入口 | 落地口径 |
+|---|---|---|
+| §3.4 输入分类（六类主类别） | `isekai_core/story/classify.py` + 会话链路的分类闸 | 结构性请求走关键词预筛（省一次调用），其余问一次便宜判断（`story_classify`，走「已接受对话」档预算）；判断失败或分不清一律按联络分享处理 |
+| §3.4 唯一处理路径 / 转交 | 会话链路的转交结算 | 转交轮入站标 `cancelled`（`handoff:<流程>`），以 `system_notice` 说明「普通对话没有执行它」；不生成角色回复，也不进她的上下文 |
+| §3.5 调用作用域与返回类型 | `story/state.py` | 五类结果 `expressed / waiting / blocked / deferred / handoff`；返回带实例 / 线 / 角色 / 会话与已完成水位、运行世代 |
+| §4.4 产品状态映射 | `story/state.py` | 八行状态分场景级与轮次级；「可做的事」与「不得暗示」随表内建（客户端文案与探针共用一份） |
+| §五 故事表达契约 | `story/expression.py` + 会话链路的表达契约块 | 来源 / 时间 / 意愿三维随扮演定义进上下文；追问轮带「没讲出口」边界行（取叙事单元的暂缓记录），材料访问权不因追问次数变化 |
+| §6 用户可见面与黑箱 | `story/view.py` | 白名单构造（不透传底层行）；禁词自检给测试与探针一个可核对的判据 |
+| §4.1 首次进入 | `story.enter` | 六步产品语言清单 + 就绪位；自己不创建任何东西，未就绪时停在准备状态、不生成假回复 |
+| §八 版本与创作操作 | `story.branch` / `story.restore` | 只编排：分叉与覆盖仍走运行层语义；恢复先给覆盖范围与保存路径，未确认或未先保存不执行 |
+| §七 失败与降级 | `story/state.py` | 模型 / 世界 / 存储 / 通道 / 版本分别翻译成产品状态与用户可理解的说明，不把失败润色成成功 |
+
+管理面 op：`story.enter` / `story.scene` / `story.home` / `story.turn` / `story.branch` / `story.restore`（同步）与
+`story.classify`（异步——它要调一次模型）；CLI 有同名命令组 `story`。
+
+**未实现（记账，不充数）**：OC 客户端表达层——窗口、会话界面、首次向导与恢复交互的界面部分。
+桌面壳是 Core Debugging 外壳，OC 客户端与 TRPG 客户端一样属独立实现范围；本层给出的产品状态、
+可见面投影与操作结果就是它的输入契约。
+

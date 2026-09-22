@@ -135,6 +135,13 @@ SYNC_OPS = frozenset(
         "trpg.commit",
         "trpg.gm.change",
         "trpg.recover",
+        # OC 故事层（OC_STORY_LAYER_SPEC）：产品状态 / 用户可见面 / 版本编排
+        "story.enter",
+        "story.scene",
+        "story.home",
+        "story.turn",
+        "story.branch",
+        "story.restore",
     }
 )
 ASYNC_OPS = frozenset(
@@ -155,6 +162,7 @@ ASYNC_OPS = frozenset(
         "world.package.revise",
         "world.package.fill",
         "world.card.generate",
+        "story.classify",
     }
 )
 
@@ -452,6 +460,11 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return _iface_op(cfg, store, runtime, op, args)
         if op == "trpg.recover":
             return _trpg_recover(cfg, store, runtime, args)
+        # OC 故事层（OC_STORY_LAYER_SPEC）：产品状态与版本编排，不写世界事实
+        if op in STORY_SYNC_OPS:
+            return _story_op(cfg, store, runtime, op, args)
+        if op == "story.classify":
+            raise UmpError(Err.UNSUPPORTED_TYPE, "story.classify 要调模型，是异步管理操作", retryable=False)
 
         if op.startswith("runtime."):
             return _runtime_op(runtime, op, args, cfg=cfg)
@@ -1303,6 +1316,101 @@ def _iface_call(fn: Any, instance_id: str, timeline_id: str, **kwargs: Any) -> d
     return fn(instance_id, timeline_id, **{key: value for key, value in kwargs.items() if value is not None})
 
 
+# ------------------------------------------------------------------ OC 故事层
+# OC_STORY_LAYER_SPEC：产品状态、用户可见面与版本编排。语义在 isekai_core/story/，
+# 这里只做参数转发（与 `_iface_op` 同一分工）。
+
+STORY_SYNC_OPS = frozenset(
+    {
+        "story.enter",
+        "story.scene",
+        "story.home",
+        "story.turn",
+        "story.branch",
+        "story.restore",
+    }
+)
+
+
+def _story_service(cfg: Config, store: Store, runtime: Any) -> Any:
+    """故事层服务：优先用挂载中的运行层（同一个库、同一份实例副本）。
+
+    管理面能连上就说明存储可用，所以这里不带核心服务对象；「存储不可用」这条阻断
+    在会话链路（进程内）里判断，不由管理面读。
+    """
+    from ..story.service import StoryService
+
+    world = runtime if runtime is not None and hasattr(runtime, "clock_row") else _world_service(cfg, store)
+    return StoryService(store=store, cfg=cfg, runtime=world)
+
+
+def _story_op(cfg: Config, store: Store, runtime: Any, op: str, args: dict[str, Any]) -> dict[str, Any]:
+    """同步故事层操作：产品状态读数与版本编排（都不写世界事实）。"""
+    from ..runtime.service import RuntimeStateError
+
+    story = _story_service(cfg, store, runtime)
+    instance_id = str(args.get("instance_id") or args.get("id") or "")
+    timeline_id = str(args.get("timeline_id") or args.get("timeline") or "")
+    character_id = str(args.get("character_id") or args.get("card") or "")
+    try:
+        if op == "story.enter":
+            return story.enter(instance_id=instance_id, timeline_id=timeline_id, character_id=character_id)
+        if op in ("story.scene", "story.home", "story.turn"):
+            if not instance_id or not timeline_id:
+                raise UmpError(Err.INVALID, "故事层读接口要求显式的 instance_id 与 timeline_id", retryable=False)
+            if op == "story.scene":
+                return story.scene(instance_id, timeline_id, character_id=character_id)
+            if op == "story.home":
+                if not character_id:
+                    raise UmpError(Err.INVALID, "缺少 character_id（要看哪个角色的会话）", retryable=False)
+                return story.home(instance_id, timeline_id, character_id=character_id)
+            seq = args.get("seq")
+            return story.turn(
+                instance_id, timeline_id, character_id=character_id,
+                seq=int(seq) if isinstance(seq, int) else None,
+            )
+        if op == "story.branch":
+            return story.branch(
+                instance_id, timeline_id,
+                commit_id=str(args.get("commit_id") or args.get("commit") or ""),
+                name=str(args.get("name") or ""),
+            )
+        if op == "story.restore":
+            return story.restore(
+                instance_id, timeline_id,
+                commit_id=str(args.get("commit_id") or args.get("commit") or ""),
+                confirm=bool(args.get("confirm")),
+                saved=bool(args.get("saved")),
+                acknowledge_unsaved=bool(args.get("acknowledge_unsaved")),
+            )
+    except RuntimeStateError as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+    raise UmpError(Err.UNSUPPORTED_TYPE, f"未知故事层操作 {op}", retryable=False)
+
+
+async def _story_classify(cfg: Config, llm: Any, store: Store | None, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """输入分类（§3.4）的诊断入口：客户端可以在发送前先看这一轮属于哪一类。"""
+    from ..story import classify as story_classify
+
+    if store is None:
+        raise UmpError(Err.INTERNAL, "本次调用没有绑定数据库", retryable=False)
+    story = _story_service(cfg, store, runtime)
+    verdict = await story.classify(
+        str(args.get("text") or ""),
+        llm=llm,
+        instance_id=str(args.get("instance_id") or ""),
+        timeline_id=str(args.get("timeline_id") or ""),
+        character_id=str(args.get("character_id") or ""),
+    )
+    target = str(verdict.get("handoff") or "")
+    return {
+        **verdict,
+        "notice": story.handoff_notice(target) if target else "",
+        "categories": list(story_classify.CATEGORIES),
+        "labels": dict(story_classify.LABELS),
+    }
+
+
 def _trpg_gm_change(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
     """GM 直接变化（§十五）：没有行动、没有插件的联合提交。
 
@@ -1684,6 +1792,8 @@ async def dispatch_async(
             return await _render_event(cfg, llm, store, args)
         if op == "event.expand":
             return await _expand_claim(cfg, llm, store, args)
+        if op == "story.classify":
+            return await _story_classify(cfg, llm, store, runtime, args)
         if op == "runtime.first_contact":
             service = getattr(runtime, "service", runtime)
             if service is None or not hasattr(service, "first_contact"):

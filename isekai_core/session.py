@@ -70,7 +70,14 @@ def plan_batches(parts: list[str], max_parts: int) -> list[list[str]]:
 
 class SessionService:
     def __init__(
-        self, *, store: Store, cfg: Config, llm: Any, deliver: Deliver, runtime: Any = None
+        self,
+        *,
+        store: Store,
+        cfg: Config,
+        llm: Any,
+        deliver: Deliver,
+        runtime: Any = None,
+        story: Any = None,
     ) -> None:
         self.store = store
         self.cfg = cfg
@@ -78,6 +85,10 @@ class SessionService:
         self.deliver = deliver
         #: 世界运行层（阶段 2 起）：真实实例的会话用它构造扮演定义
         self.runtime = runtime
+        #: OC 故事层（OC_STORY_LAYER_SPEC）：输入分类闸与表达契约由它给，会话核心只执行
+        self.story = story
+        #: 本轮的输入分类结果（按入站序号记；进程重启后按预筛兜底，不落库也不改权限）
+        self._story_turns: dict[int, dict[str, Any]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         #: 本轮注入的记忆标识（§5.3：只有实际被采纳的一轮才强化）
@@ -319,7 +330,109 @@ class SessionService:
             batch = await self._wait_and_collect(row)
             if batch is None:  # 等待期间已失效：不生成、不投递
                 return
+            if await self._story_gate(batch):  # 结构性请求转交：这一轮不生成角色回复
+                return
             await self._generate(batch[0], batch=batch)
+
+    # ---------- OC 故事层（OC_STORY_LAYER_SPEC §3.4 / §五） ----------
+
+    def _story_contract(self, rows: list[dict[str, Any]]) -> str:
+        """表达契约（§五）：只约束怎么说，不给材料的权利。
+
+        追问轮带上「没讲出口」的边界行——重复追问不自动解锁保留内容，这件事得有可核对的约束，
+        不能指望模型自己记得上一轮的取舍。
+        """
+        story = getattr(self, "story", None)
+        if story is None or not rows:
+            return ""
+        row = rows[0]
+        session = self.store.session_get(str(row["session_id"])) or {}
+        instance_id = str(session.get("instance_id") or "")
+        if not instance_id or instance_id.startswith("ph-"):
+            return ""
+        verdict = self._story_turns.get(int(row["seq"])) or {}
+        try:
+            followup = story.is_followup(
+                _batch_text(rows), category=str(verdict.get("category") or "")
+            )
+            return str(
+                story.expression_block(
+                    instance_id,
+                    str(session.get("timeline_id") or ""),
+                    str(session.get("character_id") or ""),
+                    followup=followup,
+                )
+                or ""
+            )
+        except Exception:  # 表达契约取不到不阻断对话
+            log.exception("story contract failed session=%s", row.get("session_id"))
+            return ""
+
+    async def _story_gate(self, rows: list[dict[str, Any]]) -> bool:
+        """分类闸：请求改变世界 / 版本操作 / TRPG 行动停在转交状态，不发送假装执行过的回复。
+
+        返回 True 表示这一轮已按转交结算。分类只决定走哪条路、不改变权限：转交也不写世界，
+        只是把这一轮从普通联络里拿出去（§3.4）。
+        """
+        story = getattr(self, "story", None)
+        row = rows[0]
+        session = self.store.session_get(str(row["session_id"])) or {}
+        instance_id = str(session.get("instance_id") or "")
+        if story is None or not instance_id or instance_id.startswith("ph-"):
+            return False
+        text = _batch_text(rows)
+        if not str(text or "").strip():
+            return False
+        try:
+            verdict = await story.classify(
+                text,
+                llm=self.llm,
+                instance_id=instance_id,
+                timeline_id=str(session.get("timeline_id") or ""),
+                character_id=str(session.get("character_id") or ""),
+            )
+        except Exception:  # 分类不可用不得阻断对话：分不清就当她听见了
+            log.exception("story classify failed seq=%s", row.get("seq"))
+            return False
+        if not verdict.get("handoff"):
+            self._story_turns[int(row["seq"])] = dict(verdict)
+            return False
+        await self._story_handoff(rows, verdict)
+        return True
+
+    async def _story_handoff(self, rows: list[dict[str, Any]], verdict: dict[str, Any]) -> None:
+        """转交结算：入站标 cancelled，说明以 system_notice 上线——不冒充她的回复。
+
+        这一轮不入她的上下文（没被回应的请求不是联络内容），也不写任何世界事实。
+        """
+        story = self.story
+        row = rows[0]
+        target = str(verdict.get("handoff") or "")
+        for item in rows:
+            self.store.inbound_set_state(int(item["seq"]), "cancelled", error_code=f"handoff:{target}")
+        thread = self.store.thread_get(str(row["channel_id"]), str(row["thread_id"]))
+        if thread is None or int(thread["binding_version"]) != int(row["binding_version"] or 0):
+            return  # 绑定已换代：只留已固化的入站事实，不投递（另起说明由下次交互给出）
+        message_id = ump.new_id("m")
+        self.store.outbound_put(
+            session_id=str(row["session_id"]),
+            message_id=message_id,
+            reply_to=str(rows[-1].get("env_id") or ""),
+            covers=[str(item.get("env_id") or "") for item in rows],
+            batches=[[story.handoff_notice(target)]],
+            target_channel=str(row["channel_id"]),
+            target_thread=str(row["thread_id"]),
+            binding_version=int(row["binding_version"] or 0),
+            binding_token=str(thread["binding_token"]),
+            role="notice",
+        )
+        try:
+            fixed = self.store.outbound_by_message_id(message_id)
+            if fixed is not None:
+                await self._send_batches(fixed)
+        except Exception:  # 投递失败不留半成品：说明已在历史与待投递里
+            log.exception("handoff notice delivery failed seq=%s", row.get("seq"))
+        await self._status(row, "idle")
 
     # ---------- 睡眠期等待与合并（§4.5） ----------
 
@@ -762,6 +875,9 @@ class SessionService:
         head = rows[0]
         history = self.store.context_window(head["session_id"], self.cfg.context_history_max)
         prompt, recalled, unit = self._system_prompt_with_memory(rows, query_vector=query_vector)
+        contract = self._story_contract(rows)
+        if contract:
+            prompt = f"{prompt}\n\n{contract}"
         hint = self._sleep_hint(head)
         if hint:
             prompt = f"{prompt}\n\n{hint}"

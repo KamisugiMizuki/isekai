@@ -323,22 +323,31 @@ def read_surface_facts() -> None:
 
 
 def consumers_facts() -> None:
-    """⑥ 消费方实况（§7 三类高级模块）。"""
-    if not only_matches("§7 消费方接线"):
-        return
-    oc = list(ROOT.glob("isekai_core/**/oc*.py")) + list(ROOT.glob("isekai_core/**/*story*.py"))
-    wa = list(ROOT.glob("isekai_core/**/*writing*.py"))
-    trpg = ROOT / "isekai_core/runtime/trpg.py"
-    trpg_ops = sorted(op for op in (set(world_ops.SYNC_OPS) | set(world_ops.ASYNC_OPS))
-                      if op.startswith("trpg."))
-    check("§7 消费方接线",
-            "三类高级模块都能通过公共接口读写世界",
-            f"OC 故事层代码 {len(oc)} 个文件、Writing Assistant {len(wa)} 个文件；"
-            f"TRPG 层在用 {len(trpg_ops)} 个 trpg.* op（自有提交路径，不强迁）",
-            "DEFERRED",
-            evidence="接口侧本轮已全部打通；OC / WA 只有 docs 下的规范、没有代码，"
-                     "没有第二类真实调用方可供消费端验收",
-            code_ref="docs/worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md:378-445")
+    """⑥ 消费方实况（§7 三类高级模块）。判据不是「有文件」，而是**真的经公共接口读世界**。"""
+    story_dir = ROOT / "isekai_core/story"
+    story_files = sorted(story_dir.glob("*.py")) if story_dir.is_dir() else []
+    if only_matches("§7 消费方接线｜OC 故事层"):
+        src = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in story_files)
+        used = [name for name in ("scope_inspect", "cards(", "clock_row", "reserve_call", "settle_call",
+                                  "fork(", "rollback(") if name in src]
+        bypass = [token for token in ("apply_runtime_batch", "change_commit(", "executemany") if token in src]
+        ok = bool(story_files) and len(used) >= 5 and not bypass
+        check("§7 消费方接线｜OC 故事层",
+              "OC 故事层是 WorldRuntime 对外接口的真实消费方：经接口读世界与做版本操作，不旁路写库",
+              f"故事层 {len(story_files)} 个文件；用到的接口面 {used}；旁路写库 {bypass or '（无）'}",
+              "PASS" if ok else "FAIL",
+              evidence="§7.1 的四步用法：读投影 → 会话核心表达 → 版本操作走接口；"
+                       "显式世界修改仍由调用方走 change.preview → change.commit（本层不代劳）",
+              code_ref="isekai_core/story/service.py")
+    if only_matches("§7 消费方接线｜Writing Assistant"):
+        wa = list(ROOT.glob("isekai_core/**/*writing*.py"))
+        check("§7 消费方接线｜Writing Assistant",
+              "Writing Assistant 也能通过公共接口读写世界",
+              f"Writing Assistant 代码 {len(wa)} 个文件",
+              "DEFERRED",
+              evidence="WA 仍只有 docs 下的规范、没有代码：它的消费端验收等落地后再做"
+                       "（OC 侧已由 `scripts/_audit2_ocstory.py` 的 C1 段收口）",
+              code_ref="docs/writing-assistant/WRITING_ASSISTANT_SPEC.md")
 
 
 async def ws_registry_probe() -> None:
