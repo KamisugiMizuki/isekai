@@ -37,6 +37,33 @@ def _digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _writing_payload(store: Store, instance_id: str, timelines: list[dict[str, Any]]) -> dict[str, Any]:
+    """编剧层随件（WRITING_ASSISTANT_SPEC §4.1 / §八）：定义是作者资产、状态与候选按线。
+
+    导出按**引用闭包**取大纲定义：只带本实例各线绑定 / 候选引用到的那几份，不把整个
+    作者资产库塞进实例副本。定义 id 不重铸（导入时按 id 幂等落库，见 `_restore_writing`）。
+    """
+    states: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    outline_ids: set[str] = set()
+    for item in timelines:
+        timeline_id = str(item["id"])
+        saved_states = store.wa_state_list(instance_id, timeline_id)
+        saved_candidates = store.wa_candidate_list(instance_id, timeline_id)
+        states.extend(saved_states)
+        candidates.extend(saved_candidates)
+        for row in (*saved_states, *saved_candidates):
+            outline_id = str(row.get("outline_id") or "")
+            if outline_id:
+                outline_ids.add(outline_id)
+    outlines: list[dict[str, Any]] = []
+    for outline_id in sorted(outline_ids):
+        row = store.wa_outline_get(outline_id)
+        if row is not None:
+            outlines.append(row)
+    return {"outlines": outlines, "states": states, "candidates": candidates}
+
+
 def build_container(store: Store, instance_id: str) -> dict[str, Any]:
     row = store.instance_get(instance_id)
     if row is None:
@@ -99,6 +126,8 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
             "moment": row["moment"],
             # 角色状态按已完成水位导出；不导出待生效倍率命令、投递回执与通道绑定（§2.6 / §2.3.6）
             "state": runtime_state,
+            # 编剧层：大纲定义（引用闭包）+ 各线绑定状态与候选 / 决定，随件走完整性摘要
+            "writing": _writing_payload(store, instance_id, timelines),
         },
     }
     return {
@@ -225,6 +254,10 @@ def import_instance(store: Store, container: dict[str, Any], *, display_name: st
         session_map = _restore_sessions(store, row["id"], runtime, timeline_map)
         _restore_runtime_state(store, row["id"], runtime, timeline_map)
         _restore_commit_snapshots(store, row["id"], runtime, commit_map, timeline_map, session_map)
+        kept = _restore_writing(store, row["id"], runtime.get("writing"), timeline_map)
+        if kept:
+            # 本机已有同名大纲且内容不同：保留本机那份并如实回报，不静默替换作者资产（§4.1）
+            row["writing_kept_outlines"] = kept
     except Exception:
         store.instance_delete(row["id"])
         raise
@@ -288,6 +321,48 @@ def _restore_runtime_state(
             }
         )
     return loaded
+
+
+def _restore_writing(
+    store: Store, instance_id: str, writing: Any, timeline_map: dict[str, str]
+) -> list[str]:
+    """编剧层随件导回：大纲定义按 id 幂等落库，绑定状态与候选写回新实例 / 新线。
+
+    - 定义是**作者资产**：id 不重铸（否则同一份大纲会在导入端变成新资产，跨线复用失效）；
+      本机已有同名大纲则**保留本机那份**，内容不同才回报到 `writing_kept_outlines`；
+    - 状态与候选按实例 + 时间线走：时间线用导入端的新 id，映射不到的行直接丢（不塞悬空行）。
+    """
+    if not isinstance(writing, dict):
+        return []
+    kept: list[str] = []
+    for row in writing.get("outlines") or []:
+        if not isinstance(row, dict):
+            continue
+        outline_id = str(row.get("id") or "")
+        if not outline_id:
+            continue
+        existing = store.wa_outline_get(outline_id)
+        if existing is not None:
+            if str(existing.get("payload") or "") != str(row.get("payload") or ""):
+                kept.append(outline_id)
+            continue
+        store.wa_outline_put(
+            {
+                "id": outline_id,
+                "name": str(row.get("name") or ""),
+                "payload": str(row.get("payload") or "{}"),
+                "created_real": float(row.get("created_real") or time.time()),
+            }
+        )
+    for key, put in (("states", store.wa_state_put), ("candidates", store.wa_candidate_put)):
+        for row in writing.get(key) or []:
+            if not isinstance(row, dict):
+                continue
+            new_timeline = timeline_map.get(str(row.get("timeline_id") or ""))
+            if not new_timeline:
+                continue
+            put({**row, "instance_id": instance_id, "timeline_id": new_timeline})
+    return kept
 
 
 def _remap_rows(rows: Any, instance_id: str, timeline_id: str) -> list[dict[str, Any]]:

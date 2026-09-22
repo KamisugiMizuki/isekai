@@ -381,12 +381,14 @@ async def acceptance_rows() -> None:
             campaign = await h.mgmt.call("trpg.campaign.create", instance_id=instance_id,
                                          timeline_id=timeline_id, ruleset_id="wa-probe", status="active")
             before = counts(h, instance_id, timeline_id)
+            # 声明用**变化意图**形态（§3.7 / §5.1：`consequences` 收 state_change 一类意图，
+            # 世界效果名只能进 `effects` 兼容字段）——旧夹具把效果名写进 consequences，会被拒。
             declared = await h.mgmt.call(
                 "wa.gm.declare", instance_id=instance_id, timeline_id=timeline_id, ref="gm-1",
                 campaign=str(campaign["campaign_id"]), display_name="堤长去职",
-                gm_changes={"consequences": [{"kind": "institution_state", "target": "off-1",
-                                              "value": "vacant", "expiry": "until_cleared",
-                                              "certainty": "confirmed"}],
+                gm_changes={"consequences": [{"kind": "state_change", "operation": "set",
+                                              "target_refs": ["off-1"], "value": "vacant",
+                                              "expiry": "until_cleared", "certainty": "confirmed"}],
                             "claims": [{"text": "堤长的位置空了出来", "source_id": "src-1", "audience": "公开"}]},
                 basis={"fact": "议席推举未定"})
             mid = counts(h, instance_id, timeline_id)
@@ -394,12 +396,29 @@ async def acceptance_rows() -> None:
                                      ref="gm-1", idempotency_key="wa-gm-1")
             after = counts(h, instance_id, timeline_id)
             ledger = h.store.trpg_commit_by_key(instance_id, timeline_id, "wa-gm-1")
+            # 负例：世界效果名写进 `consequences` 要被拒并指出去处（判据跟着规则共用模块的新契约走）
+            old_shape = ""
+            try:
+                await h.mgmt.call(
+                    "wa.gm.declare", instance_id=instance_id, timeline_id=timeline_id, ref="gm-old",
+                    campaign=str(campaign["campaign_id"]), display_name="旧形态",
+                    gm_changes={"consequences": [{"kind": "institution_state", "target": "off-1",
+                                                  "value": "vacant", "expiry": "until_cleared",
+                                                  "certainty": "confirmed"}]},
+                    basis={"fact": "旧形态"})
+                old_done = await h.mgmt.call("wa.gm.approve", instance_id=instance_id, timeline_id=timeline_id,
+                                             ref="gm-old", idempotency_key="wa-gm-old")
+                old_shape = json.dumps(old_done, ensure_ascii=False)
+            except UmpError as exc:
+                old_shape = str(exc)
             check("B6 GM 直接变化", "声明只是待批准结构；批准后经规则层联合提交落世界，且不制造行动行",
                   f"声明状态={declared['candidate']['status']}（未提交={declared['candidate']['uncommitted']}）；"
                   f"声明不改世界={mid == before}；批准→{done['status']}；联合提交账本={bool(ledger)}；"
-                  f"效果 {before['effects']}→{after['effects']}；行动行={len(h.store.trpg_list('action', instance_id=instance_id, timeline_id=timeline_id))}",
+                  f"效果 {before['effects']}→{after['effects']}；行动行={len(h.store.trpg_list('action', instance_id=instance_id, timeline_id=timeline_id))}；"
+                  f"旧形态被拒={'rejected' in old_shape and 'effects' in old_shape}（{old_shape[:80]}）",
                   "PASS" if declared["candidate"]["status"] == "proposed" and mid == before
-                  and done["status"] == "committed" and ledger and after != before else "FAIL",
+                  and done["status"] == "committed" and ledger and after != before
+                  and "rejected" in old_shape and "effects" in old_shape else "FAIL",
                   evidence=f"承诺文案：{declared['must_not_imply']}", code_ref="wa.gm.declare / wa.gm.approve")
 
         # --- §十二 第七行：玩家行动结果
