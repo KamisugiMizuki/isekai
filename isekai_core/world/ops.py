@@ -1126,6 +1126,7 @@ def _trpg_campaign_create(cfg: Config, store: Store, runtime: Any, args: dict[st
         plugin_manifest=str(args.get("plugin_manifest") or ""),
         participants=[str(item) for item in _json_arg(args, "participants", []) or []],
         status=str(args.get("status") or "active"),
+        host_mode=str(args.get("host_mode") or ""),
         note=str(args.get("note") or ""),
         scene=scene if isinstance(scene, dict) else None,
     )
@@ -1162,6 +1163,8 @@ def _trpg_scene_open(cfg: Config, store: Store, runtime: Any, args: dict[str, An
     }
     if args.get("scene_id"):
         fields["scene_id"] = str(args["scene_id"])
+    if args.get("advance_mode"):
+        fields["advance_mode"] = str(args["advance_mode"])
     return _campaign_call(_campaign_service(runtime).open_scene, instance_id, timeline_id, campaign_id, **fields)
 
 
@@ -1187,6 +1190,7 @@ def _trpg_action_declare(cfg: Config, store: Store, runtime: Any, args: dict[str
         expected_result=str(args.get("expected_result") or ""),
         preconditions=[str(item) for item in _json_arg(args, "preconditions", []) or []],
         visible_risks=[str(item) for item in _json_arg(args, "visible_risks", []) or []],
+        requires_confirmation=bool(args.get("require_confirmation")),
         auto_confirm=bool(args.get("auto_confirm")),
         action_id=str(args.get("action_id") or "") or None,
     )
@@ -1238,6 +1242,9 @@ def _trpg_commit(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) 
         idempotency_key=str(args.get("idempotency_key") or ""),
         audience=str(args.get("audience") or "public_party"),
         source_mode=str(args.get("source_mode") or "action"),
+        expected_campaign_revision=(
+            int(args["campaign_revision"]) if args.get("campaign_revision") is not None else None
+        ),
     )
 
 

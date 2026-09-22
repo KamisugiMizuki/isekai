@@ -249,7 +249,7 @@ async def _campaign(mgmt, info, timeline_id, plugin, **overrides) -> str:
         "trpg.campaign.create",
         instance_id=info["id"], timeline_id=timeline_id,
         ruleset_id="fake-rules", ruleset_version="1.0", plugin_manifest=plugin,
-        participants=["card-1"],
+        participants=["card-1"], host_mode="autonomous",
         scene={"kind": "conflict", "location_refs": ["rl-1"], "participants": ["card-1"]},
         **overrides,
     )
@@ -960,7 +960,7 @@ async def test_audience_keeps_private_material_apart(tmp_path) -> None:
                 "trpg.campaign.create",
                 instance_id=info["id"], timeline_id=timeline_id,
                 ruleset_id="fake-rules", ruleset_version="1.0", plugin_manifest=plugin,
-                participants=["card-1"],
+                participants=["card-1"], host_mode="autonomous",
                 scene={
                     "kind": "conflict", "location_refs": ["rl-1"], "participants": ["card-1"],
                     "public_facts": ["门外有脚印", {"text": "他袖口有血", "audience": "character:pc-1"}],

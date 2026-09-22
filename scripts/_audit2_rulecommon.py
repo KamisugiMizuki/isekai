@@ -208,7 +208,7 @@ async def campaign(h: Any, instance_id: str, timeline_id: str, manifest: Path, *
     created = await h.mgmt.call(
         "trpg.campaign.create", instance_id=instance_id, timeline_id=timeline_id,
         ruleset_id=ruleset_id, ruleset_version=version, plugin_manifest=str(manifest),
-        participants=[ACTORS.get(instance_id, "card-1")],
+        host_mode="autonomous", participants=[ACTORS.get(instance_id, "card-1")],
         scene={"kind": "conflict", "location_refs": ["rl-1"]},
     )
     return str(created["campaign_id"])

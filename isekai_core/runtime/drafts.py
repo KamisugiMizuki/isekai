@@ -26,11 +26,16 @@ def normalize_draft(
     known_targets: set[str],
     world_seconds: int,
     default_channels: list[str] | None = None,
+    require_effects: bool = True,
 ) -> dict[str, Any]:
     """把用户意图规范成草案：明确拒绝无法表达的效果，不把自由文本当成已执行。
 
     `known_targets` 是来源点已登记的对象（角色 + 登记实体 + 渠道 + 环境类型）；
     指向未登记对象的效果一律拒绝——「可以改变当前局势，不能改写过去或公理」。
+
+    `require_effects=False`：允许一批变化里**没有**世界事实效果（TRPG 规则结果可以只有规则
+    状态 / 说法 / 场景转换 / 时间，也可以是「明确无变化」）——校验照旧，只是不再要求至少一条；
+    事件行仍然会记下这次行动本身。
     """
     intent = str(payload.get("intent") or "").strip()
     if not intent:
@@ -72,7 +77,7 @@ def normalize_draft(
         if item.get("recovery"):
             effect["recovery"] = str(item["recovery"])
         effects.append(effect)
-    if not effects:
+    if not effects and require_effects:
         raise ValueError("草案至少要有一个受支持的事实效果（否则请改世界包后新建实例）")
 
     claims: list[dict[str, Any]] = []

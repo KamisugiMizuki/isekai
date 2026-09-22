@@ -1,6 +1,6 @@
 # TRPG 规则层模块设计
 
-> 状态：已定稿 v1.0（跨模块编排规范）；实现状态：底层 Campaign Runtime、规则插件协议、规则共用模块与联合提交已落地，完整客户端仍属独立实现范围。
+> 状态：已定稿 v1.0（跨模块编排规范）；实现状态：底层 Campaign Runtime、规则插件协议、规则共用模块、联合提交，以及编排层本身（三条入口 / 主持责任模式 / 推进节拍 / 结果语义）已落地，完整客户端仍属独立实现范围。口径见 §十六。
 > 上游：[`../worldruntime/DESIGN.md`](../worldruntime/DESIGN.md)、[`../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md`](../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md)、[`../trpg-client/TRPG_CLIENT_SPEC.md`](../trpg-client/TRPG_CLIENT_SPEC.md)、[`TRPG_CAMPAIGN_RUNTIME_SPEC.md`](TRPG_CAMPAIGN_RUNTIME_SPEC.md)、[`TRPG_RULE_PLUGIN_SPEC.md`](TRPG_RULE_PLUGIN_SPEC.md)、[`TRPG_RULE_COMMON_MODULE_SPEC.md`](TRPG_RULE_COMMON_MODULE_SPEC.md)。
 > 评价依据：[`TRPG_GM_USER_EVALUATION_DRAFT.md`](TRPG_GM_USER_EVALUATION_DRAFT.md)。
 >
@@ -376,3 +376,52 @@ TRPG 层复用 WorldRuntime 的认知、披露和回滚语义，不建立第二�
 | 分支与回滚 | 场景、规则状态和行动派生不跨线回流；迟到结果按新世代失效 |
 
 以上场景必须使用真实 Campaign Runtime、真实规则插件进程、真实 SQLite / WebSocket 边界验证；客户端设计不等于客户端已实现。
+
+## 十六、实现状态（2026-09-22）
+
+编排层没有另起一个「规则层服务」：它落在既有三层上，按职责分配——
+
+| 本文责任 | 落在哪 | 说明 |
+|---|---|---|
+| 三条入口的固定语义（§5.5） | `world/ops.py` 的 `trpg.*` op + CLI `trpg` 组 | `trpg.action.resolve` 带 / 不带 `campaign_id` 就是 B0 与战役两条入口；GM 直接变化是 `trpg.gm.change`，不制造行动行 |
+| 战役 / 场景 / 行动 / 待选择生命周期（§4） | `runtime/trpg.py::CampaignRuntime` + `runtime/campaign.py` 状态机 | 见 `TRPG_CAMPAIGN_RUNTIME_SPEC.md` §二十一 |
+| 规则结果 → 世界变化（§3.3 / §5.3） | `runtime/rule_common.py` | 见 `TRPG_RULE_COMMON_MODULE_SPEC.md` §十二 |
+| 快照 / 规则状态 / 插件请求的同一基准（§5.6） | `CampaignRuntime.resolve` 读世界水位 + 规则状态 revision，随请求下发 | 插件不得自报来源与版本 |
+| 联合提交与幂等重放（§5.6 / §十一） | `CampaignRuntime._joint_apply` + `trpg_commit` 账本 | 唯一一条提交管线：行动路径与 GM 直接变化共用 |
+| 来源 / 受众 / 版本 / 世代的透传（§5.7） | `SOURCE_EVENT` / 受众闭集 / `_require_compatible` / 世代校验 | 上层只传，不猜、不补 |
+| 结果与失败语义（§七） | 行动状态机 + 公共层的 `pending` / `rejected` 分账 | 七类结果都落得下：见下表 |
+| 主持责任模式（§八） | `trpg_campaign.host_mode` + 声明里的 `require_confirmation` | 2026-09-22 落地 |
+| 推进节拍（§4.1 / §九） | `trpg_scene.advance_mode` | 2026-09-22 落地 |
+| 隐私 / 认知 / 披露（§十） | 受众闭集 + `scene_view` / `action_view` 裁剪 + WorldRuntime 认知链 | 不建第二套秘密库 |
+
+§七 的七类结果落到哪：
+
+| 结果 | 落法 |
+|---|---|
+| 自动成功 / 普通成功 | 插件 `resolution` 原样保存；已确认后果写成结构化变化 |
+| 部分成功 | 同普通成功；「代价」由插件申报成后果（规则状态或世界后果） |
+| 失败但获得信息 | 失败 + `knowledge_change` / claims：说法落地，事实不变 |
+| 失败并产生代价 | 后果包里的规则状态 patch 与世界后果**同批**落地 |
+| 条件不足、暂不裁定 | 结构化错误 `needs_input` → `awaiting_gm_review`；不推进世界、不消费行动、**不阻止另起一个行动** |
+| 玩家放弃 | `trpg.action.abandon` 终结行动，世界零变化 |
+| 明确无变化 | 没有世界后果的裁定照样提交：规则状态 / 场景 / 时间落地，世界事件零效果（`require_effects=False`） |
+
+主持责任模式的边界（§八）：
+
+- `assisted`（缺省，规范推荐）：声明一律停在 `awaiting_confirmation`，核心不替玩家确认；
+- `autonomous`：**非关键**行动可以直接确认；声明里写了 `require_confirmation` 的行动照旧等玩家确认；
+- `cohost`：同 `assisted`；GM 侧未批准的草案也不会写进世界（走 Writing Assistant 的候选 → 批准 → `gm.change`）。
+
+推进节拍是**声明**而不是回合：`instant` / `continuous`（缺省）/ `opposed` / `world` 四值闭集，
+核心不据此硬套回合；「世界推进不得替玩家消耗尚未作出的关键行动」由待选择与战役 `waiting` 闸保证。
+
+行为验收：`tests/test_trpg_rules_layer.py`（7 项：主持模式 / 行动版本 / 无变化提交 / 无法裁定与放弃 /
+推进节拍 / 提交闭包版本 / 三条入口）+ `tests/test_trpg_campaign.py`、`tests/test_trpg_rule_common.py`；
+逐行读数在 `scripts/_audit2_trpglayer.py`（18 项：L 段 = §十五 表逐行、M 段 = §四/§八/§九、R 段 = §五/§七）。
+
+明确不做的（客户端范围，不是本层义务）：
+
+- 自然语言输入、确认卡与结果表达（`TRPG_CLIENT_SPEC.md`）；
+- 多玩家同步、玩家私密频道、复杂队伍权限（§二：首版非默认前提，扩展时必须在现有受众模型上加明确受众）；
+- GM 的「故事意图 / 大纲目标」这一类输入由 Writing Assistant 接（规则层只接规则行动安排与直接世界变化）；
+- 表达层四问（发生了什么 / 为什么这样判 / 世界改变了什么 / 现在能做什么）由客户端与 GM 表达层回答。

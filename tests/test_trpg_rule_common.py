@@ -138,7 +138,8 @@ async def _campaign(mgmt, info, timeline_id, plugin, *, ruleset_id: str = "fake-
         "trpg.campaign.create",
         instance_id=info["id"], timeline_id=timeline_id,
         ruleset_id=ruleset_id, ruleset_version=version, plugin_manifest=plugin,
-        participants=["card-1"], scene={"kind": "conflict", "location_refs": ["rl-1"]},
+        participants=["card-1"], host_mode="autonomous",
+        scene={"kind": "conflict", "location_refs": ["rl-1"]},
     )
     assert created["status"] == "active" and created["scene_id"]
     return str(created["campaign_id"])
@@ -301,7 +302,7 @@ async def test_b0_compat_path_goes_through_the_same_checks(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_event_frame_alone_is_not_a_world_fact(tmp_path) -> None:
-    """§5.1：事件帧是叙述材料——正文不能代替结构化效果，所以单独一批提交不下来。"""
+    """§5.1：事件帧是叙述材料——进事件路径，但正文不能代替结构化效果（零效果提交）。"""
     plugin = make_plugin(tmp_path, source=COMMON_PLUGIN_SOURCE)
     async with running_core(tmp_path) as harness:
         mgmt = await open_mgmt(harness)
@@ -315,9 +316,12 @@ async def test_event_frame_alone_is_not_a_world_fact(tmp_path) -> None:
             assert resolved["status"] == "reviewing"
             assert [item["kind"] for item in resolved["changes"]] == ["world_event"]
             assert resolved["consequences"] == [], "事件帧不产生事实效果"
-            reviewed = await _commit(mgmt, info, timeline_id, campaign_id, action["action_id"], key="frame-1")
-            assert reviewed["status"] == "needs_review", reviewed
-            assert _trpg_events(harness, info, timeline_id) == []
+            committed = await _commit(mgmt, info, timeline_id, campaign_id, action["action_id"], key="frame-1")
+            assert committed["status"] == "committed", committed
+            assert committed["effects"] == 0, "帧不产生效果"
+            rows = _trpg_events(harness, info, timeline_id)
+            assert len(rows) == 1 and "钟声在夜里响过" in str(rows[0]["summary"]), \
+                "事件帧要进事件正文（叙述材料），但不能造效果"
         finally:
             await mgmt.close()
 

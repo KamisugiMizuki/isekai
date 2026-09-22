@@ -109,6 +109,7 @@ def main() -> int:
             root, "trpg", "campaign-new", "--id", instance_id, "--timeline", timeline_id,
             "--ruleset", "cli-probe", "--ruleset-version", "1.0",
             "--plugin", str(plugin / "manifest.json"), "--actor", str(card["meta"]["card_id"]),
+            "--host-mode", "autonomous",
             "--kind", "conflict", "--ref", "rl-1",
         )
         campaign_id = str(created["campaign_id"])

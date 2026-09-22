@@ -220,6 +220,8 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
                 "status": ns.status or "active",
                 "participants": [ns.actor] if ns.actor else [],
             })
+            if getattr(ns, "host_mode", None):
+                args["host_mode"] = ns.host_mode
             if ns.kind:
                 args["scene"] = {"kind": ns.kind, "location_refs": [ns.ref] if ns.ref else []}
         if cmd == "campaign-status":
@@ -230,12 +232,15 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             })
         if cmd == "scene-open":
             args["kind"] = ns.kind or "exploration"
+            if getattr(ns, "advance_mode", None):
+                args["advance_mode"] = ns.advance_mode
         if cmd == "declare":
             args.update({
                 "actor_id": ns.actor or "",
                 "intent": ns.intent or "",
                 "raw_text": ns.intent or "",
                 "auto_confirm": bool(ns.auto_confirm),
+                "require_confirmation": bool(getattr(ns, "require_confirmation", False)),
             })
         if cmd == "confirm":
             args.update({"action_id": ns.action or "", "action_revision": int(ns.revision or 0)})
@@ -244,6 +249,8 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
         if cmd == "commit":
             args["idempotency_key"] = ns.idempotency or ""
             args["source_mode"] = ns.source_mode or "action"
+            if getattr(ns, "campaign_revision", None) is not None:
+                args["campaign_revision"] = int(ns.campaign_revision)
         if cmd == "gm-change":
             args["changes"] = ns.changes or ""
             args["idempotency_key"] = ns.idempotency or ""
@@ -604,6 +611,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--status", default=None, help="TRPG：战役状态")
     parser.add_argument("--reason", default=None, help="TRPG：状态变更原因")
     parser.add_argument("--auto-confirm", dest="auto_confirm", action="store_true", help="TRPG：低风险行动直接确认")
+    parser.add_argument("--require-confirmation", dest="require_confirmation", action="store_true",
+                        help="TRPG：这是关键行动——任何主持模式下都要玩家确认（§4.2 / §八）")
+    parser.add_argument("--host-mode", dest="host_mode", default=None,
+                        help="TRPG：主持责任模式 assisted（缺省）/ autonomous / cohost")
+    parser.add_argument("--advance-mode", dest="advance_mode", default=None,
+                        help="TRPG：场景推进节拍 instant / continuous（缺省）/ opposed / world")
+    parser.add_argument("--campaign-revision", dest="campaign_revision", type=int, default=None,
+                        help="TRPG：提交闭包里基于的战役版本（不一致 → conflict）")
     parser.add_argument("--seconds", type=int, default=None, help="TRPG / 时钟：时间消耗秒数")
     parser.add_argument("--cause", default=None, help="TRPG / 时钟：时间消耗原因（必填）")
     parser.add_argument("--time-source", dest="time_source", default=None,

@@ -660,6 +660,7 @@ CREATE TABLE IF NOT EXISTS trpg_campaign(
   current_scene_id TEXT NOT NULL DEFAULT '',
   state_revision INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'preparing',  -- preparing/active/waiting/paused/blocked/archived
+  host_mode TEXT NOT NULL DEFAULT 'assisted', -- 主持责任模式 §八：assisted / autonomous / cohost
   note TEXT NOT NULL DEFAULT '',
   created_world INTEGER NOT NULL DEFAULT 0,
   updated_world INTEGER NOT NULL DEFAULT 0,
@@ -674,6 +675,7 @@ CREATE TABLE IF NOT EXISTS trpg_scene(
   campaign_id TEXT NOT NULL,
   scene_id TEXT NOT NULL,
   kind TEXT NOT NULL DEFAULT 'exploration',
+  advance_mode TEXT NOT NULL DEFAULT 'continuous', -- 推进节拍 §4.1/§九：instant / continuous / opposed / world
   location_refs TEXT NOT NULL DEFAULT '[]',
   world_snapshot TEXT NOT NULL DEFAULT '{}', -- {snapshot 引用，不复制世界事实正文}
   participants TEXT NOT NULL DEFAULT '[]',
@@ -860,10 +862,11 @@ TRPG_COLUMNS: dict[str, tuple[str, ...]] = {
     "campaign": (
         "instance_id", "timeline_id", "campaign_id", "ruleset_id", "ruleset_version",
         "plugin_manifest", "participants", "current_scene_id", "state_revision", "status",
-        "note", "created_world", "updated_world", "created_real", "updated_real",
+        "host_mode", "note", "created_world", "updated_world", "created_real", "updated_real",
     ),
     "scene": (
-        "instance_id", "timeline_id", "campaign_id", "scene_id", "kind", "location_refs",
+        "instance_id", "timeline_id", "campaign_id", "scene_id", "kind", "advance_mode",
+        "location_refs",
         "world_snapshot", "participants", "public_facts", "private_views", "active_risks",
         "available_actions", "turn_state", "status", "revision",
         "created_world", "updated_world",
@@ -1735,6 +1738,17 @@ class Store:
         if action_columns and "audience" not in action_columns:
             self._conn.execute(
                 "ALTER TABLE trpg_action ADD COLUMN audience TEXT NOT NULL DEFAULT 'public_party'"
+            )
+        # 主持责任模式（TRPG_RULES_LAYER_SPEC §八）与场景推进节拍（§4.1 / §九）
+        campaign_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(trpg_campaign)")}
+        if campaign_columns and "host_mode" not in campaign_columns:
+            self._conn.execute(
+                "ALTER TABLE trpg_campaign ADD COLUMN host_mode TEXT NOT NULL DEFAULT 'assisted'"
+            )
+        scene_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(trpg_scene)")}
+        if scene_columns and "advance_mode" not in scene_columns:
+            self._conn.execute(
+                "ALTER TABLE trpg_scene ADD COLUMN advance_mode TEXT NOT NULL DEFAULT 'continuous'"
             )
         join_columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(character_join)")}
         for name, ddl in (

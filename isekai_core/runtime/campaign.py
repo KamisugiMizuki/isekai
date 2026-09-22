@@ -73,6 +73,33 @@ CHOICE_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "expired": (),
 }
 
+#: 主持责任模式（TRPG_RULES_LAYER_SPEC §八）：辅助裁定 / 自动主持 / 共同主持。
+#: 规范推荐默认**辅助裁定**——核心不替玩家确认行动；只有自动主持才对非关键行动直接确认。
+HOST_MODES: tuple[str, ...] = ("assisted", "autonomous", "cohost")
+DEFAULT_HOST_MODE = "assisted"
+
+#: 场景推进节拍（§4.1「场景推进方式」/ §九 四种推进节拍）。核心不硬套回合：
+#: 节拍是声明，客户端据此决定什么时候把控制权交回玩家。
+SCENE_BEATS: tuple[str, ...] = ("instant", "continuous", "opposed", "world")
+DEFAULT_BEAT = "continuous"
+
+
+def host_mode(value: Any) -> str:
+    """主持模式只能是闭集里的值；缺省 = 辅助裁定。"""
+    mode = str(value or DEFAULT_HOST_MODE)
+    if mode not in HOST_MODES:
+        raise CampaignError(f"未知的主持模式：{mode}（可用：{' / '.join(HOST_MODES)}）")
+    return mode
+
+
+def scene_beat(value: Any) -> str:
+    """场景推进节拍只能是闭集里的值；缺省 = 连续场景。"""
+    beat = str(value or DEFAULT_BEAT)
+    if beat not in SCENE_BEATS:
+        raise CampaignError(f"未知的场景推进节拍：{beat}（可用：{' / '.join(SCENE_BEATS)}）")
+    return beat
+
+
 #: 会改变规则状态或世界状态、因而必须走确认与联合提交的行动状态
 LIVE_ACTION_STATES = ("confirmed", "snapshotting", "resolving", "reviewing", "awaiting_choice",
                       "awaiting_gm_review", "committing")
@@ -210,6 +237,7 @@ def public_campaign(row: dict[str, Any]) -> dict[str, Any]:
         "ruleset_id": str(row.get("ruleset_id") or ""),
         "ruleset_version": str(row.get("ruleset_version") or ""),
         "status": str(row.get("status") or ""),
+        "host_mode": str(row.get("host_mode") or DEFAULT_HOST_MODE),
         "state_revision": int(row.get("state_revision") or 0),
         "current_scene_id": str(row.get("current_scene_id") or ""),
         "note": str(row.get("note") or ""),

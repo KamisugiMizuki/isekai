@@ -601,6 +601,19 @@ created_at / updated_at
 - **规则插件常驻形态**（§五）：清单 `resident: true` 时一个插件进程服务多次裁定（心跳 `ping`/`pong`，闲置超时就地收掉，核心退出统一关闭）；
   **跨核心复用**（§二十一 残余第 3 条，2026-09-22）：再声明 `share: true` 时改走**共享承载**——核心连本机回环上的「中继桥」（`isekai_core/runtime/plugin_bridge.py`），桥以 stdio 托管真插件并把端口/令牌写进插件目录的 `.isekai-plugin-share.json`；新核心照这份文件**接上同一个插件进程**，插件代码与线协议都不动；核心退出只断开连接（插件留着），静置 `ISEKAI_PLUGIN_IDLE_EXIT` 秒（缺省 600）桥自退不留孤儿；进程死在「还没发请求」时重开一个，**死在半路不重发**（不重跑裁定）；常驻只省启动与加载——状态仍只经快照进出；
 - 管理面 op（16 个：`trpg.campaign.create|list|info|status|migrate`、`trpg.scene.open|view`、`trpg.action.declare|confirm|abandon|resolve`、`trpg.choice.select`、`trpg.rule_state.read`、`trpg.commit`、`trpg.gm.change`、`trpg.recover`，外加 `runtime.time.consume`）与 CLI 同名命令组；
+- **主持责任模式与关键行动闸**（TRPG_RULES_LAYER_SPEC §八，2026-09-22）：战役带 `host_mode`
+  （`assisted` 缺省 / `autonomous` / `cohost`，闭集校验）；声明的 `require_confirmation`（§4.2「是否需要玩家确认」）
+  让**关键行动**在任何模式下都要玩家确认；只有 `autonomous` 对非关键行动直接确认，`assisted` / `cohost`
+  一律停在 `awaiting_confirmation`——核心不替玩家确认；
+- **场景推进节拍**（TRPG_RULES_LAYER_SPEC §4.1 / §九，2026-09-22）：场景带 `advance_mode`
+  （`instant` / `continuous` 缺省 / `opposed` / `world`，闭集校验）；节拍是声明，核心不硬套回合；
+- **提交闭包里的战役版本**（§12.1，2026-09-22）：`trpg.commit` 收可选的 `campaign_revision`
+  （Python API `expected_campaign_revision`，CLI `--campaign-revision`，取自 `trpg.scene.view` 的
+  `campaign.state_revision`）；与当前 `state_revision` 不一致 → `conflict`，不套用旧材料
+  （规则状态 / 世界 / 场景一处不动）；
+- **零世界后果的提交**（§12.1 `world_changes[]` 可以是空的，2026-09-22）：只有规则状态 patch / 说法 /
+  场景转换 / 时间请求，或「明确无变化」的裁定，都能提交落账（`drafts.normalize_draft(require_effects=False)`）——
+  事件行记录这次行动本身，效果数为 0；`world_event` 事件帧并进事件正文（叙述材料），**不产生效果**；
 - B0 兼容：不带 `campaign_id` 的 `trpg.action.resolve` 语义不变。
 
 **尚未实现（记为设计义务，不充数）**：

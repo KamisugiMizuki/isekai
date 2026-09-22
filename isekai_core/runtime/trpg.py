@@ -98,16 +98,19 @@ class CampaignRuntime:
         plugin_manifest: str = "",
         participants: list[str] | None = None,
         status: str = "active",
+        host_mode: str = campaign_mod.DEFAULT_HOST_MODE,
         note: str = "",
         scene: dict[str, Any] | None = None,
         now_real: float | None = None,
     ) -> dict[str, Any]:
-        """建立战役：绑定实例 / 时间线 / 规则版本；可选同时开首个场景。"""
+        """建立战役：绑定实例 / 时间线 / 规则版本与主持模式；可选同时开首个场景。"""
         self._require_line(instance_id, timeline_id)
         if not str(ruleset_id or "").strip():
             raise CampaignRuntimeError("战役必须声明 ruleset_id")
         if status not in ("preparing", "active"):
             raise CampaignRuntimeError("新战役只能是 preparing 或 active")
+        # §八 主持责任模式：闭集 + 缺省辅助裁定（核心不替玩家确认行动）
+        mode = campaign_mod.host_mode(host_mode)
         campaign_mod.transition("campaign", "preparing", status, what="战役")
         now = float(now_real if now_real is not None else time.time())
         world = self._world(instance_id, timeline_id)
@@ -122,6 +125,7 @@ class CampaignRuntime:
             "current_scene_id": "",
             "state_revision": 1,
             "status": status,
+            "host_mode": mode,
             "note": str(note or ""),
             "created_world": world,
             "updated_world": world,
@@ -200,6 +204,7 @@ class CampaignRuntime:
         *,
         scene_id: str | None = None,
         kind: str = "exploration",
+        advance_mode: str = campaign_mod.DEFAULT_BEAT,
         location_refs: list[str] | None = None,
         participants: list[str] | None = None,
         public_facts: list[Any] | None = None,
@@ -215,6 +220,8 @@ class CampaignRuntime:
             "campaign_id": campaign_id,
             "scene_id": str(scene_id or campaign_mod.new_id("sc")),
             "kind": str(kind or "exploration"),
+            # §4.1 场景推进方式 / §九 四种推进节拍：声明，不硬套回合
+            "advance_mode": campaign_mod.scene_beat(advance_mode),
             "location_refs": _dumps(list(location_refs or [])),
             # 只记引用（世界快照标识 + 水位），不复制世界事实正文（§3.2）
             "world_snapshot": _dumps({"world": int(world), "revision": int(world)}),
@@ -318,16 +325,24 @@ class CampaignRuntime:
         expected_result: str = "",
         preconditions: list[str] | None = None,
         visible_risks: list[str] | None = None,
+        requires_confirmation: bool = False,
         auto_confirm: bool = False,
         action_id: str | None = None,
         now_real: float | None = None,
     ) -> dict[str, Any]:
-        """行动声明（§3.3）：落到 interpreted；关键行动停在 awaiting_confirmation。"""
+        """行动声明（§3.3）：落到 interpreted；需要玩家确认的行动停在 awaiting_confirmation。
+
+        `requires_confirmation` 是声明里的「是否需要玩家确认」（§4.2 末行）：**关键行动**在
+        任何主持模式下都不能被自动确认。`auto_confirm` 只在自动主持（§八）里对非关键行动生效；
+        辅助裁定 / 共同主持一律把行动留在 awaiting_confirmation——核心不替玩家确认。
+        """
         campaign_row = self._campaign_row(instance_id, timeline_id, campaign_id)
         self._require_live(campaign_row, what="声明行动")
         intent = str(intent or raw_text or "").strip()
         if not intent:
             raise CampaignRuntimeError("行动声明缺少意图（intent 或 raw_text 至少一个）")
+        host_mode = campaign_mod.host_mode(campaign_row.get("host_mode"))
+        auto = bool(auto_confirm) and not requires_confirmation and host_mode == "autonomous"
         now = float(now_real if now_real is not None else time.time())
         world = self._world(instance_id, timeline_id)
         row = {
@@ -344,9 +359,9 @@ class CampaignRuntime:
             "expected_result": str(expected_result or ""),
             "preconditions": _dumps(list(preconditions or [])),
             "visible_risks": _dumps(list(visible_risks or [])),
-            "confirmation": "confirmed" if auto_confirm else "pending",
+            "confirmation": "confirmed" if auto else "pending",
             "action_revision": 1,
-            "status": "confirmed" if auto_confirm else "awaiting_confirmation",
+            "status": "confirmed" if auto else "awaiting_confirmation",
             "created_world": world,
             "updated_world": world,
             "created_real": now,
@@ -355,7 +370,7 @@ class CampaignRuntime:
         # received → interpreted 是同一时刻的内部步骤，落库时直接给最终态
         campaign_mod.transition("action", "received", "interpreted", what="行动")
         campaign_mod.transition(
-            "action", "interpreted", "confirmed" if auto_confirm else "awaiting_confirmation", what="行动"
+            "action", "interpreted", "confirmed" if auto else "awaiting_confirmation", what="行动"
         )
         self.store.trpg_upserts({"action": [row]})
         return campaign_mod.action_view(row, audience="gm_only")
@@ -576,6 +591,7 @@ class CampaignRuntime:
         idempotency_key: str,
         audience: str = "public_party",
         source_mode: str = "action",
+        expected_campaign_revision: int | None = None,
         now_real: float | None = None,
     ) -> dict[str, Any]:
         """行动路径的联合提交（§十二）：规则状态 patch + 世界后果 + 场景转换，同批成功或同批失败。
@@ -600,6 +616,18 @@ class CampaignRuntime:
         payload = _loads(action_row.get("resolution"), {})
         if not payload:
             raise CampaignRuntimeError("该行动还没有裁定结果，先跑 resolve")
+        if expected_campaign_revision is not None and int(expected_campaign_revision) != int(
+            campaign_row["state_revision"]
+        ):
+            # §5.6 提交闭包：调用方基于的战役版本已经过期（别的行动先提交了）→ 冲突，不套用旧材料
+            self._fail(self._action_row(instance_id, timeline_id, campaign_id, action_id),
+                       "conflict", code="conflict")
+            return {
+                "status": "conflict",
+                "action_id": str(action_id or ""),
+                "campaign_revision": int(campaign_row["state_revision"]),
+                "expected_campaign_revision": int(expected_campaign_revision),
+            }
         return self._joint_apply(
             campaign_row, payload,
             instance_id=instance_id, timeline_id=timeline_id, campaign_id=campaign_id,
@@ -741,8 +769,17 @@ class CampaignRuntime:
         # 后果只认公共模块规范化过的世界效果（规则状态 patch 之外没有第二个效果来源）
         consequences = payload.get("effects") or []
         claims = payload.get("claims") or []
+        frames = [
+            str(item.get("value") or "").strip()
+            for item in payload.get("changes") or []
+            if str(item.get("kind") or "") == "world_event"
+        ]
+        intent_text = str((action_row or {}).get("intent") or ("GM 直接裁定" if action_row is None else ""))
+        if any(frames):
+            # 事件帧（§5.1）是叙述材料：并进事件正文，不代替结构化效果
+            intent_text = "；".join([intent_text, *[item for item in frames if item]])
         draft_payload = {
-            "intent": str((action_row or {}).get("intent") or ("GM 直接裁定" if action_row is None else "")),
+            "intent": intent_text,
             "effects": [
                 {**item, "expiry": str(item.get("expiry") or "with_cause")}
                 for item in consequences if isinstance(item, dict)
@@ -755,6 +792,9 @@ class CampaignRuntime:
             normalized = drafts.normalize_draft(
                 self.runtime.setting(instance)["world_package"], draft_payload,
                 known_targets=targets, world_seconds=world, default_channels=channels,
+                # 规则结果可以没有世界事实效果（只有规则状态 / 说法 / 场景 / 时间，或明确无变化）：
+                # 公共层已经把「表达不出来」的后果挡在外面，这里不再要求至少一条效果（§七）
+                require_effects=False,
             )
         except ValueError as exc:
             return self._review(action_row, [f"世界后果无法映射：{exc}"])
