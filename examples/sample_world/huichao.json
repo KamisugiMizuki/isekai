@@ -1,0 +1,571 @@
+{
+  "meta": {
+    "schema": "1.0",
+    "package_id": "wp-59fcb2b1895d",
+    "original_name": "灰潮纪",
+    "display_name": "灰潮纪",
+    "description": "潮水每三十日退一次，露出盐滩与旧堤的世界；沿岸三城邦靠驿站信报和碑刻记着水位。",
+    "density": "normal"
+  },
+  "calendar": {
+    "era": "灰潮纪",
+    "day_seconds": 86400,
+    "months": [
+      {
+        "name": "雾月",
+        "days": 30
+      },
+      {
+        "name": "霜月",
+        "days": 30
+      },
+      {
+        "name": "融月",
+        "days": 30
+      }
+    ],
+    "week": {
+      "name": "旬",
+      "days": 10
+    },
+    "segments": [
+      {
+        "id": "seg-night",
+        "name": "夜",
+        "start": 0,
+        "end": 21600
+      },
+      {
+        "id": "seg-morning",
+        "name": "晨",
+        "start": 21600,
+        "end": 43200
+      },
+      {
+        "id": "seg-day",
+        "name": "昼",
+        "start": 43200,
+        "end": 64800
+      },
+      {
+        "id": "seg-evening",
+        "name": "暮",
+        "start": 64800,
+        "end": 86400
+      }
+    ],
+    "initial_moment": 129600000
+  },
+  "world": {
+    "axioms": [
+      {
+        "id": "ax-1",
+        "text": "潮汐每三十日一次，退潮时露出可通行的盐滩。"
+      },
+      {
+        "id": "ax-2",
+        "text": "没有跨越远海的常备航线，消息靠沿岸驿站与盐户口传传递。"
+      },
+      {
+        "id": "ax-3",
+        "text": "碑刻是唯一能跨代留下的记录；写碑的人不一定留名。"
+      }
+    ],
+    "geography": "三条沿岸城邦带（北堤、南堤、盐关），内陆为盐碱荒原。通行依赖退潮后露出的盐滩，涨潮期间城邦之间只剩驿站之间的一条岸道。",
+    "society": "城邦由堤长议会治理：堤长执事、守碑人管碑、盐户管滩场。驿站信报是公共消息来源，盐户口传则更早、更碎，也更容易失真。",
+    "lexicon": {
+      "note": "城邦名为两字，人名带堤、潮、盐的偏旁。",
+      "terms": [
+        {
+          "term": "堤长",
+          "meaning": "城邦议会的执事者"
+        },
+        {
+          "term": "通行牌",
+          "meaning": "退潮日进出盐滩的凭据，由堤长议会发放"
+        },
+        {
+          "term": "水位尺",
+          "meaning": "立在滩口记潮位刻线的石尺，堤务吏每日读一次"
+        }
+      ]
+    },
+    "institutions": [
+      {
+        "id": "inst-1",
+        "name": "堤长议会",
+        "mandate": "议定堤务、征发修补人力与发放退潮通行牌",
+        "scope": "三条沿岸城邦",
+        "succession": "堤长身故或去职时由同城邦议席推举接任；空缺期间日常堤务照旧、通行牌发放与碑文校订暂停",
+        "validity": "自崩塌后第 2 年沿用至今",
+        "offices": [
+          {
+            "id": "off-1",
+            "name": "堤长",
+            "holder": "en-1"
+          },
+          {
+            "id": "off-2",
+            "name": "守碑人",
+            "holder": ""
+          }
+        ],
+        "vacancy_policy": {
+          "continues": [
+            "日常堤务"
+          ],
+          "suspended": [
+            "通行牌发放",
+            "碑文校订"
+          ]
+        }
+      }
+    ],
+    "customs": [
+      {
+        "id": "cus-1",
+        "name": "退潮祭",
+        "applies_to": "沿岸城邦的堤务吏与盐户",
+        "practice": "大退潮首日在滩口设盐与旧堤砖，读水位尺后散去",
+        "basis": "崩堤后为记住水位而设",
+        "variation": "各城邦可换用本地盐样与本地碑拓，读尺与散去的次序不改",
+        "forms": [
+          "大退潮首日在滩口设盐与旧堤砖，读水位尺后散去",
+          "改在城邦石阶设本地盐样与碑拓，读尺与散去的次序不改"
+        ]
+      }
+    ]
+  },
+  "environment": {
+    "types": [
+      {
+        "id": "env-1",
+        "name": "潮位",
+        "unit": "尺",
+        "values": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "initial": 2,
+        "sources": [
+          "natural:潮汐"
+        ],
+        "observe": "在滩口值守且有水位尺时能读到刻线；城里只听到信报转述，说不了具体数字",
+        "scope": "滩口一带（城内只能听到转述）",
+        "observers": [
+          "rl-1"
+        ],
+        "expiry": "natural_recovery"
+      },
+      {
+        "id": "env-2",
+        "name": "风信",
+        "unit": "向",
+        "values": [
+          "北",
+          "东",
+          "南",
+          "西"
+        ],
+        "initial": "北",
+        "sources": [
+          "event"
+        ],
+        "observe": "在开阔处能直接感到风向；屋里只能从别人口中知道",
+        "scope": "开阔地（屋里只能听说）",
+        "observers": {
+          "rl-1": "她站在滩口，风向是直接感受到的，报得出方向"
+        },
+        "expiry": "until_cleared"
+      }
+    ]
+  },
+  "sources": [
+    {
+      "id": "src-1",
+      "name": "驿站信报",
+      "kind": "official",
+      "reach": "在城邦驿站停留并支付铜钱即可取阅"
+    },
+    {
+      "id": "src-2",
+      "name": "旧堤碑刻",
+      "kind": "document",
+      "reach": "退潮后可在盐滩实地拓印"
+    },
+    {
+      "id": "src-3",
+      "name": "盐户口传",
+      "kind": "oral",
+      "reach": "在滩场帮工或与盐户同席吃饭时听到"
+    }
+  ],
+  "canon": [
+    {
+      "id": "cf-1",
+      "statement": "十二年前北堤崩塌，三城邦的粮仓被淹。",
+      "tags": [
+        "灾害"
+      ]
+    },
+    {
+      "id": "cf-2",
+      "statement": "崩塌前夜，堤长议会收到过一份未被采信的潮位告警。",
+      "tags": [
+        "谜团"
+      ]
+    },
+    {
+      "id": "cf-3",
+      "statement": "三年前南堤换过一次水位尺的刻法，旧刻线留在原石上。",
+      "tags": [
+        "堤务"
+      ]
+    }
+  ],
+  "narratives": [
+    {
+      "id": "nv-1",
+      "text": "北堤崩塌被记作天罚，因为告警从未公开。",
+      "source_id": "src-1",
+      "canon_ref": "cf-1",
+      "obtain": [
+        "在城邦驿站读到刊行的灾年编年"
+      ],
+      "confidence": "believed"
+    },
+    {
+      "id": "nv-2",
+      "text": "有碑刻提到崩堤当夜曾有人登堤敲钟。",
+      "source_id": "src-2",
+      "canon_ref": "cf-2",
+      "obtain": [
+        "退潮时在盐滩亲自拓印碑文"
+      ],
+      "confidence": "doubted"
+    },
+    {
+      "id": "nv-3",
+      "text": "盐户说南堤那次改刻线，是为了把春汛的水位记低两指。",
+      "source_id": "src-3",
+      "canon_ref": "cf-3",
+      "obtain": [
+        "在滩场帮工，听盐户在饭桌上提起"
+      ],
+      "confidence": "doubted"
+    }
+  ],
+  "entities": [
+    {
+      "id": "en-1",
+      "kind": "person",
+      "name": "堤禾",
+      "race_id": "rc-1",
+      "born": -72576000,
+      "died": null
+    },
+    {
+      "id": "en-2",
+      "kind": "org",
+      "name": "堤长议会",
+      "race_id": null,
+      "born": null,
+      "died": null
+    },
+    {
+      "id": "en-3",
+      "kind": "place",
+      "name": "南堤滩场",
+      "race_id": null,
+      "born": null,
+      "died": null
+    },
+    {
+      "id": "en-4",
+      "kind": "person",
+      "name": "潮生",
+      "race_id": "rc-1",
+      "born": -111456000,
+      "died": null
+    }
+  ],
+  "races": [
+    {
+      "id": "rc-1",
+      "name": "岸民",
+      "lifespan": {
+        "min_years": 55,
+        "max_years": 80
+      }
+    }
+  ],
+  "historiography": [
+    {
+      "id": "hs-1",
+      "title": "灾年编年",
+      "contributors": [
+        {
+          "name": "堤南史馆",
+          "role": "编纂",
+          "period": "崩塌后第 3 年"
+        }
+      ],
+      "written_at": 93312000,
+      "compiled_at": 103680000,
+      "coverage": {
+        "from": 86400,
+        "to": 93312000
+      },
+      "genre": "官方编年",
+      "stance": "维护议会口径",
+      "entries": [
+        "cf-1",
+        "nv-1"
+      ]
+    },
+    {
+      "id": "hs-2",
+      "title": "盐滩碑录",
+      "contributors": [
+        {
+          "name": "无名拓者",
+          "role": "拓印",
+          "period": "年代不详"
+        }
+      ],
+      "written_at": 112320000,
+      "compiled_at": 112320000,
+      "coverage": {
+        "from": 112320000,
+        "to": 112320000
+      },
+      "genre": "民间碑录",
+      "stance": "零散",
+      "entries": [
+        "nv-2",
+        "cf-3"
+      ]
+    }
+  ],
+  "events": {
+    "density": "常规",
+    "calendar": [
+      {
+        "id": "fc-1",
+        "name": "开滩祭",
+        "month": 2,
+        "day": 3,
+        "family": "ef-1"
+      },
+      {
+        "id": "fc-2",
+        "name": "校碑日",
+        "month": 3,
+        "day": 12,
+        "family": "ef-2"
+      }
+    ],
+    "families": [
+      {
+        "id": "ef-1",
+        "name": "潮汐与堤务",
+        "templates": [
+          {
+            "id": "et-1",
+            "summary": "退潮延误导致城外驿站停摆一日",
+            "preconditions": [
+              "cf-1"
+            ],
+            "effects": [
+              {
+                "kind": "source_delay",
+                "target": "src-1",
+                "expiry": "with_cause"
+              },
+              {
+                "kind": "route_blocked",
+                "target": "src-2",
+                "expiry": "natural_recovery",
+                "recovery": "下一轮大潮退去后自行恢复"
+              },
+              {
+                "kind": "environment_state",
+                "target": "env-2",
+                "value": "西",
+                "expiry": "until_cleared"
+              },
+              {
+                "kind": "institution_state",
+                "target": "off-2",
+                "value": "en-1",
+                "expiry": "until_cleared"
+              }
+            ],
+            "weight": 1
+          },
+          {
+            "id": "et-2",
+            "summary": "水位尺的一次读数与旧刻线对不上，堤务吏们各自记下自己的数",
+            "preconditions": [
+              "cf-3"
+            ],
+            "effects": [
+              {
+                "kind": "environment_state",
+                "target": "env-1",
+                "value": 3,
+                "expiry": "until_cleared"
+              },
+              {
+                "kind": "source_delay",
+                "target": "src-2",
+                "expiry": "with_cause"
+              }
+            ],
+            "weight": 1
+          }
+        ]
+      },
+      {
+        "id": "ef-2",
+        "name": "滩场与市集",
+        "templates": [
+          {
+            "id": "et-3",
+            "summary": "盐户与外来的收盐人谈崩，滩场一日没有开秤",
+            "preconditions": [
+              "cf-1"
+            ],
+            "effects": [
+              {
+                "kind": "custom_state",
+                "target": "cus-1",
+                "value": "改在城邦石阶设本地盐样与碑拓，读尺与散去的次序不改",
+                "expiry": "until_cleared"
+              },
+              {
+                "kind": "public_notice",
+                "target": "src-1",
+                "expiry": "with_cause"
+              }
+            ],
+            "weight": 1
+          }
+        ]
+      }
+    ]
+  },
+  "life": [
+    {
+      "id": "lf-1",
+      "name": "堤务吏日常",
+      "sleep": true,
+      "windows": [
+        {
+          "start": 0,
+          "end": 25200,
+          "activity": "sleep"
+        },
+        {
+          "start": 25200,
+          "end": 72000,
+          "activity": "duty"
+        },
+        {
+          "start": 72000,
+          "end": 86400,
+          "activity": "rest"
+        }
+      ]
+    },
+    {
+      "id": "lf-2",
+      "name": "盐户日常",
+      "sleep": true,
+      "windows": [
+        {
+          "start": 0,
+          "end": 21600,
+          "activity": "sleep"
+        },
+        {
+          "start": 21600,
+          "end": 68400,
+          "activity": "saltwork"
+        },
+        {
+          "start": 68400,
+          "end": 86400,
+          "activity": "rest"
+        }
+      ]
+    }
+  ],
+  "roles": [
+    {
+      "id": "rl-1",
+      "name": "堤务吏",
+      "description": "登记水位与盐滩通行的低级执事。",
+      "life_template": "lf-1",
+      "channels": [
+        "src-1"
+      ]
+    },
+    {
+      "id": "rl-2",
+      "name": "盐户",
+      "description": "在滩场晒盐、看天候下手的营生人。",
+      "life_template": "lf-2",
+      "channels": [
+        "src-3"
+      ]
+    }
+  ],
+  "comms": {
+    "mechanisms": [
+      {
+        "id": "cm-1",
+        "name": "沿岸信箱",
+        "limits": "只在退潮日通行时收信，信使不进入内陆"
+      },
+      {
+        "id": "cm-2",
+        "name": "滩场口信",
+        "limits": "靠往来滩场的人捎带，说得清事情却说不准时日"
+      }
+    ]
+  },
+  "initial_state": {
+    "events": [
+      "cf-1",
+      "cf-3"
+    ],
+    "rumors": [
+      "nv-1",
+      "nv-2",
+      "nv-3"
+    ],
+    "mysteries": [
+      {
+        "id": "my-1",
+        "question": "那份告警是谁写的",
+        "refs": [
+          "cf-2",
+          "nv-2"
+        ]
+      },
+      {
+        "id": "my-2",
+        "question": "南堤的刻线为什么要改低两指",
+        "refs": [
+          "cf-3",
+          "nv-3"
+        ]
+      }
+    ]
+  }
+}
