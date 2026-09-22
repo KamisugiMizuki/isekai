@@ -251,8 +251,22 @@ async def main() -> None:
         # ---------------- 1) 来源 ----------------
         await click_text(cdp, "nav.u-nav button", "世界与素材")
         await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('世界')")
-        if not await click_text(cdp, "#u-main button", "创建自己的世界"):
-            problems.append("世界与素材里没有「创建自己的世界」入口")
+        await asyncio.sleep(1.2)
+        print("· route:", await cdp.js("JSON.stringify(window.__uiApp.probeState.route)"), flush=True)
+        clicked = await click_text(cdp, "#u-main button", "创建自己的世界")
+        if not clicked:
+            diag = await cdp.js(
+                "JSON.stringify([...document.querySelectorAll('#u-main button')].map(b=>[b.textContent.slice(0,14),b.disabled,b.offsetParent!==null]))"
+            )
+            problems.append(f"世界与素材里没有「创建自己的世界」入口（按钮：{diag}）")
+        await asyncio.sleep(1.5)
+        print(
+            "· 点了入口:",
+            clicked,
+            "| route:",
+            await cdp.js("JSON.stringify(window.__uiApp.probeState.route)"),
+            flush=True,
+        )
         if not await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('让 AI 起草')"):
             problems.append(f"没有进到来源页：{(await visible_text(cdp))[:160]}")
         sources = await visible_text(cdp)
