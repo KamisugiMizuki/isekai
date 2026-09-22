@@ -520,6 +520,72 @@ export class AppApi {
     return this.call("backup.restore", { path, confirm: true }, 180000);
   }
 
+  /* ---------------- 辅助写作（USER_INTERFACE_DESIGN §7） ---------------- */
+
+  waOutlines(): Promise<Json> {
+    return this.call("wa.outline.list", {});
+  }
+
+  waOutlineGet(id: string): Promise<Json> {
+    return this.call("wa.outline.get", { id });
+  }
+
+  waOutlineSave(outline: Json): Promise<Json> {
+    return this.call("wa.outline.save", { outline });
+  }
+
+  waBind(args: Json): Promise<Json> {
+    return this.call("wa.bind", args);
+  }
+
+  waState(instanceId: string, timelineId: string, outlineId: string): Promise<Json> {
+    return this.call("wa.state", { instance_id: instanceId, timeline_id: timelineId, outline_id: outlineId });
+  }
+
+  waEvaluate(instanceId: string, timelineId: string, outlineId: string): Promise<Json> {
+    return this.call("wa.evaluate", { instance_id: instanceId, timeline_id: timelineId, outline_id: outlineId });
+  }
+
+  waItemDecide(args: Json): Promise<Json> {
+    return this.call("wa.item.decide", args);
+  }
+
+  waObserve(args: Json): Promise<Json> {
+    return this.call("wa.observe", args, 60000);
+  }
+
+  waSuggest(args: Json): Promise<Json> {
+    return this.call("wa.suggest", args, 180000);
+  }
+
+  waCandidatePropose(args: Json, instanceId: string, timelineId: string, outlineId: string): Promise<Json> {
+    return this.call("wa.candidate.propose", {
+      instance_id: instanceId, timeline_id: timelineId, outline_id: outlineId, ...args,
+    });
+  }
+
+  waCandidateDecide(args: Json, instanceId: string, timelineId: string): Promise<Json> {
+    return this.call("wa.candidate.decide", { instance_id: instanceId, timeline_id: timelineId, ...args });
+  }
+
+  waCandidateCommit(candidateId: string, instanceId: string, timelineId: string): Promise<Json> {
+    return this.call(
+      "wa.candidate.commit",
+      { instance_id: instanceId, timeline_id: timelineId, candidate_id: candidateId },
+      120000,
+    );
+  }
+
+  waTextLock(locked: boolean, instanceId: string, timelineId: string, candidateId: string): Promise<Json> {
+    return this.call(locked ? "wa.text.lock" : "wa.text.unlock", {
+      instance_id: instanceId, timeline_id: timelineId, candidate_id: candidateId,
+    });
+  }
+
+  waBranch(args: Json): Promise<Json> {
+    return this.call("wa.branch", args, 120000);
+  }
+
   /* ---------------- 界面草稿（§3.5） ---------------- */
 
   draftSave(key: string, module: string, target: string, textValue: string, payload?: unknown): Promise<Json> {

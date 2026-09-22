@@ -89,6 +89,8 @@ def normalize_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "reason": str(row.get("reason") or ""),
         "preview_id": str(row.get("preview_id") or ""),
         "joint_commit_id": str(row.get("joint_commit_id") or ""),
+        #: 正文锁定（§7.5）：>0 = 锁定时间；锁定后同名提案与新生成都不许覆盖
+        "locked_at": float(row.get("locked_at") or 0),
     }
 
 
@@ -105,6 +107,9 @@ def public_candidate(row: dict[str, Any]) -> dict[str, Any]:
         # 得能指出是哪一次提交（提交标识 / 联合提交标识），界面只按这个显示
         "effective": state == "committed" and bool(item["joint_commit_id"]),
         "effective_basis": item["joint_commit_id"] if state == "committed" else "",
+        # 锁定与「批准」是两件事（§7.5）：批准表示同意采用，锁定表示这份文字不再被改写
+        "locked": bool(item["locked_at"]),
+        "locked_at": item["locked_at"],
     }
 
 
@@ -124,6 +129,7 @@ def player_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "uncommitted": item["status"] in UNCOMMITTED,
         "text": item["text"],
         "audience": item["audience"],
+        "locked": bool(item["locked_at"]),
         "must_not_imply": MUST_NOT_IMPLY.get(item["status"], ""),
     }
 

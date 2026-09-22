@@ -466,6 +466,11 @@ class WritingService:
                     str(item.get("reason") or "") for item in (pending or rejected)
                 )
         existing = self.store.wa_candidate_get(instance_id, timeline_id, str(candidate_id))
+        if existing is not None and float(existing.get("locked_at") or 0) > 0:
+            # 锁定的正文（§7.5）：新生成永远另起一稿，不能覆盖这一份
+            raise WritingError(
+                f"候选 {candidate_id} 的正文已锁定：新生成会另起一稿（要改先解锁，或复制为新稿）"
+            )
         if existing is not None and str(existing.get("status")) in ("approved", "committed"):
             # 已采用的产物不许被同名提案覆盖（§11.1）：重新提案要给新标识，旧的照旧在
             raise WritingError(
@@ -522,6 +527,33 @@ class WritingService:
         saved = self.store.wa_candidate_put({**row, "status": str(status), "reason": str(reason), "text": body})
         return {"candidate": cand.public_candidate(saved),
                 "must_not_imply": "批准就等于世界已经改变"}
+
+    def lock_text(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        candidate_id: str,
+        locked: bool = True,
+    ) -> dict[str, Any]:
+        """锁定 / 解锁一份正文（§7.5）：先保存成功再锁定；解锁只针对这一份。
+
+        锁定后：同名提案被拒、新生成拿到的是另一稿；世界恢复也不会改写它（正文不随回滚消失）。
+        """
+        row = self.store.wa_candidate_get(instance_id, timeline_id, candidate_id)
+        if row is None:
+            raise UmpError(Err.NOT_FOUND, f"没有该候选：{candidate_id}", retryable=False)
+        if str(row.get("kind")) != "text":
+            raise WritingError("只有文字草稿能锁定：世界变化候选不靠一段散文变成事实")
+        item = cand.normalize_candidate(row)
+        if locked:
+            if item["status"] != "approved":
+                raise WritingError("先保存这段文字（采用它）再锁定：锁定只对已保存的稿子生效")
+            if not item["text"].strip():
+                raise WritingError("这份稿子还是空的：先写下正文再锁定")
+        saved = self.store.wa_candidate_put({**row, "locked_at": time.time() if locked else 0.0})
+        return {"candidate": cand.public_candidate(saved),
+                "must_not_imply": "锁定等于世界已经改变" if not locked else "锁定会阻止你以后修改（要先解锁）"}
 
     def commit(
         self,
@@ -774,7 +806,11 @@ class WritingService:
                 "你在给一部持续运行的作品提情节候选，只输出 JSON。\n"
                 "候选必须是**未发生的建议**，不许把任何一条当成已经发生；不许编造上面没给过的事实。\n"
                 f'输出：{{"candidates": [{{"title": "短标题", "summary": "一到两句话的推进", '
-                f'"outline_ref": "对应的条目 id 或空串", "unsolved": ["还没定的点"]}}]}}\n'
+                f'"outline_ref": "对应的条目 id 或空串", "unsolved": ["还没定的点"], '
+                f'"changes": [{{"kind": "变化类别", "operation": "动作", "target_refs": ["对象 id 或空串"], '
+                f'"value": "变化后的值"}}]}}]}}\n'
+                "changes 只在这一条推进需要改变世界时才给（不需要就留空数组）：它只是候选，"
+                "能不能落成事实由核心校验，写不进去会被如实标出来。\n"
                 f"最多 {max(1, int(limit))} 条。"
             )},
             {"role": "user", "content": (
@@ -822,7 +858,25 @@ class WritingService:
                 "unsolved": _dumps([str(name) for name in item.get("unsolved") or []]),
                 "status": "proposed", "reason": "模型提议，未经创作者选择",
             })
-            created.append(cand.public_candidate(saved))
+            raw_changes = [change for change in (item.get("changes") or []) if isinstance(change, dict)]
+            public = cand.public_candidate(saved)
+            if raw_changes:
+                # 改世界不是「多写一段散文」：这条候选要按正式路径过一遍校验（§7.3）。
+                # propose 返回的是公开面（含被驳回的原因），直接用它，不让界面自己猜。
+                try:
+                    outcome = self.propose(
+                        instance_id, timeline_id, candidate_id=str(saved.get("id") or ""),
+                        kind="scene", outline_id=str(row["outline_id"]) if row else "",
+                        item_refs=[ref] if ref in known else [],
+                        title=str(item.get("title") or "")[:80], summary=str(item.get("summary") or ""),
+                        basis={"fact": "", "causality": material[:200], "outline": ref},
+                        unsolved=[str(name) for name in item.get("unsolved") or []],
+                        changes=raw_changes,
+                    )
+                    public = outcome.get("candidate") or public
+                except Exception:  # noqa: BLE001
+                    log.exception("suggest change propose failed")
+            created.append(public)
         if not created:
             # 解析成功但一条可用候选都没有：这是「没有建议」，不是失败
             return {"status": "ok", "candidates": [],

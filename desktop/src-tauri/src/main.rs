@@ -509,6 +509,53 @@ fn read_text_file(path: String) -> Result<String, String> {
     fs::read_to_string(&target).map_err(|error| format!("读取失败：{error}"))
 }
 
+/// 保存文本文件（导出所选文字时用）：原生保存对话框 + 落盘，返回最终路径（取消为 None）。
+#[tauri::command]
+async fn save_text_file(
+    title: Option<String>,
+    name: Option<String>,
+    text: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || save_text_file_blocking(title, name, text))
+        .await
+        .map_err(|error| format!("保存对话框任务失败：{error}"))?
+}
+
+fn save_text_file_blocking(
+    title: Option<String>,
+    name: Option<String>,
+    text: String,
+) -> Result<Option<String>, String> {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    if text.len() > LIMIT {
+        return Err(format!("要导出的正文太大（{} 字节，上限 {LIMIT}）", text.len()));
+    }
+    let script = concat!(
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;",
+        "Add-Type -AssemblyName System.Windows.Forms;",
+        "$d=New-Object System.Windows.Forms.SaveFileDialog;",
+        "if($env:ISEKAI_SAVE_TITLE){$d.Title=$env:ISEKAI_SAVE_TITLE};",
+        "if(-not $d.Title){$d.Title='导出所选文字'};",
+        "$d.Filter='Markdown (*.md)|*.md|文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*';",
+        "if($env:ISEKAI_SAVE_NAME){$d.FileName=$env:ISEKAI_SAVE_NAME};",
+        "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($d.FileName)}"
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .env("ISEKAI_SAVE_TITLE", title.unwrap_or_default())
+        .env("ISEKAI_SAVE_NAME", name.unwrap_or_else(|| "草稿.md".to_string()))
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("打开保存对话框失败：{error}"))?;
+    let picked = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if picked.is_empty() {
+        return Ok(None);
+    }
+    let target = PathBuf::from(&picked);
+    fs::write(&target, text.as_bytes()).map_err(|error| format!("写入失败：{error}"))?;
+    Ok(Some(picked))
+}
+
 /// 界面完成「退出前保存」后的确认（DESKTOP_SPEC §五 第②步）。
 #[tauri::command]
 fn exit_ready(state: State<AppState>, detail: String, saved: bool) {
@@ -622,6 +669,7 @@ fn main() {
             pick_file,
             pick_dir,
             read_text_file,
+            save_text_file,
             exit_ready,
             quit_app
         ])

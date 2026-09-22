@@ -821,6 +821,7 @@ CREATE TABLE IF NOT EXISTS wa_candidate(
   reason TEXT NOT NULL DEFAULT '',
   preview_id TEXT NOT NULL DEFAULT '',
   joint_commit_id TEXT NOT NULL DEFAULT '',
+  locked_at REAL NOT NULL DEFAULT 0,           -- 正文锁定（>0 = 锁定，后续生成不覆盖）
   created_real REAL NOT NULL DEFAULT 0,
   updated_real REAL NOT NULL DEFAULT 0,
   PRIMARY KEY(instance_id, timeline_id, id)
@@ -1373,6 +1374,8 @@ class Store:
             "reason": str(row.get("reason") or ""),
             "preview_id": str(row.get("preview_id") or ""),
             "joint_commit_id": str(row.get("joint_commit_id") or ""),
+            # 正文锁定：写回时保留原值（0 = 未锁定）
+            "locked_at": float(row.get("locked_at") or 0),
             "created_real": float(row.get("created_real") or now),
             "updated_real": now,
         }
@@ -1381,11 +1384,11 @@ class Store:
                 """INSERT INTO wa_candidate(instance_id, timeline_id, id, outline_id, kind, item_refs, title,
                                             summary, basis, audience, base_world, base_generation, changes,
                                             gm_changes, campaign_id, source_mode, unsolved, text, status, reason,
-                                            preview_id, joint_commit_id, created_real, updated_real)
+                                            preview_id, joint_commit_id, locked_at, created_real, updated_real)
                    VALUES(:instance_id, :timeline_id, :id, :outline_id, :kind, :item_refs, :title,
                           :summary, :basis, :audience, :base_world, :base_generation, :changes,
                           :gm_changes, :campaign_id, :source_mode, :unsolved, :text, :status, :reason,
-                          :preview_id, :joint_commit_id, :created_real, :updated_real)
+                          :preview_id, :joint_commit_id, :locked_at, :created_real, :updated_real)
                    ON CONFLICT(instance_id, timeline_id, id) DO UPDATE SET
                      outline_id=excluded.outline_id, kind=excluded.kind, item_refs=excluded.item_refs,
                      title=excluded.title, summary=excluded.summary, basis=excluded.basis,
@@ -1394,7 +1397,8 @@ class Store:
                      gm_changes=excluded.gm_changes, campaign_id=excluded.campaign_id,
                      source_mode=excluded.source_mode, unsolved=excluded.unsolved, text=excluded.text,
                      status=excluded.status, reason=excluded.reason, preview_id=excluded.preview_id,
-                     joint_commit_id=excluded.joint_commit_id, updated_real=excluded.updated_real""",
+                     joint_commit_id=excluded.joint_commit_id, locked_at=excluded.locked_at,
+                     updated_real=excluded.updated_real""",
                 payload,
             )
         return self.wa_candidate_get(payload["instance_id"], payload["timeline_id"], payload["id"]) or {}
@@ -1573,6 +1577,12 @@ class Store:
         if timeline_sql and "description" not in timeline_sql:
             with self._lock, self._conn:
                 self._conn.execute("ALTER TABLE timeline ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+
+        # 正文锁定（USER_INTERFACE_DESIGN §7.5）：老库补列，>0 表示这份文字被锁定
+        candidate_sql = sql_of("wa_candidate")
+        if candidate_sql and "locked_at" not in candidate_sql:
+            with self._lock, self._conn:
+                self._conn.execute("ALTER TABLE wa_candidate ADD COLUMN locked_at REAL NOT NULL DEFAULT 0")
 
         memory_sql = sql_of("memory")
         if memory_sql and "PRIMARY KEY(instance_id, timeline_id, id)" not in memory_sql:

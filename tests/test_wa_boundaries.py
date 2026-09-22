@@ -361,3 +361,144 @@ async def test_unusable_model_output_is_reported_not_silently_empty(tmp_path) ->
             assert "-" in good["candidates"][0]["id"] and len(good["candidates"][0]["id"].split("-")) >= 3
         finally:
             await mgmt.close()
+
+
+# ---------------------------------------------------------------- ⑦ 正文锁定
+
+
+async def test_text_lock_protects_the_draft(tmp_path) -> None:
+    """锁定正文先保存成功再锁定；锁定后同名提案被拒、解锁后可以改（§7.5）。"""
+    _fast(tmp_path)
+    async with running_core(tmp_path) as h:
+        mgmt = await open_mgmt(h)
+        try:
+            instance_id, timeline_id, card_id, _ = await _setup(mgmt, h)
+            await mgmt.call(
+                "wa.candidate.propose",
+                instance_id=instance_id, timeline_id=timeline_id, candidate_id="draft-1",
+                kind="text", title="第一章", summary="开场",
+            )
+            # 还没保存就锁定：先保存
+            early = None
+            try:
+                await mgmt.call("wa.text.lock", instance_id=instance_id, timeline_id=timeline_id,
+                                candidate_id="draft-1")
+            except UmpError as exc:
+                early = str(exc)
+            assert early and "先保存" in early, early
+
+            await mgmt.call(
+                "wa.candidate.decide", instance_id=instance_id, timeline_id=timeline_id,
+                candidate_id="draft-1", status="approved", reason="采用这段开场",
+                text="退潮后的盐滩像一张没写完的账页。",
+            )
+            locked = await mgmt.call("wa.text.lock", instance_id=instance_id, timeline_id=timeline_id,
+                                     candidate_id="draft-1")
+            assert locked["candidate"]["locked"] is True and locked["candidate"]["locked_at"] > 0
+
+            refused = None
+            try:
+                await mgmt.call(
+                    "wa.candidate.propose",
+                    instance_id=instance_id, timeline_id=timeline_id, candidate_id="draft-1",
+                    kind="text", title="改写稿", summary="想覆盖", text="换一段",
+                )
+            except UmpError as exc:
+                refused = str(exc)
+            assert refused and "已锁定" in refused, refused
+
+            # 已采用但仍然「未提交世界」：它会继续出现在待定里（这是对的），
+            # 但正文内容与锁定标记都不许被后来的动作改掉
+            still = await mgmt.call(
+                "wa.observe", instance_id=instance_id, timeline_id=timeline_id,
+                observer_id=card_id, audience="author",
+            )
+            row = [item for item in still["next_step"]["candidates"] if item["id"] == "draft-1"][0]
+            assert row["status"] == "approved" and row["uncommitted"] is True
+            assert row["locked"] is True and row["text"] == "退潮后的盐滩像一张没写完的账页。"
+
+            # 解锁之后：已经采用的稿子仍然受保护（改它要另起一份，旧的照旧在）
+            await mgmt.call("wa.text.unlock", instance_id=instance_id, timeline_id=timeline_id,
+                            candidate_id="draft-1")
+            new_id = None
+            try:
+                await mgmt.call(
+                    "wa.candidate.propose",
+                    instance_id=instance_id, timeline_id=timeline_id, candidate_id="draft-1",
+                    kind="text", title="改写稿", summary="想覆盖已采用的稿子", text="换一段",
+                )
+            except UmpError as exc:
+                new_id = str(exc)
+            assert new_id and "已经被采用" in new_id, new_id
+
+            copy = await mgmt.call(
+                "wa.candidate.propose",
+                instance_id=instance_id, timeline_id=timeline_id, candidate_id="draft-1-copy",
+                kind="text", title="改写稿", summary="另起一稿", text="换一段",
+            )
+            assert copy["status"] == "proposed" and copy["candidate"]["locked"] is False
+            kept = await mgmt.call(
+                "wa.state", instance_id=instance_id, timeline_id=timeline_id, outline_id="ol-b"
+            )
+            assert kept  # 老的稿子还在（下面从观察面确认内容）
+        finally:
+            await mgmt.close()
+
+
+# ---------------------------------------------------------------- ⑧ 提议里的世界变化
+
+
+async def test_suggested_world_change_is_validated(tmp_path) -> None:
+    """模型提议里带的世界变化走正式校验：合法的一条落到候选上（界面才有得预览），
+    目标非法的一条被驳回并写明原因，而不是静默丢掉（§7.3）。"""
+    _fast(tmp_path)
+    async with running_core(tmp_path) as h:
+        mgmt = await open_mgmt(h)
+        try:
+            instance_id, timeline_id, card_id, _ = await _setup(mgmt, h)
+            h.fake.judgements["情节提议"] = json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "title": "封堤三日", "summary": "先封三天", "outline_ref": "it-theme",
+                            "unsolved": ["钱谁出"],
+                            "changes": [
+                                {"id": "sg-1", "kind": "condition", "operation": "set",
+                                 "certainty": "confirmed", "target_refs": [card_id],
+                                 "value": "北堤封三日", "expiry": "until_cleared"},
+                            ],
+                        },
+                        {
+                            "title": "凭空的制度变更", "summary": "改一个不存在的东西", "outline_ref": "",
+                            "unsolved": [],
+                            "changes": [
+                                {"id": "sg-2", "kind": "condition", "operation": "set",
+                                 "certainty": "confirmed", "target_refs": ["ev-does-not-exist"],
+                                 "value": "不存在的对象", "expiry": "until_cleared"},
+                            ],
+                        },
+                    ]
+                },
+                ensure_ascii=False,
+            )
+            result = await mgmt.call(
+                "wa.suggest", instance_id=instance_id, timeline_id=timeline_id,
+                outline="ol-b", observer=card_id, goal="封堤", limit=2,
+            )
+            assert result["status"] == "ok", result
+            cards = {str(item["title"]): item for item in result["candidates"]}
+            good = cards.get("封堤三日")
+            assert good is not None, cards
+            assert good["has_world_change"] is True, good
+            assert good["preview_id"], "改世界的候选要带预览标识，界面才能列出「要发生什么」"
+            assert good["uncommitted"] is True and good["effective"] is False  # 还没提交：不许显示已生效
+
+            bad = cards.get("凭空的制度变更")
+            assert bad is not None, cards
+            # 通配拒绝（目标没登记 = 这批意图目前翻不成事实）按项目规矩是「待确认」而不是
+            # 「候选不成立」：候选留着，但原因必须指名说清哪里不对，界面才解释得出来（§11.1）
+            assert bad["status"] == "proposed", bad
+            assert "ev-does-not-exist" in str(bad["reason"]), bad["reason"]
+            assert bad["effective"] is False and bad["uncommitted"] is True
+        finally:
+            await mgmt.close()

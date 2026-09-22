@@ -181,6 +181,8 @@ SYNC_OPS = frozenset(
         "wa.candidate.propose",
         "wa.candidate.decide",
         "wa.candidate.commit",
+        "wa.text.lock",
+        "wa.text.unlock",
         "wa.gm.declare",
         "wa.gm.approve",
         "wa.branch",
@@ -1621,6 +1623,8 @@ WA_SYNC_OPS = frozenset(
         "wa.candidate.propose",
         "wa.candidate.decide",
         "wa.candidate.commit",
+        "wa.text.lock",
+        "wa.text.unlock",
         "wa.gm.declare",
         "wa.gm.approve",
         "wa.branch",
@@ -1704,6 +1708,12 @@ def _wa_op(cfg: Config, store: Store, runtime: Any, op: str, args: dict[str, Any
                 status=str(args.get("status") or ""),
                 reason=str(args.get("reason") or args.get("note") or ""),
                 text=str(args.get("text") or ""),
+            )
+        if op in ("wa.text.lock", "wa.text.unlock"):
+            return service.lock_text(
+                instance_id, timeline_id,
+                candidate_id=str(args.get("candidate_id") or args.get("ref") or ""),
+                locked=op == "wa.text.lock",
             )
         if op == "wa.candidate.commit":
             return service.commit(
