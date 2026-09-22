@@ -1,6 +1,6 @@
 # Writing Assistant 模块设计
 
-> 状态：已定稿 v1.0（产品设计）；实现状态：未实现声明。
+> 状态：已定稿 v1.0（产品设计）；实现状态：核心语义与管理面已落地（对照见 §十三），编剧层客户端表达层（大纲编辑器 / 候选对比界面）未实现。
 > 定位：面向小说创作的上层叙事约束编排模块；GM 辅助是其一种应用方式。
 > 上游契约：[`../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md`](../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md)、[`../worldruntime/NARRATIVE_LAYER_SPEC.md`](../worldruntime/NARRATIVE_LAYER_SPEC.md)。
 > 相关模块：[`../trpg-rules/TRPG_RULES_LAYER_SPEC.md`](../trpg-rules/TRPG_RULES_LAYER_SPEC.md)、[`../trpg-client/TRPG_CLIENT_SPEC.md`](../trpg-client/TRPG_CLIENT_SPEC.md)。
@@ -255,3 +255,35 @@ GM 直接变化意图
 | 受众隔离 | 玩家观察不包含 GM 私有依据、其他角色私密内容、未获知事实或规则状态正文 |
 
 以上场景必须通过真实 WorldRuntime 接口边界验证；Writing Assistant 的设计状态不等于功能已实现。
+
+## 十三、实现对照（2026-09-22）
+
+> 本节只记**落地口径与读数来源**，不改变本文任何产品语义。判据全部是行为读数：真 WebSocket +
+> 真 SQLite + 真实例，只把 LLM 换成替身。读数：`scripts/_audit2_wa.py` 22/22 PASS
+> （存档 `.hermes/audits/wa_*.txt`）、`tests/test_writing_assistant.py` 12 项、
+> CLI 端到端 `scripts/_probe_wa_cli.py`（FAIL=0，18 项）。
+
+| 本文的设计名 | 实现入口 | 落地口径 |
+|---|---|---|
+| §三 大纲（六层约束） | `isekai_core/writing/outline.py` + `wa.outline.save/get/list` | 层级 / 强度 / 范围 / 状态都是闭集；强度按层级给默认值（必达硬、主题软、弧线中）；条目必须带稳定标识、范围、前置与成功判据，非法大纲**不落盘**；禁止事项不存在「已达成」 |
+| §4.2 条目状态机 | `outline.TRANSITIONS` + `wa.item.decide` | 五个状态 + 合法迁移；允许事后认账（未开始→达成），禁止回退与复活；**硬约束标记达成必须带世界里对得上的依据**（事件 / 说法标识），对不上就拒——「规则成功但世界提交失败」凑不成达成 |
+| §4.2 偏离判定 | `outline.evaluate` + `wa.evaluate` | 未达成的硬约束（到点未见 / 一直没动）报 `gaps`；禁止事项被触发报 `forbidden_triggered`；已达成但依据已不在当前时间线报 `evidence_lost`（回滚后按目标时间线重新评估的落点）。**评估不改状态、不写世界** |
+| §5.2 只读观察（三层） | `wa.observe` + `runtime.read_snapshot` + `cognition.knowledge_slice` | 玩家观察层只给该观察者的合法材料（带来源与态度标签）；主持依据层与下一步编排层仅 `gm` / `author` 受众可见；冻结 / 追赶中的线如实返回 `not_ready`，不拿旧状态冒充当前 |
+| §5.1 GM 三种输入 | `wa.gm.declare` / `wa.gm.approve` | 声明先形成 `source=gm_declaration` 的待批准结构（不写世界），批准后经 TRPG 规则层 `gm.change` 联合提交；本层不另造 GM 写世界的路径。受众词表与规则层不同名，显式翻译（`gm→gm_only` / `player→public_party`） |
+| §4.3 候选生命周期 | `candidates.py` + `wa.candidate.propose/decide/commit` | 七个状态，`approved` 明确属于「未提交」；带世界变化的候选先过 `change.preview`——指名条目的拒绝与版本冲突才算驳回，通配拒绝与 `needs_review` 留在待确认；提交前再跑 `generation.check`（世代变了判 `stale`，不写回旧世界），并按当前水位**重新预览**一次后落库 |
+| §六 模型提议（W3） | `wa.suggest` | 一次便宜调用产出多条推进提议，落成 `proposed` 候选（带适用条目与未解决问题）；提议不写世界、不推状态、不改达成 |
+| §八 时间线与分支 | `wa.branch` | 只编排 `runtime.fork` + 把同一份大纲绑到新线：定义跨线复用，达成 / 偏离决定各自独立（新线从「未开始」记）。文案与规范一致：不提供世界线合并 |
+| §4.1 四类长期对象归属 | `store.py` 三张表（`wa_outline` / `wa_state` / `wa_candidate`） | 大纲定义是作者资产（跨线复用）；达成状态与候选按实例 + 时间线独立；**不随世界回滚消失**（规范要求的是「回滚后重新评估」，不是自动恢复旧状态）；锁定过的文本因此不受回滚影响，并随实例删除清理 |
+
+管理面 op：`wa.outline.save` / `wa.outline.list` / `wa.outline.get` / `wa.bind` / `wa.state` /
+`wa.evaluate` / `wa.item.decide` / `wa.observe` / `wa.candidate.propose` / `wa.candidate.decide` /
+`wa.candidate.commit` / `wa.gm.declare` / `wa.gm.approve` / `wa.branch`（同步）与 `wa.suggest`（异步——
+它要调一次模型）；CLI 有同名命令组 `wa`。
+
+**记账不充数**：
+
+- 编剧层客户端表达层（大纲编辑器、候选对比与并排试演界面、章节工作区）未实现——与 OC 客户端、
+  TRPG 客户端同属独立实现范围，本层给出的候选生命周期、可见面投影与读数就是它的输入契约；
+- 大纲定义未进实例导出件（跨线复用的作者资产，导出件目前只带世界包 / 角色卡 / 草稿）；
+- 大纲条目与世界引用的自动匹配未做：`watch_refs` / `evidence_refs` 由调用方给出，模型不猜；
+- 多人协作与自动出版按规范明确不做（W3 范围之外）。

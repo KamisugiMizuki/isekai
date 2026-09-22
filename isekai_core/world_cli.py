@@ -89,6 +89,22 @@ OP_BY_COMMAND = {
     ("story", "classify"): "story.classify",
     ("story", "branch"): "story.branch",
     ("story", "restore"): "story.restore",
+    # Writing Assistant（WRITING_ASSISTANT_SPEC §三 ~ §九）
+    ("wa", "outline-save"): "wa.outline.save",
+    ("wa", "outline-list"): "wa.outline.list",
+    ("wa", "outline-get"): "wa.outline.get",
+    ("wa", "bind"): "wa.bind",
+    ("wa", "state"): "wa.state",
+    ("wa", "evaluate"): "wa.evaluate",
+    ("wa", "item-decide"): "wa.item.decide",
+    ("wa", "observe"): "wa.observe",
+    ("wa", "suggest"): "wa.suggest",
+    ("wa", "propose"): "wa.candidate.propose",
+    ("wa", "candidate-decide"): "wa.candidate.decide",
+    ("wa", "commit"): "wa.candidate.commit",
+    ("wa", "gm-declare"): "wa.gm.declare",
+    ("wa", "gm-approve"): "wa.gm.approve",
+    ("wa", "branch"): "wa.branch",
     # 对外接口（WORLD_RUNTIME_INTERFACE_SPEC §四~§六）
     ("runtime", "scope"): "runtime.scope.inspect",
     ("runtime", "snapshot"): "runtime.snapshot.read",
@@ -271,6 +287,71 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args["saved"] = bool(ns.saved)
             args["acknowledge_unsaved"] = bool(ns.acknowledge_unsaved)
         return args
+    if group == "wa":
+        args: dict[str, Any] = {}
+        if ns.id:
+            args["instance_id"] = ns.id
+        if ns.timeline:
+            args["timeline_id"] = ns.timeline
+        if ns.outline:
+            args["outline_id"] = ns.outline
+        if cmd == "outline-save":
+            args["outline"] = read(ns.file)
+        if cmd == "outline-get":
+            args["outline_id"] = ns.outline or ns.file or ""
+        if cmd == "bind":
+            args["observers"] = [name.strip() for name in str(ns.observers or "").split(",") if name.strip()]
+            args["chapter"] = ns.chapter or ""
+        if cmd == "item-decide":
+            args["item_id"] = ns.item or ns.ref or ""
+            args["status"] = ns.status or ""
+            args["reason"] = ns.reason or ns.note or ""
+            args["evidence_refs"] = [name.strip() for name in str(ns.evidence or "").split(",") if name.strip()]
+        if cmd == "observe":
+            args["observer_id"] = ns.observer or ns.card or ""
+            args["audience"] = ns.audience or "author"
+        if cmd == "suggest":
+            args["observer_id"] = ns.observer or ns.card or ""
+            args["goal"] = ns.goal or ns.instruction or ""
+            args["limit"] = int(ns.limit or 3)
+        if cmd == "propose":
+            args["candidate_id"] = ns.ref or ""
+            args["kind"] = ns.kind or "world_change"
+            args["title"] = ns.display_name or ""
+            args["summary"] = ns.instruction or ns.note or ""
+            args["audience"] = ns.audience or "author"
+            args["unsolved"] = ns.unsolved or []
+            args["text"] = ns.text or ""
+            if ns.item:
+                args["item_refs"] = [name.strip() for name in str(ns.item).split(",") if name.strip()]
+            if ns.basis:
+                args["basis"] = json.loads(ns.basis)
+            if ns.changes:
+                args["changes"] = json.loads(ns.changes) if str(ns.changes).lstrip().startswith(("[", "{")) else read(ns.changes)
+        if cmd == "candidate-decide":
+            args["candidate_id"] = ns.ref or ""
+            args["status"] = ns.status or ""
+            args["reason"] = ns.reason or ns.note or ""
+            args["text"] = ns.text or ""
+        if cmd == "commit":
+            args["candidate_id"] = ns.ref or ""
+            args["idempotency_key"] = ns.idempotency or ""
+        if cmd == "gm-declare":
+            args["candidate_id"] = ns.ref or ""
+            args["campaign_id"] = ns.campaign or ""
+            args["title"] = ns.display_name or ""
+            args["audience"] = ns.audience or "gm"
+            payload = ns.gm_changes or ns.changes or ""
+            args["gm_changes"] = json.loads(payload) if str(payload).lstrip().startswith("{") else read(payload)
+            if ns.basis:
+                args["basis"] = json.loads(ns.basis)
+        if cmd == "gm-approve":
+            args["candidate_id"] = ns.ref or ""
+            args["idempotency_key"] = ns.idempotency or ""
+        if cmd == "branch":
+            args["commit_id"] = ns.commit or ns.file or ""
+            args["name"] = ns.display_name or ""
+        return args
     if group == "event":
         args = {"instance_id": ns.id, "timeline_id": ns.timeline}
         if cmd == "draft":
@@ -408,7 +489,12 @@ def persist(ns: argparse.Namespace, result: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def print_result(result: dict[str, Any], *, out: str | None = None) -> int:
+def print_result(result: dict[str, Any], *, out: str | None = None, hide_candidate: bool = True) -> int:
+    """打印读数。
+
+    `hide_candidate` 只对生成类命令成立（那里的 `candidate` 是整份世界包 / 角色卡，写在 --out 里）；
+    编剧层的 `candidate` 是**产品本身**（候选与它的生命周期），必须打出来——所以它关掉这个开关。
+    """
     errors = result.get("errors")
     if errors:
         print("校验未通过：")
@@ -423,7 +509,9 @@ def print_result(result: dict[str, Any], *, out: str | None = None) -> int:
     if isinstance(usage, dict):
         state = "已暂停（未继续重试）" if usage.get("paused") else "完成"
         print(f"用量：调用 {usage.get('calls')}/{usage.get('limit')} 次，{state}")
-    print(json.dumps({key: value for key, value in result.items() if key != "candidate"}, ensure_ascii=False, indent=2))
+    drop = {"candidate"} if hide_candidate else set()
+    print(json.dumps({key: value for key, value in result.items() if key not in drop},
+                     ensure_ascii=False, indent=2))
     return 0
 
 
@@ -450,7 +538,7 @@ async def run(ns: argparse.Namespace) -> int:
             proc.terminate()
             proc.wait(timeout=10)
     persist(ns, result)
-    return print_result(result, out=ns.out)
+    return print_result(result, out=ns.out, hide_candidate=ns.group != "wa")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -462,7 +550,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "group",
         choices=[
             "package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive", "narrative",
-            "trpg", "plugin", "story",
+            "trpg", "plugin", "story", "wa",
         ],
     )
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
@@ -556,6 +644,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--saved", action="store_true", help="故事层：已先保存当前进展（分支或导出）")
     parser.add_argument("--acknowledge-unsaved", dest="acknowledge_unsaved", action="store_true",
                         help="故事层：显式接受「不先保存就恢复」")
+    parser.add_argument("--outline", default=None, help="编剧层：大纲标识")
+    parser.add_argument("--observers", default=None, help="编剧层：观察视角（逗号分隔的角色标识）")
+    parser.add_argument("--chapter", default=None, help="编剧层：章节名")
+    parser.add_argument("--item", default=None, help="编剧层：大纲条目标识（多个用逗号分隔）")
+    parser.add_argument("--evidence", default=None, help="编剧层：依据引用（事件 / 说法标识，逗号分隔）")
+    parser.add_argument("--basis", default=None, help="编剧层：候选依据（内联 JSON）")
+    parser.add_argument("--unsolved", default=None, action="append", help="编剧层：未解决问题（可重复）")
+    parser.add_argument("--gm-changes", dest="gm_changes", default=None, help="编剧层：GM 直接变化载荷（内联 JSON 或文件）")
+    parser.add_argument("--goal", default=None, help="编剧层：章节目标（情节提议用）")
     ns = parser.parse_args(argv)
     if (ns.group, ns.command) not in OP_BY_COMMAND:
         parser.error(f"未知命令 {ns.group} {ns.command}")

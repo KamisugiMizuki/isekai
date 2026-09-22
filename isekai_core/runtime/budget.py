@@ -36,6 +36,7 @@ TASK_PRIORITY: dict[str, str] = {
     "narrative_audit": "plan_memory",   # 每条可见回复的后验审计（§6.2）：与记忆提取同档
     "memory_compact": "plan_memory",    # 积压汇总（§4.1）：一次吃一批，与记忆提取同档
     "story_classify": "dialog_commit",  # OC 输入分类（OC_STORY_LAYER_SPEC §3.4）：已接受对话的一环
+    "wa_suggest": "proactive_text",     # 情节提议（WRITING_ASSISTANT_SPEC §六）：创作文本，与主动文本同档
     "proactive_text": "proactive_text",
     "embedding": "embedding_polish",
 }

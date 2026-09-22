@@ -2,7 +2,7 @@
 
 isekai——一个持续运行的异世界。用户通过与世界内角色的对话（经由角色专属的双向联络方式），碎片化地发现这个世界的历史、人文与重要事件；世界不依赖用户在线而存在。
 
-> 状态：设计完成（总纲 + 9 篇 SPEC）；**阶段 0 已完成**——核心进程（UMP v1 / 最小会话核心 / 管理面）、开发用 CLI 客户端与 Tauri 桌面壳（sidecar 监督 / 内建聊天 / 设置 / 托盘）均已落地并实机验证；世界包、角色卡、世界实例、导入导出与生成器已随**阶段 1**落地（见「世界设定层」一节）；**阶段 2（世界运行层）已落地**——世界时钟与倍率、激活 / 冻结、离线补算、性格单元、生活线与最小认知接口（见「世界运行层」一节）；**阶段 3（事件引擎）已落地**——四族事件模板、确定性候选与每日预算、事实效果与失效方式、说法集合与获知链、角色经历与素材资格、创建期历史回填、角色自主提案与环境事实状态（见「事件引擎」一节）；**阶段 4（版本管理）已落地**——提交 / 分叉 / 回滚 / 自动提交 / 用户引入事件；**阶段 5（多角色披露）已落地**——默认隔离、显式授权、转述不冒充亲历、撤回只有回滚（见「多角色披露」一节）；——提交、分叉、回滚（覆盖语义）、自动提交；角色记忆（提取 / 隔离 / 冲突 / 全文召回 / 简报注入 / 衰减强化）已按 MEMORY_SPEC 阶段 2–3 范围落地，向量召回与索引生命周期随阶段 4；**应用层（OC 故事层）核心语义已落地**——输入分类闸、产品状态翻译、故事表达契约、用户可见面投影与版本 / 创作操作编排（见「OC 故事层」一节），OC 客户端界面属独立实现范围。
+> 状态：设计完成（总纲 + 9 篇 SPEC）；**阶段 0 已完成**——核心进程（UMP v1 / 最小会话核心 / 管理面）、开发用 CLI 客户端与 Tauri 桌面壳（sidecar 监督 / 内建聊天 / 设置 / 托盘）均已落地并实机验证；世界包、角色卡、世界实例、导入导出与生成器已随**阶段 1**落地（见「世界设定层」一节）；**阶段 2（世界运行层）已落地**——世界时钟与倍率、激活 / 冻结、离线补算、性格单元、生活线与最小认知接口（见「世界运行层」一节）；**阶段 3（事件引擎）已落地**——四族事件模板、确定性候选与每日预算、事实效果与失效方式、说法集合与获知链、角色经历与素材资格、创建期历史回填、角色自主提案与环境事实状态（见「事件引擎」一节）；**阶段 4（版本管理）已落地**——提交 / 分叉 / 回滚 / 自动提交 / 用户引入事件；**阶段 5（多角色披露）已落地**——默认隔离、显式授权、转述不冒充亲历、撤回只有回滚（见「多角色披露」一节）；——提交、分叉、回滚（覆盖语义）、自动提交；角色记忆（提取 / 隔离 / 冲突 / 全文召回 / 简报注入 / 衰减强化）已按 MEMORY_SPEC 阶段 2–3 范围落地，向量召回与索引生命周期随阶段 4；**应用层（OC 故事层）核心语义已落地**——输入分类闸、产品状态翻译、故事表达契约、用户可见面投影与版本 / 创作操作编排（见「OC 故事层」一节）、**应用层（Writing Assistant / 编剧层）核心语义已落地**——大纲约束与条目状态机、只读观察三层输出、候选生命周期、GM 直接变化经规则层联合提交、分支试演与回滚后重新评估（见「Writing Assistant（编剧层）」一节），OC 客户端界面与编剧层界面均属独立实现范围。
 > 本项目独立于 veranima-companion；后者作为设计参考与资产来源。
 
 ## 文档
@@ -11,6 +11,7 @@ isekai——一个持续运行的异世界。用户通过与世界内角色的�
 - WorldRuntime：[`docs/worldruntime/DESIGN.md`](docs/worldruntime/DESIGN.md)
 - Core Debugging：[`docs/core%20debugging/DESKTOP_SPEC.md`](docs/core%20debugging/DESKTOP_SPEC.md)
 - OC 故事层：[`docs/oc-story/OC_STORY_LAYER_SPEC.md`](docs/oc-story/OC_STORY_LAYER_SPEC.md)
+- Writing Assistant（编剧层）：[`docs/writing-assistant/WRITING_ASSISTANT_SPEC.md`](docs/writing-assistant/WRITING_ASSISTANT_SPEC.md)
 - TRPG 规则：[`docs/trpg-rules/TRPG_RULE_PLUGIN_SPEC.md`](docs/trpg-rules/TRPG_RULE_PLUGIN_SPEC.md)
 - 存档：[`docs/archive/`](docs/archive/)（总设计对话全文 / 迭代记录 / V0.1 早期条款）
 
@@ -207,6 +208,33 @@ python -m isekai_core.world_cli instance import --file packages/saltflat.isekai.
 `scripts/_audit2_ocstory.py`（23/23 PASS，存档 `.hermes/audits/ocstory_*.txt`）、
 `tests/test_oc_story.py`（14 项，真 WebSocket + 真 SQLite + 真实例）、
 `scripts/_probe_oc_story_cli.py`（CLI 端到端，FAIL=0）。
+
+## Writing Assistant（编剧层）
+
+面向小说作者的上层叙事约束编排层，GM 辅助是同一套能力的另一种应用方式。它拥有大纲、候选、草稿与偏离决定的
+产品语义，**不拥有世界事实**：大纲要求发生不构成写世界的授权。已落地并验证的行为（对照 `WRITING_ASSISTANT_SPEC` §三–§八）：
+
+- **大纲（六层约束）**（§三 / §4.2）：主题 / 必达 / 禁止 / 弧线 / 节奏 / 可变素材是闭集，强度按层级给默认值
+  （必达硬、主题软、弧线中）；条目必须带稳定标识、范围、前置与成功判据，非法大纲不落盘；禁止事项不存在
+  「已达成」——触发就是偏离。条目状态机挡住回退与复活，硬约束要标达成必须带**世界里对得上的依据**
+  （事件 / 说法标识），「规则成功但世界提交失败」凑不成达成。
+- **只读观察（三层输出）**（§5.2）：玩家观察层只给该观察者在一致快照上的合法材料（带来源与态度标签）；
+  主持依据层与下一步编排层只给 GM / 作者。冻结或追赶中的线如实返回「不可用」，不拿旧状态冒充当前。
+- **候选与草稿**（§4.3）：`approved` 属于**未提交**——只有 `change.commit` 返回成功，候选里的世界变化才算发生。
+  带世界变化的候选先过 `change.preview`（指名拒绝 / 版本冲突才算驳回，待确认内容留在待确认），提交前再跑
+  `generation.check`：世代变了判 `stale` 不写回旧世界，水位往前走了则按当前世界**重新预览**一次再落。
+- **GM 直接变化**（§5.1 / §九）：声明先形成待批准结构（`source=gm_declaration`，不写世界），批准后经 TRPG 规则层
+  联合提交；编剧层不另造一条写世界的路径。
+- **偏离、试演与回滚**（§七 / §八）：未达成的硬约束只报缺口并提出候选，不自动制造世界事实；试演在新分支里看
+  后果，主线不被污染（项目不提供世界线合并）；世界回滚后大纲状态按目标时间线**重新评估**（依据已不在当前
+  时间线的条目报 `evidence_lost`），已锁定的文本不随世界回滚消失。
+
+管理面 op 与 CLI 命令组同名：`wa.outline.save` / `wa.outline.list` / `wa.outline.get` / `wa.bind` / `wa.state` /
+`wa.evaluate` / `wa.item.decide` / `wa.observe` / `wa.candidate.propose` / `wa.candidate.decide` /
+`wa.candidate.commit` / `wa.gm.declare` / `wa.gm.approve` / `wa.branch`（同步）与 `wa.suggest`（异步，一次便宜调用
+产出多条推进提议）。行为读数：`scripts/_audit2_wa.py`（22/22 PASS，存档 `.hermes/audits/wa_*.txt`）、
+`tests/test_writing_assistant.py`（12 项，真 WebSocket + 真 SQLite + 真实例）、
+`scripts/_probe_wa_cli.py`（CLI 端到端，18 项 FAIL=0）。
 
 ## 代码结构
 

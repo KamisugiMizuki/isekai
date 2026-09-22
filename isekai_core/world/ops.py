@@ -142,6 +142,21 @@ SYNC_OPS = frozenset(
         "story.turn",
         "story.branch",
         "story.restore",
+        # Writing Assistant（WRITING_ASSISTANT_SPEC）：大纲 / 观察 / 候选 / GM 编排
+        "wa.outline.save",
+        "wa.outline.list",
+        "wa.outline.get",
+        "wa.bind",
+        "wa.state",
+        "wa.evaluate",
+        "wa.item.decide",
+        "wa.observe",
+        "wa.candidate.propose",
+        "wa.candidate.decide",
+        "wa.candidate.commit",
+        "wa.gm.declare",
+        "wa.gm.approve",
+        "wa.branch",
     }
 )
 ASYNC_OPS = frozenset(
@@ -163,6 +178,7 @@ ASYNC_OPS = frozenset(
         "world.package.fill",
         "world.card.generate",
         "story.classify",
+        "wa.suggest",
     }
 )
 
@@ -465,6 +481,11 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return _story_op(cfg, store, runtime, op, args)
         if op == "story.classify":
             raise UmpError(Err.UNSUPPORTED_TYPE, "story.classify 要调模型，是异步管理操作", retryable=False)
+        # Writing Assistant（WRITING_ASSISTANT_SPEC）：大纲 / 观察 / 候选 / GM 编排
+        if op in WA_SYNC_OPS:
+            return _wa_op(cfg, store, runtime, op, args)
+        if op == "wa.suggest":
+            raise UmpError(Err.UNSUPPORTED_TYPE, "wa.suggest 要调模型，是异步管理操作", retryable=False)
 
         if op.startswith("runtime."):
             return _runtime_op(runtime, op, args, cfg=cfg)
@@ -1411,6 +1432,164 @@ async def _story_classify(cfg: Config, llm: Any, store: Store | None, runtime: A
     }
 
 
+# ------------------------------------------------------------------ Writing Assistant
+# WRITING_ASSISTANT_SPEC：大纲 / 观察 / 候选 / 偏离与提交编排。语义在 isekai_core/writing/，
+# 这里只做参数转发（与 `_iface_op` / `_story_op` 同一分工）。
+
+WA_SYNC_OPS = frozenset(
+    {
+        "wa.outline.save",
+        "wa.outline.list",
+        "wa.outline.get",
+        "wa.bind",
+        "wa.state",
+        "wa.evaluate",
+        "wa.item.decide",
+        "wa.observe",
+        "wa.candidate.propose",
+        "wa.candidate.decide",
+        "wa.candidate.commit",
+        "wa.gm.declare",
+        "wa.gm.approve",
+        "wa.branch",
+    }
+)
+
+
+def _writing_service(cfg: Config, store: Store, runtime: Any) -> Any:
+    """编剧服务：优先用挂载中的运行层（同一个库、同一份实例副本）。"""
+    from ..writing.service import WritingService
+
+    world = runtime if runtime is not None and hasattr(runtime, "clock_row") else _world_service(cfg, store)
+    return WritingService(store=store, cfg=cfg, runtime=world)
+
+
+def _wa_op(cfg: Config, store: Store, runtime: Any, op: str, args: dict[str, Any]) -> dict[str, Any]:
+    """同步编剧操作：大纲 / 只读观察 / 候选生命周期（都不写世界事实）。"""
+    from ..runtime.service import RuntimeStateError
+    from ..writing.service import WritingError
+
+    service = _writing_service(cfg, store, runtime)
+    instance_id = str(args.get("instance_id") or args.get("id") or "")
+    timeline_id = str(args.get("timeline_id") or args.get("timeline") or "")
+    outline_id = str(args.get("outline_id") or args.get("outline") or "")
+    try:
+        if op == "wa.outline.save":
+            outline = args.get("outline")
+            if not isinstance(outline, dict):
+                raise UmpError(Err.INVALID, "缺少 outline 对象", retryable=False)
+            return service.save_outline(outline)
+        if op == "wa.outline.list":
+            return {"outlines": service.outlines()}
+        if op == "wa.outline.get":
+            return {"outline": service.outline(str(args.get("outline_id") or args.get("outline") or ""))}
+        if op == "wa.bind":
+            return service.bind(
+                instance_id, timeline_id, outline_id=outline_id,
+                observers=[str(name) for name in args.get("observers") or []],
+                chapter=str(args.get("chapter") or ""),
+            )
+        if op == "wa.state":
+            return {"state": service.state(instance_id, timeline_id, outline_id=outline_id),
+                    "public": service.public_state(instance_id, timeline_id)}
+        if op == "wa.evaluate":
+            return service.evaluate(instance_id, timeline_id, outline_id=outline_id)
+        if op == "wa.item.decide":
+            return service.decide_item(
+                instance_id, timeline_id,
+                item_id=str(args.get("item_id") or args.get("item") or args.get("ref") or ""),
+                status=str(args.get("status") or ""),
+                reason=str(args.get("reason") or args.get("note") or ""),
+                evidence_refs=[str(name) for name in args.get("evidence_refs") or []],
+                outline_id=outline_id,
+            )
+        if op == "wa.observe":
+            return service.observe(
+                instance_id, timeline_id,
+                observer_id=str(args.get("observer_id") or args.get("observer") or args.get("card") or ""),
+                outline_id=outline_id,
+                audience=str(args.get("audience") or "author"),
+            )
+        if op == "wa.candidate.propose":
+            return service.propose(
+                instance_id, timeline_id,
+                candidate_id=str(args.get("candidate_id") or args.get("ref") or ""),
+                kind=str(args.get("kind") or "world_change"),
+                item_refs=[str(name) for name in args.get("item_refs") or []],
+                title=str(args.get("title") or args.get("display_name") or ""),
+                summary=str(args.get("summary") or args.get("instruction") or ""),
+                basis=_json_arg(args, "basis", {}) if isinstance(_json_arg(args, "basis", {}), dict) else {},
+                audience=str(args.get("audience") or "author"),
+                changes=_json_arg(args, "changes", []) if isinstance(_json_arg(args, "changes", []), list) else [],
+                unsolved=[str(name) for name in args.get("unsolved") or []],
+                outline_id=outline_id,
+                text=str(args.get("text") or ""),
+            )
+        if op == "wa.candidate.decide":
+            return service.decide(
+                instance_id, timeline_id,
+                candidate_id=str(args.get("candidate_id") or args.get("ref") or ""),
+                status=str(args.get("status") or ""),
+                reason=str(args.get("reason") or args.get("note") or ""),
+                text=str(args.get("text") or ""),
+            )
+        if op == "wa.candidate.commit":
+            return service.commit(
+                instance_id, timeline_id,
+                candidate_id=str(args.get("candidate_id") or args.get("ref") or ""),
+                idempotency_key=str(args.get("idempotency_key") or args.get("idempotency") or ""),
+            )
+        if op == "wa.gm.declare":
+            gm_changes = _json_arg(args, "gm_changes", None)
+            if gm_changes is None:
+                gm_changes = _json_arg(args, "changes", {})
+            return service.gm_declare(
+                instance_id, timeline_id,
+                candidate_id=str(args.get("candidate_id") or args.get("ref") or ""),
+                campaign_id=str(args.get("campaign_id") or args.get("campaign") or ""),
+                gm_changes=gm_changes if isinstance(gm_changes, dict) else {},
+                title=str(args.get("title") or args.get("display_name") or ""),
+                basis=_json_arg(args, "basis", {}) if isinstance(_json_arg(args, "basis", {}), dict) else {},
+                audience=str(args.get("audience") or "gm"),
+            )
+        if op == "wa.gm.approve":
+            return service.gm_approve(
+                instance_id, timeline_id,
+                candidate_id=str(args.get("candidate_id") or args.get("ref") or ""),
+                idempotency_key=str(args.get("idempotency_key") or args.get("idempotency") or ""),
+            )
+        if op == "wa.branch":
+            return service.trial_branch(
+                instance_id, timeline_id,
+                commit_id=str(args.get("commit_id") or args.get("commit") or ""),
+                name=str(args.get("name") or args.get("display_name") or ""),
+                outline_id=outline_id,
+            )
+    except RuntimeStateError as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+    except WritingError as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+    raise UmpError(Err.UNSUPPORTED_TYPE, f"未知编剧层操作 {op}", retryable=False)
+
+
+async def _wa_suggest(cfg: Config, llm: Any, store: Store | None, runtime: Any,
+                      args: dict[str, Any]) -> dict[str, Any]:
+    """情节提议（§六）：一次便宜调用，产出的是候选，不写世界。"""
+    if store is None:
+        raise UmpError(Err.INTERNAL, "本次调用没有绑定数据库", retryable=False)
+    service = _writing_service(cfg, store, runtime)
+    return await service.suggest(
+        str(args.get("instance_id") or args.get("id") or ""),
+        str(args.get("timeline_id") or args.get("timeline") or ""),
+        outline_id=str(args.get("outline_id") or args.get("outline") or ""),
+        observer_id=str(args.get("observer_id") or args.get("observer") or args.get("card") or ""),
+        goal=str(args.get("goal") or args.get("instruction") or ""),
+        limit=int(args.get("limit") or 3),
+        llm=llm,
+        prefix=str(args.get("prefix") or "cand"),
+    )
+
+
 def _trpg_gm_change(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
     """GM 直接变化（§十五）：没有行动、没有插件的联合提交。
 
@@ -1794,6 +1973,8 @@ async def dispatch_async(
             return await _expand_claim(cfg, llm, store, args)
         if op == "story.classify":
             return await _story_classify(cfg, llm, store, runtime, args)
+        if op == "wa.suggest":
+            return await _wa_suggest(cfg, llm, store, runtime, args)
         if op == "runtime.first_contact":
             service = getattr(runtime, "service", runtime)
             if service is None or not hasattr(service, "first_contact"):

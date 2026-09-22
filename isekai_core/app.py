@@ -112,8 +112,18 @@ class Runtime:
 
 def build_llm(cfg: Config) -> Any:
     if os.environ.get("ISEKAI_LLM_FAKE") == "1":
-        # 开发 / 测试开关：不联网，直接返回脚本化文本
-        return FakeLLM([os.environ.get("ISEKAI_LLM_FAKE_REPLY", "（占位回复）")])
+        # 开发 / 测试开关：不联网，直接返回脚本化文本。
+        # 判断点脚本（`ISEKAI_LLM_FAKE_JUDGEMENTS`=JSON 字典）让 CLI 探针也能跑判断点链路：
+        # 提示词首条含某个键就返回对应值，键不在里面等于「判不出来」，走调用方的兜底。
+        fake = FakeLLM([os.environ.get("ISEKAI_LLM_FAKE_REPLY", "（占位回复）")])
+        raw = os.environ.get("ISEKAI_LLM_FAKE_JUDGEMENTS", "")
+        if raw:
+            try:
+                seeded = json.loads(raw)
+                fake.judgements = {str(key): str(value) for key, value in (seeded or {}).items()}
+            except (ValueError, AttributeError):
+                pass
+        return fake
     return LLMClient(cfg.llm)
 
 

@@ -771,6 +771,58 @@ CREATE TABLE IF NOT EXISTS trpg_commit(
   UNIQUE(instance_id, timeline_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS ix_trpg_commit_campaign ON trpg_commit(instance_id, timeline_id, campaign_id);
+
+-- Writing Assistant（WRITING_ASSISTANT_SPEC §4.1）：四类长期对象里的三张表。
+-- 大纲定义是作者资产（可跨时间线复用，不随世界回滚消失）；状态与候选绑实例+时间线；
+-- 锁定的文本草稿（wa_candidate.kind='text' 且 status='approved'）同样不随世界回滚消失。
+CREATE TABLE IF NOT EXISTS wa_outline(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  payload TEXT NOT NULL DEFAULT '{}',        -- JSON：大纲条目（含层级 / 强度 / 范围 / 判据）
+  created_real REAL NOT NULL DEFAULT 0,
+  updated_real REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS wa_state(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  outline_id TEXT NOT NULL,
+  observers TEXT NOT NULL DEFAULT '[]',      -- JSON：观察视角（角色标识）
+  chapter TEXT NOT NULL DEFAULT '',
+  items TEXT NOT NULL DEFAULT '[]',          -- JSON：条目状态（达成 / 偏离 / 放弃 + 理由与依据）
+  evaluated_world INTEGER NOT NULL DEFAULT 0,
+  evaluated_generation INTEGER NOT NULL DEFAULT 0,
+  updated_real REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, outline_id)
+);
+
+CREATE TABLE IF NOT EXISTS wa_candidate(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  outline_id TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT 'world_change',
+  item_refs TEXT NOT NULL DEFAULT '[]',
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  basis TEXT NOT NULL DEFAULT '{}',
+  audience TEXT NOT NULL DEFAULT 'author',
+  base_world INTEGER NOT NULL DEFAULT 0,
+  base_generation INTEGER NOT NULL DEFAULT 0,
+  changes TEXT NOT NULL DEFAULT '[]',        -- JSON：change_intent 列表（世界变化候选）
+  gm_changes TEXT NOT NULL DEFAULT '{}',     -- JSON：GM 直接变化的原生载荷
+  campaign_id TEXT NOT NULL DEFAULT '',
+  source_mode TEXT NOT NULL DEFAULT '',
+  unsolved TEXT NOT NULL DEFAULT '[]',
+  text TEXT NOT NULL DEFAULT '',             -- 锁定的文本草稿（approved 后保留）
+  status TEXT NOT NULL DEFAULT 'proposed',
+  reason TEXT NOT NULL DEFAULT '',
+  preview_id TEXT NOT NULL DEFAULT '',
+  joint_commit_id TEXT NOT NULL DEFAULT '',
+  created_real REAL NOT NULL DEFAULT 0,
+  updated_real REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, id)
+);
 """
 
 
@@ -1191,6 +1243,157 @@ class Store:
         for item in rows:
             out |= set(_json_list(item[0]))
         return out
+
+    # ---------- Writing Assistant（WRITING_ASSISTANT_SPEC §4.1） ----------
+    # ponytail: 大纲定义是作者资产（跨线复用）；状态与候选绑实例+时间线，**不进快照 / 不进回滚清理**——
+    # 规范要求的是「回滚后按目标时间线重新评估」（§八），不是自动恢复旧状态；候选的时效由
+    # generation_check 在写入前判定。要改成随版本走，就把这两张表接进 runtime_dump/load。
+
+    def wa_outline_put(self, row: dict[str, Any]) -> dict[str, Any]:
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO wa_outline(id, name, payload, created_real, updated_real)
+                   VALUES(:id, :name, :payload, :created_real, :updated_real)
+                   ON CONFLICT(id) DO UPDATE SET
+                     name=excluded.name, payload=excluded.payload, updated_real=excluded.updated_real""",
+                {
+                    "id": str(row.get("id") or ""),
+                    "name": str(row.get("name") or ""),
+                    "payload": str(row.get("payload") or "{}"),
+                    "created_real": float(row.get("created_real") or now),
+                    "updated_real": now,
+                },
+            )
+            saved = self._conn.execute("SELECT * FROM wa_outline WHERE id=?", (str(row.get("id") or ""),)).fetchone()
+        return _row_to_dict(saved)  # type: ignore[arg-type]
+
+    def wa_outline_get(self, outline_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM wa_outline WHERE id=?", (str(outline_id),)).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def wa_outline_list(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM wa_outline ORDER BY created_real, id").fetchall()
+        return [_row_to_dict(item) for item in rows]
+
+    def wa_outline_delete(self, outline_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM wa_outline WHERE id=?", (str(outline_id),))
+
+    def wa_state_put(self, row: dict[str, Any]) -> dict[str, Any]:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO wa_state(instance_id, timeline_id, outline_id, observers, chapter, items,
+                                        evaluated_world, evaluated_generation, updated_real)
+                   VALUES(:instance_id, :timeline_id, :outline_id, :observers, :chapter, :items,
+                          :evaluated_world, :evaluated_generation, :updated_real)
+                   ON CONFLICT(instance_id, timeline_id, outline_id) DO UPDATE SET
+                     observers=excluded.observers, chapter=excluded.chapter, items=excluded.items,
+                     evaluated_world=excluded.evaluated_world,
+                     evaluated_generation=excluded.evaluated_generation, updated_real=excluded.updated_real""",
+                {
+                    "instance_id": str(row.get("instance_id") or ""),
+                    "timeline_id": str(row.get("timeline_id") or ""),
+                    "outline_id": str(row.get("outline_id") or ""),
+                    "observers": str(row.get("observers") or "[]"),
+                    "chapter": str(row.get("chapter") or ""),
+                    "items": str(row.get("items") or "[]"),
+                    "evaluated_world": int(row.get("evaluated_world") or 0),
+                    "evaluated_generation": int(row.get("evaluated_generation") or 0),
+                    "updated_real": time.time(),
+                },
+            )
+        saved = self.wa_state_get(str(row.get("instance_id") or ""), str(row.get("timeline_id") or ""),
+                                  str(row.get("outline_id") or ""))
+        return saved or {}
+
+    def wa_state_get(self, instance_id: str, timeline_id: str, outline_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM wa_state WHERE instance_id=? AND timeline_id=? AND outline_id=?",
+            (str(instance_id), str(timeline_id), str(outline_id)),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def wa_state_list(self, instance_id: str, timeline_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM wa_state WHERE instance_id=? AND timeline_id=? ORDER BY outline_id",
+            (str(instance_id), str(timeline_id)),
+        ).fetchall()
+        return [_row_to_dict(item) for item in rows]
+
+    def wa_candidate_put(self, row: dict[str, Any]) -> dict[str, Any]:
+        now = time.time()
+        payload = {
+            "instance_id": str(row.get("instance_id") or ""),
+            "timeline_id": str(row.get("timeline_id") or ""),
+            "id": str(row.get("id") or ""),
+            "outline_id": str(row.get("outline_id") or ""),
+            "kind": str(row.get("kind") or "world_change"),
+            "item_refs": str(row.get("item_refs") or "[]"),
+            "title": str(row.get("title") or ""),
+            "summary": str(row.get("summary") or ""),
+            "basis": str(row.get("basis") or "{}"),
+            "audience": str(row.get("audience") or "author"),
+            "base_world": int(row.get("base_world") or 0),
+            "base_generation": int(row.get("base_generation") or 0),
+            "changes": str(row.get("changes") or "[]"),
+            "gm_changes": str(row.get("gm_changes") or "{}"),
+            "campaign_id": str(row.get("campaign_id") or ""),
+            "source_mode": str(row.get("source_mode") or ""),
+            "unsolved": str(row.get("unsolved") or "[]"),
+            "text": str(row.get("text") or ""),
+            "status": str(row.get("status") or "proposed"),
+            "reason": str(row.get("reason") or ""),
+            "preview_id": str(row.get("preview_id") or ""),
+            "joint_commit_id": str(row.get("joint_commit_id") or ""),
+            "created_real": float(row.get("created_real") or now),
+            "updated_real": now,
+        }
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO wa_candidate(instance_id, timeline_id, id, outline_id, kind, item_refs, title,
+                                            summary, basis, audience, base_world, base_generation, changes,
+                                            gm_changes, campaign_id, source_mode, unsolved, text, status, reason,
+                                            preview_id, joint_commit_id, created_real, updated_real)
+                   VALUES(:instance_id, :timeline_id, :id, :outline_id, :kind, :item_refs, :title,
+                          :summary, :basis, :audience, :base_world, :base_generation, :changes,
+                          :gm_changes, :campaign_id, :source_mode, :unsolved, :text, :status, :reason,
+                          :preview_id, :joint_commit_id, :created_real, :updated_real)
+                   ON CONFLICT(instance_id, timeline_id, id) DO UPDATE SET
+                     outline_id=excluded.outline_id, kind=excluded.kind, item_refs=excluded.item_refs,
+                     title=excluded.title, summary=excluded.summary, basis=excluded.basis,
+                     audience=excluded.audience, base_world=excluded.base_world,
+                     base_generation=excluded.base_generation, changes=excluded.changes,
+                     gm_changes=excluded.gm_changes, campaign_id=excluded.campaign_id,
+                     source_mode=excluded.source_mode, unsolved=excluded.unsolved, text=excluded.text,
+                     status=excluded.status, reason=excluded.reason, preview_id=excluded.preview_id,
+                     joint_commit_id=excluded.joint_commit_id, updated_real=excluded.updated_real""",
+                payload,
+            )
+        return self.wa_candidate_get(payload["instance_id"], payload["timeline_id"], payload["id"]) or {}
+
+    def wa_candidate_get(self, instance_id: str, timeline_id: str, candidate_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM wa_candidate WHERE instance_id=? AND timeline_id=? AND id=?",
+            (str(instance_id), str(timeline_id), str(candidate_id)),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def wa_candidate_list(
+        self, instance_id: str, timeline_id: str, *, outline_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        if outline_id:
+            rows = self._conn.execute(
+                """SELECT * FROM wa_candidate WHERE instance_id=? AND timeline_id=? AND outline_id=?
+                   ORDER BY created_real, id""",
+                (str(instance_id), str(timeline_id), str(outline_id)),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM wa_candidate WHERE instance_id=? AND timeline_id=? ORDER BY created_real, id",
+                (str(instance_id), str(timeline_id)),
+            ).fetchall()
+        return [_row_to_dict(item) for item in rows]
 
     # ---------- 整库备份 / 恢复（DESKTOP_SPEC §3.3） ----------
 
@@ -2224,6 +2427,7 @@ class Store:
                 "proactive_log",
                 "first_contact",
                 "session_notice",
+                "reaction",
                 "narrative_unit",
                 "trpg_campaign",
                 "trpg_scene",
@@ -2231,6 +2435,12 @@ class Store:
                 "trpg_choice",
                 "trpg_rule_state",
                 "trpg_commit",
+                # Writing Assistant 的线级状态与候选（大纲定义是作者资产，不随实例删除）
+                "wa_state",
+                "wa_candidate",
+                # 派生表遗漏会让删除实例留下孤儿行（本次审查顺手补上）
+                "notice",
+                "claim_coverage",
             ):
                 self._conn.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
             self._conn.execute(

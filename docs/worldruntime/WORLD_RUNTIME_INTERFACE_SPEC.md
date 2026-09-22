@@ -1,9 +1,11 @@
 # WorldRuntime 对外接口设计
 
-> 状态：**接口已接线**（2026-09-22 落地）。探针 `scripts/_audit2_iface.py`：18 检查 / 17 PASS / 0 FAIL / 1 DEFERRED，
-> 读数存于 `.hermes/audits/iface_wiring_*`。唯一 DEFERRED 是 §7 的 Writing Assistant 消费方（仍只有规范、
-> 没有代码）。**§7 的 OC 故事层消费方已收口**：`isekai_core/story/` 经 `scope_inspect` / `fork` / `rollback`
-> 等接口读世界与做版本操作、不旁路写库；消费端行为读数另见 `scripts/_audit2_ocstory.py` 的 C 段。
+> 状态：**接口已接线 + §7 三类消费方全部收口**（2026-09-22）。探针 `scripts/_audit2_iface.py`：18 检查 /
+> 18 PASS / 0 FAIL / 0 DEFERRED，读数存于 `.hermes/audits/iface_wiring_*`。两类上层消费方都已落地：
+> `isekai_core/story/`（OC 故事层）经 `scope_inspect` / `fork` / `rollback` 读世界与做版本操作、不旁路写库；
+> `isekai_core/writing/`（Writing Assistant）经 `snapshot.read` + `cognition.project` 观察、
+> 经 `change.preview` → `change.commit` 提交、GM 直接变化走规则层联合提交。消费端行为读数另见
+> `scripts/_audit2_ocstory.py` 与 `scripts/_audit2_wa.py` 的 C 段。TRPG 规则层走战役运行时（见 TRPG 各 SPEC）。
 >
 > 落地口径：14 个 op 全部在管理面注册；5 个规范名走别名表（`world_ops.IFACE_ALIASES`，在 dispatch 入口统一改写）、
 > 9 个按本文语义原生实现（`runtime/change.py` + `RuntimeService` 的接口段）。所有响应带 §3.2 返回信封。
@@ -449,6 +451,8 @@ Writing Assistant：
 - 小说模式默认只读或在草稿分支提交；
 - GM 辅助是应用方式：GM 直接变化使用 `gm_declaration`，玩家行动结果则经 TRPG 规则层进入本接口；
 - 偏离可以被创作者明确接受，但不能由 WorldRuntime 静默改写成达成。
+
+**落地状态（2026-09-22）**：已按上述七步实现并逐步验收——`isekai_core/writing/` 是第二类真实消费方（观察走 `snapshot.read` + `cognition.project`，提交走 `change.preview` → `change.commit`，GM 直接变化走规则层 `gm.change` 联合提交路径，试演走 `runtime.timeline.fork`），行为读数见 `scripts/_audit2_wa.py` 与 `scripts/_audit2_iface.py` §7（消费方判据：真的经公共接口读世界 + 不旁路写库）。
 
 ## 八、错误与降级
 

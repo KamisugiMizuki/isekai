@@ -340,14 +340,27 @@ def consumers_facts() -> None:
                        "显式世界修改仍由调用方走 change.preview → change.commit（本层不代劳）",
               code_ref="isekai_core/story/service.py")
     if only_matches("§7 消费方接线｜Writing Assistant"):
-        wa = list(ROOT.glob("isekai_core/**/*writing*.py"))
+        folder = ROOT / "isekai_core/writing"
+        files = sorted(folder.glob("*.py")) if folder.is_dir() else []
+        src = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in files)
+        # 判据同 OC：真的经公共接口读世界 / 提交，而不是绕过边界自己写库
+        used = [name for name in ("read_snapshot", "cognition_project", "change_preview", "change_commit",
+                                  "generation_check", "fork", "clock_row", "reserve_call", "settle_call",
+                                  "card_of", "setting")
+                if name in src]
+        bypass = [token for token in ("apply_runtime_batch", "executemany", "event_put", "claim_put",
+                                      "effect_put", "knowledge_put")
+                  if token in src]
+        gm = "campaign.gm_change(" in src
+        ok = bool(files) and len(used) >= 6 and not bypass and gm
         check("§7 消费方接线｜Writing Assistant",
-              "Writing Assistant 也能通过公共接口读写世界",
-              f"Writing Assistant 代码 {len(wa)} 个文件",
-              "DEFERRED",
-              evidence="WA 仍只有 docs 下的规范、没有代码：它的消费端验收等落地后再做"
-                       "（OC 侧已由 `scripts/_audit2_ocstory.py` 的 C1 段收口）",
-              code_ref="docs/writing-assistant/WRITING_ASSISTANT_SPEC.md")
+              "Writing Assistant 也经公共接口读世界：观察走认知投影、提交走 change.preview → commit、"
+              "GM 直接变化走规则层联合提交",
+              f"编剧层 {len(files)} 个文件；用到的接口面 {used}；旁路写库 {bypass or '（无）'}；"
+              f"GM 走规则层={gm}",
+              "PASS" if ok else "FAIL",
+              evidence="§7.1 的四步用法；这也是 `_audit2_wa.py` 的 C 段：编剧层是第二类真实调用方",
+              code_ref="isekai_core/writing/service.py")
 
 
 async def ws_registry_probe() -> None:
