@@ -179,8 +179,9 @@ def main() -> int:
         campaign = run(root, "trpg", "campaign-new", "--id", instance_id, "--timeline", timeline_id,
                        "--ruleset", "wa-probe", "--status", "active")
         campaign_id = str(campaign.get("campaign_id") or campaign.get("id") or "")
-        gm_changes = {"consequences": [{"kind": "institution_state", "target": "off-1", "value": "vacant",
-                                        "expiry": "until_cleared", "certainty": "confirmed"}],
+        # 声明用**变化意图**形态（`consequences` 收 state_change 一类意图；世界效果名只能进 `effects` 兼容字段）
+        gm_changes = {"consequences": [{"kind": "state_change", "operation": "set", "target_refs": ["off-1"],
+                                        "value": "vacant", "expiry": "until_cleared", "certainty": "confirmed"}],
                       "claims": [{"text": "堤长的位置空了出来", "source_id": "src-1", "audience": "公开"}]}
         (creation / "gm.json").write_text(json.dumps(gm_changes, ensure_ascii=False), encoding="utf-8")
         declared = run(root, "wa", "gm-declare", "--id", instance_id, "--timeline", timeline_id,
