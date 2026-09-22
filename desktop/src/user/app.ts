@@ -14,12 +14,13 @@ import { button, chip, clear, el, errorCard, facts, fill, paragraph, primary, se
 import { ContactPane } from "./contact";
 import { HelpPane } from "./help";
 import { HomePane } from "./home";
+import { CreatePane } from "./create";
 import { OnboardingPane } from "./onboarding";
 import { SettingsPane } from "./settings";
 import { WorldsPane } from "./worlds";
 import { WritingPane } from "./writing";
 
-export type PaneId = "home" | "contact" | "writing" | "trpg" | "worlds" | "settings" | "help" | "onboarding";
+export type PaneId = "home" | "contact" | "writing" | "trpg" | "worlds" | "settings" | "help" | "onboarding" | "create";
 
 export interface Route {
   pane: PaneId;
@@ -422,6 +423,9 @@ export class App {
       case "onboarding":
         pane = new OnboardingPane(ctx);
         break;
+      case "create":
+        pane = new CreatePane(ctx);
+        break;
       case "contact":
         pane = new ContactPane(ctx);
         break;
@@ -645,7 +649,11 @@ export class App {
 
 export function paneTitle(id: PaneId): string {
   const all = [...NAV, ...NAV_FOOT];
-  return all.find((item) => item.id === id)?.label ?? (id === "onboarding" ? "首次设置" : "首页");
+  const found = all.find((item) => item.id === id)?.label;
+  if (found) return found;
+  if (id === "onboarding") return "首次设置";
+  if (id === "create") return "创建世界";
+  return "首页";
 }
 
 function coreStatusText(status: CoreStatus): string {

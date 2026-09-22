@@ -167,6 +167,39 @@ export class AppApi {
     return this.call("world.card.list");
   }
 
+  packageTemplate(name: string): Promise<Json> {
+    return this.call("world.package.template", { name }, 60000);
+  }
+
+  packageLoad(path: string): Promise<Json> {
+    return this.call("world.package.load", { path }, 60000);
+  }
+
+  packageSave(path: string, pkg: Json): Promise<Json> {
+    return this.call("world.package.save", { path, package: pkg }, 120000);
+  }
+
+  packageValidate(payload: Json): Promise<Json> {
+    return this.call("world.package.validate", payload, 120000);
+  }
+
+  /** 生成一整份设定：3–6 次调用（含重试），超时给足 */
+  packageGenerate(payload: Json): Promise<Json> {
+    return this.call("world.package.generate", payload, 900000);
+  }
+
+  packageRevise(payload: Json): Promise<Json> {
+    return this.call("world.package.revise", payload, 900000);
+  }
+
+  packageFill(payload: Json): Promise<Json> {
+    return this.call("world.package.fill", payload, 900000);
+  }
+
+  cardConfirm(args: Json): Promise<Json> {
+    return this.call("world.card.confirm", args, 120000);
+  }
+
   instances(): Promise<Json> {
     return this.call("instance.list");
   }

@@ -63,7 +63,7 @@ export class HomePane implements Pane {
             "div",
             { class: "u-row" },
             primary("从样例世界开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
-            button("创建自己的世界", () => this.ctx.navigate({ pane: "onboarding", sub: "own" })),
+            button("创建自己的世界", () => this.ctx.navigate({ pane: "create" })),
             button("导入已有内容", () => this.ctx.navigate({ pane: "worlds", sub: "import" })),
           ),
         ),

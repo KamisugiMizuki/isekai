@@ -112,7 +112,7 @@ export class WorldsPane implements Pane {
             "div",
             { class: "u-row" },
             primary("从样例开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
-            button("创建自己的世界", () => this.ctx.navigate({ pane: "onboarding", sub: "own" })),
+            button("创建自己的世界", () => this.ctx.navigate({ pane: "create" })),
             button("导入已有内容", () => void this.importFlow()),
           ),
         ),
@@ -786,39 +786,90 @@ export class WorldsPane implements Pane {
     if (!host) return;
     const packages = await this.ctx.api.packages();
     const cards = await this.ctx.api.cards();
-    const drafts = await this.ctx.api.draftList("world");
+    const drafts = await this.ctx.api.draftList("create");
     const page = el("div", { class: "u-page" });
     page.appendChild(el("h2", { class: "u-h2", text: "世界设定与角色卡" }));
     page.appendChild(this.tabs());
-    const pkgList = ((packages.packages as Json[]) ?? []).map((item) => {
-      const ok = Boolean(item.valid);
-      return `${String(item.name ?? item.file)}：${ok ? "可用于创建" : `需要检查（${((item.errors as string[]) ?? []).slice(0, 2).join("；")}）`}`;
-    });
-    const cardList = ((cards.cards as Json[]) ?? []).map(
-      (item) => `${String(item.name ?? item.file)}：${item.confirmed ? "已审定" : "未确认（不能用于创建）"}`,
-    );
-    page.appendChild(section("世界设定", bulletList(pkgList.length ? pkgList : ["还没有世界设定"], "u-list")));
-    page.appendChild(section("角色卡", bulletList(cardList.length ? cardList : ["还没有角色卡"], "u-list")));
+
+    const pkgRows = el("div", { class: "u-rows" });
+    for (const item of (packages.packages as Json[]) ?? []) {
+      const row = el("div", { class: "u-row-line" });
+      row.appendChild(el("span", { class: "u-grow", text: String(item.name ?? item.file) }));
+      row.appendChild(chip(item.valid ? "可用于创建" : "需要检查", item.valid ? "ok" : "bad"));
+      if (!item.valid) {
+        row.appendChild(el("span", { class: "u-hint", text: ((item.errors as string[]) ?? []).slice(0, 1).join("") }));
+      }
+      // 编辑已有设定 = 进创作工作区（表单 / 锁定 / 校验定位），不是改文件
+      row.appendChild(button("编辑", () => this.ctx.navigate({ pane: "create", sub: `edit:${String(item.file)}` })));
+      pkgRows.appendChild(row);
+    }
+    if (!pkgRows.childElementCount) pkgRows.appendChild(el("p", { class: "u-hint", text: "还没有世界设定。" }));
     page.appendChild(
       section(
-        "未完成内容",
-        bulletList(
-          ((drafts.drafts as Json[]) ?? []).map((item) => `${String(item.target ?? "")}（${stamp(Number(item.updated_at ?? 0))}）`),
-          "u-list",
-        ),
+        "世界设定",
+        pkgRows,
+        el("div", { class: "u-row" }, primary("新建世界设定（进创作工作区）", () => this.ctx.navigate({ pane: "create" }))),
       ),
     );
+
+    const cardRows = el("div", { class: "u-rows" });
+    for (const item of (cards.cards as Json[]) ?? []) {
+      const file = String(item.file ?? "");
+      const row = el("div", { class: "u-row-line" });
+      row.appendChild(el("span", { class: "u-grow", text: String(item.name ?? file) }));
+      row.appendChild(chip(item.confirmed ? "已审定（可用于创建）" : "未确认", item.confirmed ? "ok" : "pending"));
+      if (!item.confirmed) {
+        row.appendChild(
+          button("确认", () => {
+            void (async () => {
+              try {
+                await this.ctx.api.cardConfirm({ card_path: file });
+                this.flash("角色卡已确认：可以用于创建");
+                await this.rerender();
+              } catch (error) {
+                setNote(this.note, uiError(error, { module: "角色卡", action: "确认", done: "卡没有改动" }).message, "bad");
+              }
+            })();
+          }),
+        );
+      }
+      cardRows.appendChild(row);
+    }
+    if (!cardRows.childElementCount) cardRows.appendChild(el("p", { class: "u-hint", text: "还没有角色卡。" }));
+    page.appendChild(section("角色卡", cardRows));
+
+    const draftRows = el("div", { class: "u-rows" });
+    for (const item of (drafts.drafts as Json[]) ?? []) {
+      const key = String(item.key ?? "");
+      const row = el("div", { class: "u-row-line" });
+      row.appendChild(el("span", { class: "u-grow", text: `${String(item.target || key)}（${stamp(Number(item.updated_at ?? 0))}）` }));
+      row.appendChild(chip("未完成", "muted"));
+      row.appendChild(button("继续编辑", () => this.ctx.navigate({ pane: "create", sub: `draft:${key}` })));
+      row.appendChild(
+        button("丢弃", () => {
+          void (async () => {
+            try {
+              await this.ctx.api.draftDiscard(key);
+              this.flash("已丢弃这份草稿");
+              await this.rerender();
+            } catch (error) {
+              setNote(this.note, uiError(error, { module: "草稿", action: "丢弃" }).message, "bad");
+            }
+          })();
+        }),
+      );
+      draftRows.appendChild(row);
+    }
+    if (!draftRows.childElementCount) draftRows.appendChild(el("p", { class: "u-hint", text: "没有未完成的设定草稿。" }));
+    page.appendChild(section("未完成内容（草稿）", draftRows, paragraph("草稿允许未通过校验；确认设定后才成为正式材料。", "u-hint")));
     page.appendChild(
       section(
-        "创作工作区",
-        paragraph(
-          "结构化表单、锁定与分段重跑的工作区按实施顺序在 U2 落地；现在创建世界请走「从样例开始」，或使用核心命令行。",
-          "u-hint",
-        ),
+        "从这里开始",
         el(
           "div",
           { class: "u-row" },
-          primary("从样例开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
+          primary("创建世界", () => this.ctx.navigate({ pane: "create" })),
+          button("从样例开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
           button("返回世界列表", () => {
             this.view = "list";
             void this.rerender();
