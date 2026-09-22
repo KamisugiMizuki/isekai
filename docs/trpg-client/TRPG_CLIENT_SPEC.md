@@ -906,13 +906,40 @@ TRPG 行动造成的世界后果可以被 OC 角色之后通过合法认知路�
 
 ## 二十一、实施状态与边界
 
-本规范已定稿，但客户端实现尚未开始。当前代码已经提供 Campaign Runtime、规则插件协议、联合提交、受众裁剪、恢复、幂等和版本阻断等可消费边界；当前桌面前端没有 `trpg.*` 客户端消费者。
+本规范定稿时的判断是「客户端实现尚未开始」。**2026-09-22 C0–C3 已落地**，实现面与判据如下。
 
-因此：
+客户端产品语义住在 `isekai_core/trpg_client/`（`states` 状态表 / `views` 四个面与显示闸门 /
+`expression` 结果四层与双轨时间 / `draft` 行动草稿 / `service` 编排），由管理面 `trpg.client.*`
+（`enter` / `refresh` / `act` / `choice` / `retry` / `gm_change` / `review`）与 CLI 同名命令组承载。
+产品语义只实现一份：任何壳（桌面 / 浏览器 / CLI）渲染同一批面，不各自重写状态文案与闸门
+（§18.17 连接方式可替换）。工作区（§4.1）由调用方持有并传进传出，权威永远在运行时。
 
-- 本文是产品与验收依据，不是实现完成声明；
-- C0–C2 的客户端实现必须先用真实 Campaign Runtime 与真实插件闭环验证；
-- 若实现需要改动战役、插件或 WorldRuntime 契约，应修改对应 SPEC，不在客户端文档里复制新真值；
-- 桌面连接设计完成后，只需补充承载适配，不改变本文的产品语义。
+| 分期 | 落地内容 | 判据 |
+|---|---|---|
+| C0 只读场景壳 | 战役项与状态条、场景面六类（公开事实 / 未知 / 风险 / 可行动作 / 行动结果 / 下一选择）、受众切换、空态与只读态、投影作废后重读 | 探针 B01–B06；`tests::test_faces_are_audience_trimmed` |
+| C1 单玩家行动闭环 | 确认卡（模型只补空缺、缺口不放行）、声明·确认·修改·放弃、真插件裁定、玩家模式自动提交 / GM 停 `reviewing`、幂等重放与重新裁定分离 | 探针 C01–C11b；`test_action_card_then_player_auto_commit` |
+| C2 待选择·时间·恢复 | waiting 闸与待选择卡置首、规则时间与世界时间双轨、时间消耗结果、重启恢复与显式重试、版本阻断与人工接受 | 探针 D01–D09；`test_waiting_locks_and_choice_round_trip`、`test_interrupted_action_can_be_explicitly_rerun` |
+| C3 GM 辅助 | GM 受众与四层材料、玩家视角预览、GM 直接变化（`gm_declaration`）、待审工作区（hold / approve / reject）、版本阻断出口 | 探针 E01–E05；`test_gm_mode_stops_at_reviewing_and_private_stays_private` |
 
-本文到这里停止在产品设计边界，不继续推导桌面连接实现。
+读数：`scripts/_audit2_trpgclient.py` **78/78**（A 规范⇄常数 / B C0 / C C1 / D C2 / E C3 / F §十八 不变量），
+`tests/test_trpg_client.py` 8 项；`scripts/_probe_trpg_cli.py` 用真 CLI（spawn 核心）走通
+`client enter` → `client act`（草稿 → 确认 → 自动提交）→ `client enter --mode gm`。
+
+### 明确没做（不充数）
+
+- **C4 队伍与差异化规则视图**：多角色切换与 `character:` 受众的界面流程、以第二个真实插件（CoC）
+  验收「基础流程不写死第一套规则的字段」——客户端材料本身不带规则字段名，但这两条客户端验收还没跑；
+- **C5 主持创作与分支**：从提交创建分支、回滚 / 导出前的风险确认、场景草稿与结构化结果的人工表达入口。
+  底层能力（`runtime.fork` / `runtime.rollback` / `trpg.campaign.migrate`）已在，客户端只做到版本阻断的**出口提示**；
+- **承载适配**：窗口、输入控件、视觉设计与桌面 / 移动承载（本规范 §2.2 明确排除）；客户端语义与连接方式解耦，
+  壳只需渲染四个面。当前桌面前端仍没有 `trpg.*` 消费者。
+
+### 两条实现口径（规范内部有张力，写明取哪一边）
+
+1. **玩家面的「结果等级」**（§20.4 与 §4.2 / §8.3 之间）：现有插件协议里 `resolution` 没有公开标记，
+   因此按 §8.3「先消费插件现有受众标记」处理——等级（`outcome` / `degree`）进 GM 面，
+   玩家面用**已提交的公开世界后果 + 公开说法**表达「已经发生什么」。要让玩家看到等级，要么插件把摘要
+   写成公开材料，要么由 Campaign Runtime 增加公开摘要字段（属运行时契约变更，不在客户端里发明）。
+2. **「批准」的成立条件**（§7.1 `awaiting_gm_review` 一行）：只有**有裁定**的待提交状态
+   （`reviewing` / `conflict` / `stale`）能批准；公共层判死的待审（`needs_review`，没有可提交载荷）
+   只能**补充条件重跑裁定或拒绝**——客户端如实说明，不假装批准已发生。

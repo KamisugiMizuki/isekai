@@ -170,6 +170,31 @@ def main() -> int:
             root, "trpg", "scene", "--id", instance_id, "--timeline", timeline_id,
             "--campaign", campaign_id,
         )
+        # TRPG 客户端层（TRPG_CLIENT_SPEC）：CLI 参考客户端走一遍只读壳 → 草稿 → 确认 → 自动提交
+        card_id = str(card["meta"]["card_id"])
+        ws_file = Path(root) / "client_ws.json"
+        client_enter = run(
+            root, "client", "enter", "--id", instance_id, "--timeline", timeline_id,
+            "--campaign", campaign_id, "--mode", "player", "--audience", "public_party",
+            "--card", card_id, "--ws-file", str(ws_file),
+        )
+        client_draft = run(
+            root, "client", "act", "--id", instance_id, "--timeline", timeline_id,
+            "--campaign", campaign_id, "--mode", "player", "--audience", "public_party",
+            "--card", card_id, "--ws-file", str(ws_file), "--text", "再摸一次门缝",
+        )
+        client_act = run(
+            root, "client", "act", "--id", instance_id, "--timeline", timeline_id,
+            "--campaign", campaign_id, "--mode", "player", "--audience", "public_party",
+            "--card", card_id, "--ws-file", str(ws_file), "--confirm", "--text", "再摸一次门缝",
+            "--action-fields", json.dumps({"target": "off-1", "intent": "再摸一次门缝", "method": "徒手"},
+                                          ensure_ascii=False),
+        )
+        client_gm = run(
+            root, "client", "enter", "--id", instance_id, "--timeline", timeline_id,
+            "--campaign", campaign_id, "--mode", "gm", "--audience", "gm_only",
+            "--card", card_id, "--ws-file", str(ws_file),
+        )
         print("\n== 读数 ==")
         print("世界时间消耗：", json.dumps({k: consumed["consume"].get(k) for k in
                                        ("consumed_seconds", "state", "processed_world", "cause")}, ensure_ascii=False))
@@ -179,6 +204,15 @@ def main() -> int:
                                         "new_state_revision")}, ensure_ascii=False))
         print("提交：", json.dumps({k: committed.get(k) for k in ("status", "state_revisions", "effects")}, ensure_ascii=False))
         print("规则状态：", json.dumps({k: state.get(k) for k in ("state_revision", "opaque_state")}, ensure_ascii=False))
+        print("客户端：", json.dumps({
+            "gate": client_enter["faces"]["gates"]["violations"],
+            "draft_stage": client_draft.get("stage"),
+            "draft_gaps": client_draft.get("draft", {}).get("gaps"),
+            "act": {"stage": client_act.get("stage"), "commit": client_act.get("commit_status"),
+                    "kind": (client_act.get("result") or {}).get("result", {}).get("kind")},
+            "gm_face": bool((client_gm.get("faces") or {}).get("gm")),
+            "ws_file": ws_file.exists(),
+        }, ensure_ascii=False))
         print("可行动局面：", json.dumps({"recent": view.get("recent"), "rule_state": view.get("rule_state")}, ensure_ascii=False))
         print("迁移后规则状态：", json.dumps({k: state_after.get(k) for k in
                                        ("state_revision", "state_ruleset_version", "opaque_state")}, ensure_ascii=False))
@@ -193,6 +227,10 @@ def main() -> int:
             and state_after.get("state_ruleset_version") == "2.0"
             and (state_after.get("opaque_state") or {}).get("actors", {}).get("pc-1", {}).get("hp") == 2
             and [item["status"] for item in (view.get("recent") or [])] == ["transitioned"]
+            and client_enter["faces"]["gates"]["violations"] == []
+            and client_draft.get("stage") == "draft"
+            and client_act.get("committed") is True
+            and bool((client_gm.get("faces") or {}).get("gm"))
         )
         print("\nPASS" if ok else "\nFAIL")
         return 0 if ok else 1

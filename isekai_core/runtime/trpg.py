@@ -435,6 +435,29 @@ class CampaignRuntime:
         self.store.trpg_upserts({"action": [row]})
         return campaign_mod.action_view(row, audience="gm_only")
 
+    def reject(
+        self, instance_id: str, timeline_id: str, campaign_id: str, action_id: str, *, reason: str = ""
+    ) -> dict[str, Any]:
+        """主持拒绝（TRPG_CLIENT_SPEC §7.1 待审工作区）：把待提交 / 待审的裁定退回。
+
+        裁定载荷原样保留（主持人还要看依据），规则状态与世界一律不写；拒绝原因只回执给调用方，
+        不往规范化载荷里塞额外字段。
+        """
+        row = self._action_row(instance_id, timeline_id, campaign_id, action_id)
+        status = str(row["status"])
+        if "rejected" not in campaign_mod.ACTION_TRANSITIONS.get(status, ()):
+            raise CampaignRuntimeError(f"该行动当前状态不能拒绝：{status}")
+        row = {
+            **row,
+            "status": "rejected",
+            "confirmation": "rejected",
+            "failure_code": "gm_rejected",
+            "updated_world": self._world(instance_id, timeline_id),
+            "updated_real": time.time(),
+        }
+        self.store.trpg_upserts({"action": [row]})
+        return {**campaign_mod.action_view(row, audience="gm_only"), "reason": str(reason or "")}
+
     async def resolve(
         self,
         instance_id: str,
@@ -502,8 +525,16 @@ class CampaignRuntime:
             },
             "context": _loads(row.get("preconditions"), {}),
         }
-        self._set_action_status(row, "snapshotting")
-        self._set_action_status(self._action_row(instance_id, timeline_id, campaign_id, action_id), "resolving")
+        current = str(self._action_row(instance_id, timeline_id, campaign_id, action_id)["status"])
+        if current in ("interrupted", "plugin_failed"):
+            # 显式重试（§C2）：这两个状态只能回到 resolving，不经过 snapshotting
+            self._set_action_status(
+                self._action_row(instance_id, timeline_id, campaign_id, action_id), "resolving"
+            )
+        else:
+            self._set_action_status(row, "snapshotting")
+            self._set_action_status(self._action_row(instance_id, timeline_id, campaign_id, action_id),
+                                    "resolving")
         try:
             session = await self._rule_session(plugin_manifest or str(campaign_row["plugin_manifest"]))
             result = await rules.resolve(

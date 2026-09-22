@@ -126,6 +126,7 @@ OP_BY_COMMAND = {
     ("trpg", "declare"): "trpg.action.declare",
     ("trpg", "confirm"): "trpg.action.confirm",
     ("trpg", "abandon"): "trpg.action.abandon",
+    ("trpg", "reject"): "trpg.action.reject",
     ("trpg", "resolve"): "trpg.action.resolve",
     ("trpg", "commit"): "trpg.commit",
     ("trpg", "gm-change"): "trpg.gm.change",
@@ -133,6 +134,14 @@ OP_BY_COMMAND = {
     ("trpg", "choose"): "trpg.choice.select",
     ("trpg", "rule-state"): "trpg.rule_state.read",
     ("trpg", "recover"): "trpg.recover",
+    # TRPG 客户端层（TRPG_CLIENT_SPEC）：四个产品面 / 行动闭环 / 主持辅助
+    ("client", "enter"): "trpg.client.enter",
+    ("client", "refresh"): "trpg.client.refresh",
+    ("client", "act"): "trpg.client.act",
+    ("client", "choice"): "trpg.client.choice",
+    ("client", "retry"): "trpg.client.retry",
+    ("client", "gm-change"): "trpg.client.gm_change",
+    ("client", "review"): "trpg.client.review",
     ("runtime", "backfill"): "runtime.backfill",
     ("event", "render"): "event.render",
     ("event", "expand"): "event.expand",
@@ -272,6 +281,51 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             })
         if cmd == "choose":
             args.update({"choice_id": ns.choice or "", "selection": ns.selection or ""})
+        return args
+    if group == "client":
+        args: dict[str, Any] = {
+            "instance_id": ns.id, "timeline_id": ns.timeline, "campaign_id": ns.campaign or "",
+            "mode": ns.mode or "player",
+        }
+        if ns.audience:
+            args["audience"] = ns.audience
+        if ns.card:
+            args["character_id"] = ns.card
+        if getattr(ns, "ws_file", None):
+            path = Path(ns.ws_file)
+            if path.exists():
+                # 工作区由客户端持有并传进传出（§4.1）：CLI 把它落在文件里
+                args["workspace"] = json.loads(path.read_text(encoding="utf-8"))
+        if cmd == "act":
+            args.update({"text": ns.text or ns.intent or "", "confirm": bool(ns.confirm),
+                         "action_id": ns.action or "", "abandon": bool(getattr(ns, "abandon", False))})
+            if getattr(ns, "action_fields", None):
+                raw = str(ns.action_fields)
+                args["fields"] = (json.loads(raw) if raw.lstrip().startswith("{")
+                                  else json.loads(Path(raw).read_text(encoding="utf-8")))
+        if cmd == "choice":
+            args.update({"choice_id": ns.choice or "", "selection": ns.selection or ""})
+        if cmd == "retry":
+            args.update({"kind": ns.retry_kind or "", "action_id": ns.action or ""})
+        if cmd in ("act", "choice", "retry", "gm-change", "review") and ns.idempotency:
+            args["idempotency_key"] = ns.idempotency
+        if cmd == "gm-change":
+            form: dict[str, Any] = {
+                "target_ref": ns.ref or ns.actor or "", "kind": ns.kind or "",
+                "audience": ns.audience or "public_party", "reason": ns.reason or ns.note or "",
+                "idempotency_key": ns.idempotency or "",
+            }
+            if getattr(ns, "value", None):
+                raw = str(ns.value)
+                form["value"] = (json.loads(raw) if raw.lstrip().startswith(("{", "[")) else raw)
+            if getattr(ns, "frame", None):
+                form["frame"] = ns.frame
+            if getattr(ns, "op", None):
+                form["op"] = ns.op
+            args["form"] = form
+            args["preview_only"] = bool(getattr(ns, "preview_only", False))
+        if cmd == "review":
+            args.update({"action_id": ns.action or "", "decision": ns.decision or ""})
         return args
     if group == "story":
         args: dict[str, Any] = {}
@@ -545,6 +599,11 @@ async def run(ns: argparse.Namespace) -> int:
             proc.terminate()
             proc.wait(timeout=10)
     persist(ns, result)
+    if ns.group == "client" and getattr(ns, "ws_file", None) and isinstance(result, dict):
+        workspace = result.get("workspace")
+        if isinstance(workspace, dict):
+            Path(ns.ws_file).write_text(json.dumps(workspace, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"工作区已写入 {ns.ws_file}")
     return print_result(result, out=ns.out, hide_candidate=ns.group != "wa")
 
 
@@ -557,7 +616,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "group",
         choices=[
             "package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive", "narrative",
-            "trpg", "plugin", "story", "wa",
+            "trpg", "plugin", "story", "wa", "client",
         ],
     )
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
@@ -633,6 +692,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--accept-losses", dest="accept_losses", action="store_true",
                         help="TRPG：显式接受有信息损失的规则状态转换")
     parser.add_argument("--changes", default=None, help="TRPG：GM 直接变化的 changes（内联 JSON 或文件路径）")
+    parser.add_argument("--mode", default=None, help="客户端：player（缺省）/ gm")
+    parser.add_argument("--ws-file", dest="ws_file", default=None,
+                        help="客户端：工作区文件（§4.1，传进传出，可丢弃）")
+    parser.add_argument("--action-fields", dest="action_fields", default=None,
+                        help="客户端：行动确认卡字段（内联 JSON 或文件）")
+    parser.add_argument("--decision", default=None, help="客户端：待审决定 approve / reject / hold")
+    parser.add_argument("--retry-kind", dest="retry_kind", default=None,
+                        help="客户端：重试类型 resume_submit / retry_resolve / reroll")
+    parser.add_argument("--abandon", action="store_true", help="客户端：放弃指定行动（不调插件、不写世界）")
+    parser.add_argument("--preview-only", dest="preview_only", action="store_true",
+                        help="客户端：GM 直接变化只预览玩家视角，不提交")
+    parser.add_argument("--value", default=None, help="客户端：GM 直接变化的值（内联 JSON 或文本）")
+    parser.add_argument("--frame", default=None, help="客户端：GM 直接变化的事件帧（叙述材料）")
+    parser.add_argument("--op", default=None, help="客户端：GM 直接变化的操作（set / change / reveal / advance）")
     parser.add_argument("--observer", default=None, help="接口：观察者角色标识")
     parser.add_argument("--subject", default=None, help="接口：主体标识")
     parser.add_argument("--query", default=None, help="接口：认知投影 query（内联 JSON）")

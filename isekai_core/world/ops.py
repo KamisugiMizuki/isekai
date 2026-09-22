@@ -130,11 +130,18 @@ SYNC_OPS = frozenset(
         "trpg.action.declare",
         "trpg.action.confirm",
         "trpg.action.abandon",
+        "trpg.action.reject",
         "trpg.choice.select",
         "trpg.rule_state.read",
         "trpg.commit",
         "trpg.gm.change",
         "trpg.recover",
+        # TRPG 客户端层（TRPG_CLIENT_SPEC）：四个产品面 / 行动闭环 / 主持辅助
+        "trpg.client.enter",
+        "trpg.client.refresh",
+        "trpg.client.choice",
+        "trpg.client.gm_change",
+        "trpg.client.review",
         # OC 故事层（OC_STORY_LAYER_SPEC）：产品状态 / 用户可见面 / 版本编排
         "story.enter",
         "story.scene",
@@ -172,6 +179,8 @@ ASYNC_OPS = frozenset(
         "runtime.extract",
         "event.draft",
         "trpg.action.resolve",
+        "trpg.client.act",
+        "trpg.client.retry",
         "trpg.campaign.migrate",
         "world.package.generate",
         "world.package.revise",
@@ -464,6 +473,8 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return _trpg_action_confirm(cfg, store, runtime, args)
         if op == "trpg.action.abandon":
             return _trpg_action_abandon(cfg, store, runtime, args)
+        if op == "trpg.action.reject":
+            return _trpg_action_reject(cfg, store, runtime, args)
         if op == "trpg.choice.select":
             return _trpg_choice_select(cfg, store, runtime, args)
         if op == "trpg.rule_state.read":
@@ -476,6 +487,9 @@ def dispatch(cfg: Config, store: Store, op: str, args: dict[str, Any], runtime: 
             return _iface_op(cfg, store, runtime, op, args)
         if op == "trpg.recover":
             return _trpg_recover(cfg, store, runtime, args)
+        # TRPG 客户端层（TRPG_CLIENT_SPEC）：产品面与主持辅助，语义在 isekai_core/trpg_client/
+        if op in TRPG_CLIENT_SYNC_OPS:
+            return _trpg_client_op(cfg, store, runtime, op, args)
         # OC 故事层（OC_STORY_LAYER_SPEC）：产品状态与版本编排，不写世界事实
         if op in STORY_SYNC_OPS:
             return _story_op(cfg, store, runtime, op, args)
@@ -1214,6 +1228,15 @@ def _trpg_action_abandon(cfg: Config, store: Store, runtime: Any, args: dict[str
     instance_id, timeline_id, campaign_id = _campaign_ref(args)
     return _campaign_call(
         _campaign_service(runtime).abandon,
+        instance_id, timeline_id, campaign_id, str(args.get("action_id") or ""),
+        reason=str(args.get("reason") or args.get("note") or ""),
+    )
+
+
+def _trpg_action_reject(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
+    instance_id, timeline_id, campaign_id = _campaign_ref(args)
+    return _campaign_call(
+        _campaign_service(runtime).reject,
         instance_id, timeline_id, campaign_id, str(args.get("action_id") or ""),
         reason=str(args.get("reason") or args.get("note") or ""),
     )
@@ -1965,6 +1988,117 @@ async def _expand_claim(cfg: Config, llm: Any, store: Store | None, args: dict[s
 
 
 
+# TRPG 客户端层（TRPG_CLIENT_SPEC）：语义在 isekai_core/trpg_client/，
+# 这里只做参数转发与错误码翻译（与 `_story_op` / `_wa_op` 同一分工）。
+TRPG_CLIENT_SYNC_OPS = frozenset(
+    {
+        "trpg.client.enter",
+        "trpg.client.refresh",
+        "trpg.client.choice",
+        "trpg.client.gm_change",
+        "trpg.client.review",
+    }
+)
+
+
+def _trpg_client_service(*, cfg: Config, store: Store, runtime: Any, llm: Any = None) -> Any:
+    """客户端服务：复用挂载中的运行层与战役运行时（同一个库、同一份实例副本）。"""
+    from ..trpg_client.service import TrpgClient
+
+    world = runtime if runtime is not None and hasattr(runtime, "clock_row") else _world_service(cfg, store)
+    return TrpgClient(store=store, cfg=cfg, runtime=world,
+                      campaign=getattr(runtime, "campaign", None), llm=llm)
+
+
+def _workspace_arg(args: dict[str, Any]) -> dict[str, Any]:
+    """工作区（§4.1）：调用方给 `workspace` 就用它，否则从显式作用域字段拼一个。"""
+    from ..trpg_client.service import default_workspace, merge_workspace
+
+    given = args.get("workspace")
+    if isinstance(given, dict):
+        return merge_workspace(given)
+    return default_workspace(
+        mode=str(args.get("mode") or "player"),
+        instance_id=str(args.get("instance_id") or ""),
+        timeline_id=str(args.get("timeline_id") or ""),
+        campaign_id=str(args.get("campaign_id") or ""),
+        audience=str(args.get("audience") or "public_party"),
+        active_character_id=str(args.get("character_id") or ""),
+    )
+
+
+def _client_call(fn: Any, *positional: Any, **kwargs: Any) -> dict[str, Any]:
+    """客户端层与战役运行时的可预期错误都翻成 invalid_input（别落成 internal: TrpgClientError）。"""
+    from ..runtime import campaign as campaign_mod
+    from ..trpg_client.service import TrpgClientError
+
+    try:
+        return fn(*positional, **kwargs)
+    except (campaign_mod.CampaignError, TrpgClientError) as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+
+
+def _trpg_client_op(cfg: Config, store: Store, runtime: Any, op: str, args: dict[str, Any]) -> dict[str, Any]:
+    """客户端同步操作：进入 / 刷新 / 待选择 / GM 直接变化 / 待审工作区（都不调模型）。"""
+    client = _trpg_client_service(cfg=cfg, store=store, runtime=runtime)
+    ws = _workspace_arg(args)
+    if op == "trpg.client.enter":
+        return _client_call(
+            client.enter, instance_id=str(args.get("instance_id") or ""),
+            timeline_id=str(args.get("timeline_id") or ""), campaign_id=str(args.get("campaign_id") or ""),
+            mode=str(args.get("mode") or "player"), audience=str(args.get("audience") or ""),
+            character_id=str(args.get("character_id") or ""), workspace=args.get("workspace"),
+        )
+    if op == "trpg.client.refresh":
+        return _client_call(client.refresh, workspace=ws, mode=str(args.get("mode") or ""))
+    if op == "trpg.client.choice":
+        return _client_call(
+            client.choose, workspace=ws, choice_id=str(args.get("choice_id") or ""),
+            option_id=str(args.get("selection") or args.get("option_id") or ""),
+            idempotency_key=str(args.get("idempotency_key") or ""),
+        )
+    if op == "trpg.client.gm_change":
+        form = args.get("form") if isinstance(args.get("form"), dict) else {}
+        if not form:
+            raise UmpError(Err.INVALID, "GM 直接变化要给 form（变化目标 / 变化类型 / 受众 / 幂等键）",
+                           retryable=False)
+        return _client_call(client.gm_change, workspace=ws, form=form,
+                              preview_only=bool(args.get("preview_only")))
+    if op == "trpg.client.review":
+        return _client_call(
+            client.review, workspace=ws, action_id=str(args.get("action_id") or ""),
+            decision=str(args.get("decision") or ""), reason=str(args.get("reason") or ""),
+            idempotency_key=str(args.get("idempotency_key") or ""),
+        )
+    raise UmpError(Err.UNSUPPORTED_TYPE, f"未知客户端操作 {op}", retryable=False)
+
+
+async def _trpg_client_async(cfg: Config, llm: Any, store: Store, runtime: Any, op: str,
+                             args: dict[str, Any]) -> dict[str, Any]:
+    """客户端异步操作：行动闭环（草稿要调模型）与重试语义。"""
+    from ..runtime import campaign as campaign_mod
+    from ..trpg_client.service import TrpgClientError
+
+    client = _trpg_client_service(cfg=cfg, store=store, runtime=runtime, llm=llm)
+    ws = _workspace_arg(args)
+    try:
+        if op == "trpg.client.act":
+            fields = args.get("fields") if isinstance(args.get("fields"), dict) else None
+            return await client.act(
+                workspace=ws, text=str(args.get("text") or args.get("intent") or ""), fields=fields,
+                confirm=bool(args.get("confirm")), action_id=str(args.get("action_id") or ""),
+                abandon=bool(args.get("abandon")), idempotency_key=str(args.get("idempotency_key") or ""),
+            )
+        if op == "trpg.client.retry":
+            return await client.retry(
+                workspace=ws, kind=str(args.get("kind") or ""), action_id=str(args.get("action_id") or ""),
+                idempotency_key=str(args.get("idempotency_key") or ""),
+            )
+    except (campaign_mod.CampaignError, TrpgClientError) as exc:
+        raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
+    raise UmpError(Err.UNSUPPORTED_TYPE, f"未知客户端操作 {op}", retryable=False)
+
+
 async def dispatch_async(
     cfg: Config,
     llm: Any,
@@ -2031,6 +2165,10 @@ async def dispatch_async(
             return await _resolve_trpg_action(cfg, store, args, runtime=runtime)
         if op == "trpg.campaign.migrate":
             return await _trpg_campaign_migrate(cfg, store, runtime, args)
+        if op in ("trpg.client.act", "trpg.client.retry"):
+            if store is None:
+                raise UmpError(Err.INTERNAL, "本次调用没有绑定数据库", retryable=False)
+            return await _trpg_client_async(cfg, llm, store, runtime, op, args)
         if op == "world.package.generate":
             package, errors, usage = await generate_package(
                 llm,

@@ -614,6 +614,12 @@ created_at / updated_at
 - **零世界后果的提交**（§12.1 `world_changes[]` 可以是空的，2026-09-22）：只有规则状态 patch / 说法 /
   场景转换 / 时间请求，或「明确无变化」的裁定，都能提交落账（`drafts.normalize_draft(require_effects=False)`）——
   事件行记录这次行动本身，效果数为 0；`world_event` 事件帧并进事件正文（叙述材料），**不产生效果**；
+- **主持拒绝**（TRPG_CLIENT_SPEC §7.1 待审工作区，2026-09-22）：`trpg.action.reject`（CLI `trpg reject`）
+  把待提交 / 待审的裁定推成 `rejected`（终态）——裁定载荷原样保留供主持复核，规则状态与世界一律不写；
+  拒绝原因只回执给调用方，不往规范化载荷里塞额外字段；
+- **显式重试裁定**（TRPG_CLIENT_SPEC §C2，2026-09-22）：`interrupted` / `plugin_failed` 的行动重新
+  `trpg.action.resolve` 时**直接进 `resolving`**（不经过 `snapshotting`——那两个状态到不了它），
+  这就是「显式重试」的合法路径，仍然不自动重跑不带用户意图的随机裁定；
 - B0 兼容：不带 `campaign_id` 的 `trpg.action.resolve` 语义不变。
 
 **尚未实现（记为设计义务，不充数）**：
