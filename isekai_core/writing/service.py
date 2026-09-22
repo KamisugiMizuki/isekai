@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import time
 from typing import Any, Iterable
 
@@ -132,11 +133,33 @@ class WritingService:
         observers: Iterable[str] = (),
         chapter: str = "",
     ) -> dict[str, Any]:
-        """把大纲绑到实例 + 时间线（并记观察视角）：条目状态按定义初始化，未开始。"""
+        """把大纲绑到实例 + 时间线（并记观察视角）。
+
+        首次绑定：条目按定义的结构来，状态一律从「未开始」起——模板里写着的达成状态
+        不能随绑定混进进度（§11.1）。已经绑定过就是**改元数据**（观察者 / 章节）：
+        各线的进度原样保留，不清零。
+        """
         definition = self.outline(outline_id)
         self._line(instance_id, timeline_id)
         world, generation = self._world(instance_id, timeline_id)
-        items = [outline_mod.normalize_item({**item, "evaluated_world": world}) for item in definition["items"]]
+        existing = self.store.wa_state_get(instance_id, timeline_id, definition["id"])
+        if existing is not None:
+            saved = self.store.wa_state_put({
+                **existing,
+                "observers": _dumps([str(name) for name in observers]),
+                "chapter": str(chapter or ""),
+            })
+            return {
+                "state": self._state_payload(saved, definition),
+                "updated": True,
+                "note": "只改了观察视角 / 章节：这条线上的进度原样保留",
+            }
+        items = [
+            outline_mod.normalize_item(
+                {**item, "evaluated_world": world, "status": "unstarted", "reason": "", "evidence_refs": []}
+            )
+            for item in definition["items"]
+        ]
         row = self.store.wa_state_put({
             "instance_id": instance_id,
             "timeline_id": timeline_id,
@@ -260,7 +283,9 @@ class WritingService:
         merged = outline_mod.normalize_item({
             **item, "status": status, "reason": str(reason), "evidence_refs": sorted(resolved),
         })
-        if not outline_mod.evidence_ok(merged, refs):
+        if str(status) == "achieved" and not outline_mod.evidence_ok(merged, refs):
+            # 只对「标记达成」施加依据要求（§11.1）：开始 / 偏离 / 放弃不需要世界依据，
+            # 但达成必须带得住——规则成功 ≠ 世界已改。
             raise WritingError("硬约束标记达成需要可追溯的世界依据（事件 / 说法标识）：先提交或给出依据")
         world, generation = self._world(instance_id, timeline_id)
         updated = [merged if entry["id"] == item["id"] else entry for entry in items]
@@ -343,10 +368,27 @@ class WritingService:
             report = self.evaluate(instance_id, timeline_id, outline_id=outline_id)
         except UmpError:
             state, report = None, {"gaps": [], "deviations": [], "evidence": []}
-        opened = [cand.public_candidate(item) for item in
-                  self.store.wa_candidate_list(instance_id, timeline_id, outline_id=outline_id or None)
-                  if str(item.get("status")) in cand.UNCOMMITTED]
-        payload["next_step"] = {"candidates": opened, "gaps": report["gaps"], "deviations": report["deviations"]}
+        rows = self.store.wa_candidate_list(instance_id, timeline_id, outline_id=outline_id or None)
+        opened = [
+            cand.public_candidate(item)
+            for item in rows
+            if str(item.get("status")) in cand.UNCOMMITTED and cand.visible_to(item, mode)
+        ]
+        if mode == "player":
+            # 玩家受众（§5.2 第 1 层 / §11.1）：候选只留「这条建议是什么」，依据与世界变化意图
+            # 都属主持材料；大纲缺口与偏离是作者的编排依据，也一并裁掉——界面不靠隐藏控件挡。
+            payload["next_step"] = {
+                "candidates": [
+                    cand.player_candidate(item)
+                    for item in rows
+                    if str(item.get("status")) in cand.UNCOMMITTED and cand.visible_to(item, "player")
+                ],
+                "gaps": [],
+                "deviations": [],
+                "withheld": ["主持依据", "大纲缺口与偏离", "世界变化意图"],
+            }
+        else:
+            payload["next_step"] = {"candidates": opened, "gaps": report["gaps"], "deviations": report["deviations"]}
         if mode != "player":
             # 主持依据层：默认只给 GM / 作者（§5.2 第 2 层）
             payload["gm_basis"] = {
@@ -423,6 +465,13 @@ class WritingService:
                 reason = "需要确认后才能提交：" + "；".join(
                     str(item.get("reason") or "") for item in (pending or rejected)
                 )
+        existing = self.store.wa_candidate_get(instance_id, timeline_id, str(candidate_id))
+        if existing is not None and str(existing.get("status")) in ("approved", "committed"):
+            # 已采用的产物不许被同名提案覆盖（§11.1）：重新提案要给新标识，旧的照旧在
+            raise WritingError(
+                f"候选 {candidate_id} 已经{'进世界' if str(existing.get('status')) == 'committed' else '被采用'}："
+                "重新提案要用新标识（这条不会被改写）"
+            )
         saved = self.store.wa_candidate_put({
             "instance_id": instance_id, "timeline_id": timeline_id, "id": str(candidate_id),
             "outline_id": str(row["outline_id"]) if row else "", "kind": str(kind),
@@ -454,6 +503,12 @@ class WritingService:
             raise UmpError(Err.NOT_FOUND, f"没有该候选：{candidate_id}", retryable=False)
         if not str(reason or "").strip():
             raise UmpError(Err.INVALID, "候选决定必须给出理由", retryable=False)
+        if str(status) == "committed":
+            # 「已生效」只能由真实提交结果产生（§11.1）：这里说清该走哪条路，不静默放行
+            raise WritingError(
+                "不能靠状态决定把候选标成已生效：世界变化候选走 wa.candidate.commit，"
+                "GM 直接变化走 wa.gm.approve"
+            )
         try:
             cand.transition(str(row["status"]), status)
         except ValueError as exc:
@@ -739,15 +794,27 @@ class WritingService:
             self._settle_suggest(reservation, prompt_text=prompt_text, reply="", outcome="error")
             return {"status": "failed", "candidates": [], "reason": f"{type(exc).__name__}: {exc}"}
         self._settle_suggest(reservation, prompt_text=prompt_text, reply=str(raw or ""))
-        proposals = self._parse_suggestions(raw)
+        proposals, parse_error = self._parse_suggestions(raw)
+        if parse_error:
+            # 「没有建议」和「没拿到可用输出」是两件事（§11.1）：如实说哪一种，
+            # 带上模型原文的短摘要（单行、截断），让人能排错而不是看着空清单猜。
+            excerpt = " ".join(str(raw or "").split())[:160]
+            return {
+                "status": "unparsable",
+                "candidates": [],
+                "reason": f"模型输出没法解析成候选列表：{parse_error}",
+                "raw_excerpt": excerpt,
+            }
         world, generation = self._world(instance_id, timeline_id)
+        # 每次生成独立身份（§11.1）：这一轮的标识带本次批次号，不覆盖上一轮（尤其已采用的）候选
+        batch = secrets.token_hex(3)
         created: list[dict[str, Any]] = []
         for index, item in enumerate(proposals[: max(1, int(limit))]):
             known = {entry["id"] for entry in items}
             ref = str(item.get("outline_ref") or "")
             saved = self.store.wa_candidate_put({
                 "instance_id": instance_id, "timeline_id": timeline_id,
-                "id": f"{prefix}-{index + 1}", "outline_id": str(row["outline_id"]) if row else "",
+                "id": f"{prefix}-{batch}-{index + 1}", "outline_id": str(row["outline_id"]) if row else "",
                 "kind": "scene", "item_refs": _dumps([ref] if ref in known else []),
                 "title": str(item.get("title") or "")[:80], "summary": str(item.get("summary") or ""),
                 "basis": _dumps({"fact": "", "causality": material[:200], "outline": ref}),
@@ -756,6 +823,11 @@ class WritingService:
                 "status": "proposed", "reason": "模型提议，未经创作者选择",
             })
             created.append(cand.public_candidate(saved))
+        if not created:
+            # 解析成功但一条可用候选都没有：这是「没有建议」，不是失败
+            return {"status": "ok", "candidates": [],
+                    "reason": "模型这一轮没有给出可用的候选",
+                    "must_not_imply": "这些提议已经发生或已被采用"}
         return {"status": "ok", "candidates": created,
                 "must_not_imply": "这些提议已经发生或已被采用"}
 
@@ -782,18 +854,28 @@ class WritingService:
             log.exception("wa suggest settle failed")
 
     @staticmethod
-    def _parse_suggestions(raw: Any) -> list[dict[str, Any]]:
-        """解析提议；解析不出来回空清单（调用方如实说没提议，不猜）。"""
-        body = str(raw or "")
+    def _parse_suggestions(raw: Any) -> tuple[list[dict[str, Any]], str]:
+        """解析提议。返回 (候选, 失败原因)。
+
+        失败原因非空 = 「没拿到可用输出」（空回复 / 不是 JSON / 不是那个形状）；
+        原因为空且候选为空 = 「模型这一轮没有建议」。两件事都要如实分开报（§11.1）。
+        """
+        body = str(raw or "").strip()
+        if not body:
+            return [], "模型返回了空内容"
         start, end = body.find("{"), body.rfind("}")
         if start < 0 or end <= start:
-            return []
+            return [], "输出里没有 JSON 对象"
         try:
             payload = json.loads(body[start : end + 1])
         except json.JSONDecodeError:
-            return []
-        items = payload.get("candidates") if isinstance(payload, dict) else None
-        return [item for item in items or [] if isinstance(item, dict)]
+            return [], "JSON 解析失败"
+        if not isinstance(payload, dict) or "candidates" not in payload:
+            return [], "JSON 里没有 candidates 字段"
+        items = payload.get("candidates")
+        if not isinstance(items, list):
+            return [], "candidates 不是列表"
+        return [item for item in items if isinstance(item, dict)], ""
 
     # ---------------------------------------------------------------- 工具
 

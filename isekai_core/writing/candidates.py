@@ -31,7 +31,9 @@ STATES: tuple[str, ...] = ("proposed", "selected", "approved", "committed", "rej
 TRANSITIONS: dict[str, tuple[str, ...]] = {
     "proposed": ("selected", "approved", "rejected", "deferred", "stale"),
     "selected": ("approved", "rejected", "deferred", "stale"),
-    "approved": ("committed", "stale"),          # 批准 ≠ 已提交：还能过期
+    # 批准 ≠ 已提交：还能过期。「committed」不在这张表里——它只能由真实提交结果写入
+    # （wa.candidate.commit / wa.gm.approve），普通状态决定不许把候选标成已生效（§11.1）。
+    "approved": ("stale",),
     "deferred": ("selected", "approved", "rejected", "stale"),
     "committed": (),
     "rejected": (),
@@ -99,7 +101,39 @@ def public_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "uncommitted": state in UNCOMMITTED,
         "must_not_imply": MUST_NOT_IMPLY.get(state, ""),
         "has_world_change": bool(item["changes"] or item["gm_changes"]),
+        # 「已生效」必须带得住提交依据（§11.1）：状态是 committed 还不够，
+        # 得能指出是哪一次提交（提交标识 / 联合提交标识），界面只按这个显示
+        "effective": state == "committed" and bool(item["joint_commit_id"]),
+        "effective_basis": item["joint_commit_id"] if state == "committed" else "",
     }
+
+
+def player_candidate(row: dict[str, Any]) -> dict[str, Any]:
+    """玩家受众能看的候选面（§5.2 第 1 层 / §11.1 受众隔离）。
+
+    只给「这条建议是什么」与状态；不带依据（事实 / 因果 / 大纲三条都属于主持材料）、
+    不带世界变化意图、不带内部条目引用。
+    """
+    item = normalize_candidate(row)
+    return {
+        "id": item["id"],
+        "kind": item["kind"],
+        "title": item["title"],
+        "summary": item["summary"],
+        "status": item["status"],
+        "uncommitted": item["status"] in UNCOMMITTED,
+        "text": item["text"],
+        "audience": item["audience"],
+        "must_not_imply": MUST_NOT_IMPLY.get(item["status"], ""),
+    }
+
+
+def visible_to(row: dict[str, Any], audience: str) -> bool:
+    """这条候选能不能出现在该受众的观察结果里（默认只给作者 / GM）。"""
+    mode = str(audience or "author")
+    if mode != "player":
+        return True
+    return str(row.get("audience") or "author") == "player"
 
 
 def is_text(row: dict[str, Any]) -> bool:
