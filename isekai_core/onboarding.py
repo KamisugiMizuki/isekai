@@ -364,10 +364,20 @@ def _error_facts(exc: LLMError) -> dict[str, Any]:
     match = re.match(r"HTTP (\d{3})", str(exc.message or ""))
     if match:
         status = int(match.group(1))
-    if status in (401, 403):
-        reason = f"服务拒绝了这次访问（HTTP {status}）：通常是访问密钥无效或权限不足。"
+    if status == 401:
+        reason = (
+            "服务没通过这把访问密钥（HTTP 401）：核对填进去的密钥是不是完整可用的那一串——"
+            "有没有带引号或空格、是不是复制自平台的打码显示、末尾有没有被截断。"
+        )
+    elif status == 403:
+        reason = f"服务拒绝了这次访问（HTTP 403）：密钥有效但权限不足，或该账号 / 地区被服务方限制。"
     elif status == 404:
         reason = "服务没有找到这个地址或模型（HTTP 404）：检查服务地址与模型名称。"
+    elif status in (400, 422):
+        reason = (
+            f"服务不接受这次请求（HTTP {status}）：多半是模型名或高级参数的问题——"
+            "检查模型名称与服务提供方一致、高级参数（输出长度 / 随机程度）在允许范围内。"
+        )
     elif status == 429:
         reason = "服务暂时不接受请求（HTTP 429）：稍后再试，或检查该服务的用量与额度。"
     elif status is not None and status >= 500:
@@ -542,11 +552,14 @@ async def test_llm(
         "note": "测试只发送两段固定测试文字，不发送你的世界与聊天内容；通过不代表任意篇幅的生成都会成功。",
     }
     log.info(
-        "llm test status=%s calls=%s model=%s duration_ms=%s",
+        "llm test status=%s calls=%s model=%s duration_ms=%s code=%s status_code=%s reason=%s",
         status,
         calls,
         probe_cfg.model,
         duration_ms,
+        result.get("code"),
+        result.get("status_code"),
+        result.get("reason"),
     )
     return result
 

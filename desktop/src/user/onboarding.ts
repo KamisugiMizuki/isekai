@@ -243,7 +243,9 @@ export class OnboardingPane implements Pane {
           el(
             "p",
             { class: "u-hint" },
-            `服务 ${String(result.service ?? "")}｜模型 ${String(result.model ?? "")}｜用时 ${String(result.duration_ms ?? 0)} 毫秒｜调用 ${String(result.calls ?? 0)} 次（上限 ${String(result.call_budget ?? 4)}）`,
+            `服务 ${String(result.service ?? "")}｜模型 ${String(result.model ?? "")}`
+              + (result.key_set ? `｜密钥 ${String(result.api_key_masked ?? "")}` : "")
+              + `｜用时 ${String(result.duration_ms ?? 0)} 毫秒｜调用 ${String(result.calls ?? 0)} 次（上限 ${String(result.call_budget ?? 4)}）`,
           ),
         );
         if (result.ok) {
