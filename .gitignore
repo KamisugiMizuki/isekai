@@ -9,6 +9,7 @@ data/
 exports/
 packages/
 logs/
+backups/
 config/*
 !config/README.md
 !config/config.example.yaml
