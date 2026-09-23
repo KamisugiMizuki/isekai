@@ -83,7 +83,8 @@ async def main() -> None:
             problems.append("界面没有连上核心（发行件里的自带解释器可能没起来）")
 
         # 数据根：程序目录只放程序，数据在用户目录
-        for name in ("data/isekai.db", "examples/sample_world", "logs/shell.log", "config"):
+        # config/ 是首次写入设置时才建的：这里只查首次运行就该有的东西
+        for name in ("data/isekai.db", "examples/sample_world", "logs/shell.log"):
             target = data_root / name
             if not target.exists():
                 problems.append(f"数据根里缺 {name}")
@@ -98,15 +99,17 @@ async def main() -> None:
         steps: list[str] = []
         await click_text(cdp, "nav.u-nav button", "世界与素材")
         await asyncio.sleep(1.5)
-        before = await cdp.js("document.querySelector('#u-main').innerText.slice(0,80)")
+        before = await cdp.js("(()=>{const n=document.querySelector('#u-main');return n?(n.innerText||'').slice(0,80):'';})()")
         steps.append(f"世界与素材：{before}")
         clicked = await click_text(cdp, "#u-main button", "从样例开始")
         steps.append(f"点「从样例开始」：{clicked}")
         await asyncio.sleep(2.0)
-        after = await cdp.js("document.querySelector('#u-main').innerText.slice(0,120)")
+        after = await cdp.js("(()=>{const n=document.querySelector('#u-main');return n?(n.innerText||''):'';})()")
         steps.append(f"之后：{after}")
-        if "样例" not in str(after):
-            problems.append("点了「从样例开始」但页面没有进到样例流程")
+        route = str(await cdp.js("JSON.stringify(window.__uiApp.probeState.route)"))
+        steps.append(f"route：{route}")
+        if "onboarding" not in route:
+            problems.append(f"点了「从样例开始」但没进首次设置流程（route={route}｜页面：{str(after)[:80]}）")
         print("\n".join(steps), flush=True)
     finally:
         try:

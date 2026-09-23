@@ -73,6 +73,9 @@ export class TrpgPane implements Pane {
   private bundle: Json | null = null;
   private actionText = "";
   private actionId = "";
+  private actorId = "";
+  private targetText = "";
+  private methodText = "";
   private lastResults: Json | null = null;
 
   // 新建战役的表单
@@ -713,7 +716,21 @@ export class TrpgPane implements Pane {
     const actor = el("select", { class: "u-input", id: "u-trpg-actor" }) as HTMLSelectElement;
     const actorOptions = this.actorOptions.length ? this.actorOptions : [this.characterId].filter(Boolean);
     for (const id of actorOptions) actor.appendChild(el("option", { value: id, text: id }));
-    if (this.characterId && actorOptions.includes(this.characterId)) actor.value = this.characterId;
+    const preActor = this.actorId || this.characterId;
+    if (preActor && actorOptions.includes(preActor)) actor.value = preActor;
+    actor.addEventListener("change", () => {
+      this.actorId = actor.value;
+    });
+    const targetInput = el("input", { class: "u-input", id: "u-trpg-target", placeholder: "已知对象（可留空）" }) as HTMLInputElement;
+    targetInput.value = this.targetText;
+    targetInput.addEventListener("input", () => {
+      this.targetText = targetInput.value;
+    });
+    const methodInput = el("input", { class: "u-input", id: "u-trpg-method", placeholder: "怎么做（可留空）" }) as HTMLInputElement;
+    methodInput.value = this.methodText;
+    methodInput.addEventListener("input", () => {
+      this.methodText = methodInput.value;
+    });
     host.appendChild(
       section(
         "我想……",
@@ -728,8 +745,8 @@ export class TrpgPane implements Pane {
           "div",
           { class: "u-row u-row-wrap" },
           field("行动者", actor),
-          field("目标", el("input", { class: "u-input", id: "u-trpg-target", placeholder: "已知对象（可留空）" }) as HTMLInputElement),
-          field("方法", el("input", { class: "u-input", id: "u-trpg-method", placeholder: "怎么做（可留空）" }) as HTMLInputElement),
+          field("目标", targetInput),
+          field("方法", methodInput),
         ),
         paragraph("行动者与目标取自当前局面；补充信息只填空项，你写过的不会被静默替换。", "u-hint"),
         el(
@@ -738,10 +755,47 @@ export class TrpgPane implements Pane {
           primary("查看行动确认卡", () => void this.declareAction(false)),
           button("确认并裁定", () => void this.declareAction(true)),
         ),
+        this.draftCard(),
       ),
     );
     this.renderActions(host, bundle ?? {});
     if (this.mode === "gm") this.renderGm(host, faces);
+  }
+
+  /** 行动确认卡（§8.2/§8.3）：行动者 / 目标 / 方法 / 已知代价 / 缺什么，缺了就不给确认。 */
+  private draftCard(): HTMLElement {
+    const draft = ((this.bundle?.draft as Json) ?? null) as Json | null;
+    if (!draft) {
+      return section(
+        "行动确认卡",
+        paragraph("还没有草稿：写下行动、填上行动者与目标，点「查看行动确认卡」。", "u-hint"),
+      );
+    }
+    const fields = ((draft.fields as Json) ?? {}) as Json;
+    const sources = ((draft.sources as Json) ?? {}) as Json;
+    const gaps = ((draft.gaps as string[]) ?? []).map((item) => String(item));
+    const risks = ((draft.risks as string[]) ?? []).map((item) => String(item));
+    const sourceText = (key: string): string => {
+      const where = String(sources[key] ?? "");
+      return where === "user" ? "你填的" : where === "model" ? "由 AI 补的" : where === "uncertain" ? "待你确认" : "";
+    };
+    return section(
+      "行动确认卡",
+      facts([
+        ["行动者", `${String(fields.actor ?? "") || "（未定）"}${sourceText("actor") ? `｜${sourceText("actor")}` : ""}`],
+        ["目标", `${String(fields.target ?? "") || "（未定）"}${sourceText("target") ? `｜${sourceText("target")}` : ""}`],
+        ["方法", `${String(fields.method ?? "") || "（未定）"}${sourceText("method") ? `｜${sourceText("method")}` : ""}`],
+        ["打算", String(fields.intent ?? "") || "（未定）"],
+        ["已知代价", risks.length ? "由规则裁定（没有真实裁定就不给估计）" : "（未列出）"],
+      ]),
+      gaps.length
+        ? bulletList(gaps.map((item) => `缺：${item}`), "u-list")
+        : paragraph("确认卡齐了：可以点「确认并裁定」。", "u-hint"),
+      paragraph(
+        String(this.bundle?.blocked ?? "") || "没有真实裁定之前，这里不会出现骰点或成功字样，也不会提前写成世界已经改变。",
+        "u-hint",
+      ),
+    );
   }
 
   private renderChoice(choice: Json): HTMLElement {
@@ -787,13 +841,25 @@ export class TrpgPane implements Pane {
     }
     setNote(this.note, confirm ? "正在确认并裁定…" : "正在整理行动确认卡…", "pending");
     try {
-      const actorId = String((this.host?.querySelector("#u-trpg-actor") as HTMLSelectElement | null)?.value ?? "");
-      const target = String((this.host?.querySelector("#u-trpg-target") as HTMLInputElement | null)?.value ?? "").trim();
-      const method = String((this.host?.querySelector("#u-trpg-method") as HTMLInputElement | null)?.value ?? "").trim();
+      const actorId = String(
+        (this.host?.querySelector("#u-trpg-actor") as HTMLSelectElement | null)?.value ?? this.actorId,
+      );
+      const target = String(
+        (this.host?.querySelector("#u-trpg-target") as HTMLInputElement | null)?.value ?? this.targetText,
+      ).trim();
+      const method = String(
+        (this.host?.querySelector("#u-trpg-method") as HTMLInputElement | null)?.value ?? this.methodText,
+      ).trim();
+      this.actorId = actorId || this.actorId;
+      this.targetText = target;
+      this.methodText = method;
+      // 确认卡的字段名是 actor / target / method / intent（draft.CARD_FIELDS），
+      // 缺 target 与 intent 就打不开卡——别拿行动 op 的 actor_id / target_refs 去顶
       const fields: Json = {};
-      if (actorId) fields.actor_id = actorId;
-      if (target) fields.target_refs = [target];
+      if (actorId) fields.actor = actorId;
+      if (target) fields.target = target;
       if (method) fields.method = method;
+      if (text) fields.intent = text;
       const result = await this.ctx.api.trpgClient("act", {
         instance_id: this.instanceId, timeline_id: this.timelineId, campaign_id: this.campaignId,
         mode: this.mode, workspace: this.workspace, text, confirm,

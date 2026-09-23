@@ -227,14 +227,22 @@ async def main() -> None:
         )
         print("· 诊断:", diag, flush=True)
         await click_text(cdp, "#u-main button", "开始战役")
-        started = await wait_true(
-            cdp,
-            "document.querySelector('#u-main').innerText.includes('视角') or document.querySelector('#u-main').innerText.includes('当前场景')",
-            timeout=300,
-        )
+        # 记时读数：既等回执也等局面页，卡在哪一步看得见（别再拿「失败」当结论）
+        began = time.time()
+        started = False
+        trace: list[str] = []
+        while time.time() - began < 300:
+            note = str(await cdp.js("(()=>{const n=document.querySelector('#u-main .u-note');return n?(n.innerText||'').slice(0,80):'';})()") or "")
+            page = str(await cdp.js("(()=>{const n=document.querySelector('#u-main');return n?(n.innerText||''):'';})()") or "")
+            if "当前场景" in page:
+                started = True
+                break
+            if len(trace) < 6:
+                trace.append(f"{int(time.time() - began)}s:{note[:40]}")
+            await asyncio.sleep(2.0)
         if not started:
             note_text = await cdp.js("(()=>{const n=document.querySelector('#u-main .u-note');return n?(n.innerText||'').slice(0,160):'';})()")
-            problems.append(f"开始战役之后没有进到进行中页面：note={note_text}｜页面尾：{(await visible_text(cdp))[-160:]}")
+            problems.append(f"开始战役之后没有进到进行中页面：note={note_text}｜轨迹={trace}｜页面尾：{(await visible_text(cdp))[-160:]}")
         state = inspect(root)
         if not state["campaigns"] or state["campaigns"][0]["name"] != CAMPAIGN_NAME:
             problems.append(f"库里没有这次战役 / 名称没落库：{state['campaigns']}")
@@ -265,7 +273,19 @@ async def main() -> None:
         await click_text(cdp, "#u-main button", "查看行动确认卡")
         carded = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('行动确认卡已就绪')", timeout=120)
         if not carded:
-            problems.append(f"没有拿到行动确认卡：{(await visible_text(cdp))[-200:]}")
+            card_text = await cdp.js(
+                "(()=>{const s=[...document.querySelectorAll('.u-section')].find(x=>(x.textContent||'').includes('行动确认卡'));"
+                "return s?(s.innerText||'').slice(0,240):'（没有确认卡分区）';})()"
+            )
+            problems.append(f"没有拿到行动确认卡：卡面={card_text}")
+        # 页面会重画，行动表单要重新填一遍（人也会这么干）
+        await set_value(cdp, "#u-trpg-intent", INTENT)
+        await set_value(cdp, "#u-trpg-target", "rl-1")
+        await set_value(cdp, "#u-trpg-method", "沿堤顶走过去，看水深")
+        await cdp.js(
+            "(()=>{const s=document.querySelector('#u-trpg-actor');if(!s||!s.options.length){return false;}"
+            "s.value=s.options[0].value;s.dispatchEvent(new Event('change',{bubbles:true}));return s.value;})()"
+        )
         await click_text(cdp, "#u-main button", "确认并裁定")
         resolved = await wait_true(
             cdp,
@@ -285,7 +305,11 @@ async def main() -> None:
 
         # ---------------- 5) 主持面 ----------------
         await click_text(cdp, "#u-main button", "主持准备")
-        gm = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('主持准备')", timeout=60)
+        gm = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('视角：主持')", timeout=90)
+        if not gm:
+            # 第一次切换撞上核心忙段时再点一次（用户也会这么干）
+            await click_text(cdp, "#u-main button", "主持准备")
+            gm = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('视角：主持')", timeout=90)
         gm_text = await visible_text(cdp)
         for need in ("待处理行动", "直接变化", "场景准备", "暂停战役"):
             if need not in gm_text:
