@@ -170,3 +170,19 @@ def test_list_reports_status_and_reuses_verification(tmp_path) -> None:
     assert listed["isekai-manual-19700101-000000.zip"]["status"] == "broken"
     assert again["checked_at"] == cached, "同一份文件第二次列表不该重算摘要"
     assert sqlite3.sqlite_version  # 真 SQLite 参与（连接可用）
+
+
+def test_shutdown_saved_flag_matches_a_real_pack(tmp_path, monkeypatch) -> None:
+    """退出握手的判据是 `saved.ok`（界面读它决定显示成功还是「未通过完整性校验」）。
+
+    失败时界面要能显示真实原因，成功时不能报成失败：ok 必须与包的真实完整性一致。
+    """
+    from isekai_core.world import ops as world_ops
+
+    world = _world(tmp_path, "退出世界")
+    monkeypatch.setattr(world_ops, "_request_exit", lambda *args, **kwargs: None)
+    result = world_ops.dispatch(world["cfg"], world["store"], "app.shutdown", {})
+
+    saved = result["saved"]
+    assert saved["ok"] is True
+    assert backup_pack.verify_pack(Path(saved["path"]))["complete"], "报成功就得是真完整的包"

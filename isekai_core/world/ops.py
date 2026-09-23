@@ -2499,6 +2499,9 @@ def _pack_create(cfg: Any, store: Any, *, kind: str, note: str) -> dict[str, Any
         record["rotated"] = backup_pack.rotate(
             cfg, keep=int(getattr(getattr(cfg, "backup", None), "keep", 7) or 7)
         )
+    # 界面读法有两代：退出握手与旧管理页读 `ok`（备份失败时它们要能显示真实原因），
+    # 备份列表与校验报告读 `complete`。走到这里就是快照过了完整性检查、包已原子发布，两者同真。
+    record["ok"] = bool(record.get("complete"))
     return record
 
 
