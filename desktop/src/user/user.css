@@ -31,7 +31,7 @@ html[data-theme="dark"] {
   --u-sunken: #1f1f1f;
   --u-border: #f2f2f2;
   --u-border-soft: #3a3a3a;
-  --u-border-control: #787878;
+  --u-border-control: #a0a0a0;
   /* 状态色各主题分别取值、分别实测（沿用浅色值在深色底上只有 2.0–3.2:1） */
   --u-ok: #5fbf8a;
   --u-bad: #ef8f8f;
@@ -47,7 +47,7 @@ html[data-theme="dark"] {
     --u-sunken: #1f1f1f;
     --u-border: #f2f2f2;
     --u-border-soft: #3a3a3a;
-    --u-border-control: #787878;
+    --u-border-control: #a0a0a0;
     --u-ok: #5fbf8a;
     --u-bad: #ef8f8f;
     --u-warn: #d9a54a;

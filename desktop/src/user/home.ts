@@ -18,9 +18,9 @@ interface Recent {
 }
 
 const TASKS: Array<{ pane: "contact" | "writing" | "trpg"; title: string; body: string }> = [
-  { pane: "contact", title: "与角色联络", body: "选一个世界和角色，和生活在其中的人对话。" },
-  { pane: "writing", title: "辅助写作", body: "整理大纲，观察角色能知道的事，比较下一步方案并保存文字草稿。" },
-  { pane: "trpg", title: "进行跑团", body: "选规则与角色，声明行动，确认后得到裁定与后果。" },
+  { pane: "contact", title: "💬 与角色联络", body: "选一个角色,和她对话" },
+  { pane: "writing", title: "✍️ 辅助写作", body: "整理大纲,保存文字草稿" },
+  { pane: "trpg", title: "🎲 进行跑团", body: "声明行动,得到裁定" },
 ];
 
 export class HomePane implements Pane {
@@ -42,13 +42,13 @@ export class HomePane implements Pane {
     if (!ai.configured) {
       page.appendChild(
         section(
-          "先连接 AI",
-          paragraph("这个程序本身不做生成：它调用你配置的 AI 服务。密钥只保存在本机。"),
+          "第一步:连接 AI",
+          paragraph("这个程序调用你提供的 AI 服务。密钥只保存在本机。"),
           el(
             "div",
             { class: "u-row" },
-            primary("连接 AI", () => this.ctx.navigate({ pane: "settings", sub: "ai" })),
-            button("先整理素材（稍后配置）", () => this.ctx.navigate({ pane: "worlds" })),
+            primary("现在配置", () => this.ctx.navigate({ pane: "settings", sub: "ai" })),
+            button("先看看样例,稍后再配置", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
           ),
         ),
       );
@@ -58,7 +58,7 @@ export class HomePane implements Pane {
       page.appendChild(
         section(
           "推荐下一步",
-          paragraph("用随程序附带的样例世界走一遍：选一位角色，创建一次就能开始联络。"),
+          paragraph("用随程序附带的样例世界走一遍。选一位角色,创建后就能开始联络。"),
           el(
             "div",
             { class: "u-row" },
@@ -119,16 +119,12 @@ export class HomePane implements Pane {
       );
     }
 
-    const checks = ((readiness.checks as Json[]) ?? []).map(
-      (item) => `${String(item.label)}：${item.ok ? "通过" : String(item.detail ?? "需要处理")}`,
-    );
     page.appendChild(
       section(
         "本机状态",
         facts([
-          ["世界", `${Number(firstRun.instances ?? 0)} 个实例 / ${Number(firstRun.packages ?? 0)} 份世界设定`],
-          ["AI 服务", ai.configured ? `${String(ai.model)} @ ${String(ai.base_url)}` : "还没有可用的配置"],
-          ["检查", checks.join("；") || "还没检查"],
+          ["世界", `${Number(firstRun.instances ?? 0)} 个实例 / ${Number(firstRun.packages ?? 0)} 份设定`],
+          ["AI 服务", ai.configured ? `${String(ai.model)}` : "还没有配置"],
         ]),
         el(
           "div",

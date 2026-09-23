@@ -92,26 +92,40 @@ export class SettingsPane implements Pane {
     };
 
     const test = async (): Promise<void> => {
-      setNote(note, "正在测试：检查地址 / 验证访问 / 检查回复格式…", "pending");
+      setNote(note, "正在测试...", "pending");
       fill(results);
+      const progress = el("div", { class: "u-progress" });
+      results.appendChild(progress);
+      
+      const addStep = (label: string, ok: boolean | null) => {
+        const icon = ok === null ? "⏳" : ok ? "✓" : "✗";
+        const line = el("p", { text: `${icon} ${label}` });
+        progress.appendChild(line);
+      };
+      
+      addStep("检查地址", null);
       try {
         const result = await this.ctx.api.testAi(payload());
         const checks = (result.checks as Json[]) ?? [];
+        fill(progress);
         results.appendChild(
           facts(
-            checks.map((item) => [String(item.label), `${item.ok ? "通过" : "未通过"}：${String(item.detail ?? "")}`]),
+            checks.map((item) => [String(item.label), `${item.ok ? "✓ 通过" : "✗ 未通过"}：${String(item.detail ?? "")}`]),
           ),
         );
         if (result.ok) {
           await save(true);
           return;
         }
-        setNote(note, String(result.reason || "这次测试没有成功"), "bad");
+        setNote(note, String(result.reason || "测试未通过"), "bad");
+        results.appendChild(
+          paragraph("你可以："),
+        );
         results.appendChild(
           el(
             "div",
             { class: "u-row" },
-            button("重新测试连接", () => void test()),
+            primary("重新测试连接", () => void test()),
             button("保存未验证配置", () => void save(false)),
           ),
         );
@@ -132,14 +146,14 @@ export class SettingsPane implements Pane {
 
     return section(
       "AI 服务",
-      paragraph("凭据只保存在本机配置文件，读取时打码；修改不会重写已有内容。"),
+      paragraph("凭据只保存在本机,读取时打码。测试只发送简短测试文字。"),
       field("服务地址", baseUrl, "接口地址，不是聊天网页网址"),
       field("模型", model),
       field("访问密钥", key),
       el(
         "details",
         { class: "u-advanced" },
-        el("summary", { text: "高级输出参数" }),
+        el("summary", { text: "高级参数（通常不需要调整）" }),
         field("等待时间（秒）", timeout),
         field("单次输出长度（token）", maxTokens),
         field("生成随机程度（0–2）", temperature),

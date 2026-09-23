@@ -1,0 +1,122 @@
+/* 方案 B 专注模式样式。
+ *
+ * 注意：user.css 由 src/user/main.ts 引入（构建后排在 index.html 的 <link> 之后加载），
+ * 同特异性的规则它一定赢——这里一律用「双类」选择器（.u-x.u-x-focused）。
+ * 写成单类会被 user.css 的两列 grid / 竖排标题压回去（这是第一版布局崩坏的原因）。
+ */
+
+/* 删掉左侧边栏后，内容区占满全宽（user.css 的 .u-frame 是 220px + 1fr 两列 grid） */
+.u-frame.u-frame-focused {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.u-content.u-content-focused {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+}
+
+.u-main.u-main-focused {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* 顶栏:固定高度 56px（user.css 的 .u-topbar 靠 padding 撑高、还带 flex-wrap） */
+.u-topbar.u-topbar-focused {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 56px;
+  min-height: 56px;
+  padding: 0 24px;
+  border-bottom: 1px solid #e0e0e0;
+  background: white;
+  flex-wrap: nowrap;
+}
+
+/* 标题区横排：[返回] 图标 + 页名（user.css 的 .u-title 是竖排的旧「标题 + 面包屑」） */
+.u-topbar-focused .u-title {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+}
+
+/* 返回按钮只有 emoji，不要 user.css 的 .u-btn 边框 */
+.u-btn.u-btn-back {
+  font-size: 24px;
+  padding: 8px 12px;
+  min-width: auto;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.u-btn.u-btn-back:hover {
+  background: #f5f5f5;
+  border-radius: 4px;
+}
+
+/* 更多按钮 */
+#u-more-btn {
+  font-size: 20px;
+  font-weight: bold;
+  padding: 4px 12px;
+}
+
+/* 更多菜单浮层 */
+.u-more-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
+  padding-top: 56px;
+  padding-right: 24px;
+}
+
+.u-more-menu {
+  background: var(--u-surface);
+  border: 1px solid var(--u-border);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  min-width: 180px;
+}
+
+.u-more-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+.u-more-menu-item:hover,
+.u-more-menu-item:focus {
+  background: var(--u-sunken);
+  outline: none;
+}
+
+/* 深色模式 */
+@media (prefers-color-scheme: dark) {
+  .u-topbar.u-topbar-focused {
+    background: #1e1e1e;
+    border-bottom-color: #444;
+  }
+
+  .u-btn.u-btn-back:hover {
+    background: #2a2a2a;
+  }
+}

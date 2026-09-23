@@ -1,6 +1,7 @@
 /* 正式界面入口：先建外壳，再按核心状态决定是启动页还是工作区。 */
 
 import "./user.css";
+import "./style-accessibility.css";   // 可访问性增强（此前没接线：没有 link 也没有 import，整份规则是空转）
 import { App } from "./app";
 
 const root = document.getElementById("user-root");

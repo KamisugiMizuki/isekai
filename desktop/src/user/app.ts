@@ -20,6 +20,7 @@ import { SettingsPane } from "./settings";
 import { WorldsPane } from "./worlds";
 import { TrpgPane } from "./trpg";
 import { WritingPane } from "./writing";
+import { Launcher } from "./launcher";
 
 export type PaneId = "home" | "contact" | "writing" | "trpg" | "worlds" | "settings" | "help" | "onboarding" | "create";
 
@@ -63,19 +64,6 @@ interface CoreStatus {
   data_format?: string | null;
   rules?: string | null;
 }
-
-const NAV: Array<{ id: PaneId; label: string }> = [
-  { id: "home", label: "首页" },
-  { id: "contact", label: "角色联络" },
-  { id: "writing", label: "辅助写作" },
-  { id: "trpg", label: "跑团" },
-  { id: "worlds", label: "世界与素材" },
-];
-
-const NAV_FOOT: Array<{ id: PaneId; label: string }> = [
-  { id: "settings", label: "设置" },
-  { id: "help", label: "帮助与诊断" },
-];
 
 const PREF_KEYS = {
   onboard: "onboard.done",
@@ -229,65 +217,88 @@ export class App {
     }, 1500);
     this.status = await this.waitForCore();
     await this.onCoreStatus();
+    
+    // ponytail: 原型启动选择器，只在首次（还没完成首次设置）或没选过应用时显示
+    if (!this.prefs.app_mode || !this.prefs[PREF_KEYS.onboard]) {
+      const launcher = new Launcher(this.context());
+      launcher.show();
+    }
   }
 
   private build(): void {
     clear(this.root);
     this.root.className = "u-app";
-    const brand = el("div", { class: "u-brand", text: "isekai" });
-    const nav = el("nav", { class: "u-nav", "aria-label": "主导航" });
-    const mainList = el("ul", { class: "u-nav-list" });
-    for (const item of NAV) mainList.appendChild(this.navItem(item.id, item.label));
-    const footList = el("ul", { class: "u-nav-list" });
-    for (const item of NAV_FOOT) footList.appendChild(this.navItem(item.id, item.label));
-    nav.appendChild(mainList);
-    nav.appendChild(footList);
-    this.navHost = nav;
-    const side = el("aside", { class: "u-side" }, brand, nav);
+    // ponytail: 方案 B 删除左侧导航栏和 brand,顶部添加返回启动器按钮
+    this.navHost = el("div", { hidden: true }); // 保留引用避免其他代码崩溃
 
-    this.topHost = el("header", { class: "u-topbar" });
+    this.topHost = el("header", { class: "u-topbar u-topbar-focused" });
     this.bannerHost = el("div", { class: "u-banner hidden", role: "status", "aria-live": "polite" });
-    this.mainHost = el("main", { class: "u-main", id: "u-main" });
+    this.mainHost = el("main", { class: "u-main u-main-focused", id: "u-main" });
     this.toastHost = el("div", { class: "u-toasts", role: "status", "aria-live": "polite" });
-    const content = el("section", { class: "u-content" }, this.topHost, this.bannerHost, this.mainHost);
-    this.root.appendChild(el("div", { class: "u-frame" }, side, content, this.toastHost));
-  }
-
-  private navItem(id: PaneId, label: string): HTMLLIElement {
-    const item = el("li", {});
-    const node = button(label, () => this.navigate({ pane: id }), { class: "u-nav-btn" });
-    node.dataset.pane = id;
-    item.appendChild(node);
-    return item;
+    const content = el("section", { class: "u-content u-content-focused" }, this.topHost, this.bannerHost, this.mainHost);
+    this.root.appendChild(el("div", { class: "u-frame u-frame-focused" }, content, this.toastHost));
   }
 
   /* ---------------------------------------------------------------- 顶栏 / 条幅 */
 
   private renderTop(): void {
-    const title = this.current ? paneTitle(this.route.pane) : "首页";
-    const select = this.apiRef ? this.selectionLabel() : "";
+    const title = this.current ? paneTitle(this.route.pane) : "";
+    const mode = String(this.prefs.app_mode ?? "chat");
+    const modeIcon = mode === "chat" ? "💬" : mode === "writer" ? "✍️" : "🎲";
+    
+    // ponytail: 专注模式顶栏 = [≡] 返回启动器 + 任务名 + 状态 + [⋯] 更多菜单
+    const backBtn = button(`${modeIcon}`, () => {
+      new Launcher(this.context()).show();
+    }, { class: "u-btn u-btn-back", title: "返回选择应用" });
+    backBtn.setAttribute("aria-label", "返回选择应用");
+    
+    const moreBtn = button("⋯", () => this.showMoreMenu(), { class: "u-btn u-ghost", id: "u-more-btn", title: "更多选项" });
+    moreBtn.setAttribute("aria-label", "更多选项");
+    
     fill(
       this.topHost,
-      el("div", { class: "u-title" }, el("strong", { text: title }), el("span", { class: "u-crumb", text: select })),
+      el("div", { class: "u-title" }, 
+        backBtn,
+        el("strong", { text: title }),
+      ),
       el(
         "div",
         { class: "u-row" },
         chip(coreStatusText(this.status), this.status.state === "ready" ? "ok" : this.status.state === "starting" ? "pending" : "bad"),
-        button("世界管理", () => this.navigate({ pane: "worlds" }), { class: "u-btn u-ghost" }),
+        moreBtn,
       ),
     );
   }
-
-  private selectionLabel(): string {
-    const sel = (this.prefs[PREF_KEYS.contact] as Json) ?? {};
-    const instanceName = this.instanceCache.find((item) => item.id === String(sel.instance_id ?? ""))?.name;
-    const pieces = [
-      paneTitle(this.route.pane),
-      instanceName ? String(instanceName) : "",
-      sel.timeline_name ? String(sel.timeline_name) : "",
-      sel.character_name ? String(sel.character_name) : "",
+  
+  private showMoreMenu(): void {
+    const menu = el("div", { class: "u-more-menu", role: "menu" });
+    const backdrop = el("div", { class: "u-more-backdrop" });
+    const items = [
+      { label: "设置", action: () => this.navigate({ pane: "settings" }) },
+      { label: "帮助与诊断", action: () => this.navigate({ pane: "help" }) },
+      { label: "世界管理", action: () => this.navigate({ pane: "worlds" }) },
+      { label: "返回选择应用", action: () => new Launcher(this.context()).show() },
     ];
-    return pieces.filter(Boolean).join(" / ");
+    
+    // 点条目先关菜单再执行动作（原来只处理「点空白关闭」，浮层会压在新页面上）
+    for (const item of items) {
+      const btn = button(item.label, () => {
+        backdrop.remove();
+        item.action();
+      }, { class: "u-more-menu-item" });
+      btn.setAttribute("role", "menuitem");
+      menu.appendChild(btn);
+    }
+    
+    backdrop.addEventListener("click", () => backdrop.remove());
+    backdrop.appendChild(menu);
+    document.body.appendChild(backdrop);
+    
+    // 焦点管理
+    (menu.firstElementChild as HTMLElement)?.focus();
+    backdrop.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") backdrop.remove();
+    });
   }
 
   banner(text: string, kind: "ok" | "bad" | "pending" | "muted" = "muted"): void {
@@ -648,13 +659,21 @@ export class App {
   }
 }
 
+/** 页面标题（顶栏与页内标题共用）。方案 B 删左侧导航后不能再从导航项取，用一张表。 */
+const PANE_TITLES: Partial<Record<PaneId, string>> = {
+  home: "首页",
+  contact: "角色联络",
+  writing: "辅助写作",
+  trpg: "跑团",
+  worlds: "世界与素材",
+  settings: "设置",
+  help: "帮助与诊断",
+  onboarding: "首次设置",
+  create: "创建世界",
+};
+
 export function paneTitle(id: PaneId): string {
-  const all = [...NAV, ...NAV_FOOT];
-  const found = all.find((item) => item.id === id)?.label;
-  if (found) return found;
-  if (id === "onboarding") return "首次设置";
-  if (id === "create") return "创建世界";
-  return "首页";
+  return PANE_TITLES[id] ?? "首页";
 }
 
 function coreStatusText(status: CoreStatus): string {

@@ -96,8 +96,17 @@ async def main() -> None:
             problems.append("壳把数据写进了程序目录")
 
         # 首屏 + 从样例世界开一份（真链路）
+        # 界面按方案 B 改过（启动选择器 + 顶栏 [⋯] 菜单，左侧导航已删）：
+        # 到「世界与素材」的真实路径 = 启动器选一个应用 → [⋯] → 世界管理
         steps: list[str] = []
-        await click_text(cdp, "nav.u-nav button", "世界与素材")
+        launched = await click_text(cdp, ".u-launcher-card", "isekai Chat")
+        steps.append(f"启动选择器选 Chat：{launched}")
+        await asyncio.sleep(1.5)
+        opened = await click_text(cdp, "#u-more-btn", "⋯")
+        steps.append(f"打开 [⋯] 菜单：{opened}")
+        await asyncio.sleep(0.6)
+        went = await click_text(cdp, ".u-more-menu-item", "世界管理")
+        steps.append(f"点「世界管理」：{went}")
         await asyncio.sleep(1.5)
         before = await cdp.js("(()=>{const n=document.querySelector('#u-main');return n?(n.innerText||'').slice(0,80):'';})()")
         steps.append(f"世界与素材：{before}")

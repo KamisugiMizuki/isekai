@@ -118,7 +118,8 @@ export class ContactPane implements Pane {
     }) as HTMLTextAreaElement;
     const send = primary("发送", () => void this.send());
     send.id = "u-contact-send";
-    const form = el("form", { class: "u-composer" }, textarea, el("div", { class: "u-col-actions" }, send));
+    const hint = el("p", { class: "u-note u-muted", text: "Enter 发送 · Shift+Enter 换行" });
+    const form = el("form", { class: "u-composer" }, textarea, el("div", { class: "u-col-actions" }, send), hint);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.send();
