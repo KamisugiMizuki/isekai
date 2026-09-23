@@ -232,6 +232,7 @@ def public_campaign(row: dict[str, Any]) -> dict[str, Any]:
     """战役对外投影：只给管理元数据，不带规则私有状态正文。"""
     return {
         "campaign_id": str(row.get("campaign_id") or ""),
+        "name": str(row.get("name") or ""),
         "instance_id": str(row.get("instance_id") or ""),
         "timeline_id": str(row.get("timeline_id") or ""),
         "ruleset_id": str(row.get("ruleset_id") or ""),
@@ -292,6 +293,10 @@ def scene_view(scene: dict[str, Any], *, audience: Any = PUBLIC_PARTY) -> dict[s
     """
     out = {
         **{key: value for key, value in scene.items() if not key.endswith("_world")},
+        # 客户端面（TRPG_CLIENT_SPEC）读的是 title / description：名称与公开简介同一份数据，
+        # 不再存第二份（§8.1：名称进场景自己的元数据）
+        "title": str(scene.get("name") or ""),
+        "description": str(scene.get("brief") or ""),
         "world_snapshot": _loads(scene.get("world_snapshot"), {}),
         "location_refs": _loads(scene.get("location_refs"), []),
         "participants": _loads(scene.get("participants"), []),

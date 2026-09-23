@@ -577,11 +577,104 @@ export class SettingsPane implements Pane {
         fill(list, paragraph(uiError(error, { module: "扩展", action: "读取扩展" }).message, "u-note u-note-bad"));
       }
     };
+    const rulesNote = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
+    const rulesList = el("div", {});
+    const loadRules = async (): Promise<void> => {
+      fill(rulesList, paragraph("正在读取本机规则…", "u-hint"));
+      try {
+        const result = await this.ctx.api.rulesList();
+        const plugins = (result.plugins as Json[]) ?? [];
+        if (!plugins.length) {
+          fill(rulesList, paragraph("本机还没有登记跑团规则插件。", "u-hint"));
+          return;
+        }
+        const rows = el("div", { class: "u-rows" });
+        for (const item of plugins) {
+          const id = String(item.ruleset_id ?? "");
+          const version = String(item.ruleset_version ?? "");
+          const row = el("div", { class: "u-row-line" });
+          row.appendChild(el("span", { class: "u-grow", text: `${String(item.name ?? id)} ${version}` }));
+          row.appendChild(
+            chip(
+              String(item.status_text ?? item.status),
+              String(item.status) === "available" ? "ok" : String(item.status) === "disabled" ? "muted" : "bad",
+            ),
+          );
+          if (item.referenced_count) row.appendChild(chip(`被 ${Number(item.referenced_count)} 局使用`, "muted"));
+          if (item.changed_since_registered) row.appendChild(chip("登记后清单被改过", "pending"));
+          row.appendChild(
+            button(item.enabled ? "停用" : "启用", () => {
+              void (async () => {
+                try {
+                  await this.ctx.api.rulesEnable(!item.enabled, id, version);
+                  setNote(rulesNote, item.enabled ? "已停用：只阻止之后的调用，进行中的结果照旧" : "已启用", "ok");
+                  await loadRules();
+                } catch (error) {
+                  setNote(rulesNote, uiError(error, { module: "规则", action: "切换启用状态" }).message, "bad");
+                }
+              })();
+            }),
+          );
+          row.appendChild(
+            button("移除", () => {
+              void (async () => {
+                try {
+                  await this.ctx.api.rulesRemove(id, version);
+                  setNote(rulesNote, "已移除这条规则登记（战役引用过的版本不会走到这里）", "ok");
+                  await loadRules();
+                } catch (error) {
+                  setNote(rulesNote, uiError(error, { module: "规则", action: "移除" }).message, "bad");
+                }
+              })();
+            }),
+          );
+          rows.appendChild(row);
+          if (item.reason) rows.appendChild(paragraph(String(item.reason), "u-hint"));
+        }
+        fill(rulesList, rows);
+      } catch (error) {
+        fill(rulesList, paragraph(uiError(error, { module: "规则", action: "读取规则" }).message, "u-note u-note-bad"));
+      }
+    };
+    void loadRules();
     return section(
       "扩展",
-      paragraph("规则与外部聊天通道是两类扩展：这里管通道；规则插件的登记与版本管理按实施顺序在 U4 落地。"),
-      el("div", { class: "u-row" }, button("读取本机扩展", () => void scan())),
+      paragraph("规则与外部聊天通道是两类扩展，分开管：这一页上下两块各自独立，互不代管。"),
+      el("div", { class: "u-row" }, button("读取本机通道", () => void scan()), button("刷新规则登记", () => void loadRules())),
       list,
+      el("h4", { class: "u-sub", text: "跑团规则" }),
+      paragraph("规则来自随发行样例或你自己选的目录：登记前先看检查摘要，选择文件本身不执行它；进程隔离不是完整安全沙箱。"),
+      rulesList,
+      el(
+        "div",
+        { class: "u-row" },
+        button("从本机选择规则目录…", () => {
+          void (async () => {
+            try {
+              const { invoke } = await import("@tauri-apps/api/core");
+              const picked = await invoke<string | null>("pick_dir", { title: "选择规则插件所在目录" });
+              if (!picked) {
+                setNote(rulesNote, "已取消选择", "muted");
+                return;
+              }
+              const scanned = await this.ctx.api.rulesScan(picked);
+              const candidates = (scanned.candidates as Json[]) ?? [];
+              if (!candidates.length) {
+                setNote(rulesNote, `这里没有找到规则插件清单：${String(scanned.reason ?? "")}`, "bad");
+                return;
+              }
+              for (const item of candidates) {
+                await this.ctx.api.rulesRegister(String(item.manifest_path ?? picked));
+              }
+              setNote(rulesNote, `已登记并启用 ${candidates.length} 份规则`, "ok");
+              await loadRules();
+            } catch (error) {
+              setNote(rulesNote, uiError(error, { module: "规则", action: "添加并启用" }).message, "bad");
+            }
+          })();
+        }),
+      ),
+      rulesNote,
       note,
       chip("当前版本不自动启用任何外部扩展", "muted"),
     );

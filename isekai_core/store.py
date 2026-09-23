@@ -653,6 +653,7 @@ CREATE TABLE IF NOT EXISTS trpg_campaign(
   instance_id TEXT NOT NULL,
   timeline_id TEXT NOT NULL,
   campaign_id TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',              -- 战役显示名（§8.1：名称要存在战役自己的元数据里）
   ruleset_id TEXT NOT NULL DEFAULT '',
   ruleset_version TEXT NOT NULL DEFAULT '',
   plugin_manifest TEXT NOT NULL DEFAULT '',
@@ -674,6 +675,8 @@ CREATE TABLE IF NOT EXISTS trpg_scene(
   timeline_id TEXT NOT NULL,
   campaign_id TEXT NOT NULL,
   scene_id TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',              -- 场景显示名（不拿 id 当标题）
+  brief TEXT NOT NULL DEFAULT '',             -- 公开简介（私密说明走 private_views）
   kind TEXT NOT NULL DEFAULT 'exploration',
   advance_mode TEXT NOT NULL DEFAULT 'continuous', -- 推进节拍 §4.1/§九：instant / continuous / opposed / world
   location_refs TEXT NOT NULL DEFAULT '[]',
@@ -689,6 +692,25 @@ CREATE TABLE IF NOT EXISTS trpg_scene(
   created_world INTEGER NOT NULL DEFAULT 0,
   updated_world INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(instance_id, timeline_id, campaign_id, scene_id)
+);
+
+-- 规则插件登记簿（USER_INTERFACE_DESIGN §8.5）：与「外部聊天通道插件」（plugin 表）分开，
+-- 是本机的安装事实、不是实例数据，所以不进 runtime_dump / 不随备份搬。
+CREATE TABLE IF NOT EXISTS rule_plugin(
+  ruleset_id TEXT NOT NULL,
+  ruleset_version TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  manifest_path TEXT NOT NULL DEFAULT '',
+  protocol TEXT NOT NULL DEFAULT '',
+  modes TEXT NOT NULL DEFAULT '[]',
+  state_schema TEXT NOT NULL DEFAULT '',
+  sha256 TEXT NOT NULL DEFAULT '',            -- 清单内容指纹：同身份同版本换内容不许静默覆盖
+  has_converters INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  request_id TEXT NOT NULL DEFAULT '',
+  registered_at REAL NOT NULL DEFAULT 0,
+  updated_real REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY(ruleset_id, ruleset_version)
 );
 
 CREATE TABLE IF NOT EXISTS trpg_action(
@@ -885,12 +907,12 @@ def _relabel_payload(payload: dict[str, Any], instance_id: str, timeline_id: str
 #: 读 / 写 / 装载共用，避免「导出有、导入后没」的老毛病。
 TRPG_COLUMNS: dict[str, tuple[str, ...]] = {
     "campaign": (
-        "instance_id", "timeline_id", "campaign_id", "ruleset_id", "ruleset_version",
+        "instance_id", "timeline_id", "campaign_id", "name", "ruleset_id", "ruleset_version",
         "plugin_manifest", "participants", "current_scene_id", "state_revision", "status",
         "host_mode", "note", "created_world", "updated_world", "created_real", "updated_real",
     ),
     "scene": (
-        "instance_id", "timeline_id", "campaign_id", "scene_id", "kind", "advance_mode",
+        "instance_id", "timeline_id", "campaign_id", "scene_id", "name", "brief", "kind", "advance_mode",
         "location_refs",
         "world_snapshot", "participants", "public_facts", "private_views", "active_risks",
         "available_actions", "turn_state", "status", "revision",
@@ -1577,6 +1599,19 @@ class Store:
         if timeline_sql and "description" not in timeline_sql:
             with self._lock, self._conn:
                 self._conn.execute("ALTER TABLE timeline ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+
+        # U4：战役名称 / 场景名称与公开简介（老库补列，不重建表）
+        campaign_sql = sql_of("trpg_campaign")
+        if campaign_sql and "name" not in campaign_sql:
+            with self._lock, self._conn:
+                self._conn.execute("ALTER TABLE trpg_campaign ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+        scene_sql = sql_of("trpg_scene")
+        if scene_sql and "name" not in scene_sql:
+            with self._lock, self._conn:
+                self._conn.execute("ALTER TABLE trpg_scene ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+        if scene_sql and "brief" not in scene_sql:
+            with self._lock, self._conn:
+                self._conn.execute("ALTER TABLE trpg_scene ADD COLUMN brief TEXT NOT NULL DEFAULT ''")
 
         # 正文锁定（USER_INTERFACE_DESIGN §7.5）：老库补列，>0 表示这份文字被锁定
         candidate_sql = sql_of("wa_candidate")
@@ -4688,6 +4723,73 @@ class Store:
         return out
 
     # ---------- 补卡 ----------
+
+    # ------------------------------------------------ 规则插件登记簿（§8.5）
+
+    def rule_plugin_list(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM rule_plugin ORDER BY ruleset_id, ruleset_version"
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def rule_plugin_get(self, ruleset_id: str, ruleset_version: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM rule_plugin WHERE ruleset_id=? AND ruleset_version=?",
+            (ruleset_id, ruleset_version),
+        ).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def rule_plugin_upsert(self, row: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(row)
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO rule_plugin(ruleset_id, ruleset_version, name, manifest_path, protocol, modes,
+                                           state_schema, sha256, has_converters, enabled, request_id,
+                                           registered_at, updated_real)
+                   VALUES(:ruleset_id, :ruleset_version, :name, :manifest_path, :protocol, :modes,
+                          :state_schema, :sha256, :has_converters, :enabled, :request_id,
+                          :registered_at, :updated_real)
+                   ON CONFLICT(ruleset_id, ruleset_version) DO UPDATE SET
+                     name=excluded.name, manifest_path=excluded.manifest_path, protocol=excluded.protocol,
+                     modes=excluded.modes, state_schema=excluded.state_schema, sha256=excluded.sha256,
+                     has_converters=excluded.has_converters, enabled=excluded.enabled,
+                     updated_real=excluded.updated_real""",
+                {
+                    "ruleset_id": str(payload.get("ruleset_id") or ""),
+                    "ruleset_version": str(payload.get("ruleset_version") or ""),
+                    "name": str(payload.get("name") or ""),
+                    "manifest_path": str(payload.get("manifest_path") or ""),
+                    "protocol": str(payload.get("protocol") or ""),
+                    "modes": str(payload.get("modes") or "[]"),
+                    "state_schema": str(payload.get("state_schema") or ""),
+                    "sha256": str(payload.get("sha256") or ""),
+                    "has_converters": int(payload.get("has_converters") or 0),
+                    "enabled": int(payload.get("enabled") or 0),
+                    "request_id": str(payload.get("request_id") or ""),
+                    "registered_at": float(payload.get("registered_at") or 0),
+                    "updated_real": float(payload.get("updated_real") or 0),
+                },
+            )
+        return self.rule_plugin_get(str(payload.get("ruleset_id") or ""), str(payload.get("ruleset_version") or "")) or {}
+
+    def rule_plugin_delete(self, ruleset_id: str, ruleset_version: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM rule_plugin WHERE ruleset_id=? AND ruleset_version=?",
+                (ruleset_id, ruleset_version),
+            )
+
+    def rule_plugin_references(self, ruleset_id: str, ruleset_version: str) -> list[dict[str, Any]]:
+        """哪些战役还在用这条规则（跨实例）：移除前的闸门要靠它列名单。"""
+        rows = self._conn.execute(
+            """SELECT c.campaign_id, c.name, c.instance_id, c.timeline_id, c.status,
+                      i.name AS instance_name
+                 FROM trpg_campaign c LEFT JOIN instance i ON i.id = c.instance_id
+                WHERE c.ruleset_id=? AND c.ruleset_version=?
+                ORDER BY c.campaign_id""",
+            (ruleset_id, ruleset_version),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
 
     def character_join_add(self, row: dict[str, Any]) -> None:
         payload = {

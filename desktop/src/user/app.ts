@@ -18,6 +18,7 @@ import { CreatePane } from "./create";
 import { OnboardingPane } from "./onboarding";
 import { SettingsPane } from "./settings";
 import { WorldsPane } from "./worlds";
+import { TrpgPane } from "./trpg";
 import { WritingPane } from "./writing";
 
 export type PaneId = "home" | "contact" | "writing" | "trpg" | "worlds" | "settings" | "help" | "onboarding" | "create";
@@ -442,7 +443,7 @@ export class App {
         pane = new HelpPane(ctx);
         break;
       case "trpg":
-        pane = new WritingPane(ctx, "trpg");
+        pane = new TrpgPane(ctx);
         break;
       default:
         pane = new HomePane(ctx);

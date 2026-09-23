@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,12 +58,31 @@ class Paths:
         return self.root / "exports"
 
 
+def user_data_root() -> Path:
+    """发行件的数据根（ONBOARDING §3.2）：装在用户目录下，不跟程序文件混在一起。
+
+    程序目录可能只读、升级时会被整体替换，用户的数据与备份不能放在那里。
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "isekai"
+
+
+def is_packaged() -> bool:
+    """打包运行：冻结的解释器，或发行件启动器显式声明的 `ISEKAI_PACKAGED=1`。"""
+    return bool(getattr(sys, "frozen", False)) or os.environ.get("ISEKAI_PACKAGED") == "1"
+
+
 def resolve_root(explicit: str | os.PathLike[str] | None = None) -> Path:
     if explicit:
         return Path(explicit).resolve()
     env = os.environ.get("ISEKAI_ROOT")
     if env:
         return Path(env).resolve()
+    if is_packaged():
+        return user_data_root()
     return Path(__file__).resolve().parent.parent
 
 

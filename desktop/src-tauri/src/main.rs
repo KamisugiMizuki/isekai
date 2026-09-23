@@ -86,6 +86,28 @@ fn find_project_root() -> PathBuf {
     std::env::current_dir().unwrap_or_default()
 }
 
+/// 发行件运行时目录（`<程序目录>/runtime`）：里面的 `python/python.exe` 就是自带解释器。
+fn bundled_runtime() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.join("runtime");
+    if dir.join("python").join("python.exe").exists() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// 发行件的数据根（与 isekai_core.config.user_data_root 同一口径）：
+/// 装在用户目录下；程序目录可能只读、升级会被整体替换。
+fn user_data_root() -> PathBuf {
+    if let Ok(value) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(value).join("isekai");
+    }
+    std::env::var("USERPROFILE")
+        .map(|home| PathBuf::from(home).join("AppData").join("Local").join("isekai"))
+        .unwrap_or_else(|_| PathBuf::from("isekai-data"))
+}
+
 fn kill_core(state: &AppState) {
     let taken = state.child.lock().unwrap().take();
     if let Some(mut child) = taken {
@@ -102,23 +124,40 @@ fn kill_core(state: &AppState) {
 }
 
 fn spawn_core(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
-    let python = root.join(".venv").join("Scripts").join("python.exe");
+    // 打包态：解释器与代码来自 `<程序目录>/runtime`，数据根在用户目录（ONBOARDING §3.2）；
+    // 开发态：仓库里的 .venv，数据根就是仓库（行为不变）。
+    let bundled = bundled_runtime();
+    let (python, code_root, data_root, packaged) = match bundled.as_ref() {
+        Some(dir) => (
+            dir.join("python").join("python.exe"),
+            dir.clone(),
+            user_data_root(),
+            true,
+        ),
+        None => {
+            let python = root.join(".venv").join("Scripts").join("python.exe");
+            (python, root.to_path_buf(), root.to_path_buf(), false)
+        }
+    };
     if !python.exists() {
         return Err(format!("找不到核心解释器 {}", python.display()));
     }
-    log_line(root, "spawning core");
+    let _ = fs::create_dir_all(&data_root);
+    log_line(&data_root, &format!("spawning core (packaged={packaged})"));
     let mut child = Command::new(&python)
         .arg("-m")
         .arg("isekai_core")
         .arg("--root")
-        .arg(root)
+        .arg(&data_root)
         .arg("--parent-pid")
         .arg(std::process::id().to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null())
+        .current_dir(&code_root)
         .env_remove("PYTHONPATH")
         .env("PYTHONIOENCODING", "utf-8")
+        .env("ISEKAI_PACKAGED", if packaged { "1" } else { "0" })
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| format!("启动核心失败：{error}"))?;
@@ -631,7 +670,12 @@ fn quit_app(app: tauri::AppHandle) {
 }
 
 fn main() {
-    let root = find_project_root();
+    // 发行件：日志与数据都放用户目录（程序目录可能只读）；开发态：仓库根
+    let root = match bundled_runtime() {
+        Some(_) => user_data_root(),
+        None => find_project_root(),
+    };
+    let _ = fs::create_dir_all(&root);
     log_line(&root, &format!("shell starting, root={}", root.display()));
     let state = AppState {
         root,

@@ -8,7 +8,7 @@
  * 两条界面层的硬规矩（§7.3 / §7.5）：
  *   - 候选是候选：只有真实提交结果才显示「已生效」，批准与提交是两步；
  *   - 正文锁定后，新生成永远另起一稿，世界恢复也不会改写它。
- * 跑团（U4）仍然是占位说明：这条路径的界面还没做，界面不摆可点击的空壳。
+ * 跑团（U4）在 `trpg.ts` 里单独实现，这里只负责写作。
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -57,7 +57,7 @@ function refs(value: string): string[] {
 }
 
 export class WritingPane implements Pane {
-  readonly id: "writing" | "trpg";
+  readonly id = "writing" as const;
   private host: HTMLElement | null = null;
   private note: HTMLElement | null = null;
   private tab: Tab = "outline";
@@ -79,16 +79,10 @@ export class WritingPane implements Pane {
   private autoTimer: number | null = null;
   private busy = false;
 
-  constructor(private readonly ctx: AppContext, id: "writing" | "trpg" = "writing") {
-    this.id = id;
-  }
+  constructor(private readonly ctx: AppContext) {}
 
   async mount(host: HTMLElement): Promise<void> {
     this.host = host;
-    if (this.id === "trpg") {
-      this.mountTrpg(host);
-      return;
-    }
     this.note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
     fill(host, this.note);
     await this.render();
@@ -1170,43 +1164,5 @@ export class WritingPane implements Pane {
     } catch (error) {
       setNote(this.note, uiError(error, { module: "文字草稿", action: "导出" }).message, "bad");
     }
-  }
-
-  /* ------------------------------------------------------------ 跑团：仍未实现，如实说明 */
-
-  private mountTrpg(host: HTMLElement): void {
-    const readiness = this.ctx.readiness ?? {};
-    const firstRun = ((readiness.first_run as Json) ?? {}) as Json;
-    const ai = ((readiness.ai as Json) ?? {}) as Json;
-    const instances = this.ctx.instances();
-    const page = el("div", { class: "u-page" });
-    page.appendChild(el("h2", { class: "u-h2", text: "跑团" }));
-    page.appendChild(
-      section(
-        "这条路径还在准备中",
-        paragraph("选规则与角色，声明行动，确认后得到裁定与后果——这套工作区正在实现中。"),
-        facts([
-          ["世界与角色", instances.length ? `${instances.length} 个世界可用` : "还没有世界（可以先从样例开始）"],
-          ["AI 服务", ai.configured ? "已配置" : "还没有可用配置"],
-          ["素材", `${Number(firstRun.packages ?? 0)} 份世界设定 / ${Number(firstRun.instances ?? 0)} 个世界`],
-        ]),
-        bulletList(
-          [
-            "现在可以做的：整理世界与角色素材、和角色联络、管理时间线与版本、辅助写作。",
-            "还没做的：战役列表与创建、场景与行动确认卡、玩家 / 主持视图、规则登记。",
-            "已落地的内核能力（命令行可用）：战役创建、场景、行动声明与裁定、待选择、联合提交、规则版本迁移。",
-          ],
-          "u-list",
-        ),
-        el(
-          "div",
-          { class: "u-row" },
-          primary("去辅助写作", () => this.ctx.navigate({ pane: "writing" })),
-          button("世界与素材", () => this.ctx.navigate({ pane: "worlds" })),
-          button("看帮助与诊断", () => this.ctx.navigate({ pane: "help" })),
-        ),
-      ),
-    );
-    fill(host, page);
   }
 }

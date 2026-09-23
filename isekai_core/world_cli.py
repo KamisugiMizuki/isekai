@@ -138,6 +138,13 @@ OP_BY_COMMAND = {
     ("trpg", "commit"): "trpg.commit",
     ("trpg", "gm-change"): "trpg.gm.change",
     ("trpg", "migrate"): "trpg.campaign.migrate",
+    # 规则插件登记簿（USER_INTERFACE_DESIGN §8.5）：与通道插件 `plugin` 组分开
+    ("rules", "scan"): "rules.scan",
+    ("rules", "list"): "rules.list",
+    ("rules", "register"): "rules.register",
+    ("rules", "enable"): "rules.enable",
+    ("rules", "disable"): "rules.disable",
+    ("rules", "remove"): "rules.remove",
     ("trpg", "choose"): "trpg.choice.select",
     ("trpg", "rule-state"): "trpg.rule_state.read",
     ("trpg", "recover"): "trpg.recover",
@@ -213,6 +220,16 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
         if cmd == "install":
             return {"archive": ns.archive or ns.file or "", "replace": bool(ns.replace)}
         return {}
+    if group == "rules":
+        # 规则插件登记簿（与通道插件 plugin 组分开）：只读扫描 / 本机登记 / 启停 / 移除
+        target = ns.dir or ns.manifest or ""
+        if cmd == "scan":
+            return {"dir": target}
+        if cmd == "register":
+            return {"manifest_path": target}
+        if cmd == "list":
+            return {}
+        return {"ruleset_id": ns.ruleset or "", "ruleset_version": ns.ruleset_version or ""}
     if group == "setup":
         args = {}
         if cmd in ("migrate-check", "migrate"):
@@ -258,6 +275,7 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args["campaign_id"] = ns.campaign
         if cmd == "campaign-new":
             args.update({
+                "name": getattr(ns, "name", "") or "",
                 "ruleset_id": ns.ruleset or "",
                 "ruleset_version": ns.ruleset_version or "",
                 "plugin_manifest": ns.plugin or "",
@@ -276,6 +294,10 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             })
         if cmd == "scene-open":
             args["kind"] = ns.kind or "exploration"
+            if getattr(ns, "name", "") or "":
+                args["name"] = ns.name
+            if getattr(ns, "brief", "") or "":
+                args["brief"] = ns.brief
             if getattr(ns, "advance_mode", None):
                 args["advance_mode"] = ns.advance_mode
         if cmd == "declare":
@@ -305,8 +327,6 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
                 args["audience"] = ns.audience
         if cmd == "migrate":
             args["converter_id"] = ns.converter or ""
-            args["to_version"] = ns.ruleset_version or ""
-            args["accept_losses"] = bool(ns.accept_losses)
         if cmd == "resolve":
             args.update({
                 "action_id": ns.action or "",
@@ -690,7 +710,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "group",
         choices=[
             "package", "card", "instance", "runtime", "event", "disclose", "backup", "proactive", "narrative",
-            "trpg", "plugin", "story", "wa", "client", "setup",
+            "trpg", "plugin", "story", "wa", "client", "setup", "rules",
         ],
     )
     parser.add_argument("command", help="/".join(f"{g}.{c}" for g, c in OP_BY_COMMAND))
@@ -763,6 +783,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--source", default=None,
                         help="TRPG：GM 直接变化的来源（gm_declaration / world_process / npc_script）")
     parser.add_argument("--converter", default=None, help="TRPG：状态转换器标识（规则版本迁移）")
+    parser.add_argument("--dir", default=None, help="规则插件：清单所在目录（rules scan / register）")
+    parser.add_argument("--manifest", default=None, help="规则插件：清单文件路径（rules scan / register）")
     parser.add_argument("--accept-losses", dest="accept_losses", action="store_true",
                         help="TRPG：显式接受有信息损失的规则状态转换")
     parser.add_argument("--changes", default=None, help="TRPG：GM 直接变化的 changes（内联 JSON 或文件路径）")

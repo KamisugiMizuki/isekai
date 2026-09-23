@@ -586,6 +586,62 @@ export class AppApi {
     return this.call("wa.branch", args, 120000);
   }
 
+  /* ---------------- 跑团（USER_INTERFACE_DESIGN §8） ---------------- */
+
+  trpgClient(op: string, args: Json): Promise<Json> {
+    return this.call(`trpg.client.${op}`, args, 180000);
+  }
+
+  trpgCampaigns(instanceId: string, timelineId = ""): Promise<Json> {
+    return this.call("trpg.campaign.list", {
+      instance_id: instanceId, ...(timelineId ? { timeline_id: timelineId } : {}),
+    });
+  }
+
+  trpgCampaignInfo(instanceId: string, timelineId: string, campaignId: string): Promise<Json> {
+    return this.call("trpg.campaign.info", {
+      instance_id: instanceId, timeline_id: timelineId, campaign_id: campaignId,
+    });
+  }
+
+  trpgCampaignCreate(args: Json): Promise<Json> {
+    return this.call("trpg.campaign.create", args, 60000);
+  }
+
+  trpgCampaignStatus(instanceId: string, timelineId: string, campaignId: string, status: string): Promise<Json> {
+    return this.call("trpg.campaign.status", {
+      instance_id: instanceId, timeline_id: timelineId, campaign_id: campaignId, status,
+    });
+  }
+
+  trpgSceneOpen(args: Json): Promise<Json> {
+    return this.call("trpg.scene.open", args);
+  }
+
+  /* ---------------- 规则插件登记（§8.5，与通道插件 plugin.* 分开） ---------------- */
+
+  rulesList(): Promise<Json> {
+    return this.call("rules.list", {});
+  }
+
+  rulesScan(dir: string): Promise<Json> {
+    return this.call("rules.scan", { dir });
+  }
+
+  rulesRegister(manifestPath: string): Promise<Json> {
+    return this.call("rules.register", { manifest_path: manifestPath });
+  }
+
+  rulesEnable(enabled: boolean, rulesetId: string, rulesetVersion: string): Promise<Json> {
+    return this.call(enabled ? "rules.enable" : "rules.disable", {
+      ruleset_id: rulesetId, ruleset_version: rulesetVersion,
+    });
+  }
+
+  rulesRemove(rulesetId: string, rulesetVersion: string): Promise<Json> {
+    return this.call("rules.remove", { ruleset_id: rulesetId, ruleset_version: rulesetVersion });
+  }
+
   /* ---------------- 界面草稿（§3.5） ---------------- */
 
   draftSave(key: string, module: string, target: string, textValue: string, payload?: unknown): Promise<Json> {

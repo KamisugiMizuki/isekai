@@ -141,6 +141,12 @@ SYNC_OPS = frozenset(
         "trpg.campaign.list",
         "trpg.campaign.info",
         "trpg.campaign.status",
+        "rules.scan",
+        "rules.list",
+        "rules.register",
+        "rules.enable",
+        "rules.disable",
+        "rules.remove",
         "trpg.scene.open",
         "trpg.scene.view",
         "trpg.action.declare",
@@ -499,6 +505,31 @@ def dispatch(
         if op == "runtime.budget.set":
             return _budget_set(cfg, store, args)
         # TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）：编排态读写与联合提交
+        if op in ("rules.scan", "rules.list", "rules.register", "rules.enable", "rules.disable", "rules.remove"):
+            from .. import rules_registry as registry
+
+            if op == "rules.scan":
+                return registry.scan(str(args.get("dir") or args.get("path") or ""))
+            if op == "rules.list":
+                return registry.list_plugins(store)
+            if op == "rules.register":
+                return registry.register(
+                    store,
+                    manifest_path=str(args.get("manifest_path") or args.get("path") or args.get("dir") or ""),
+                    request_id=str(args.get("request_id") or ""),
+                )
+            if op in ("rules.enable", "rules.disable"):
+                return registry.set_enabled(
+                    store,
+                    ruleset_id=str(args.get("ruleset_id") or args.get("id") or ""),
+                    ruleset_version=str(args.get("ruleset_version") or args.get("version") or ""),
+                    enabled=op == "rules.enable",
+                )
+            return registry.remove(
+                store,
+                ruleset_id=str(args.get("ruleset_id") or args.get("id") or ""),
+                ruleset_version=str(args.get("ruleset_version") or args.get("version") or ""),
+            )
         if op == "trpg.campaign.create":
             return _trpg_campaign_create(cfg, store, runtime, args)
         if op == "trpg.campaign.list":
@@ -1281,6 +1312,7 @@ def _trpg_campaign_create(cfg: Config, store: Store, runtime: Any, args: dict[st
         timeline_id,
         ruleset_id=str(args.get("ruleset_id") or ""),
         ruleset_version=str(args.get("ruleset_version") or ""),
+        name=str(args.get("name") or ""),
         plugin_manifest=str(args.get("plugin_manifest") or ""),
         participants=[str(item) for item in _json_arg(args, "participants", []) or []],
         status=str(args.get("status") or "active"),
@@ -1323,6 +1355,11 @@ def _trpg_scene_open(cfg: Config, store: Store, runtime: Any, args: dict[str, An
         fields["scene_id"] = str(args["scene_id"])
     if args.get("advance_mode"):
         fields["advance_mode"] = str(args["advance_mode"])
+    # 显示名与公开简介（§8.1：名称进场景自己的元数据，不拿内部标识当标题）
+    if str(args.get("name") or "").strip():
+        fields["name"] = str(args["name"]).strip()
+    if args.get("brief") is not None:
+        fields["brief"] = str(args.get("brief") or "")
     return _campaign_call(_campaign_service(runtime).open_scene, instance_id, timeline_id, campaign_id, **fields)
 
 

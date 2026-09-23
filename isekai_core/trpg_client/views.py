@@ -96,7 +96,9 @@ def campaign_item(
     status = str(campaign.get("status") or "")
     plugin = plugin if isinstance(plugin, dict) else {}
     return {
-        "display_name": str(campaign.get("display_name") or campaign.get("campaign_id") or ""),
+        # §8.1：名称进战役自己的元数据，界面不拿内部标识当标题
+        "display_name": str(campaign.get("name") or campaign.get("display_name") or campaign.get("campaign_id") or ""),
+        "name": str(campaign.get("name") or ""),
         "campaign_id": str(campaign.get("campaign_id") or ""),
         "ruleset": str(campaign.get("ruleset_id") or plugin.get("id") or ""),
         "ruleset_version": str(campaign.get("ruleset_version") or plugin.get("version") or ""),
