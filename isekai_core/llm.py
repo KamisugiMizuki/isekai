@@ -67,19 +67,20 @@ class LLMClient:
         request_timeout = timeout or self.cfg.timeout_s
         # 结构化产物用更低的温度（默认温度按对话场景设定，JSON 容易出残句）
         heat = self.cfg.temperature if temperature is None else temperature
+        payload: dict[str, Any] = {
+            "model": self.cfg.model,
+            "messages": messages,
+            "max_tokens": budget,
+            "temperature": heat,
+            "stream": False,
+        }
         last: LLMError | None = None
         for attempt in (0, 1):
             try:
                 response = await self._http().post(
                     "/chat/completions",
                     timeout=request_timeout,
-                    json={
-                        "model": self.cfg.model,
-                        "messages": messages,
-                        "max_tokens": budget,
-                        "temperature": heat,
-                        "stream": False,
-                    },
+                    json=payload,
                 )
             except httpx.HTTPError as exc:
                 last = LLMError("llm_unreachable", f"{type(exc).__name__}", retryable=True)
@@ -98,7 +99,19 @@ class LLMClient:
                 raise last
 
             if response.status_code >= 400:
-                raise LLMError("llm_rejected", f"HTTP {response.status_code}", retryable=False)
+                # 服务端的原话带上（诊断时能直接点名哪个参数/什么原因，不靠猜）
+                detail = response.content.decode("utf-8", "replace").strip()[:200]
+                # 有些服务/模型不接受采样参数（如思考模式对 temperature 的约束与文档不符时）：
+                # 被拒且本次带了它，就去掉采样参数按服务默认再试一次（只试一次）
+                if response.status_code in (400, 422) and attempt == 0 and "temperature" in payload:
+                    payload.pop("temperature")
+                    log.warning(
+                        "llm rejected %s, retry without temperature: %s",
+                        response.status_code,
+                        detail[:120],
+                    )
+                    continue
+                raise LLMError("llm_rejected", f"HTTP {response.status_code} {detail}".strip(), retryable=False)
 
             try:
                 data = json.loads(response.content.decode("utf-8", "replace"))
@@ -113,6 +126,7 @@ class LLMClient:
                 last = LLMError("empty_completion", "模型返回空文本", retryable=True)
                 if attempt == 0:
                     budget = min(budget * 2, MAX_COMPLETION_BUDGET)
+                    payload["max_tokens"] = budget
                     continue
                 raise last
             if finish == "length":
@@ -120,6 +134,7 @@ class LLMClient:
                 last = LLMError("truncated_completion", f"输出被截断（{len(content)} 字符，预算 {budget}）", retryable=True)
                 if attempt == 0:
                     budget = min(budget * 2, MAX_COMPLETION_BUDGET)
+                    payload["max_tokens"] = budget
                     continue
                 raise last
             return content.strip()

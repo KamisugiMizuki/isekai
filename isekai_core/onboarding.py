@@ -397,6 +397,8 @@ def _error_facts(exc: LLMError) -> dict[str, Any]:
         "status_code": status,
         "reason": reason,
         "retryable": bool(exc.retryable),
+        # 服务端原话（截断）：写进日志用于定位，不上主界面（§5：原始原因放详情）
+        "server_message": str(exc.message or "")[:200],
     }
 
 
@@ -547,12 +549,13 @@ async def test_llm(
         "tested_at": time.time(),
         "reason": str(failure.get("reason") or ""),
         "code": str(failure.get("code") or ""),
+        "server_message": str(failure.get("server_message") or ""),
         "status_code": failure.get("status_code"),
         "retryable": bool(failure.get("retryable", False)),
         "note": "测试只发送两段固定测试文字，不发送你的世界与聊天内容；通过不代表任意篇幅的生成都会成功。",
     }
     log.info(
-        "llm test status=%s calls=%s model=%s duration_ms=%s code=%s status_code=%s reason=%s",
+        "llm test status=%s calls=%s model=%s duration_ms=%s code=%s status_code=%s reason=%s message=%s",
         status,
         calls,
         probe_cfg.model,
@@ -560,6 +563,7 @@ async def test_llm(
         result.get("code"),
         result.get("status_code"),
         result.get("reason"),
+        result.get("server_message"),
     )
     return result
 
