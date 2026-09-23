@@ -28,6 +28,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import _audit2_desk as desk  # noqa: E402
+import _ui_nav_common as nav  # noqa: E402
 
 LOG = REPO / "scripts" / "_u4probe.log"
 PLUGIN = REPO / "examples" / "tide_rules_plugin" / "manifest.json"
@@ -179,7 +180,7 @@ async def main() -> None:
             raise SystemExit("止损：正式界面没连上核心")
 
         # ---------------- 1) 战役列表 + 本机规则 ----------------
-        await click_text(cdp, "nav.u-nav button", "跑团")
+        await nav.launch_app(cdp, "isekai GM")
         await asyncio.sleep(1.6)
         text = await visible_text(cdp)
         for need in ("继续已有战役", "新建战役", "从样例开始", "本机规则"):

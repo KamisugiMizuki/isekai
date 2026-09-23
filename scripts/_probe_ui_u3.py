@@ -27,6 +27,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import _audit2_desk as desk  # noqa: E402
+import _ui_nav_common as nav  # noqa: E402
 
 SAMPLE = REPO / "examples" / "sample_world"
 WORLD_NAME = "北堤世界"
@@ -255,7 +256,7 @@ async def main() -> None:
             raise SystemExit("止损：正式界面没连上核心")
 
         # ---------------- 1) 进工作区 ----------------
-        await click_text(cdp, "nav.u-nav button", "辅助写作")
+        await nav.launch_app(cdp, "isekai Writer")
         await asyncio.sleep(1.6)
         text = await visible_text(cdp)
         for need in ("辅助写作", "世界", "时间线", "观察角色", "大纲", "新建大纲", "绑定到大纲"):

@@ -221,7 +221,7 @@ export class App {
     // ponytail: 原型启动选择器，只在首次（还没完成首次设置）或没选过应用时显示
     if (!this.prefs.app_mode || !this.prefs[PREF_KEYS.onboard]) {
       const launcher = new Launcher(this.context());
-      launcher.show();
+      launcher.show(true);   // 启动时的自动弹窗：刚选过就不打扰
     }
   }
 
@@ -241,25 +241,34 @@ export class App {
 
   /* ---------------------------------------------------------------- 顶栏 / 条幅 */
 
+  /** 上一级页面：应用三页（联络 / 写作 / 跑团）与首页之上是启动选择器，其余页面挂在当前应用下。 */
+  private parentTarget(): Route | null {
+    if (APP_ROOT_PANES.has(this.route.pane)) return null;
+    return { pane: appPane(String(this.prefs.app_mode ?? "chat")) };
+  }
+
   private renderTop(): void {
     const title = this.current ? paneTitle(this.route.pane) : "";
     const mode = String(this.prefs.app_mode ?? "chat");
-    const modeIcon = mode === "chat" ? "💬" : mode === "writer" ? "✍️" : "🎲";
-    
-    // ponytail: 专注模式顶栏 = [≡] 返回启动器 + 任务名 + 状态 + [⋯] 更多菜单
-    const backBtn = button(`${modeIcon}`, () => {
-      new Launcher(this.context()).show();
-    }, { class: "u-btn u-btn-back", title: "返回选择应用" });
-    backBtn.setAttribute("aria-label", "返回选择应用");
-    
+    const atAppRoot = Boolean(this.current) && this.route.pane === appPane(mode);
+    const parent = this.current ? this.parentTarget() : null;
+
+    // 返回按钮写清去处（原来只有一个应用图标，点下去回哪儿看不出来）
+    const backLabel = parent ? `← 返回${paneTitle(parent.pane)}` : "← 返回选择应用";
+    const backBtn = button(backLabel, () => {
+      if (parent) this.navigate(parent);
+      else new Launcher(this.context()).show();
+    }, { class: "u-btn u-btn-back", id: "u-back", title: backLabel });
+    backBtn.setAttribute("aria-label", backLabel);
+
     const moreBtn = button("⋯", () => this.showMoreMenu(), { class: "u-btn u-ghost", id: "u-more-btn", title: "更多选项" });
     moreBtn.setAttribute("aria-label", "更多选项");
-    
+
     fill(
       this.topHost,
       el("div", { class: "u-title" }, 
         backBtn,
-        el("strong", { text: title }),
+        el("strong", { text: atAppRoot ? `${appIcon(mode)} ${title}` : title }),
       ),
       el(
         "div",
@@ -274,6 +283,7 @@ export class App {
     const menu = el("div", { class: "u-more-menu", role: "menu" });
     const backdrop = el("div", { class: "u-more-backdrop" });
     const items = [
+      { label: "首页", action: () => this.navigate({ pane: "home" }) },
       { label: "设置", action: () => this.navigate({ pane: "settings" }) },
       { label: "帮助与诊断", action: () => this.navigate({ pane: "help" }) },
       { label: "世界管理", action: () => this.navigate({ pane: "worlds" }) },
@@ -433,7 +443,8 @@ export class App {
     let pane: Pane;
     switch (target.pane) {
       case "onboarding":
-        pane = new OnboardingPane(ctx);
+        // 入口带着要看的那一步来（`sub:"sample"` = 直接用样例开始）；丢掉它就得从「本机检查」重走
+        pane = new OnboardingPane(ctx, target.sub);
         break;
       case "create":
         pane = new CreatePane(ctx);
@@ -657,6 +668,22 @@ export class App {
       await invoke("exit_ready", { detail: `退出前保存失败：${String(error)}`, saved: false });
     }
   }
+}
+
+/** 应用根页（它们的上一级是启动选择器）；首页是通用落点，同样归在根这一层。 */
+const APP_ROOT_PANES: ReadonlySet<PaneId> = new Set<PaneId>(["home", "contact", "writing", "trpg"]);
+
+/** 启动选择器的三个模式 → 对应的应用根页（与 launcher.launch 的路由一致） */
+export function appPane(mode: string): PaneId {
+  if (mode === "writer") return "writing";
+  if (mode === "gm") return "trpg";
+  return "contact";
+}
+
+export function appIcon(mode: string): string {
+  if (mode === "writer") return "✍️";
+  if (mode === "gm") return "🎲";
+  return "💬";
 }
 
 /** 页面标题（顶栏与页内标题共用）。方案 B 删左侧导航后不能再从导航项取，用一张表。 */

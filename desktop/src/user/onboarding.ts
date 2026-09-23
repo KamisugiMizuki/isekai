@@ -7,8 +7,10 @@
  */
 
 import type { AppContext, Pane } from "./app";
+import { appPane, paneTitle } from "./app";
 import type { Json } from "./api";
 import { uiError } from "./api";
+import type { AppMode } from "./launcher";
 import { migrateCard } from "./migrate";
 import { button, el, errorCard, facts, field, fill, paragraph, primary, section, setNote, stamp } from "./dom";
 
@@ -21,6 +23,16 @@ const STEPS: Array<{ id: StepId; label: string }> = [
   { id: "material", label: "准备材料" },
   { id: "start", label: "开始使用" },
 ];
+
+/** 入口带的下标 → 向导步骤：`sub:"sample"`（各处「从样例世界开始」）直接落到「准备材料」。 */
+const SUB_STEPS: Record<string, StepId> = {
+  sample: "material",
+  check: "check",
+  ai: "ai",
+  task: "task",
+  material: "material",
+  start: "start",
+};
 
 const PRESET_SERVICES: Array<{ id: string; label: string; base_url: string; model: string; key_url: string }> = [
   {
@@ -44,10 +56,23 @@ export class OnboardingPane implements Pane {
 
   async mount(host: HTMLElement): Promise<void> {
     const saved = String(this.ctx.prefs["onboard.step"] ?? "check") as StepId;
-    this.step = (this.startAt as StepId) ?? (STEPS.some((item) => item.id === saved) ? saved : "check");
+    // 入口指名的那一步优先（「从样例世界开始」不该把人扔回「本机检查」），其次才是上次停在哪
+    const asked = SUB_STEPS[String(this.startAt ?? "")];
+    this.step = asked ? this.entryStep(asked) : STEPS.some((item) => item.id === saved) ? saved : "check";
     if (this.step === "start") this.step = "material";
     this.root = host;
     await this.render();
+  }
+
+  /**
+   * 点名的那一步之前，前置（本机检查 / 连接 AI）都过完了才直接落到点名那一步；
+   * 前置还缺就按向导顺序从第一步走——配置好的用户不该被「从样例世界开始」扔回本机检查，
+   * 没配置完的用户也不该被跳过配置。
+   */
+  private entryStep(asked: StepId): StepId {
+    const readiness = this.ctx.readiness ?? {};
+    const configured = Boolean((readiness.ai as Json | undefined)?.configured);
+    return readiness.ready && configured ? asked : "check";
   }
 
   private async render(): Promise<void> {
@@ -87,11 +112,13 @@ export class OnboardingPane implements Pane {
     return list;
   }
 
-  private async goto(step: StepId): Promise<void> {
+  private async goto(step: StepId, mode?: AppMode): Promise<void> {
     this.step = step;
     await this.ctx.setPrefs({
       "onboard.step": step,
       "onboard.done": step === "start" ? true : this.ctx.prefs["onboard.done"] ?? false,
+      // 选了第一件事就顺手把应用模式定下来：建完世界直接落进那个应用，不在向导里再问一遍
+      ...(mode ? { app_mode: mode, "onboard.task": mode } : {}),
     });
     await this.render();
   }
@@ -299,24 +326,28 @@ export class OnboardingPane implements Pane {
 
   /* ---------------------------------------------------------------- ③ 选择任务 */
 
+  /**
+   * 三条路都真的能走：写作（U3）与跑团（U4）界面已经落地，不再是「暂未开放」。
+   * 选哪条记下应用模式，创建完世界直接落到那个应用（见 renderStartSection）。
+   */
   private renderTask(host: HTMLElement): void {
-    const choose = (task: string, next: StepId | null, reason = ""): HTMLElement => {
+    const instances = Number((((this.ctx.readiness ?? {}).first_run as Json) ?? {}).instances ?? 0);
+    const aiNote = ((this.ctx.readiness ?? {}).ai as Json | undefined)?.configured ? "" : "；AI 可以稍后在设置里配";
+    const missing = (text: string): string => (instances ? `已就绪${aiNote}` : text);
+    const choose = (mode: AppMode, title: string, body: string, note: string, action: string): HTMLElement => {
       const card = el("article", { class: "u-card" });
-      card.appendChild(el("h3", { text: task }));
-      if (next) {
-        card.appendChild(primary("开始联络", () => void this.goto(next)));
-      } else {
-        card.appendChild(el("p", { class: "u-hint", text: reason }));
-        card.appendChild(button("暂未开放", () => undefined, { disabled: true }));
-      }
+      card.appendChild(el("h3", { text: title }));
+      card.appendChild(paragraph(body));
+      card.appendChild(el("p", { class: "u-hint", text: note }));
+      card.appendChild(primary(action, () => void this.goto("material", mode)));
       return card;
     };
     const grid = el(
       "div",
       { class: "u-cards" },
-      choose("与角色联络", "material"),
-      choose("辅助写作", null, "这条路径正在实现中（内核已有语义与命令行入口，界面尚未开放）。可以先去「世界与素材」整理材料。"),
-      choose("进行跑团", null, "这条路径正在实现中（规则插件与战役运行时已可用）。"),
+      choose("chat", "与角色联络", "选一个世界和角色，和生活在其中的人对话。", missing("还缺：一个已创建的世界（这一步会建）"), "开始联络"),
+      choose("writer", "辅助写作", "整理大纲、观察角色能知道的事、比较下一步方案，保存文字草稿。", missing("还缺：世界与观察角色（这一步会建）"), "开始写作"),
+      choose("gm", "进行跑团", "选规则与角色，声明行动，确认后得到裁定与后果。", "还缺：一份已登记的规则插件（在跑团页登记）", "开始跑团"),
     );
     host.appendChild(
       section(
@@ -475,6 +506,8 @@ export class OnboardingPane implements Pane {
     const world = String(this.ctx.prefs["onboard.world_name"] ?? "");
     const note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
     const details = el("div", { class: "u-test-results" });
+    // 「选择第一件事」定的落点：联络 / 写作 / 跑团
+    const target = appPane(String(this.ctx.prefs["onboard.task"] ?? this.ctx.prefs.app_mode ?? "chat"));
 
     const begin = async (activate: boolean): Promise<void> => {
       setNote(note, activate ? "正在启动这条世界线…" : "已创建，暂不运行", "pending");
@@ -492,8 +525,8 @@ export class OnboardingPane implements Pane {
           },
           "onboard.done": true,
         });
-        setNote(note, activate ? "已开始运行，正在打开联络…" : "已创建，暂不运行；随时可以在世界详情里启动", "ok");
-        this.ctx.navigate({ pane: "contact" });
+        setNote(note, activate ? `已开始运行，正在打开${paneTitle(target)}…` : "已创建，暂不运行；随时可以在世界详情里启动", "ok");
+        this.ctx.navigate({ pane: target });
       } catch (error) {
         const info = uiError(error, {
           module: "开始使用",

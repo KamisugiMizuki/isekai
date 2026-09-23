@@ -30,12 +30,15 @@ export class Launcher {
 
   constructor(private readonly ctx: AppContext) {}
 
-  /** 显示应用选择器 */
-  show(): void {
+  /**
+   * 显示应用选择器。
+   * `auto` = 启动时的自动弹窗：刚选过应用就直接进去，不重复问（快速重启场景）。
+   * 用户自己点「返回选择应用」走的是 `auto=false`——那是明确意图，不能被「刚选过」吞掉。
+   */
+  show(auto = false): void {
     const lastMode = this.ctx.prefs.app_mode as AppMode | undefined;
-    
-    // ponytail: 有上次选择且 < 5 秒前启动 = 直接进入,不弹窗(快速重启场景)
-    if (lastMode && this.isRecentLaunch()) {
+
+    if (auto && lastMode && this.isRecentLaunch()) {
       this.launch(lastMode);
       return;
     }

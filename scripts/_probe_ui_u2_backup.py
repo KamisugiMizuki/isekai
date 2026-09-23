@@ -23,6 +23,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import _audit2_desk as desk  # noqa: E402
+import _ui_nav_common as nav  # noqa: E402
 
 FAKE_REPLY = '{"ok": true}'
 WORLD_NAME = "备份验收世界"
@@ -179,7 +180,7 @@ async def main() -> None:
             raise SystemExit("止损：界面没连上核心")
 
         # ---------------- 1) 打一份备份 ----------------
-        if not await click_text(cdp, "nav.u-nav button", "设置"):
+        if not await nav.open_menu(cdp, "设置"):
             problems.append("侧栏没有「设置」入口")
         await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('数据与备份')")
         await click_text(cdp, "#u-main button", "立即备份全部数据")
@@ -212,7 +213,7 @@ async def main() -> None:
         say("预检取消", cancelled)
 
         # ---------------- 4) 造差异，再真恢复 ----------------
-        await click_text(cdp, "nav.u-nav button", "世界与素材")
+        await nav.open_menu(cdp, "世界管理")
         await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('删除')")
         # 备份是在这个世界之后打的：删掉它，恢复后应当回来
         picked_delete = await click_row(cdp, WORLD_NAME, "删除")
@@ -229,7 +230,7 @@ async def main() -> None:
             problems.append(f"没有造出差异（删除世界失败）：{after_delete}")
         say("删除世界", after_delete)
 
-        await click_text(cdp, "nav.u-nav button", "设置")
+        await nav.open_menu(cdp, "设置")
         await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('数据与备份')")
         await click_text(cdp, "#u-main button", "恢复…")
         await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('替换当前数据')")

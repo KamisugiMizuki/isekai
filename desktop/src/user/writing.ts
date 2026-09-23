@@ -271,7 +271,10 @@ export class WritingPane implements Pane {
         void this.render();
       });
       node.dataset.tab = id;
-      if (id === this.tab) node.classList.add("u-nav-active");
+      if (id === this.tab) {
+        node.classList.add("u-nav-active");
+        node.setAttribute("aria-current", "page");
+      }
       tabs.appendChild(node);
     }
     host.appendChild(tabs);

@@ -139,6 +139,22 @@ body[data-mode="debug"] #debug-app {
   font-weight: 600;
 }
 
+/* 并列选项（写作分区 / 创建向导步骤）：当前所处的那个必须有肉眼可见的区别 */
+.u-btn.u-nav-active,
+.u-btn.u-nav-active:hover {
+  background: var(--u-fg);
+  color: var(--u-bg);
+  border-color: var(--u-fg);
+  font-weight: 600;
+}
+
+.u-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
 .u-content {
   display: flex;
   flex-direction: column;

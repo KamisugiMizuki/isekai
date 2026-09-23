@@ -24,6 +24,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import _audit2_desk as desk  # noqa: E402
+import _ui_nav_common as nav  # noqa: E402
 
 FAKE_REPLY = '{"ok": true}'
 WORLD_NAME = "验收世界"
@@ -185,8 +186,8 @@ async def main() -> None:
             raise SystemExit("止损：界面没连上核心")
 
         # ---------------- 1) 世界详情：时间线块 ----------------
-        if not await click_text(cdp, "nav.u-nav button", "世界与素材"):
-            problems.append("侧栏没有「世界与素材」入口")
+        if not await nav.open_menu(cdp, "世界管理"):
+            problems.append("⋯ 菜单打不开「世界管理」")
         if not await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('验收世界')"):
             problems.append("世界里没有列出刚建的世界")
         else:

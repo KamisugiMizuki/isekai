@@ -26,6 +26,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import _audit2_desk as desk  # noqa: E402
+import _ui_nav_common as nav  # noqa: E402
 
 SAMPLE = REPO / "examples" / "sample_world"
 # 假模型照着样例那份设定回答：起草结果是一份能通过校验的真设定
@@ -249,7 +250,7 @@ async def main() -> None:
             raise SystemExit("止损：界面没连上核心")
 
         # ---------------- 1) 来源 ----------------
-        await click_text(cdp, "nav.u-nav button", "世界与素材")
+        await nav.open_menu(cdp, "世界管理")
         await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('世界')")
         await asyncio.sleep(1.2)
         print("· route:", await cdp.js("JSON.stringify(window.__uiApp.probeState.route)"), flush=True)

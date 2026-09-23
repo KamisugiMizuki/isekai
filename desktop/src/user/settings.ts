@@ -41,11 +41,16 @@ export class SettingsPane implements Pane {
     page.appendChild(await this.backupSection());
     page.appendChild(await this.usageSection());
     page.appendChild(this.appearanceSection());
-    page.appendChild(this.extensionSection());
+    const extensions = this.extensionSection();
+    extensions.id = "u-set-extensions";
+    page.appendChild(extensions);
     fill(host, page);
+    // 入口带的下标要认：`ai` 定位到密钥框，`extensions` 定位到扩展那一节（不然这么长一页得自己找）
     if (this.ctx.route.sub === "ai") {
       const node = host.querySelector("#u-set-key") as HTMLInputElement | null;
       node?.focus();
+    } else if (this.ctx.route.sub === "extensions") {
+      host.querySelector("#u-set-extensions")?.scrollIntoView({ block: "start" });
     }
   }
 

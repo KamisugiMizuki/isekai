@@ -27,6 +27,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import _audit2_desk as desk  # noqa: E402
+import _ui_nav_common as nav  # noqa: E402
 
 SAMPLE = REPO / "examples" / "sample_world"
 FAKE_REPLY = (SAMPLE / "huichao.card1.json").read_text(encoding="utf-8")
@@ -233,7 +234,7 @@ async def main() -> None:
             raise SystemExit("止损：界面没连上核心")
 
         # ---------------- 1) 用样例设定进工作区 ----------------
-        await click_text(cdp, "nav.u-nav button", "世界与素材")
+        await nav.open_menu(cdp, "世界管理")
         await asyncio.sleep(1.2)
         if not await click_text(cdp, "#u-main button", "创建自己的世界"):
             problems.append("世界与素材里没有「创建自己的世界」入口")

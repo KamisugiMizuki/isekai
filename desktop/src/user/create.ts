@@ -453,7 +453,10 @@ export class CreatePane implements Pane {
       });
       step.disabled = id !== this.step && !this.allowed(id);
       step.dataset.step = id;
-      if (id === this.step) step.classList.add("u-nav-active");
+      if (id === this.step) {
+        step.classList.add("u-nav-active");
+        step.setAttribute("aria-current", "step");
+      }
       nav.appendChild(step);
     }
     this.note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });

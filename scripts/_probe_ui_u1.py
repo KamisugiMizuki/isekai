@@ -119,8 +119,8 @@ async def main() -> None:
         print("[首页]", json.dumps({"卡片": cards, "片段": home[:80]}, ensure_ascii=False))
         if cards != 3:
             problems.append(f"首页任务入口数={cards}（应 3）")
-        if "先连接 AI" not in home:
-            problems.append("未配置 AI 时首页没有给出「先连接 AI」")
+        if "第一步:连接 AI" not in home:
+            problems.append("未配置 AI 时首页没有给出「第一步:连接 AI」")
         if "推荐下一步" not in home:
             problems.append("无数据时首页没有给出推荐下一步")
 

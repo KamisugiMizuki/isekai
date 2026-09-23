@@ -39,6 +39,8 @@ const STATE_TEXT: Record<string, string> = {
 export class WorldsPane implements Pane {
   readonly id = "worlds" as const;
   private view: "list" | "detail" | "change" = "list";
+  /** 并列分栏的当前格（「我的世界」/「世界设定与角色卡」）：只由各自的渲染函数设置，切换时看得见 */
+  private tab: "worlds" | "assets" = "worlds";
   private current: InstanceEntry | null = null;
   private note: HTMLElement | null = null;
   /** 动作结果：rerender 会重建反馈槽，先把话记下来，渲染完再写回 */
@@ -48,11 +50,14 @@ export class WorldsPane implements Pane {
   constructor(private readonly ctx: AppContext) {}
 
   async mount(host: HTMLElement): Promise<void> {
-    if (this.ctx.route.sub === "detail" && this.ctx.instances().length) {
+    // 入口带的下标要认：`detail` / `timeline` = 直接开世界详情（时间线就在它里面），`import` = 直接选文件
+    const sub = this.ctx.route.sub;
+    if ((sub === "detail" || sub === "timeline") && this.ctx.instances().length) {
       this.view = "detail";
       this.current = this.ctx.instances()[0];
     }
     await this.render(host);
+    if (sub === "import") await this.importFlow();
   }
 
   private async render(host: HTMLElement): Promise<void> {
@@ -75,14 +80,24 @@ export class WorldsPane implements Pane {
   }
 
   private tabs(): HTMLElement {
+    // 分栏条：当前那格要有可见的高亮（点了「世界设定 / 角色卡」还留着「我的世界」加粗等于说谎）
+    const entry = (id: "worlds" | "assets", label: string, run: () => void): HTMLElement => {
+      const active = this.tab === id;
+      const node = button(label, () => {
+        this.tab = id;
+        run();
+      }, { class: active ? "u-btn u-nav-active" : "u-btn" });
+      if (active) node.setAttribute("aria-current", "page");
+      return node;
+    };
     return el(
       "div",
       { class: "u-row u-tabs" },
-      button("我的世界", () => {
+      entry("worlds", "我的世界", () => {
         this.view = "list";
         void this.rerender();
-      }, { class: this.view === "list" ? "u-btn u-primary" : "u-btn" }),
-      button("世界设定 / 角色卡", () => void this.renderAssetsInline()),
+      }),
+      entry("assets", "世界设定 / 角色卡", () => void this.renderAssetsInline()),
       button("导入", () => void this.importFlow()),
       primary("从样例开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
     );
@@ -102,6 +117,7 @@ export class WorldsPane implements Pane {
   /* ---------------------------------------------------------------- 我的世界 */
 
   private async renderList(host: HTMLElement): Promise<void> {
+    this.tab = "worlds";
     const instances = this.ctx.instances();
     if (!instances.length) {
       host.appendChild(
@@ -784,6 +800,7 @@ export class WorldsPane implements Pane {
   private async renderAssetsInline(): Promise<void> {
     const host = document.querySelector("#u-main") as HTMLElement | null;
     if (!host) return;
+    this.tab = "assets";
     const packages = await this.ctx.api.packages();
     const cards = await this.ctx.api.cards();
     const drafts = await this.ctx.api.draftList("create");
