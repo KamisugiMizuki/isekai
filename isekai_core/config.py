@@ -252,7 +252,8 @@ def validate_llm_updates(updates: dict[str, Any]) -> dict[str, Any]:
         else:
             if not isinstance(value, (int, float)) or isinstance(value, bool) or float(value) <= 0:
                 raise SettingsError(f"{key} 必须是正数")
-            cleaned[key] = float(value)
+            # max_tokens 是整数语义（服务端要求 u32）；timeout_s 保持浮点
+            cleaned[key] = int(value) if key == "max_tokens" else float(value)
     return cleaned
 
 

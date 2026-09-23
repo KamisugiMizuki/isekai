@@ -70,7 +70,8 @@ class LLMClient:
         payload: dict[str, Any] = {
             "model": self.cfg.model,
             "messages": messages,
-            "max_tokens": budget,
+            # 服务端严格反序列化要整数（Rust u32）：配置层可能是浮点，出口统一 int 化
+            "max_tokens": int(budget),
             "temperature": heat,
             "stream": False,
         }
@@ -126,7 +127,7 @@ class LLMClient:
                 last = LLMError("empty_completion", "模型返回空文本", retryable=True)
                 if attempt == 0:
                     budget = min(budget * 2, MAX_COMPLETION_BUDGET)
-                    payload["max_tokens"] = budget
+                    payload["max_tokens"] = int(budget)
                     continue
                 raise last
             if finish == "length":
@@ -134,7 +135,7 @@ class LLMClient:
                 last = LLMError("truncated_completion", f"输出被截断（{len(content)} 字符，预算 {budget}）", retryable=True)
                 if attempt == 0:
                     budget = min(budget * 2, MAX_COMPLETION_BUDGET)
-                    payload["max_tokens"] = budget
+                    payload["max_tokens"] = int(budget)
                     continue
                 raise last
             return content.strip()

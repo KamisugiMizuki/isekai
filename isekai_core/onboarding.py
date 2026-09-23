@@ -419,7 +419,8 @@ def _probe_llm(base: LLMConfig, overrides: dict[str, Any]) -> tuple[LLMConfig, d
                 continue
             if number <= 0:
                 continue
-            clean[key] = float(int(number)) if key == "max_tokens" else number
+            # max_tokens 必须是真整数：服务端（Rust 反序列化）拒绝 65536.0 这类浮点
+            clean[key] = int(number) if key == "max_tokens" else number
         elif key == "temperature":
             try:
                 number = float(value)

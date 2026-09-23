@@ -92,6 +92,28 @@ async def test_empty_completion_retry_uses_doubled_budget() -> None:
     assert [item["max_tokens"] for item in bodies] == [64, 128], "空内容重试要带上翻倍后的预算"
 
 
+async def test_max_tokens_is_sent_as_integer() -> None:
+    """max_tokens 必须是真整数：服务端（Rust 反序列化）拒绝 `65536.0` 这类浮点。
+
+    配置层可能把 max_tokens 存成浮点（历史配置就是），出网口要统一 int 化。
+    """
+    client = LLMClient(_cfg(max_tokens=65536.0))
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        )
+
+    _wire(client, handler)
+    await client.chat([{"role": "user", "content": "hi"}])
+
+    assert bodies[0]["max_tokens"] == 65536
+    assert isinstance(bodies[0]["max_tokens"], int), "浮点 max_tokens 会在服务端反序列化失败（422）"
+    assert "65536.0" not in json.dumps(bodies[0]), "请求体里不能出现浮点字面量"
+
+
 async def test_rejection_detail_keeps_server_message() -> None:
     client = LLMClient(_cfg())
 
