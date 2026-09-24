@@ -423,10 +423,15 @@ class CoreServer:
         if msg is None or msg["channel_id"] != conn.channel_id:
             raise UmpError(Err.NOT_FOUND, "找不到对应的出站消息", retryable=False, stage=Stage.DELIVERY)
         if envelope.binding_token != msg["binding_token"]:
-            # 旧回执不能作用于新绑定（§2.3）
-            raise UmpError(
-                Err.BINDING_EXPIRED, "回执的绑定令牌与固化时不一致", retryable=False, stage=Stage.DELIVERY
-            )
+            # 消息固化在**旧代表令**上（换绑 / 恢复旧库之后）时，它永远等不到「当代表令」的回执：
+            # 这类回执按幂等接受——否则每条都刷一次错误卡，而且它会一直算「未确认」被反复补投。
+            # 仍然拒绝的是：消息就固化在当前代表令上，回执却拿着别的令牌（错配的客户端不该动当前投递）。
+            thread = self.store.thread_get(conn.channel_id or "", msg["thread_id"] or "")
+            if thread is None or msg["binding_token"] == thread["binding_token"]:
+                raise UmpError(
+                    Err.BINDING_EXPIRED, "回执的绑定令牌与固化时不一致", retryable=False, stage=Stage.DELIVERY
+                )
+            log.warning("回执用了换代前的令牌 msg=%s（消息固化于旧绑定，按幂等接受）", message_id)
         index = envelope.payload.get("batch_index", 0)
         batches = json.loads(msg["parts"] or "[]")
         if index >= len(batches):

@@ -118,9 +118,12 @@ async def test_negotiated_text_limit_is_enforced(tmp_path):
             await mgmt.close()
 
 
-async def test_delivery_receipt_with_stale_token_is_rejected(tmp_path):
-    """回执必须按固化时捕获的绑定令牌核对：换绑后的令牌不能触碰原投递记录。"""
-    async with running_core(tmp_path, replies=["回了。"]) as h:
+async def test_delivery_receipt_after_rebind_is_accepted(tmp_path):
+    """消息固化在旧代表令上时，换代后的回执按幂等接受——否则每条都刷错误卡，而且永远算未确认被反复补投。
+
+    仍然拒绝的是「消息固化在当前代表令上、回执却拿别的令牌」：错配的客户端不该动当前投递。
+    """
+    async with running_core(tmp_path, replies=["回了。", "又回了。"]) as h:
         mgmt = await open_mgmt(h)
         client, info = await bind_thread(h, mgmt, channel_id="builtin", thread_id="dm-1")
         token = info["thread"]["binding_token"]
@@ -131,20 +134,38 @@ async def test_delivery_receipt_with_stale_token_is_rejected(tmp_path):
             seq = h.store.outbound_by_message_id(message_id)["seq"]
             assert h.store.delivery_rollup(seq) == "sent"
 
-            # 换代之后拿「新绑定」的令牌给旧回复补回执：不得写进原记录
+            # 换代之后拿「新绑定」的令牌给旧回复补回执：消息固化于旧绑定，按幂等接受
             rebound = await mgmt.call(
                 "thread.bind", channel="builtin", thread_id="dm-1", session_id=info["session"]["id"]
             )
+            new_token = rebound["thread"]["binding_token"]
             await client.report_delivery(
                 thread_id="dm-1",
-                binding_token=rebound["thread"]["binding_token"],
+                binding_token=new_token,
                 message_id=message_id,
+                batch_index=0,
+                state="accepted",
+            )
+            for _ in range(100):
+                if h.store.delivery_rollup(seq) == "delivered":
+                    break
+                await asyncio.sleep(0.02)
+            assert h.store.delivery_rollup(seq) == "delivered"
+
+            # 当前代表令上的消息，回执拿别的令牌：照旧拒绝
+            await client.send_user_message(thread_id="dm-1", binding_token=new_token, text="还在吗")
+            fresh = await client.expect(lambda e: e.type == "reply")
+            fresh_seq = h.store.outbound_by_message_id(fresh.payload["message_id"])["seq"]
+            await client.report_delivery(
+                thread_id="dm-1",
+                binding_token="bt-别人家的",
+                message_id=fresh.payload["message_id"],
                 batch_index=0,
                 state="accepted",
             )
             error = await client.expect(lambda e: e.type == "error")
             assert error.payload["code"] == ump.Err.BINDING_EXPIRED
-            assert h.store.delivery_rollup(seq) == "sent"
+            assert h.store.delivery_rollup(fresh_seq) == "sent"
         finally:
             await client.close()
             await mgmt.close()

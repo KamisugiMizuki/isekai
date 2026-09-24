@@ -710,9 +710,10 @@ export class ChannelLink {
   async open(api: AppApi, instanceId: string, timelineId: string, characterId: string): Promise<ThreadLink> {
     this.close();
     const issued = await api.ensureChannel(this.channelName, "isekai 桌面");
-    // 缓存里的那份凭据可能属于另一个数据根（换根 / 恢复备份之后）：它只会一直失败，所以失败就轮换重试一次
-    let credential = (issued.credential as string | null) ?? localStorage.getItem(`isekai.credential.${this.channelName}`);
-    if (!credential) credential = await this.rotateCredential(api);
+    // 凭据按「通道实例」缓存：换数据根（换根 / 恢复备份）会换实例，就不会再拿另一个根的凭据去连
+    const channelKey = this.credentialKey(issued);
+    let credential = (issued.credential as string | null) ?? localStorage.getItem(channelKey);
+    if (!credential) credential = await this.rotateCredential(api, channelKey);
     const session = (await api.sessionEnsure(instanceId, timelineId, characterId)).session as Json;
     const sessionId = String(session.id);
     const threadId = this.threadId(instanceId, timelineId, characterId);
@@ -721,8 +722,8 @@ export class ChannelLink {
     try {
       ack = await client.connect({ credential, bootstrap: null });
     } catch (error) {
-      localStorage.removeItem(`isekai.credential.${this.channelName}`);
-      const rotated = await this.rotateCredential(api);
+      localStorage.removeItem(channelKey);
+      const rotated = await this.rotateCredential(api, channelKey);
       if (!rotated) throw error;
       client.close();
       client = this.buildClient();
@@ -752,11 +753,17 @@ export class ChannelLink {
     return client;
   }
 
+  /** 本机凭据缓存的键：带上通道实例 id（ci-xxxx），不同数据根互不干扰 */
+  private credentialKey(issued: Json): string {
+    const channelId = String(((issued.channel as Json) ?? {}).id ?? "");
+    return `isekai.credential.${this.channelName}${channelId ? `.${channelId}` : ""}`;
+  }
+
   /** 显式轮换通道凭据并记住（界面是这条通道的唯一使用者，轮换不会踢掉别人） */
-  private async rotateCredential(api: AppApi): Promise<string> {
+  private async rotateCredential(api: AppApi, key: string): Promise<string> {
     const issued = await api.ensureChannel(this.channelName, "isekai 桌面", true);
     const credential = String(issued.credential ?? "");
-    if (credential) localStorage.setItem(`isekai.credential.${this.channelName}`, credential);
+    if (credential) localStorage.setItem(key, credential);
     return credential;
   }
 

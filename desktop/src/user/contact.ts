@@ -607,6 +607,8 @@ export class ContactPane implements Pane {
         ref: "",
         parts: [],
       });
+      // 说明也要回执（单批）：不回执的话这条永远算未确认，每次重连都会被当成待投递重发一遍
+      this.link?.confirmDelivery(event.messageId, 0, "accepted");
       this.renderMessages();
       this.appendSystem(this.handoffCard(event.text));
       return;
