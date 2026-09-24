@@ -33,7 +33,9 @@ from urllib.request import ProxyHandler, build_opener
 
 REPO = Path(__file__).resolve().parent.parent
 PY = REPO / ".venv" / "Scripts" / "python.exe"
-EXE = REPO / "desktop" / "src-tauri" / "target" / "debug" / "isekai-desktop.exe"
+EXE = Path(os.environ["ISEKAI_SHELL"]) if os.environ.get("ISEKAI_SHELL") else (
+    REPO / "desktop" / "src-tauri" / "target" / "debug" / "isekai-desktop.exe"
+)  # ISEKAI_SHELL 指到 release/isekai/isekai.exe 就能对发行件跑同一批探针
 DIST = REPO / "desktop" / "dist"
 TMPBASE = Path(os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or ".") / "Temp"
 PORT = 9333          # 与旧探针（9222）分开，避免互相抢 target
@@ -67,8 +69,9 @@ def dump(tag: str) -> None:
 
 # ------------------------------------------------------------------ 环境
 
-def make_root(tag: str, *, venv: bool = True, broken_data: bool = False) -> Path:
-    root = TMPBASE / f"isekai_audit2_{tag}_{int(time.time())}"
+def make_root(tag: str, *, venv: bool = True, broken_data: bool = False,
+              base: Path | None = None) -> Path:
+    root = base or (TMPBASE / f"isekai_audit2_{tag}_{int(time.time())}")
     (root / "config").mkdir(parents=True, exist_ok=True)
     (root / "packages").mkdir(parents=True, exist_ok=True)
     for name in ([".venv"] if venv else []) + ["isekai_core"]:
@@ -158,8 +161,8 @@ def force_clean(path: Path) -> None:
         path.unlink()
 
 
-def kill_tree(name: str = "isekai-desktop.exe") -> None:
-    subprocess.run(["taskkill", "/F", "/T", "/IM", name], capture_output=True)
+def kill_tree(name: str | None = None) -> None:
+    subprocess.run(["taskkill", "/F", "/T", "/IM", name or EXE.name], capture_output=True)
 
 
 def pid_alive(pid: int) -> bool:

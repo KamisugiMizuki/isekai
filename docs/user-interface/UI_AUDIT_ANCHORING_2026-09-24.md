@@ -78,9 +78,13 @@
 .venv/Scripts/python.exe scripts/_probe_ui_u2.py   # 世界与素材
 .venv/Scripts/python.exe scripts/_probe_ui_u3.py   # 辅助写作
 .venv/Scripts/python.exe scripts/_probe_ui_u4.py   # 跑团
+# 发行件（打包壳 + 自带解释器 + 数据根在用户目录）走它自己的冒烟
+.venv/Scripts/python.exe scripts/_probe_release_smoke.py
 ```
 
-探针断言：输入框底边在 0/1/9 轮三次读数一致且在视口内；消息列表成为滚动容器且不被压扁；`#u-main` scrollTop 恒为 0；新消息到达时列表停在底部；停在历史里时给提示且不抢滚动；点提示回到底部；**分栏条锚定**——把视口压矮到 420 高让页面滚得动，滚到底后 `.u-tabs`（世界与素材）与 `nav.u-crumbs`（写作分区）仍贴在主区顶部。
+> 发行件的首屏是**工作台**（随包样例已在数据根里），不是首次设置向导；向导那套探针只对开发壳有意义。发行件的界面修复是否随包，看 `desktop/dist/assets/*.css` 里有没有对应规则（17:11 那份含 `sticky`/`u-crumbs`）。
+
+探针断言：输入框底边在 0/1/9 轮三次读数一致且在视口内；消息列表成为滚动容器且不被压扁；`#u-main` scrollTop 恒为 0；新消息到达时列表停在底部；停在历史里时给提示且不抢滚动；点提示回到底部；**分栏条锚定**——把视口压矮到 420 高让页面滚得动，滚到底后 `.u-tabs`（世界与素材）与 `nav.u-crumbs`（写作分区）仍贴在主区顶部。——失败必须喊出声：曾经这条路径上是 `raise SystemExit(0)`，进不去联络页就静默退出 0，日志里连原因都没有（已改成打印原因 + 退出码 1）。
 
 > 探针基建坑：本机回环请求必须绕开系统代理（Clash 会让 `127.0.0.1/json` 返回 502 Bad Gateway），`_audit2_desk.Cdp.attach` 已改用 `build_opener(ProxyHandler({}))`。
 

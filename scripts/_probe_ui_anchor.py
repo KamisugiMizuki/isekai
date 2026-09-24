@@ -104,7 +104,7 @@ async def say(cdp: desk.Cdp, text: str) -> bool:
 
 
 async def main() -> None:
-    root = desk.make_root("uianchor")
+    root = desk.make_root("uianchor")  # 发行件那套流程见 scripts/_probe_release_smoke.py（首屏是工作台，不是向导）
     (root / "examples").mkdir(parents=True, exist_ok=True)
     shutil.copytree(SAMPLE, root / "examples" / "sample_world")
     config_file = root / "config" / "config.yaml"
@@ -136,8 +136,9 @@ async def main() -> None:
         await u1.wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('开始运行并联络')", timeout=60)
         await u1.click_text(cdp, "#u-main button", "开始运行并联络")
         if not await u1.wait_true(cdp, "!!document.getElementById('u-contact-input')", timeout=60):
-            problems.append(f"没有进入角色联络：{(await u1.visible_text(cdp, '#u-main'))[:200]}")
-            raise SystemExit(0)
+            problems.append(f"没有进入角色联络：{(await u1.visible_text(cdp, '#u-main'))[:300]}")
+            print("\n结果: FAIL", "；".join(problems), flush=True)  # 别静默退出：失败原因必须落日志
+            raise SystemExit(1)
 
         empty = await measure(cdp)
         print("[0 条]", json.dumps(empty, ensure_ascii=False))
