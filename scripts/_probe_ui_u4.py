@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import socket
 import sys
@@ -260,6 +261,25 @@ async def main() -> None:
             problems.append("场景名没有显示出来（不该拿内部标识当标题）")
         if "这一面有" in play and "不该出现的内容" in play:
             problems.append("玩家面受众闸报了违规内容")
+        # 行动流程轨（图形化）：四个阶段画成一条，刚开始时应停在「写下行动」
+        rail_expr = (
+            "(()=>{const r=document.querySelector('#u-main .u-rail');if(!r){return null;}"
+            "return {steps:[...r.querySelectorAll('.u-rail-label')].map(x=>x.textContent),"
+            "current:(r.querySelector('.u-rail-current .u-rail-label')||{}).textContent||''};})()"
+        )
+        rail = await cdp.js(rail_expr)
+        if not rail or len(rail.get("steps") or []) != 4:
+            problems.append(f"玩家面没有行动流程轨：{rail}")
+        elif rail.get("current") != "写下行动":
+            problems.append(f"行动流程轨的当前位置不对：{rail}")
+        # 截图（本地证据）：流程轨与页面一起看，别只读文本
+        try:
+            raw = await cdp.call("Page.captureScreenshot", format="png")
+            shots = REPO / ".hermes" / "audits" / "ui_graphics"
+            shots.mkdir(parents=True, exist_ok=True)
+            (shots / "06_trpg_play.png").write_bytes(base64.b64decode(raw["data"]))
+        except Exception as exc:  # noqa: BLE001
+            print(f"截图失败：{type(exc).__name__}: {exc}", flush=True)
         say("玩家面", play[:180])
 
         # ---------------- 4) 行动：确认卡 → 确认并裁定 ----------------
@@ -291,11 +311,14 @@ async def main() -> None:
         resolved = await wait_true(
             cdp,
             "(()=>{const t=document.querySelector('#u-main .u-note')?.innerText||document.querySelector('#u-main').innerText;"
-            "return t.includes('已固化')||t.includes('阶段');})()",
+            "return t.includes('已固化');})()",
             timeout=180,
         )
         await asyncio.sleep(2.0)
         after = inspect(root)
+        rail_done = await cdp.js(rail_expr)
+        if not rail_done or rail_done.get("current") != "写入世界":
+            problems.append(f"裁定提交之后流程轨没有走到「写入世界」：{rail_done}")
         if not after["actions"]:
             problems.append(f"行动没有落库：{after['actions']}")
         if not resolved:

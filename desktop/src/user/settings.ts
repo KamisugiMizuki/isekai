@@ -10,7 +10,6 @@ import { migrateCard } from "./migrate";
 import type { Json } from "./api";
 import { uiError } from "./api";
 import {
-  bulletList,
   button,
   chip,
   el,
@@ -24,7 +23,26 @@ import {
   section,
   setNote,
   stamp,
+  type Child,
 } from "./dom";
+import { meter, checkList } from "./graphics";
+
+/** 预算账本里的任务名 → 人话（核心给的是内部标识，认不出来就照原样显示） */
+const TASK_TEXT: Record<string, string> = {
+  dialog: "对话生成",
+  dialog_commit: "对话生成",
+  event_render: "事件表述",
+  claim_expand: "说法展开",
+  intent_propose: "意图提案",
+  life_refine: "生活线细化",
+  memory_extract: "记忆提取",
+  memory_compact: "记忆汇总",
+  narrative_audit: "回复后验审计",
+  story_classify: "输入分类",
+  wa_suggest: "写作建议",
+  proactive_text: "主动消息",
+  embedding: "向量化",
+};
 
 export class SettingsPane implements Pane {
   readonly id = "settings" as const;
@@ -114,8 +132,12 @@ export class SettingsPane implements Pane {
         const checks = (result.checks as Json[]) ?? [];
         fill(progress);
         results.appendChild(
-          facts(
-            checks.map((item) => [String(item.label), `${item.ok ? "✓ 通过" : "✗ 未通过"}：${String(item.detail ?? "")}`]),
+          checkList(
+            checks.map((item) => ({
+              label: String(item.label),
+              ok: Boolean(item.ok),
+              detail: String(item.detail ?? ""),
+            })),
           ),
         );
         if (result.ok) {
@@ -492,16 +514,74 @@ export class SettingsPane implements Pane {
       }
       try {
         const result = await this.ctx.api.budget(select.value);
-        const totals = (result.totals as Json) ?? (result as Json);
-        fill(
-          host,
-          facts(
-            Object.entries(totals)
-              .filter(([, value]) => typeof value === "number" || typeof value === "string")
-              .slice(0, 8)
-              .map(([key, value]) => [key, String(value)]),
+        const limits = ((result.limits as Json) ?? {}) as Json;
+        const usage = ((result.usage as Json) ?? {}) as Json;
+        const ledger = (result.rows as Json[]) ?? [];
+        const paused = ((result.paused_tasks as string[]) ?? []).map((item) => String(item));
+        const names = new Map<string, string>();
+        try {
+          const info = await this.ctx.api.instanceInfo(select.value);
+          for (const timeline of (info.timelines as Json[]) ?? []) {
+            names.set(String(timeline.id), String(timeline.name ?? timeline.id));
+          }
+        } catch {
+          /* 名字读不到就退回用标识：读数是真值，名字只是好看 */
+        }
+        const instanceLimit = Number(limits.instance_tokens_per_day ?? 0);
+        const timelineLimit = Number(limits.timeline_tokens_per_day ?? 0);
+        const taskLimit = Number(limits.task_tokens_per_day ?? 0);
+        const perTask = new Map<string, { tokens: number; calls: number }>();
+        for (const row of ledger) {
+          const task = String(row.task ?? "");
+          const seen = perTask.get(task) ?? { tokens: 0, calls: 0 };
+          seen.tokens += Number(row.tokens ?? 0);
+          seen.calls += Number(row.calls ?? 0);
+          perTask.set(task, seen);
+        }
+        const timelines = Object.entries(((usage.timelines as Json) ?? {}) as Json);
+        const body: Child[] = [
+          paragraph(
+            "按现实日统计：每一个外部调用发起前先占额度，成功、失败、超时都按真实消耗结算。这里只读。",
+            "u-hint",
           ),
-        );
+          el("div", { class: "u-meters" }, meter(Number(usage.instance ?? 0), instanceLimit, "这个世界今天用掉（全部时间线）")),
+        ];
+        if (timelines.length) {
+          body.push(el("h4", { class: "u-sub", text: "各条时间线" }));
+          body.push(
+            el(
+              "div",
+              { class: "u-meters" },
+              ...timelines.map(([id, tokens]) =>
+                meter(Number(tokens ?? 0), timelineLimit, names.get(id) ?? id),
+              ),
+            ),
+          );
+        }
+        if (perTask.size) {
+          body.push(el("h4", { class: "u-sub", text: "按任务" }));
+          body.push(
+            el(
+              "div",
+              { class: "u-meters" },
+              ...[...perTask.entries()]
+                .sort((a, b) => b[1].tokens - a[1].tokens)
+                .map(([task, seen]) => meter(seen.tokens, taskLimit, `${TASK_TEXT[task] ?? task}（${seen.calls} 次）`)),
+            ),
+          );
+        } else {
+          body.push(paragraph("这一现实日还没有调用记录。", "u-hint"));
+        }
+        if (paused.length) {
+          body.push(
+            el(
+              "div",
+              { class: "u-row" },
+              ...paused.map((task) => chip(`已暂停：${TASK_TEXT[task] ?? task}`, "bad")),
+            ),
+          );
+        }
+        fill(host, ...body);
       } catch (error) {
         fill(host, paragraph(uiError(error, { module: "用量", action: "读取用量" }).message, "u-note u-note-bad"));
       }
@@ -510,11 +590,10 @@ export class SettingsPane implements Pane {
     await load();
     return section(
       "用量",
-      paragraph("这里显示核心记录的调用次数与量级，不做费用面板；每个世界的额度在世界详情里调整。"),
+      paragraph("这里显示核心记录的调用次数与量级，不做费用面板；上限目前只能在命令行按世界调整。"),
       field("世界", select),
       host,
       note,
-      bulletList([`设置 -> 世界详情可以调整上限（runtime.budget.set）`], "u-list u-hint"),
     );
   }
 

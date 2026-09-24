@@ -9,6 +9,7 @@ import type { AppContext, Pane } from "./app";
 import { openDir } from "./app";
 import type { Json } from "./api";
 import { bulletList, button, el, facts, fill, paragraph, primary, section, stamp } from "./dom";
+import { dotLine } from "./graphics";
 
 interface Recent {
   pane: string;
@@ -146,7 +147,8 @@ export class HomePane implements Pane {
       card.appendChild(el("h3", { text: task.title }));
       card.appendChild(paragraph(task.body));
       const ready = this.taskReady(task.pane);
-      card.appendChild(el("p", { class: "u-hint", text: ready.note }));
+      // 就绪 / 还缺什么：一行字前面给个状态点，扫一眼就能看出哪张卡还不能开
+      card.appendChild(dotLine(ready.note, ready.open ? "ok" : "pending"));
       card.appendChild(primary(ready.open ? `打开${task.title}` : "准备材料", () => this.ctx.navigate({ pane: task.pane })));
       grid.appendChild(card);
     }

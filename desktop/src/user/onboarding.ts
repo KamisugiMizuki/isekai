@@ -12,7 +12,8 @@ import type { Json } from "./api";
 import { uiError } from "./api";
 import type { AppMode } from "./launcher";
 import { migrateCard } from "./migrate";
-import { button, el, errorCard, facts, field, fill, paragraph, primary, section, setNote, stamp } from "./dom";
+import { button, el, errorCard, field, fill, paragraph, primary, section, setNote, stamp } from "./dom";
+import { checkList } from "./graphics";
 
 type StepId = "check" | "ai" | "task" | "material" | "start";
 
@@ -133,7 +134,13 @@ export class OnboardingPane implements Pane {
       section(
         "本机环境",
         paragraph("先确认程序和数据位置可用；这一步不涉及 AI 密钥，也不写任何东西。"),
-        facts(checks.map((item) => [String(item.label), `${item.ok ? "通过" : "需要处理"}：${String(item.detail ?? "")}`])),
+        checkList(
+          checks.map((item) => ({
+            label: String(item.label),
+            ok: Boolean(item.ok),
+            detail: String(item.detail ?? ""),
+          })),
+        ),
       ),
     );
     if (!ok) {
@@ -261,11 +268,12 @@ export class OnboardingPane implements Pane {
         const checks = (result.checks as Json[]) ?? [];
         fill(
           results,
-          facts(
-            checks.map((item) => [
-              String(item.label),
-              `${item.ok ? "通过" : "未通过"}：${String(item.detail ?? "")}`,
-            ]),
+          checkList(
+            checks.map((item) => ({
+              label: String(item.label),
+              ok: Boolean(item.ok),
+              detail: String(item.detail ?? ""),
+            })),
           ),
           el(
             "p",

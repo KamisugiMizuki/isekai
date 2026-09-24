@@ -25,6 +25,7 @@ import {
   setNote,
   stamp,
 } from "./dom";
+import { stackBar } from "./graphics";
 import { paneTitle } from "./app";
 
 interface Message {
@@ -349,11 +350,14 @@ export class ContactPane implements Pane {
 
   private renderCluePanel(): void {
     if (!this.clueHost) return;
+    // 说过多少 / 还留着多少：一句话读不出比例，用一段条表示（内容依然不上屏）
+    const summary = el("div", { id: "u-clue-bar" });
     const clues = el("ol", { class: "u-list", id: "u-clues" });
     fill(
       this.clueHost,
       section(
         "已讲过的线索",
+        summary,
         clues,
         el(
           "div",
@@ -370,22 +374,33 @@ export class ContactPane implements Pane {
   private async loadClues(): Promise<void> {
     const selection = this.selection;
     const host = this.clueHost?.querySelector("#u-clues");
+    const bar = this.clueHost?.querySelector("#u-clue-bar");
     if (!selection || !host) return;
     try {
       const result = await this.ctx.api.narrativeMap(selection.instance_id, selection.timeline_id, selection.character_id);
       const map = (result.map as Json) ?? {};
       const nodes = (map.nodes as Json[]) ?? [];
-      const spoken = nodes.filter((item) => String(item.stage ?? "") === "spoken");
-      const held = nodes.filter((item) => String(item.stage ?? "") !== "spoken");
+      // 图谱给的字段是 kind / label（见 runtime.narrative.map_payload）——按 stage / text 取会永远空
+      const spoken = nodes.filter((item) => String(item.kind ?? "") === "spoken");
+      const held = nodes.filter((item) => String(item.kind ?? "") !== "spoken");
+      if (bar) {
+        const graph = stackBar([
+          { label: "已经讲出口", value: spoken.length, tone: "ok" },
+          { label: "还没讲出口", value: held.length, tone: "muted" },
+        ]);
+        fill(bar, graph ?? el("span", { class: "u-hint", text: "" }));
+      }
       fill(
         host,
         ...spoken.map((item) =>
           el(
             "li",
             {},
-            button(String(item.text ?? "（这条内容已经不在当前记录里）"), () => void this.focusMessage(String(item.message_id ?? "")), {
-              class: "u-btn u-ghost",
-            }),
+            button(
+              String(item.label ?? "（这条内容已经不在当前记录里）"),
+              () => void this.focusMessage(String(item.message_id ?? "")),
+              { class: "u-btn u-ghost" },
+            ),
           ),
         ),
         held.length

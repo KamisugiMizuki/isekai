@@ -841,3 +841,292 @@ nav.u-crumbs {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* ------------------------------------------------------------------ 图形化
+ * 说不清的关系 / 比例 / 流程用图表达（DOM + SVG，见 graphics.ts）。
+ * 颜色只做强调：每张图都带文字图例或 title，读屏与色盲用户不吃亏。
+ */
+
+/* 流程轨：几个阶段排成一条，走过的打勾、当前那格反白 */
+.u-rail {
+  display: flex;
+  align-items: flex-start;
+  margin: 8px 0 4px;
+}
+
+.u-rail-step {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.u-rail-step::before {
+  content: "";
+  position: absolute;
+  top: 11px;
+  right: 50%;
+  left: -50%;
+  height: 1px;
+  background: var(--u-border-soft);
+}
+
+.u-rail-step:first-child::before {
+  display: none;
+}
+
+.u-rail-done::before {
+  background: var(--u-fg);
+  opacity: 0.5;
+}
+
+.u-rail-dot {
+  position: relative;
+  z-index: 1;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px solid var(--u-border-control);
+  background: var(--u-bg);
+  color: var(--u-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7em;
+  line-height: 1;
+}
+
+.u-rail-label {
+  font-size: 0.75em;
+  color: var(--u-muted);
+  text-align: center;
+}
+
+.u-rail-done .u-rail-dot,
+.u-rail-done .u-rail-label {
+  color: var(--u-fg);
+}
+
+.u-rail-current .u-rail-dot {
+  background: var(--u-fg);
+  border-color: var(--u-fg);
+  color: var(--u-bg);
+  font-weight: 700;
+}
+
+.u-rail-current .u-rail-label {
+  color: var(--u-fg);
+  font-weight: 600;
+}
+
+/* 比例条 / 计量条 */
+.u-bar-wrap,
+.u-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 160px;
+}
+
+.u-bar {
+  display: flex;
+  height: 12px;
+  border: 1px solid var(--u-border-soft);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--u-sunken);
+}
+
+.u-bar-seg {
+  height: 100%;
+  min-width: 3px;
+}
+
+.u-bar-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 0.8em;
+  color: var(--u-muted);
+}
+
+.u-bar-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.u-bar-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid var(--u-border-soft);
+}
+
+.u-meter {
+  flex: 1 1 200px;
+}
+
+.u-meter-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.85em;
+}
+
+.u-meter-value {
+  color: var(--u-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.u-meters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 6px 0;
+}
+
+/* 分段色调（只做强调，含义在文字图例里） */
+.u-bar-seg.u-tone-accent,
+.u-bar-swatch.u-tone-accent,
+.u-dot.u-tone-accent {
+  background: var(--u-fg);
+}
+
+.u-bar-seg.u-tone-ok,
+.u-bar-swatch.u-tone-ok,
+.u-dot.u-tone-ok {
+  background: var(--u-ok);
+}
+
+.u-bar-seg.u-tone-bad,
+.u-bar-swatch.u-tone-bad,
+.u-dot.u-tone-bad {
+  background: var(--u-bad);
+}
+
+.u-bar-seg.u-tone-warn,
+.u-bar-swatch.u-tone-warn,
+.u-dot.u-tone-warn,
+.u-bar-seg.u-tone-pending,
+.u-bar-swatch.u-tone-pending,
+.u-dot.u-tone-pending {
+  background: var(--u-warn);
+}
+
+.u-bar-seg.u-tone-muted,
+.u-bar-swatch.u-tone-muted,
+.u-dot.u-tone-muted {
+  background: var(--u-border-soft);
+}
+
+/* 状态点 / 检查清单 */
+.u-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  margin-top: 0.55em;
+}
+
+.u-dot-line {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.u-dot-text {
+  flex: 1;
+}
+
+.u-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.u-check-line {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.u-check-glyph {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.u-check-glyph.u-tone-ok {
+  color: var(--u-ok);
+}
+
+.u-check-glyph.u-tone-bad {
+  color: var(--u-bad);
+}
+
+.u-check-label {
+  flex: 0 0 auto;
+}
+
+.u-check-detail {
+  color: var(--u-muted);
+  font-size: 0.85em;
+}
+
+/* 分支图：一条时间线一条泳道，分叉用虚线连回来源提交 */
+.u-branch-wrap {
+  margin: 6px 0 4px;
+  overflow-x: auto;
+}
+
+.u-branch {
+  display: block;
+  height: auto;
+  color: var(--u-fg);
+}
+
+.u-edge {
+  stroke: var(--u-border-soft);
+}
+
+.u-edge-live {
+  stroke: var(--u-fg);
+}
+
+.u-edge-branch {
+  stroke: var(--u-border-control);
+}
+
+.u-node {
+  fill: var(--u-surface);
+  stroke: var(--u-fg);
+  stroke-width: 1.5;
+}
+
+.u-node-head {
+  fill: var(--u-fg);
+}
+
+.u-node-initial {
+  stroke-width: 2.5;
+}
+
+.u-branch-label {
+  fill: var(--u-fg);
+  font-size: 12px;
+}
+
+.u-branch-sub {
+  fill: var(--u-muted);
+  font-size: 10px;
+}
+
+.u-commit-hit {
+  background: var(--u-sunken);
+  outline: 1px solid var(--u-border-control);
+}

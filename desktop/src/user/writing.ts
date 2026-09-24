@@ -31,6 +31,7 @@ import {
   setNote,
   stamp,
 } from "./dom";
+import { stackBar, type Seg } from "./graphics";
 
 type Tab = "outline" | "material" | "advice" | "draft";
 
@@ -51,6 +52,25 @@ const STATUS_TEXT: Record<string, string> = {
   deviated: "已偏离",
   abandoned: "已放弃",
 };
+
+/** 条目状态的图例顺序与色调（与下面 rows 里的 chip 同一套说法） */
+const STATUS_SEGS: Array<[string, Seg["tone"]]> = [
+  ["unstarted", "muted"],
+  ["in_progress", "pending"],
+  ["achieved", "ok"],
+  ["deviated", "bad"],
+  ["abandoned", "muted"],
+];
+
+/** 一组条目的状态分布 → 一段比例条（六类各自一条，一眼看出哪类在偏离） */
+function statusBar(items: Json[], legend = false): HTMLElement | null {
+  const segs: Seg[] = STATUS_SEGS.map(([status, tone]) => ({
+    label: STATUS_TEXT[status] ?? status,
+    tone,
+    value: items.filter((item) => String(item.status) === status).length,
+  }));
+  return stackBar(segs, { legend });
+}
 
 function refs(value: string): string[] {
   return value.split(/[,，;；\s]+/).map((item) => item.trim()).filter(Boolean);
@@ -290,11 +310,23 @@ export class WritingPane implements Pane {
       return;
     }
     const items = ((this.state.items as Json[]) ?? []).slice();
+    host.appendChild(
+      section(
+        "进度概览",
+        paragraph(
+          `这条线上共 ${items.length} 条约束与目标。状态是记下来的事实，不是会自动涨的进度条：偏离会被留着，不会被抹掉。`,
+          "u-hint",
+        ),
+        statusBar(items, true) ?? paragraph("这份大纲还没有条目。", "u-hint"),
+      ),
+    );
     const groups = el("div", { class: "u-cards" });
     for (const [layer, label, example] of LAYERS) {
       const mine = items.filter((item) => String(item.layer) === layer);
       const card = el("article", { class: "u-card" });
       card.appendChild(el("h3", { text: `${label}（${mine.length}）` }));
+      const bar = statusBar(mine);
+      if (bar) card.appendChild(bar);
       card.appendChild(paragraph(example, "u-hint"));
       for (const item of mine) {
         const status = String(item.status);
@@ -333,6 +365,13 @@ export class WritingPane implements Pane {
       host.appendChild(
         section(
           "检查结果",
+          el(
+            "div",
+            { class: "u-row" },
+            chip(`缺口 ${gaps.length}`, gaps.length ? "bad" : "ok"),
+            chip(`偏离 ${deviations.length}`, deviations.length ? "bad" : "ok"),
+            chip(`可用依据 ${evidence.length}`, evidence.length ? "ok" : "muted"),
+          ),
           gaps.length ? bulletList(gaps.map((item) => `缺口：${String(item.detail ?? item)}`), "u-list") : paragraph("硬约束没有缺口。", "u-hint"),
           deviations.length
             ? bulletList(deviations.map((item) => `偏离：${String(item.detail ?? item)}｜需要：${String(item.need ?? "")}`), "u-list")
@@ -738,6 +777,15 @@ export class WritingPane implements Pane {
       ),
     );
     const rows = el("div", { class: "u-rows" });
+    // 依据三条：先给 ✓/✗ 一眼看全不全，原文照旧在旁边（缺哪条比缺什么更该先看见）
+    const basisRow = (name: string, value: string): HTMLElement =>
+      el(
+        "div",
+        { class: "u-row" },
+        el("span", { class: `u-check-glyph ${value ? "u-tone-ok" : "u-tone-bad"}`, text: value ? "✓" : "✗" }),
+        el("span", { class: "u-hint", text: name }),
+        el("span", { class: "u-grow", text: value || "（缺）" }),
+      );
     for (const item of this.candidates) {
       const card = el("article", { class: "u-card" });
       card.appendChild(el("h3", { text: String(item.title || item.summary || item.id) }));
@@ -745,13 +793,19 @@ export class WritingPane implements Pane {
       card.appendChild(
         facts([
           ["方案", String(item.summary ?? "")],
-          ["依据·事实", String(basis.fact || "（缺）")],
-          ["依据·因果", String(basis.causality || "（缺）")],
-          ["依据·大纲", String(basis.outline || "（缺）")],
           ["待定问题", ((item.unsolved as string[]) ?? []).join("、") || "（没有列出的待定问题）"],
           ["是否改世界", item.has_world_change ? "含世界变化（要预览后确认）" : "不改世界（只作文字）"],
           ["受众", String(item.audience) === "player" ? "可给玩家看" : "仅作者 / 主持人"],
         ]),
+      );
+      card.appendChild(
+        el(
+          "div",
+          { class: "u-rows" },
+          basisRow("依据·事实", String(basis.fact ?? "")),
+          basisRow("依据·因果", String(basis.causality ?? "")),
+          basisRow("依据·大纲", String(basis.outline ?? "")),
+        ),
       );
       card.appendChild(
         el(

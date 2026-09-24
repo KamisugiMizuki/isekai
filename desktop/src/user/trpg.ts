@@ -24,8 +24,25 @@ import {
   section,
   setNote,
 } from "./dom";
+import { flowRail, type FlowStep } from "./graphics";
 
 type View = "list" | "create" | "play";
+
+/** 一次行动在界面上走到哪一步（§8.2/§8.3）；写死的是流程，不是核心状态名 */
+const ACTION_STEPS: FlowStep[] = [
+  { label: "写下行动", hint: "行动、行动者与目标齐了才能打开确认卡" },
+  { label: "确认卡齐备", hint: "改任何关键项都会让旧确认失效" },
+  { label: "规则裁定", hint: "不取消后自动重掷；切页不会发第二次裁定" },
+  { label: "写入世界", hint: "规则状态与世界后果同批成功或同批失败" },
+];
+
+/** 结果的固定顺序（§8.3）：行动结果 → 世界后果 → 谁知道 → 下一步 */
+const RESULT_STEPS: FlowStep[] = [
+  { label: "行动结果" },
+  { label: "实际世界后果" },
+  { label: "相关角色能知道的内容" },
+  { label: "下一步" },
+];
 
 const STATUS_TEXT: Record<string, string> = {
   preparing: "准备中",
@@ -637,7 +654,6 @@ export class TrpgPane implements Pane {
     const campaign = (faces.campaign as Json) ?? {};
     const scene = (faces.scene as Json) ?? {};
     const next = (faces.next as Json) ?? {};
-    const stage = String(bundle?.stage ?? "");
     host.appendChild(
       el(
         "div",
@@ -656,10 +672,13 @@ export class TrpgPane implements Pane {
     );
     host.appendChild(
       paragraph(
-        `时间线 ${this.timelineId}｜阶段 ${stage}｜世界时刻 ${String(((faces.world as Json) ?? {}).revision ?? "")}；世界时间与现实时间分开看。`,
+        `时间线 ${this.timelineId}｜世界时刻 ${String(((faces.world as Json) ?? {}).revision ?? "")}；世界时间与现实时间分开看。`,
         "u-hint",
       ),
     );
+    // 现在走到哪一步：核心只给阶段名，用一条轨把「写下行动 → 确认卡 → 裁定 → 写入世界」画出来
+    const rail = this.actionRail(bundle);
+    if (rail) host.appendChild(rail);
     host.appendChild(
       section(
         "当前场景",
@@ -710,7 +729,9 @@ export class TrpgPane implements Pane {
               "u-list",
             )
           : paragraph("这个场景还没有走过的行动。", "u-hint"),
-        paragraph("结果顺序固定：行动结果 → 实际世界后果 → 相关角色能知道的内容 → 下一步。世界后果没提交成功时不会写成已经发生。", "u-hint"),
+        // 结果的层次是一句话说不清的东西：按固定顺序画出来，再说一句「没提交成功就不算发生」
+        flowRail(RESULT_STEPS, -1),
+        paragraph("结果按这个顺序出现；世界后果没提交成功时不会写成已经发生，也不跳级。", "u-hint"),
       ),
     );
     const actor = el("select", { class: "u-input", id: "u-trpg-actor" }) as HTMLSelectElement;
@@ -760,6 +781,18 @@ export class TrpgPane implements Pane {
     );
     this.renderActions(host, bundle ?? {});
     if (this.mode === "gm") this.renderGm(host, faces);
+  }
+
+  /** 行动走到哪一步（§8.2/§8.3）：按当前局面判断，不拿核心的阶段名当进度 */
+  private actionRail(bundle: Json | null): HTMLElement | null {
+    if (!bundle) return null;
+    const faces = ((bundle.faces as Json) ?? {}) as Json;
+    const scene = (faces.scene as Json) ?? {};
+    const draft = (bundle.draft as Json) ?? null;
+    const gaps = ((draft?.gaps as string[]) ?? []).length;
+    const unfinished = ((scene.unfinished_actions as Json[]) ?? []).length;
+    const current = bundle.committed ? 3 : unfinished ? 2 : draft ? (gaps ? 0 : 1) : 0;
+    return flowRail(ACTION_STEPS, current);
   }
 
   /** 行动确认卡（§8.2/§8.3）：行动者 / 目标 / 方法 / 已知代价 / 缺什么，缺了就不给确认。 */
@@ -874,14 +907,19 @@ export class TrpgPane implements Pane {
       this.bundle = result;
       this.lastResults = result;
       const stage = String(result.stage ?? "");
+      // 「阶段」这个词对用户没意义：把「现在停在哪一步」说人话，理由用核心给的原文
+      const committed = Boolean(result.committed);
+      const rail = this.actionRail(result);
+      const stopped = String(rail?.querySelector(".u-rail-current .u-rail-label")?.textContent ?? "") || stage;
+      const why = String(result.skipped ?? "") || String(((result.errors as string[]) ?? [])[0] ?? "");
       setNote(
         this.note,
         confirm
-          ? stage === "fixed" || stage === "committed"
+          ? committed
             ? "裁定与后果已固化；世界里已经按它变化"
-            : `行动已推进到阶段：${stage}（没有真实裁定就不显示骰点，也不说成功）`
+            : `规则给了结果，世界还没变：这一轮停在「${stopped}」${why ? `——${why}` : "（没有真实裁定就不显示骰点，也不说成功）"}`
           : `行动确认卡已就绪（阶段 ${stage}）`,
-        confirm ? "ok" : "muted",
+        confirm ? (committed ? "ok" : "pending") : "muted",
       );
       await this.render();
     } catch (error) {

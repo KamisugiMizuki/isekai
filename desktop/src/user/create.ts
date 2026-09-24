@@ -25,6 +25,7 @@ import {
   section,
   setNote,
 } from "./dom";
+import { stackBar } from "./graphics";
 
 type Step = "source" | "world" | "cards" | "review" | "create" | "start";
 
@@ -694,7 +695,13 @@ export class CreatePane implements Pane {
     for (const item of sections) {
       const row = el("div", { class: "u-row-line" });
       row.appendChild(el("span", { class: "u-grow", text: item.label }));
-      row.appendChild(el("span", { class: "u-hint", text: `${item.items.length} 条` }));
+      // 锁定进度与待处理项都是「要翻遍六个区才知道」的整体状态，直接摆在目录里
+      const locked = (this.locks[item.path] ?? []).length;
+      row.appendChild(
+        el("span", { class: "u-hint", text: `${item.items.length} 条${locked ? ` · 已锁 ${locked}` : ""}` }),
+      );
+      const bad = this.errorsFor(item);
+      if (bad) row.appendChild(chip(`${bad} 处待处理`, "bad"));
       const pick = button(item.path === this.section ? "在编辑" : "打开", () => {
         this.section = item.path;
         this.entryId = String(item.items[0]?.id ?? "");
@@ -702,6 +709,18 @@ export class CreatePane implements Pane {
       });
       pick.dataset.section = item.path;
       row.appendChild(pick);
+      const bar = stackBar(
+        [
+          { label: "已锁定", value: locked, tone: "accent" },
+          { label: "未锁定", value: item.items.length - locked, tone: "muted" },
+        ],
+        { legend: false },
+      );
+      if (bar) {
+        bar.style.flex = "1 1 100%";
+        bar.title = `${item.label}：共 ${item.items.length} 条，已锁 ${locked} 条`;
+        row.appendChild(bar);
+      }
       catalog.appendChild(row);
     }
     if (!sections.length) {
@@ -875,6 +894,13 @@ export class CreatePane implements Pane {
       );
     }
     return card;
+  }
+
+  /** 这一段里有多少条校验问题（与 locate() 同一条匹配规则：问题原文里出现条目标识） */
+  private errorsFor(sectionRef: Section): number {
+    const ids = sectionRef.items.map((item) => String(item.id ?? "")).filter((id) => id.length > 2);
+    if (!ids.length) return 0;
+    return this.errors.filter((problem) => ids.some((id) => problem.includes(id))).length;
   }
 
   /** 校验问题定位：把问题里提到的标识对到分区与条目上（对不上就明说） */

@@ -11,6 +11,7 @@ import type { AppContext } from "./app";
 import type { Json } from "./api";
 import { uiError } from "./api";
 import { button, dialog, el, errorCard, facts, fill, paragraph, primary, setNote, sizeText } from "./dom";
+import { flowRail } from "./graphics";
 
 export function migrateCard(ctx: AppContext): HTMLElement {
   const note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
@@ -42,6 +43,16 @@ export function migrateCard(ctx: AppContext): HTMLElement {
       result.appendChild(
         paragraph("迁移会把这些带过来：世界、会话、版本、素材与草稿、非敏感偏好。不带过来的：API 密钥与通道凭据、进程锁与运行句柄、日志与缓存。源目录始终保留，不会移动或删除。"),
       );
+      // 三步是顺序发生的，且失败会停在其中一步：画出来比「复制 → 校验 → 启用」一句话清楚
+      const steps = flowRail(
+        [
+          { label: "检查旧目录", hint: "只读，不改任何一边的数据" },
+          { label: "复制到暂存", hint: "先落到暂存区，不覆盖当前数据" },
+          { label: "校验并启用", hint: "整批校验通过才切换；失败会回退并留副本" },
+        ],
+        0,
+      );
+      if (steps) result.appendChild(steps);
       result.appendChild(paragraph("迁移完成后，所有时间线处于暂停状态；要接着跑就在世界里逐条启动。", "u-hint"));
       result.appendChild(
         el(

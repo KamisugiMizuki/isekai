@@ -21,6 +21,7 @@ import {
   facts,
   field,
   fill,
+  humanDuration,
   link,
   paragraph,
   primary,
@@ -28,12 +29,61 @@ import {
   setNote,
   stamp,
 } from "./dom";
+import { branchGraph, flowRail, type BranchLane } from "./graphics";
 
 /** 时间线状态的人话（核心给的是内部状态名） */
 const STATE_TEXT: Record<string, string> = {
   active: "运行中",
   frozen: "已暂停",
   archived: "已归档",
+};
+
+/**
+ * 版本记录 → 分支图的泳道。主线在前、分叉按辈分排：`source_commit` 指到哪条线的提交，
+ * 就说明这条线是从那里长出来的（平铺的列表看不出这层关系，所以要画）。
+ */
+function branchLanes(timelines: Json[], commits: Json[]): BranchLane[] {
+  const laneOfCommit = new Map<string, string>();
+  for (const commit of commits) laneOfCommit.set(String(commit.id ?? ""), String(commit.timeline_id ?? ""));
+  const lanes: BranchLane[] = timelines.map((timeline) => {
+    const id = String(timeline.id);
+    return {
+      id,
+      name: String(timeline.name ?? id),
+      state: String(timeline.state ?? ""),
+      source: String(timeline.source_commit ?? "") || undefined,
+      commits: commits
+        .filter((commit) => String(commit.timeline_id ?? "") === id)
+        .map((commit) => ({
+          id: String(commit.id ?? ""),
+          moment: Number(commit.moment ?? 0),
+          kind: String(commit.kind ?? ""),
+          title: `${stamp(Number(commit.created_at ?? 0))}｜${String(commit.kind ?? "")}${commit.note ? `｜${String(commit.note)}` : ""}`,
+        })),
+    };
+  });
+  const depthOf = (lane: BranchLane, seen = new Set<string>()): number => {
+    if (seen.has(lane.id)) return 0;
+    seen.add(lane.id);
+    const parent = lane.source ? laneOfCommit.get(lane.source) : "";
+    const next = lanes.find((item) => item.id === parent && item.id !== lane.id);
+    return next ? 1 + depthOf(next, seen) : 0;
+  };
+  return lanes.sort((a, b) => depthOf(a) - depthOf(b) || String(a.id).localeCompare(String(b.id)));
+}
+
+/** 世界速度的人话：光看「世界秒 / 现实秒」的数字看不出这是多快 */
+function rateText(rate: number): string {
+  const value = Number.isFinite(rate) && rate > 0 ? rate : 1;
+  if (value === 1) return "现实 1 分钟 ≈ 世界 1 分钟（一比一）";
+  return `现实 1 分钟 ≈ 世界 ${humanDuration(value * 60)}`;
+}
+
+/** 效果持续到什么时候（核心给的是内部枚举） */
+const EXPIRY_TEXT: Record<string, string> = {
+  with_cause: "跨日后随原因解除",
+  natural_recovery: "达到恢复条件后自行恢复",
+  until_cleared: "保留到被明确解除",
 };
 
 export class WorldsPane implements Pane {
@@ -325,7 +375,7 @@ export class WorldsPane implements Pane {
       ),
     );
     host.appendChild(this.timelineSection(timelines));
-    host.appendChild(this.versionSection(commits));
+    host.appendChild(this.versionSection(timelines, commits));
     host.appendChild(
       section(
         "数据位置",
@@ -372,6 +422,11 @@ export class WorldsPane implements Pane {
       rows.appendChild(row);
     }
     const rate = el("input", { class: "u-input u-input-narrow", type: "number", min: "1", value: "1" }) as HTMLInputElement;
+    // 数字看不出多快：旁边常驻一句人话换算（跟着输入走）
+    const rateNote = el("p", { class: "u-hint", id: "u-rate-note", text: rateText(1) });
+    rate.addEventListener("input", () => {
+      rateNote.textContent = rateText(Number(rate.value || 1));
+    });
     return section(
       "时间线",
       rows,
@@ -398,6 +453,7 @@ export class WorldsPane implements Pane {
             })
           : null,
       ),
+      rateNote,
       paragraph("关闭窗口只是收起到托盘，世界会继续运行；想停下故事进展请点「暂停」。", "u-hint"),
     );
   }
@@ -548,14 +604,30 @@ export class WorldsPane implements Pane {
             ["意图", String(draft.intent ?? "")],
             ["生效", String(draft.when) === "scheduled" ? `预约到世界时刻 ${Number(draft.at_world ?? 0)}` : "现在"],
           ]),
-          bulletList(
-            effects.map(
-              (item) =>
-                `${kindLabels.get(String(item.kind)) ?? String(item.kind)} → ${
-                  targetLabels.get(String(item.target)) ?? String(item.target)
-                }${item.value ? `：${String(item.value)}` : ""}（${String(item.expiry)}）`,
+          // 一条变化 = 什么变化 · 作用到谁 · 变成什么；串成一行比一句话好读
+          el(
+            "div",
+            { class: "u-rows" },
+            ...effects.map((item) =>
+              el(
+                "div",
+                { class: "u-row u-row-wrap" },
+                chip(kindLabels.get(String(item.kind)) ?? String(item.kind), "muted"),
+                el("span", { class: "u-hint", text: "作用到" }),
+                chip(targetLabels.get(String(item.target)) ?? String(item.target), "muted"),
+                item.value ? el("span", { class: "u-hint", text: "→" }) : null,
+                item.value ? chip(String(item.value), "ok") : null,
+                el("span", { class: "u-hint", text: EXPIRY_TEXT[String(item.expiry)] ?? String(item.expiry) }),
+              ),
             ),
-            "u-list",
+          ),
+          flowRail(
+            [
+              { label: "草案已生成", hint: "此刻世界没有任何变化" },
+              { label: "等你确认", hint: "确认后从来源版本另开一条新线" },
+              { label: "新线（暂停）", hint: "原线保持原样；要试演先启动那条新线" },
+            ],
+            1,
           ),
           paragraph("确认后会从这条线的来源版本另开一条新线，新线默认暂停；原线保持原样。", "u-hint"),
           field("新时间线名称", name),
@@ -661,10 +733,11 @@ export class WorldsPane implements Pane {
     }
   }
 
-  private versionSection(commits: Json[]): HTMLElement {
+  private versionSection(timelines: Json[], commits: Json[]): HTMLElement {
     const list = el("ol", { class: "u-list" });
     for (const commit of commits.slice(0, 20)) {
       const line = el("li", {});
+      line.dataset.commitRow = String(commit.id ?? "");
       line.appendChild(
         el("span", {
           text: `${stamp(Number(commit.created_at ?? 0))}｜世界进度 ${Number(commit.moment ?? 0)}｜${String(commit.kind ?? "")}${commit.note ? `｜${String(commit.note)}` : ""}`,
@@ -677,6 +750,7 @@ export class WorldsPane implements Pane {
       list.appendChild(line);
     }
     if (!commits.length) list.appendChild(el("li", { class: "u-hint", text: "尚无可用版本：运行中会自动留下版本点，也可以手动保存一个。" }));
+    const graph = branchGraph(branchLanes(timelines, commits));
     return section(
       "版本记录",
       el(
@@ -684,6 +758,10 @@ export class WorldsPane implements Pane {
         { class: "u-row" },
         primary("保存当前版本", () => void this.saveVersion()),
       ),
+      graph,
+      graph
+        ? paragraph("一条时间线一条泳道，圆点按出现顺序排；虚线是「这条线从哪个版本分出来的」。点圆点会滚到下面那一行。", "u-hint")
+        : null,
       list,
       paragraph("版本记录是给这个世界留的进度点；不是整份外部备份（备份在设置里）。", "u-hint"),
     );

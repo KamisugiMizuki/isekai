@@ -9,6 +9,7 @@ import { openDir } from "./app";
 import type { Json } from "./api";
 import { uiError } from "./api";
 import { bulletList, button, el, facts, fill, paragraph, primary, section, stamp } from "./dom";
+import { checkList } from "./graphics";
 
 const FAQ: Array<[string, string]> = [
   ["后台服务未启动", "在启动页点「重启后台服务」；仍失败就打开日志目录并复制诊断信息。"],
@@ -67,11 +68,12 @@ export class HelpPane implements Pane {
     page.appendChild(
       section(
         "本机检查明细",
-        facts(
-          checks.map((item) => [
-            String(item.label),
-            `${item.ok ? "通过" : "需要处理"}：${String(item.detail ?? "")}`,
-          ]),
+        checkList(
+          checks.map((item) => ({
+            label: String(item.label),
+            ok: Boolean(item.ok),
+            detail: String(item.detail ?? ""),
+          })),
         ),
       ),
     );
