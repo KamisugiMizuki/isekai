@@ -204,6 +204,11 @@ body[data-mode="debug"] #debug-app {
   display: none;
 }
 
+.u-pane {
+  height: 100%;
+  min-height: 0;
+}
+
 .u-main {
   flex: 1;
   min-height: 0;
@@ -585,6 +590,7 @@ body[data-mode="debug"] #debug-app {
   z-index: 50;
 }
 
+/* 弹窗：正文自己滚（min-height 撑得住时），标题与按钮不跟着内容滚走（空间恒常性） */
 .u-dialog {
   background: var(--u-bg);
   border: 1px solid var(--u-border);
@@ -592,7 +598,7 @@ body[data-mode="debug"] #debug-app {
   padding: 18px;
   max-width: min(680px, 90vw);
   max-height: 86vh;
-  overflow: auto;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -600,18 +606,22 @@ body[data-mode="debug"] #debug-app {
 
 .u-dialog-title {
   margin: 0;
+  flex: 0 0 auto;
 }
 
 .u-dialog-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  overflow: auto;
+  min-height: 0;
 }
 
 .u-dialog-actions {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
+  flex: 0 0 auto;
 }
 
 .u-table {
@@ -630,8 +640,7 @@ body[data-mode="debug"] #debug-app {
 /* ---------------- 角色联络 ---------------- */
 
 .u-contact {
-  display: grid;
-  grid-template-columns: 240px minmax(0, 1fr) 300px;
+  display: flex;
   gap: 16px;
   height: 100%;
   min-height: 0;
@@ -645,13 +654,19 @@ body[data-mode="debug"] #debug-app {
   min-width: 0;
 }
 
-.u-col-left,
+.u-col-left {
+  flex: 0 0 240px;
+  overflow: auto;
+}
+
 .u-col-right {
+  flex: 0 0 300px;
   overflow: auto;
 }
 
 .u-col-center {
-  height: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
   position: relative;
 }
 
@@ -728,12 +743,11 @@ body[data-mode="debug"] #debug-app {
   outline: 2px solid var(--u-fg);
 }
 
+/* 说明 / 失败卡：现在是对话内容的一部分（在 .u-messages 里），自己不再需要滚动 */
 .u-system {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 30vh;
-  overflow: auto;
 }
 
 .u-handoff {

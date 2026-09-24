@@ -147,7 +147,6 @@ export class ContactPane implements Pane {
       scroll,
       newHint,
       live,
-      this.systemHost,
       composerNote,
       this.draftSlot,
       form,
@@ -465,6 +464,9 @@ export class ContactPane implements Pane {
       this.scrollHost,
       ...this.messages.map((message) => this.renderMessage(message)),
       ...this.pending.map((item) => this.renderPending(item)),
+      // 说明 / 失败卡属于对话内容，跟着消息一起滚：
+      // 留在列里当兄弟节点的话，它一长就把消息列表挤没（内容区不能跟操作区抢地方）
+      this.systemHost,
     );
     const total = this.messages.length + this.pending.length;
     if (force || wasAtBottom) this.scrollHost.scrollTop = this.scrollHost.scrollHeight;
@@ -686,6 +688,8 @@ export class ContactPane implements Pane {
     if (this.systemHost && this.systemHost.childElementCount > 6) {
       this.systemHost.firstElementChild?.remove();
     }
+    // 卡片现在长在对话里：在底部就跟着滚过去，别让它在屏幕外继续冒出来
+    if (this.atBottom && this.scrollHost) this.scrollHost.scrollTop = this.scrollHost.scrollHeight;
   }
 
   private setStatus(text: string, kind: "ok" | "bad" | "pending" | "muted"): void {
