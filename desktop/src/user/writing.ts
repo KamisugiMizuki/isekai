@@ -132,8 +132,10 @@ export class WritingPane implements Pane {
       }
       await this.loadState();
       await this.refreshCandidates();
-      this.renderHeader(instances, timelines, characters, outlineList);
+      // 分栏条排在页首（世界 / 时间线选择器之前）：内容再长它也贴在视口顶部，
+      // 排在中间时它落在页尾附近，sticky 没有可吸附的行程，等于没锚定
       this.renderTabs(host);
+      this.renderHeader(instances, timelines, characters, outlineList);
       if (!this.state) {
         host.appendChild(
           paragraph(

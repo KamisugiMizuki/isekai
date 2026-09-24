@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 
 REPO = Path(__file__).resolve().parent.parent
 PY = REPO / ".venv" / "Scripts" / "python.exe"
@@ -407,9 +407,11 @@ class Cdp:
 
         deadline = time.time() + timeout
         last = None
+        # 本机回环必须绕开系统代理：Clash 这类代理会让 127.0.0.1 的请求返回 502 Bad Gateway
+        opener = build_opener(ProxyHandler({}))
         while time.time() < deadline:
             try:
-                targets = json.loads(urlopen(f"http://127.0.0.1:{port}/json", timeout=2).read())
+                targets = json.loads(opener.open(f"http://127.0.0.1:{port}/json", timeout=2).read())
                 pages = [t for t in targets if t.get("type") == "page"
                          and "devtools" not in str(t.get("url", ""))
                          and str(t.get("url", "")) not in ("", "about:blank")]

@@ -24,8 +24,19 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import _audit2_desk as desk  # noqa: E402
 import _probe_ui_u1 as u1  # noqa: E402  （复用向导走法与点击辅助）
+import _ui_nav_common as nav  # noqa: E402  （⋯ 菜单 / 启动器导航原语）
 
 SAMPLE = REPO / "examples" / "sample_world"
+BAR = (
+    "JSON.stringify((()=>{{const t=document.querySelector({sel});const m=document.getElementById('u-main');"
+    "if(!t||!m){{return null;}}const r=t.getBoundingClientRect();const mr=m.getBoundingClientRect();"
+    "const chain=[];let p=t.parentElement;for(let i=0;i<6&&p;i++){{const c=getComputedStyle(p);"
+    "chain.push([p.className||p.tagName,c.position,c.overflowY,Math.round(p.getBoundingClientRect().height)]);"
+    "p=p.parentElement;}}"
+    "return {{rowTop:Math.round(r.top),rowBottom:Math.round(r.bottom),mainTop:Math.round(mr.top),"
+    "mainBottom:Math.round(mr.bottom),scroll:Math.round(m.scrollTop),scrollable:m.scrollHeight-m.clientHeight,"
+    "position:getComputedStyle(t).position,chain:chain}};}})())"
+)
 MEASURE = (
     "JSON.stringify((()=>{"
     "const box=document.querySelector('.u-composer');"
@@ -49,6 +60,35 @@ def free_port() -> int:
 
 async def measure(cdp: desk.Cdp) -> dict:
     return json.loads(await cdp.js(MEASURE) or "{}")
+
+
+async def toolbar_ok(cdp: desk.Cdp, selector: str, label: str, problems: list[str]) -> None:
+    """滚到中段与到底时，分栏条都得看得见；中段还要贴在视口顶部（sticky）。"""
+    mid = await cdp.js(
+        "(()=>{const m=document.getElementById('u-main');if(!m){return 0;}"
+        "m.scrollTop=Math.round((m.scrollHeight-m.clientHeight)*0.6);return m.scrollTop;})()"
+    )
+    await asyncio.sleep(0.5)
+    got = json.loads(await cdp.js(BAR.format(sel=json.dumps(selector))) or "{}")
+    print(f"[分栏条·{label}·中段{mid}px]", json.dumps(got, ensure_ascii=False))
+    if not got:
+        problems.append(f"{label}：找不到分栏条 {selector}")
+        return
+    if got["scrollable"] < 40:
+        problems.append(f"{label}：视口压矮后页面仍滚不动（scrollable={got['scrollable']}），测不到锚定")
+        return
+    if got["position"] != "sticky":
+        problems.append(f"{label}：分栏条 position={got['position']}（应为 sticky）")
+    if not (got["mainTop"] - 8 <= got["rowTop"] <= got["mainTop"] + 40):
+        problems.append(
+            f"{label}：滚到中段后分栏条没贴在顶部（rowTop={got['rowTop']}、主区顶={got['mainTop']}）"
+        )
+    await cdp.js("(()=>{const m=document.getElementById('u-main');if(m){m.scrollTop=99999;}})()")
+    await asyncio.sleep(0.4)
+    end = json.loads(await cdp.js(BAR.format(sel=json.dumps(selector))) or "{}")
+    print(f"[分栏条·{label}·到底]", json.dumps({k: end.get(k) for k in ('rowTop', 'rowBottom', 'mainTop', 'mainBottom', 'scroll')}, ensure_ascii=False))
+    if end.get("rowTop", 1e9) < end.get("mainTop", 0) - 8 or end.get("rowBottom", 1e9) > end.get("mainBottom", 0):
+        problems.append(f"{label}：滚到底后分栏条看不见了（{end.get('rowTop')}..{end.get('rowBottom')}）")
 
 
 async def say(cdp: desk.Cdp, text: str) -> bool:
@@ -178,6 +218,19 @@ async def main() -> None:
             problems.append("点「有新消息」没有回到底部")
         if back.get("bottom") is not None and back["bottom"] > back["vh"] - 4:
             problems.append("回到底部之后输入框又跑出视口了")
+
+        # --- 5) 分栏条锚定：把视口压矮让页面滚得动，滚到底后分栏条仍在视口顶部 ---
+        await cdp.call(
+            "Emulation.setDeviceMetricsOverride", width=1000, height=260, deviceScaleFactor=1, mobile=False
+        )
+        await asyncio.sleep(0.6)
+        await nav.open_menu(cdp, "世界管理")
+        await u1.wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('世界与素材')")
+        await toolbar_ok(cdp, ".u-tabs", "世界与素材", problems)
+        await nav.launch_app(cdp, "isekai Writer")
+        await u1.wait_true(cdp, "!!document.querySelector('nav.u-crumbs')")
+        await toolbar_ok(cdp, "nav.u-crumbs", "写作分区", problems)
+        await cdp.call("Emulation.clearDeviceMetricsOverride")
 
         print("\n结果:", "PASS" if not problems else "FAIL", "；".join(problems))
     finally:

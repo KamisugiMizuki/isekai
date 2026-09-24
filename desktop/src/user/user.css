@@ -155,6 +155,17 @@ body[data-mode="debug"] #debug-app {
   align-items: center;
 }
 
+/* 分栏条（世界与素材 / 写作分区 / 创建步骤）：内容再长也贴在视口顶部——
+   切换分区不用先滚回页首（空间恒常性：操作区不跟着内容走） */
+.u-tabs,
+nav.u-crumbs {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--u-bg);
+  padding: 10px 0;
+}
+
 .u-content {
   display: flex;
   flex-direction: column;
@@ -204,7 +215,9 @@ body[data-mode="debug"] #debug-app {
   display: none;
 }
 
-.u-pane {
+/* 只给「整屏布局」的页（联络页）确定高度；内容页保持自然高度——
+   内容页若也钉成 100%，页内 sticky 分栏条的可吸附区间会被压缩成 0，粘不住 */
+.u-pane:has(> .u-contact) {
   height: 100%;
   min-height: 0;
 }
