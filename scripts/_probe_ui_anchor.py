@@ -232,6 +232,43 @@ async def main() -> None:
         await toolbar_ok(cdp, "nav.u-crumbs", "写作分区", problems)
         await cdp.call("Emulation.clearDeviceMetricsOverride")
 
+        # --- 6) 150% 字号下复核同一批不变量（走设置页真实控件，不用 hack）---
+        await nav.open_menu(cdp, "设置")
+        await u1.wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('通知与外观')")
+        # 注意：设置页有两个「保存这一组」（另一组是检索设置）——按所在 section 里那个选择器的兄弟按钮点，别按文案找第一个
+        PICK_SIZE = (
+            "(()=>{{const v={value};const s=[...document.querySelectorAll('#u-main select')]"
+            ".find(n=>[...n.options].some(o=>o.value===v));if(!s){{return false;}}"
+            "s.value=v;s.dispatchEvent(new Event('change',{{bubbles:true}}));"
+            "const sec=s.closest('section');const btn=[...(sec?sec.querySelectorAll('button'):[])]"
+            ".find(b=>(b.textContent||'').includes('保存这一组'));if(!btn){{return false;}}btn.click();return true;}})()"
+        )
+        picked = await cdp.js(PICK_SIZE.format(value="'150'"))
+        if not picked:
+            problems.append("设置页找不到文字大小选择器（或它所在的保存按钮）")
+        else:
+            await u1.wait_true(cdp, "document.documentElement.dataset.textSize==='150'", timeout=20)
+        big = await cdp.js("document.documentElement.dataset.textSize")
+        if big != "150":
+            problems.append(f"字号没有切到 150（读到 {big}）")
+        else:
+            await nav.launch_app(cdp, "isekai Chat")
+            await u1.wait_true(cdp, "!!document.getElementById('u-contact-input')", timeout=30)
+            await asyncio.sleep(1.5)
+            zoom = await measure(cdp)
+            print("[150% 字号]", json.dumps(zoom, ensure_ascii=False))
+            if zoom.get("bottom") is None or zoom["bottom"] > zoom["vh"] - 4:
+                problems.append(f"150% 字号下输入框跑出视口：{zoom.get('bottom')} / 视口 {zoom.get('vh')}")
+            # 大字下空间预算本就紧：这里只卡「至少还看得见一行」，具体读数打出来记文档
+            if zoom.get("list", [0, 0, 0])[2] < 48:
+                problems.append(f"150% 字号下消息列表被压到看不见：clientHeight={zoom['list'][2]}")
+            if zoom.get("main", [1])[0] != 0:
+                problems.append(f"150% 字号下页面容器被滚动：scrollTop={zoom['main'][0]}")
+            # 复原，别给后面的跑留个 150% 的根
+            await nav.open_menu(cdp, "设置")
+            await cdp.js(PICK_SIZE.format(value="'100'"))
+            await u1.wait_true(cdp, "document.documentElement.dataset.textSize==='100'", timeout=20)
+
         print("\n结果:", "PASS" if not problems else "FAIL", "；".join(problems))
     finally:
         desk.kill_tree()
