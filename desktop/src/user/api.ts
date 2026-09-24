@@ -710,30 +710,54 @@ export class ChannelLink {
   async open(api: AppApi, instanceId: string, timelineId: string, characterId: string): Promise<ThreadLink> {
     this.close();
     const issued = await api.ensureChannel(this.channelName, "isekai 桌面");
+    // 缓存里的那份凭据可能属于另一个数据根（换根 / 恢复备份之后）：它只会一直失败，所以失败就轮换重试一次
     let credential = (issued.credential as string | null) ?? localStorage.getItem(`isekai.credential.${this.channelName}`);
-    if (!credential) {
-      // 持久凭据丢了：显式轮换一次（界面是这条通道的唯一使用者）
-      const again = await api.ensureChannel(this.channelName, "isekai 桌面", true);
-      credential = String(again.credential ?? "");
-    }
-    localStorage.setItem(`isekai.credential.${this.channelName}`, credential);
+    if (!credential) credential = await this.rotateCredential(api);
     const session = (await api.sessionEnsure(instanceId, timelineId, characterId)).session as Json;
     const sessionId = String(session.id);
-    const bound = (await api.bindThread(this.channelName, this.threadId(instanceId, timelineId, characterId), sessionId))
-      .thread as Json;
-    const client = new UmpClient(this.endpoint, this.channelName, "isekai 桌面");
-    client.onMessage((env) => this.onEnvelope(env));
-    const ack = await client.connect({ credential, bootstrap: null });
+    const threadId = this.threadId(instanceId, timelineId, characterId);
+    let client = this.buildClient();
+    let ack: Record<string, unknown>;
+    try {
+      ack = await client.connect({ credential, bootstrap: null });
+    } catch (error) {
+      localStorage.removeItem(`isekai.credential.${this.channelName}`);
+      const rotated = await this.rotateCredential(api);
+      if (!rotated) throw error;
+      client.close();
+      client = this.buildClient();
+      ack = await client.connect({ credential: rotated, bootstrap: null });
+    }
+    // 握手回带本通道已有的 thread 令牌（§2.2）：重连直接沿用，不重绑——
+    // 重绑会换代表令，已投递消息的回执会全部对不上（表现是「回执的绑定令牌与固化时不一致」）
     const threads = (ack.threads as Array<{ id: string; binding_token: string }>) ?? [];
-    const mine = threads.find((item) => item.id === String(bound.thread_id));
+    let token = threads.find((item) => item.id === threadId)?.binding_token;
+    if (!token) {
+      const bound = (await api.bindThread(this.channelName, threadId, sessionId)).thread as Json;
+      token = String(bound.binding_token ?? "");
+    }
     this.client = client;
     this.link = {
       channel: this.channelName,
-      threadId: String(bound.thread_id),
-      token: mine?.binding_token ?? String(bound.binding_token ?? ""),
+      threadId,
+      token,
       sessionId,
     };
     return this.link;
+  }
+
+  private buildClient(): UmpClient {
+    const client = new UmpClient(this.endpoint, this.channelName, "isekai 桌面");
+    client.onMessage((env) => this.onEnvelope(env));
+    return client;
+  }
+
+  /** 显式轮换通道凭据并记住（界面是这条通道的唯一使用者，轮换不会踢掉别人） */
+  private async rotateCredential(api: AppApi): Promise<string> {
+    const issued = await api.ensureChannel(this.channelName, "isekai 桌面", true);
+    const credential = String(issued.credential ?? "");
+    if (credential) localStorage.setItem(`isekai.credential.${this.channelName}`, credential);
+    return credential;
   }
 
   private threadId(instanceId: string, timelineId: string, characterId: string): string {

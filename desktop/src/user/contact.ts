@@ -49,6 +49,8 @@ interface ContactSelection {
 export class ContactPane implements Pane {
   readonly id = "contact" as const;
   private link: ChannelLink | null = null;
+  /** 连接失败的反馈卡（每次重试更新它，不新增） */
+  private connectError: HTMLElement | null = null;
   private selection: ContactSelection | null = null;
   private messages: Message[] = [];
   private pending: Array<{ ref: string; text: string; state: string; error?: UiError }> = [];
@@ -216,6 +218,8 @@ export class ContactPane implements Pane {
       this.link.onEvent((event) => this.onEvent(event));
       await this.link.open(this.ctx.api, selection.instance_id, selection.timeline_id, selection.character_id);
       this.setStatus("已连接，可以开始联络", "muted");
+      this.connectError?.remove();
+      this.connectError = null;
     } catch (error) {
       const info = uiError(error, {
         module: "角色联络",
@@ -223,7 +227,10 @@ export class ContactPane implements Pane {
         target: selection.character_name,
         unknown: "这条联络是否已经建立",
       });
-      this.appendSystem(errorCard(info, [{ label: "重新连接", run: () => void this.connect() }]));
+      // 反复重试不该在时间线里堆一串同样的卡片：同一处失败更新原卡（§错误停留在发生处）
+      this.connectError?.remove();
+      this.connectError = errorCard(info, [{ label: "重新连接", run: () => void this.connect() }]);
+      this.appendSystem(this.connectError);
       this.setStatus("连接没有建立", "bad");
     }
     await this.loadHistory();

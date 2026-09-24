@@ -368,12 +368,27 @@ export class App {
   }
 
   private async connect(): Promise<void> {
+    // 并发只跑一次：管理凭据是一次性的，两次 connect 会用同一个凭据抢同一条管理面，
+    // 后到的那次被拒（现象是界面从此全是「未连接核心」，而核心里明明是就绪）。
+    if (this.connecting) return this.connecting;
+    this.connecting = this.openConnection().finally(() => {
+      this.connecting = null;
+    });
+    return this.connecting;
+  }
+
+  /** 真正打开管理连接；失败照旧往外抛（顶栏会显示未就绪） */
+  private async openConnection(): Promise<void> {
     if (!this.status.endpoint || !this.status.mgmt) return;
-    this.mgmt = new MgmtClient(this.status.endpoint, this.status.mgmt);
-    await this.mgmt.connect();
-    this.apiRef = new AppApi(this.mgmt);
+    const mgmt = new MgmtClient(this.status.endpoint, this.status.mgmt);
+    await mgmt.connect();
+    this.mgmt = mgmt;
+    this.apiRef = new AppApi(mgmt);
     await this.refresh();
   }
+
+  /** 连接尝试在途时的句柄（见 connect） */
+  private connecting: Promise<void> | null = null;
 
   async refresh(): Promise<void> {
     if (!this.apiRef) return;
