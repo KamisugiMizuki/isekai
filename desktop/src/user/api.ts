@@ -628,6 +628,11 @@ export class AppApi {
     return this.call("rules.scan", { dir });
   }
 
+  /** 随发行样例规则（只读）：返回样例根目录与该目录下的候选清单，目录不在就是空候选。 */
+  rulesBundled(): Promise<Json> {
+    return this.call("rules.bundled", {});
+  }
+
   rulesRegister(manifestPath: string): Promise<Json> {
     return this.call("rules.register", { manifest_path: manifestPath });
   }

@@ -142,6 +142,7 @@ SYNC_OPS = frozenset(
         "trpg.campaign.info",
         "trpg.campaign.status",
         "rules.scan",
+        "rules.bundled",
         "rules.list",
         "rules.register",
         "rules.enable",
@@ -505,11 +506,20 @@ def dispatch(
         if op == "runtime.budget.set":
             return _budget_set(cfg, store, args)
         # TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）：编排态读写与联合提交
-        if op in ("rules.scan", "rules.list", "rules.register", "rules.enable", "rules.disable", "rules.remove"):
+        if op in (
+            "rules.scan", "rules.bundled", "rules.list", "rules.register",
+            "rules.enable", "rules.disable", "rules.remove",
+        ):
             from .. import rules_registry as registry
 
             if op == "rules.scan":
                 return registry.scan(str(args.get("dir") or args.get("path") or ""))
+            if op == "rules.bundled":
+                # 随发行样例规则（ONBOARDING §4.3）：只读地扫样例根目录，目录不在也如实回空
+                folder = cfg.paths.root / onboarding_mod.SAMPLE_DIR_NAME
+                if not folder.is_dir():
+                    return {"dir": str(folder), "candidates": []}
+                return {"dir": str(folder), "candidates": list(registry.scan(folder).get("candidates") or [])}
             if op == "rules.list":
                 return registry.list_plugins(store)
             if op == "rules.register":

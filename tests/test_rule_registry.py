@@ -176,3 +176,62 @@ async def test_campaign_and_scene_keep_their_display_names(tmp_path, world, stor
             assert view["campaign"]["name"] == "北堤调查", view.get("campaign")
         finally:
             await mgmt.close()
+
+
+def _bundled_tide(root: Path) -> str:
+    """在临时 root 下放一份随发行潮汐样例（清单内容与 examples/tide_rules_plugin 同口径）。"""
+    folder = root / "examples" / "tide_rules_plugin"
+    folder.mkdir(parents=True)
+    (folder / "tide_rules.py").write_text("import json, sys\nprint('{}')\n", encoding="utf-8")
+    manifest = folder / "manifest.json"
+    manifest.write_text(
+        json.dumps({
+            "id": "tide", "name": "潮汐骰池（示例规则）", "version": "0.1.0",
+            "ruleset_version": "0.1.0", "protocol": "isekai.trpg.rules/1",
+            "entry": ["python", "tide_rules.py"],
+            "modes": ["stateless_resolver", "campaign_resolver"],
+            "state_schema": "tide.state/1",
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return str(manifest)
+
+
+async def test_bundled_sample_rules_scan_then_register(tmp_path) -> None:
+    """随发行样例：rules.bundled 只读给出样例根目录与候选；显式登记后进本机登记簿（§8.5）。"""
+    _bundled_tide(tmp_path)
+    async with running_core(tmp_path) as h:
+        mgmt = await open_mgmt(h)
+        try:
+            before = await mgmt.call("rules.list")
+            assert before["plugins"] == [], "没登记之前登记簿必须是空的"
+
+            bundled = await mgmt.call("rules.bundled")
+            assert Path(bundled["dir"]).is_absolute(), bundled
+            assert Path(bundled["dir"]).resolve() == (tmp_path / "examples").resolve(), bundled
+            assert [item["ruleset_id"] for item in bundled["candidates"]] == ["tide"], bundled
+            head = bundled["candidates"][0]
+            assert head["status"] == "available" and head["ruleset_version"] == "0.1.0", head
+
+            still = await mgmt.call("rules.list")
+            assert still["plugins"] == [], "扫描随发行样例不许顺手登记"
+
+            await mgmt.call("rules.register", manifest_path=str(head["manifest_path"]))
+            listed = await mgmt.call("rules.list")
+            assert [item["ruleset_id"] for item in listed["plugins"]] == ["tide"], listed
+            row = listed["plugins"][0]
+            assert row["enabled"] is True and row["status"] == "available", row
+        finally:
+            await mgmt.close()
+
+
+async def test_bundled_sample_rules_without_dir_is_empty(tmp_path) -> None:
+    """样例根目录不存在：rules.bundled 如实回空候选，不报错。"""
+    async with running_core(tmp_path) as h:
+        mgmt = await open_mgmt(h)
+        try:
+            bundled = await mgmt.call("rules.bundled")
+            assert Path(bundled["dir"]).resolve() == (tmp_path / "examples").resolve(), bundled
+            assert bundled["candidates"] == [], bundled
+        finally:
+            await mgmt.close()

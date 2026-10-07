@@ -7,7 +7,7 @@
  */
 
 import type { AppContext, Pane } from "./app";
-import type { Json } from "./api";
+import type { Json, UiError } from "./api";
 import { uiError } from "./api";
 import {
   bulletList,
@@ -71,6 +71,23 @@ function displayName(name: unknown, id: string, fallback: string): string {
   return id ? `${fallback}（${shortId(id)}）` : fallback;
 }
 
+/** 可重试的界面错误：给「随发行样例规则」这类有明确下一步的失败用（替代只有一句话的死路提示）。 */
+function actionable(message: string, action: string): UiError {
+  return {
+    module: "跑团",
+    action,
+    target: "",
+    stage: "",
+    code: "bundled_rules_unavailable",
+    message,
+    retryable: true,
+    done: "没有任何改动",
+    unknown: "这次操作是否已生效",
+    field: "",
+    requestId: "",
+  };
+}
+
 export class TrpgPane implements Pane {
   readonly id = "trpg";
   private host: HTMLElement | null = null;
@@ -78,6 +95,8 @@ export class TrpgPane implements Pane {
   private view: View = "list";
   private campaigns: Json[] = [];
   private plugins: Json[] = [];
+  /** 「从样例开始」失败时挂出的可行动错误卡（重试后就地替换，避免越堆越多） */
+  private sampleErrorCard: HTMLElement | null = null;
 
   // 战役进行中的状态
   private instanceId = "";
@@ -126,6 +145,7 @@ export class TrpgPane implements Pane {
     const host = this.host;
     if (!host || !this.note) return;
     fill(host, this.note);
+    this.sampleErrorCard = null;
     try {
       if (this.view === "list") await this.renderList(host);
       else if (this.view === "create") await this.renderCreate(host);
@@ -233,31 +253,143 @@ export class TrpgPane implements Pane {
     setNote(this.note, "正在准备样例战役材料…", "pending");
     try {
       if (!this.plugins.length) await this.loadPlugins();
-      const sample = this.plugins.find((item) => String(item.status) === "available");
       const instances = this.ctx.instances();
       if (!instances.length) {
         setNote(this.note, "还没有世界：先从样例世界开始，再回来建战役", "bad");
         this.ctx.navigate({ pane: "onboarding", sub: "sample" });
         return;
       }
-      if (!sample) {
-        setNote(this.note, "本机还没有可用的规则插件：先「从本机选择规则目录」登记一份（随发行的潮汐样例在 examples/tide_rules_plugin）", "bad");
+      if (!this.plugins.some((item) => String(item.status) === "available")) {
+        // 本机还没有可用规则：走「一键登记随发行样例规则」，不再让用户自己去找目录
+        await this.useBundledRule(true);
         return;
       }
-      this.draft = {
-        ...this.draft,
-        name: "样例战役",
-        instanceId: instances[0].id,
-        rulesetId: String(sample.ruleset_id ?? ""),
-        rulesetVersion: String(sample.ruleset_version ?? ""),
-        manifest: String(sample.manifest_path ?? ""),
-      };
-      this.view = "create";
-      setNote(this.note, "已按样例预填：规则与规则版本来自本机登记，世界用第一个世界（可在向导里改）", "muted");
+      await this.prefillSampleCampaign();
+    } catch (error) {
+      this.sampleError(
+        "准备样例战役材料没有完成",
+        uiError(error, { module: "跑团", action: "准备样例" }),
+        () => void this.startFromSample(),
+      );
+    }
+  }
+
+  /** 「从样例开始」的预填：用一个可用规则加第一个世界起一局，规则仍来自本机登记。 */
+  private async prefillSampleCampaign(): Promise<void> {
+    if (!this.plugins.length) await this.loadPlugins();
+    const instances = this.ctx.instances();
+    if (!instances.length) {
+      setNote(this.note, "还没有世界：先从样例世界开始，再回来建战役", "bad");
+      this.ctx.navigate({ pane: "onboarding", sub: "sample" });
+      return;
+    }
+    const sample = this.plugins.find((item) => String(item.status) === "available");
+    if (!sample) {
+      this.sampleError(
+        "本机仍然没有可用规则",
+        actionable("可以重试登记随发行样例规则，或从本机选择规则目录登记自己的规则。", "准备样例战役"),
+        () => void this.startFromSample(),
+      );
+      return;
+    }
+    this.draft = {
+      ...this.draft,
+      name: "样例战役",
+      instanceId: instances[0].id,
+      rulesetId: String(sample.ruleset_id ?? ""),
+      rulesetVersion: String(sample.ruleset_version ?? ""),
+      manifest: String(sample.manifest_path ?? ""),
+    };
+    this.view = "create";
+    setNote(this.note, "已按样例预填：规则与规则版本来自本机登记，世界用第一个世界（可在向导里改）", "muted");
+    await this.render();
+  }
+
+  /**
+   * 一键登记随发行样例规则（§8.5）：只读找样例 → 先给一句确认文案 → 显式登记。
+   * 只在用户点「从样例开始」或「登记随发行样例规则」之后走这里，不做启动时静默注册。
+   */
+  private async useBundledRule(thenPrefill: boolean): Promise<void> {
+    setNote(this.note, "正在查找随发行样例规则…", "pending");
+    let bundled: Json;
+    try {
+      bundled = await this.ctx.api.rulesBundled();
+    } catch (error) {
+      this.sampleError(
+        "没能读取随发行样例规则",
+        uiError(error, { module: "跑团", action: "查找随发行样例规则" }),
+        () => void this.useBundledRule(thenPrefill),
+      );
+      return;
+    }
+    const candidates = ((bundled.candidates as Json[]) ?? []).filter(
+      (item) => String(item.status) === "available",
+    );
+    if (!candidates.length) {
+      this.sampleError(
+        "随发行样例规则没有找到",
+        actionable("这个安装包可能没有带样例规则。可以重试，或从本机选择规则目录登记自己的规则。", "查找随发行样例规则"),
+        () => void this.useBundledRule(thenPrefill),
+      );
+      return;
+    }
+    const item = candidates[0];
+    const manifestPath = String(item.manifest_path ?? "");
+    setNote(this.note, "随发行样例规则已就绪：登记后本机可用。", "pending");
+    const modal = dialog(
+      "登记随发行样例规则",
+      [
+        facts([
+          ["名称", String(item.name ?? "")],
+          ["规则标识与版本", `${String(item.ruleset_id ?? "")} ${String(item.ruleset_version ?? "")}`],
+          ["规则状态", String(item.state_schema ?? "")],
+        ]),
+        paragraph("这是随发行附带的样例规则，登记后本机可用；之后可以在设置里停用或移除。选择清单本身不执行它。", "u-hint"),
+      ],
+      [
+        {
+          label: "登记并继续",
+          primary: true,
+          run: () => void this.registerBundledSample(manifestPath, thenPrefill),
+        },
+        { label: "取消", run: () => setNote(this.note, "已取消登记随发行样例规则", "muted") },
+      ],
+    );
+    document.body.appendChild(modal.node);
+  }
+
+  private async registerBundledSample(manifestPath: string, thenPrefill: boolean): Promise<void> {
+    setNote(this.note, "正在登记随发行样例规则…", "pending");
+    try {
+      const result = await this.ctx.api.rulesRegister(manifestPath);
+      await this.loadPlugins();
+      if (thenPrefill) {
+        await this.prefillSampleCampaign();
+        return;
+      }
+      setNote(this.note, `已登记并启用：${String((result.plugin as Json)?.name ?? "随发行样例规则")}`, "ok");
       await this.render();
     } catch (error) {
-      setNote(this.note, uiError(error, { module: "跑团", action: "准备样例" }).message, "bad");
+      this.sampleError(
+        "随发行样例规则登记失败",
+        uiError(error, { module: "跑团", action: "登记随发行样例规则" }),
+        () => void this.registerBundledSample(manifestPath, thenPrefill),
+      );
     }
+  }
+
+  /** 可行动的错误：笔记一行摘要 + 错误卡带「重试」与「从本机选择规则目录」。 */
+  private sampleError(noteText: string, detail: UiError, retry: () => void): void {
+    setNote(this.note, noteText, "bad");
+    const host = this.host;
+    if (!host) return;
+    this.sampleErrorCard?.remove();
+    const card = errorCard(detail, [
+      { label: "重试", run: retry },
+      { label: "从本机选择规则目录…", run: () => void this.addRuleFromDisk() },
+    ]);
+    this.sampleErrorCard = card;
+    host.appendChild(card);
   }
 
   private async addRuleFromDisk(): Promise<void> {
@@ -464,8 +596,13 @@ export class TrpgPane implements Pane {
         field("规则与版本", rulePicker),
         usable.length
           ? paragraph("登记过的规则都在这里；规则名与版本分别登记，缺失或不适配的不会出现在这一栏。", "u-hint")
-          : paragraph("本机还没有可用规则：先「从本机选择规则目录」登记一份（样例规则在 examples/tide_rules_plugin）。", "u-hint"),
-        button("从本机选择规则目录…", () => void this.addRuleFromDisk()),
+          : paragraph("本机还没有可用规则：可以登记随发行样例规则，或从本机选择规则目录。", "u-hint"),
+        el(
+          "div",
+          { class: "u-row" },
+          button("从本机选择规则目录…", () => void this.addRuleFromDisk()),
+          usable.length ? null : button("登记随发行样例规则", () => void this.useBundledRule(false)),
+        ),
         paragraph(
           "角色属性来自规则插件自己声明的初始化材料；没有适配的插件时这里不做自动建卡，只按已登记的角色参与。",
           "u-hint",
