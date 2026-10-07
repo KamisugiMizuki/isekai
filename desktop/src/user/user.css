@@ -773,6 +773,12 @@ nav.u-crumbs {
   background: var(--u-sunken);
 }
 
+/* 系统说明也长在 .u-messages 里：不加这条会被拉伸成整行宽 */
+.u-messages .u-handoff {
+  align-self: flex-start;
+  max-width: 70ch;
+}
+
 .u-composer {
   display: flex;
   flex-direction: column;

@@ -497,6 +497,8 @@ export class ContactPane implements Pane {
   }
 
   private renderMessage(message: Message): HTMLElement {
+    // 说明不冒充任何一方：既不进「我」的气泡，也不进她的气泡，统一是系统说明卡
+    if (message.role === "notice") return this.noticeCard(message);
     const cls = message.role === "character" ? "u-bubble u-bubble-them" : "u-bubble u-bubble-me";
     const node = el("div", { class: cls, "data-message": message.messageId });
     node.appendChild(el("p", { class: "u-bubble-text", text: message.text }));
@@ -626,8 +628,8 @@ export class ContactPane implements Pane {
       });
       // 说明也要回执（单批）：不回执的话这条永远算未确认，每次重连都会被当成待投递重发一遍
       this.link?.confirmDelivery(event.messageId, 0, "accepted");
+      // 只经 messages 流渲染这一次；再补一张卡就是同一通知出现两份
       this.renderMessages();
-      this.appendSystem(this.handoffCard(event.text));
       return;
     }
     if (event.kind === "accepted") {
@@ -676,21 +678,36 @@ export class ContactPane implements Pane {
     }
   }
 
-  private handoffCard(text: string): HTMLElement {
-    const targets: Array<{ key: string; label: string; pane: "worlds" | "writing" | "contact" }> = [
-      { key: "creation", label: "尝试世界变化", pane: "worlds" },
-      { key: "version", label: "版本与恢复", pane: "worlds" },
-      { key: "trpg", label: "跑团行动", pane: "contact" },
-    ];
-    const hit = targets.find((item) => text.includes(item.label));
-    const node = el("div", { class: "u-handoff" });
-    node.appendChild(el("p", { text: text }));
-    node.appendChild(el("p", { class: "u-hint", text: "当前世界尚未因这次请求改变。" }));
-    const row = el("div", { class: "u-row" });
-    if (hit) row.appendChild(primary(`查看${hit.label}`, () => this.ctx.navigate({ pane: hit.pane })));
-    row.appendChild(button("继续联络", () => this.dismissHandoff(node)));
-    row.appendChild(button("仅作为联络发送", () => this.dismissHandoff(node)));
-    node.appendChild(row);
+  /** 转交类说明的固定出口：只有这些通知才带按钮与「尚未改变」那句（§6.3） */
+  private static readonly handoffTargets: Array<{
+    key: string;
+    label: string;
+    pane: "worlds" | "writing" | "contact";
+  }> = [
+    { key: "creation", label: "尝试世界变化", pane: "worlds" },
+    { key: "version", label: "版本与恢复", pane: "worlds" },
+    { key: "trpg", label: "跑团行动", pane: "contact" },
+  ];
+
+  /**
+   * role=notice 的呈现：转交类带按钮，其余（追赶、离场等）同款卡但不带任何按钮。
+   * live 与历史重载走同一条路径，所以两边的样子一致。
+   */
+  private noticeCard(message: Message): HTMLElement {
+    const node = el("div", { class: "u-handoff", "data-message": message.messageId });
+    node.appendChild(el("p", { text: message.text }));
+    const hit = ContactPane.handoffTargets.find((item) => message.text.includes(item.label));
+    if (hit) {
+      node.appendChild(el("p", { class: "u-hint", text: "当前世界尚未因这次请求改变。" }));
+      const row = el("div", { class: "u-row" });
+      row.appendChild(primary(`查看${hit.label}`, () => this.ctx.navigate({ pane: hit.pane })));
+      row.appendChild(button("继续联络", () => this.dismissHandoff(node)));
+      row.appendChild(button("仅作为联络发送", () => this.dismissHandoff(node)));
+      node.appendChild(row);
+    }
+    const meta = el("div", { class: "u-bubble-meta" });
+    meta.appendChild(el("span", { text: stamp(message.at) }));
+    node.appendChild(meta);
     return node;
   }
 
