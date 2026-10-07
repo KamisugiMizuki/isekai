@@ -634,19 +634,11 @@ class SessionService:
         clock = self.store.clock_get(timeline_id) if timeline_id else None
         if clock is None:
             return
-        # 判「追赶中」要看**当下投影**（目标水位 vs 已完成水位），不能只看落库的 catching_up：
-        # 高倍率下还没跑到第一次补算时，标志位仍是 0，而世界已经领先一大截（§2.6 条 5）。
-        behind = int(clock.get("catching_up") or 0) == 1
-        runtime = getattr(self, "runtime", None)
-        if runtime is not None and timeline_id and str(session.get("instance_id") or ""):
-            try:
-                view = runtime.view(
-                    str(session["instance_id"]), timeline_id, now_real=time.time()
-                )
-            except Exception:
-                view = {}
-            if view.get("world_seconds") is not None:
-                behind = int(view["world_seconds"]) > int(view.get("processed_world") or 0)
+        # 判「追赶中」以推进器的记账为准（§2.6，commit 099c3f9）：`catching_up` / `limited`
+        # 由水位推进在每一批上写、追平的那批清 0。不能改回「此刻投影 processed < target」：
+        # 持续运行的线在两个推进点之间总有未处理区间，那会把追赶报成常态
+        # （同口径见 runtime/service.py 的 `_catching()`）。
+        behind = bool(int(clock.get("catching_up") or 0) or int(clock.get("limited") or 0))
         existing = self.store.session_notice_get(session_id, "catching_up")
         if not behind:
             if existing is not None:
