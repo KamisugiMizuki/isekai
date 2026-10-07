@@ -726,12 +726,15 @@ export class ContactPane implements Pane {
   /** 转交类说明的固定出口：只有这些通知才带按钮与「尚未改变」那句（§6.3） */
   private static readonly handoffTargets: Array<{
     key: string;
+    /** 与核心通知正文对齐的稳定短语（isekai_core/story/classify.py HANDOFF_NOTICES 开头的定性词）。
+        改核心文案时这里必须一起改——不匹配的后果是按钮整排不渲染（2026-10-07 探针实锤过） */
+    match: string;
     label: string;
-    pane: "worlds" | "writing" | "contact";
+    pane: "worlds" | "writing" | "contact" | "trpg";
   }> = [
-    { key: "creation", label: "尝试世界变化", pane: "worlds" },
-    { key: "version", label: "版本与恢复", pane: "worlds" },
-    { key: "trpg", label: "跑团行动", pane: "contact" },
+    { key: "creation", match: "创作请求", label: "草案", pane: "worlds" },
+    { key: "version", match: "版本操作", label: "版本与恢复", pane: "worlds" },
+    { key: "trpg", match: "TRPG 行动", label: "跑团", pane: "trpg" },
   ];
 
   /**
@@ -741,7 +744,7 @@ export class ContactPane implements Pane {
   private noticeCard(message: Message): HTMLElement {
     const node = el("div", { class: "u-handoff", "data-message": message.messageId });
     node.appendChild(el("p", { text: message.text }));
-    const hit = ContactPane.handoffTargets.find((item) => message.text.includes(item.label));
+    const hit = ContactPane.handoffTargets.find((item) => message.text.includes(item.match));
     if (hit) {
       node.appendChild(el("p", { class: "u-hint", text: "当前世界尚未因这次请求改变。" }));
       const row = el("div", { class: "u-row" });

@@ -4,16 +4,18 @@
  */
 
 /* ============ 按钮尺寸（菲茨定律 + 触控目标） ============ */
-/* 主按钮的真实类名是 .u-primary（dom.ts primary() 产出 "u-btn u-primary"），
+/* 顺序有讲究：两条同特异性（0,1,0），后出现者胜出——`.u-primary` 必须排在 `.u-btn` 之后，
+   否则 44px 会被下面的 40px 压掉（2026-10-07 实测算得 40px 就是这个原因）。
+   主按钮的真实类名是 .u-primary（dom.ts primary() 产出 "u-btn u-primary"），
    原 .u-btn-primary 匹配不到任何元素，44px 触控目标从未生效 */
+.u-btn {
+  min-height: 40px;
+}
+
 .u-primary {
   min-height: 44px;
   /* user.css 的 .u-primary 已是 600；本文件后加载，若写 500 反而会把主按钮压轻 */
   font-weight: 600;
-}
-
-.u-btn {
-  min-height: 40px;
 }
 
 /* ============ 状态指示器：图标前缀（不只靠颜色） ============ */
