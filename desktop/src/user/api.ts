@@ -48,10 +48,10 @@ const CODE_TEXT: Record<string, string> = {
   empty_completion: "模型没有返回可用内容",
   truncated_completion: "模型输出被截断",
   internal: "程序内部处理失败，已记录诊断信息",
-  overloaded: "核心正忙，稍后重试",
+  overloaded: "现在正忙，过一会儿再试",
   rate_limited: "操作太快，稍后再试",
-  auth_failed: "核心拒绝了这次连接凭据",
-  auth_required: "需要先完成认证",
+  auth_failed: "本机保存的连接凭据被拒绝了（可能换过数据文件夹）",
+  auth_required: "这次连接还没通过认证，需要重新连接",
 };
 
 export function uiError(error: unknown, ctx: ErrorContext): UiError {
@@ -693,15 +693,43 @@ export interface ThreadLink {
 }
 
 /**
+ * 联络连接的可观察状态。界面拿它决定「能不能发」与那一行状态文案。
+ *
+ * 为什么要显式暴露（2026-10-07 可用性评审 P1「断线不重连」）：以前界面把
+ * 「`link` 对象非空」当成已连接，断线后对象还在，于是断线了照旧写「已连接，可以开始联络」，
+ * 输入框也照旧可用。
+ */
+export type ChannelState = "idle" | "connecting" | "connected" | "reconnecting" | "failed";
+
+/** 有界退避重连的等待序列（与 desktop/src/main.ts 同一口径）：用尽就停下，交给用户手动重连 */
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
+
+function waitMs(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+/**
  * 一个角色的联络连接：通道登记 → 会话 → 线程绑定 → UMP 握手。
  *
  * 只服务「角色联络」工作区：发送、收回复、投递回执。切换角色 / 时间线时重建，
  * 不让上一条连接的回执落进新会话（§3.3「不把旧请求返回结果画到新对象下」）。
+ *
+ * 断线（非主动关闭）由这里自己按有界退避重连，并把状态播给订阅者：
+ * 底层 `UmpClient` 只有 `onClose` 回调，不在这一层重连的话，界面只能干等着。
  */
 export class ChannelLink {
   private client: UmpClient | null = null;
   private listeners = new Set<(event: ChannelEvent) => void>();
+  private stateListeners = new Set<(state: ChannelState, note: string) => void>();
   link: ThreadLink | null = null;
+  private connState: ChannelState = "idle";
+  /** 上次连接的对象：重连按它再来一次，不要求调用方再交一次参数 */
+  private target: { api: AppApi; instanceId: string; timelineId: string; characterId: string } | null = null;
+  private reconnectAttempt = 0;
+  /** 作废在途重连链：换角色 / 主动关闭 / 重新 open 都 +1，旧链醒来即退出（不叠连接） */
+  private reconnectToken = 0;
+  /** 主动关闭：关闭后不再重连（与「断线」区分开；初值是 true，没连过就没得重连） */
+  private closedByUs = true;
 
   constructor(private readonly endpoint: string, private readonly channelName = "builtin") {}
 
@@ -709,12 +737,49 @@ export class ChannelLink {
     this.listeners.add(fn);
   }
 
+  /** 连接状态订阅：界面据此写状态行、开关输入框、给出「重新连接」入口 */
+  onStateChange(fn: (state: ChannelState, note: string) => void): void {
+    this.stateListeners.add(fn);
+  }
+
+  /** 这条连接是不是真的建起来了（握手完成）。界面不要再用 `link` 非空当已连接 */
+  get connected(): boolean {
+    return this.connState === "connected" && this.client !== null;
+  }
+
+  get state(): ChannelState {
+    return this.connState;
+  }
+
+  private setState(state: ChannelState, note = ""): void {
+    this.connState = state;
+    for (const listener of [...this.stateListeners]) listener(state, note);
+  }
+
   private emit(event: ChannelEvent): void {
     for (const listener of [...this.listeners]) listener(event);
   }
 
   async open(api: AppApi, instanceId: string, timelineId: string, characterId: string): Promise<ThreadLink> {
-    this.close();
+    this.closedByUs = false;
+    this.reconnectToken += 1; // 作废在途的重连链：这次 open 的结果说了算
+    this.reconnectAttempt = 0;
+    this.target = { api, instanceId, timelineId, characterId };
+    this.setState("connecting");
+    try {
+      const link = await this.connectOnce(api, instanceId, timelineId, characterId);
+      this.setState("connected");
+      return link;
+    } catch (error) {
+      // 失败原样抛给调用方（它要出错误卡）；状态播成 failed，界面据此显示「重新连接」
+      this.setState("failed");
+      throw error;
+    }
+  }
+
+  /** 建立一次连接：首次接入与断线重连都走这里，成功与否由调用方决定节奏 */
+  private async connectOnce(api: AppApi, instanceId: string, timelineId: string, characterId: string): Promise<ThreadLink> {
+    this.teardownClient(); // 同一通道只挂一条连接
     const issued = await api.ensureChannel(this.channelName, "isekai 桌面");
     // 凭据按「通道实例」缓存：换数据根（换根 / 恢复备份）会换实例，就不会再拿另一个根的凭据去连
     const channelKey = this.credentialKey(issued);
@@ -724,39 +789,93 @@ export class ChannelLink {
     const sessionId = String(session.id);
     const threadId = this.threadId(instanceId, timelineId, characterId);
     let client = this.buildClient();
-    let ack: Record<string, unknown>;
     try {
-      ack = await client.connect({ credential, bootstrap: null });
+      let ack: Record<string, unknown>;
+      try {
+        ack = await client.connect({ credential, bootstrap: null });
+      } catch (error) {
+        localStorage.removeItem(channelKey);
+        const rotated = await this.rotateCredential(api, channelKey);
+        if (!rotated) throw error;
+        client.close();
+        client = this.buildClient();
+        ack = await client.connect({ credential: rotated, bootstrap: null });
+      }
+      // 握手回带本通道已有的 thread 令牌（§2.2）：重连直接沿用，不重绑——
+      // 重绑会换代表令，已投递消息的回执会全部对不上（表现是「回执的绑定令牌与固化时不一致」）
+      const threads = (ack.threads as Array<{ id: string; binding_token: string }>) ?? [];
+      let token = threads.find((item) => item.id === threadId)?.binding_token;
+      if (!token) {
+        const bound = (await api.bindThread(this.channelName, threadId, sessionId)).thread as Json;
+        token = String(bound.binding_token ?? "");
+      }
+      this.client = client;
+      this.link = {
+        channel: this.channelName,
+        threadId,
+        token,
+        sessionId,
+      };
+      return this.link;
     } catch (error) {
-      localStorage.removeItem(channelKey);
-      const rotated = await this.rotateCredential(api, channelKey);
-      if (!rotated) throw error;
+      // 半途失败不能把这条连接留在后台：它的断线回调会被当成普通断线，凭空多出一条重连链
       client.close();
-      client = this.buildClient();
-      ack = await client.connect({ credential: rotated, bootstrap: null });
+      throw error;
     }
-    // 握手回带本通道已有的 thread 令牌（§2.2）：重连直接沿用，不重绑——
-    // 重绑会换代表令，已投递消息的回执会全部对不上（表现是「回执的绑定令牌与固化时不一致」）
-    const threads = (ack.threads as Array<{ id: string; binding_token: string }>) ?? [];
-    let token = threads.find((item) => item.id === threadId)?.binding_token;
-    if (!token) {
-      const bound = (await api.bindThread(this.channelName, threadId, sessionId)).thread as Json;
-      token = String(bound.binding_token ?? "");
-    }
-    this.client = client;
-    this.link = {
-      channel: this.channelName,
-      threadId,
-      token,
-      sessionId,
-    };
-    return this.link;
   }
 
   private buildClient(): UmpClient {
     const client = new UmpClient(this.endpoint, this.channelName, "isekai 桌面");
     client.onMessage((env) => this.onEnvelope(env));
+    // 必须挂 onClose：不挂的话断线在界面上完全不可见（评审 P1「断线不重连、界面仍写已连接」）
+    client.onClose(() => this.onClosed());
     return client;
+  }
+
+  /** 只拆底层连接（保留 target 与重连状态）：首次接入与重连都从这里开始 */
+  private teardownClient(): void {
+    const client = this.client;
+    this.client = null;
+    this.link = null;
+    // UmpClient.close 会清掉 closeHandlers：主动拆除不触发「断线重连」
+    client?.close();
+  }
+
+  /** 断线（非主动关闭）：先播状态，再按有界退避重连 */
+  private onClosed(): void {
+    if (this.closedByUs || !this.target) return;
+    // 已经有一条重连链在跑就不再起第二条：重连途中半成品连接失败也会把断线回调打上来
+    if (this.connState === "reconnecting") return;
+    this.setState("reconnecting", "连接已断开，正在重连…");
+    void this.scheduleReconnect();
+  }
+
+  /**
+   * 有界退避重连：1/2/4/8/16 秒各试一次，用尽就停在 `failed`。
+   * 不无限重试的理由：核心可能已经退出，界面上必须出现一个可点的「重新连接」，
+   * 而不是一条永远转下去的提示。
+   */
+  private async scheduleReconnect(): Promise<void> {
+    const mine = this.reconnectToken;
+    if (this.closedByUs || !this.target) return;
+    if (this.reconnectAttempt >= RECONNECT_DELAYS_MS.length) {
+      this.setState("failed", "重连没有成功");
+      return;
+    }
+    const wait = RECONNECT_DELAYS_MS[this.reconnectAttempt];
+    this.reconnectAttempt += 1;
+    await waitMs(wait);
+    if (mine !== this.reconnectToken || this.closedByUs || !this.target) return; // 已被新的连接流程接管
+    const { api, instanceId, timelineId, characterId } = this.target;
+    try {
+      await this.connectOnce(api, instanceId, timelineId, characterId);
+      this.reconnectAttempt = 0;
+      this.setState("connected");
+    } catch {
+      if (mine !== this.reconnectToken || this.closedByUs) return;
+      this.setState("reconnecting", `连接已断开，正在重连…（已试 ${this.reconnectAttempt} 次）`);
+      void this.scheduleReconnect();
+    }
   }
 
   /** 本机凭据缓存的键：带上通道实例 id（ci-xxxx），不同数据根互不干扰 */
@@ -838,7 +957,9 @@ export class ChannelLink {
 
   /** 发送一条联络：返回这次请求的身份（界面按它查询结果，不重复发） */
   send(textValue: string, opts?: { asContact?: boolean }): string {
-    if (!this.client || !this.link) throw new Error("还没有连上这个角色");
+    if (!this.client || !this.link || this.connState !== "connected") {
+      throw new Error("还没有连上这个角色：先点「重新连接」");
+    }
     return this.client.userMessage(this.link.threadId, this.link.token, textValue, opts);
   }
 
@@ -852,10 +973,14 @@ export class ChannelLink {
     this.client.retry(this.link.threadId, this.link.token, ref, kindName);
   }
 
+  /** 主动关闭：作废在途重连链并播「空闲」，之后不再自动重连 */
   close(): void {
-    this.client?.close();
-    this.client = null;
-    this.link = null;
+    this.closedByUs = true;
+    this.reconnectToken += 1;
+    this.reconnectAttempt = 0;
+    this.target = null;
+    this.teardownClient();
+    this.setState("idle");
   }
 }
 

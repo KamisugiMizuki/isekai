@@ -20,9 +20,11 @@ interface AppChoice {
 }
 
 const APPS: AppChoice[] = [
-  { mode: "chat", icon: "💬", title: "isekai Chat", subtitle: "与虚拟角色对话" },
-  { mode: "writer", icon: "✍️", title: "isekai Writer", subtitle: "辅助写作和大纲管理" },
-  { mode: "gm", icon: "🎲", title: "isekai GM", subtitle: "跑团主持和规则裁定" },
+  // 标题用中文（与首页/顶栏同一套名字），英文名留在副标题里——两套叫法指同一件事时，
+  // 用户至少要能对上号；「裁定」这类行话也换成能猜到的说法。
+  { mode: "chat", icon: "💬", title: "角色联络", subtitle: "isekai Chat · 选一个角色和她对话" },
+  { mode: "writer", icon: "✍️", title: "辅助写作", subtitle: "isekai Writer · 整理大纲、保存文字草稿" },
+  { mode: "gm", icon: "🎲", title: "跑团", subtitle: "isekai GM · 声明行动，得到结果" },
 ];
 
 /** 三个模式各自的落点（与 `app.ts` 的 appPane 一致；这里单独放一份避免 app ⇄ launcher 循环运行引用） */
@@ -57,7 +59,10 @@ export class Launcher {
       return;
     }
 
-    this.previous = !auto && lastMode ? this.ctx.route : null;
+    // 首次设置走完之后，这一屏永远留一条退路（Esc / 点空白回刚才的页面）：
+    // 只有「第一次打开、什么都还没建」时才必须先选一个。
+    const onboardDone = Boolean(this.ctx.prefs["onboard.done"]);
+    this.previous = lastMode || onboardDone ? this.ctx.route : null;
 
     this.overlay = el("div", { class: "u-launcher-overlay" });
     const dialog = el("div", { class: "u-launcher" });

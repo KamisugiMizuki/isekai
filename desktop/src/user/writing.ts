@@ -6,7 +6,7 @@
  * 三种结果三个动作：以此起草（留作文字）/ 另开分支试演 / 预览世界变化并确认应用到当前线。
  *
  * 两条界面层的硬规矩（§7.3 / §7.5）：
- *   - 候选是候选：只有真实提交结果才显示「已生效」，批准与提交是两步；
+ *   - 建议只是建议：只有真实提交过的结果才显示「已进世界」，采用与提交是两步；
  *   - 正文锁定后，新生成永远另起一稿，世界恢复也不会改写它。
  * 跑团（U4）在 `trpg.ts` 里单独实现，这里只负责写作。
  */
@@ -26,18 +26,22 @@ import {
   facts,
   field,
   fill,
+  pageHead,
+  panel,
   paragraph,
   primary,
   section,
   setNote,
   stamp,
+  tools,
+  type Child,
 } from "./dom";
-import { stackBar, type Seg } from "./graphics";
+import { dotLine, meter, stackBar, type Seg } from "./graphics";
 
 type Tab = "outline" | "material" | "advice" | "draft";
 
 /**
- * 写作工作区自己的上下文（§3.3）：世界 / 时间线 / 大纲分别记住，形状照抄 `sel.contact`。
+ * 写作工作区自己的上下文（§3.3）：世界 / 世界线 / 大纲分别记住，形状照抄 `sel.contact`。
  * 只读自己这一个键，不跨工作区继承别的域的写入目标。
  */
 interface WritingSelection {
@@ -51,9 +55,9 @@ interface WritingSelection {
 /** 六类条目：界面说法 + 一句示例（§7.2） */
 const LAYERS: Array<[string, string, string]> = [
   ["theme", "主题约束", "例：主题围绕记住与遗忘"],
-  ["required_node", "必达节点", "例：她在本章结束前知道那份告警"],
-  ["forbidden", "禁止事项", "例：北堤不得再次崩塌（触发就是偏离）"],
-  ["character_arc", "角色弧线", "例：她从不信人到愿意托付"],
+  ["required_node", "必须做到", "例：这一章结束前，主角要知道那份告警"],
+  ["forbidden", "禁止事项", "例：北堤不得再次崩塌（触发就是没有按大纲走）"],
+  ["character_arc", "角色变化", "例：主角从不信人，变成愿意托付"],
   ["pacing", "节奏目标", "例：前三章都在北堤附近"],
   ["variable_material", "可变素材", "例：可以用盐价、碑文、旧账本"],
 ];
@@ -62,7 +66,7 @@ const STATUS_TEXT: Record<string, string> = {
   unstarted: "未开始",
   in_progress: "进行中",
   achieved: "已达成",
-  deviated: "已偏离",
+  deviated: "没有按大纲走",
   abandoned: "已放弃",
 };
 
@@ -75,7 +79,7 @@ const STATUS_SEGS: Array<[string, Seg["tone"]]> = [
   ["abandoned", "muted"],
 ];
 
-/** 一组条目的状态分布 → 一段比例条（六类各自一条，一眼看出哪类在偏离） */
+/** 一组条目的状态分布 → 一段比例条（六类各自一条，一眼看出哪类没有按大纲走） */
 function statusBar(items: Json[], legend = false): HTMLElement | null {
   const segs: Seg[] = STATUS_SEGS.map(([status, tone]) => ({
     label: STATUS_TEXT[status] ?? status,
@@ -117,12 +121,18 @@ export class WritingPane implements Pane {
   private autoTimer: number | null = null;
   /** 读大纲状态真失败时的错误（not_found 是真空态，不进这里）：渲染优先于「还没有绑定大纲」 */
   private stateError: UiError | null = null;
-  /** 读候选真失败时的错误（not_found 是真无候选）：用到候选的地方要如实说读取失败 */
+  /** 读建议真失败时的错误（not_found 是真无建议）：用到建议的地方要如实说读取失败 */
   private candidatesError: UiError | null = null;
   /** 上次选择读了但对象已不存在时，如实说明回落原因（不静默继承别的域） */
   private selectionHint = "";
   /** 上一次已写入「最近使用 / sel.writing」的 key：同一选择不重复写 */
   private lastRecallKey = "";
+  /** 未配置 AI 这类可行动失败的错误卡（画在「推进建议」页首；重画时先清掉） */
+  private aiActionError: HTMLElement | null = null;
+  /** 本次会话里新建的试演线：核心清单是进入页面时读的，新线要立刻出现在本页选择里（P1-5） */
+  private extraTimelines: Array<{ id: string; name: string; state: string }> = [];
+  /** 正在编辑的正文是否还没成为草稿（「以此起草」直接打开的情形）：列表与「锁定正文」都据此说话 */
+  private draftFromSuggestion = false;
 
   constructor(private readonly ctx: AppContext) {}
 
@@ -147,22 +157,23 @@ export class WritingPane implements Pane {
     fill(host, this.note);
     const instances = this.ctx.instances();
     if (!instances.length) {
-      host.appendChild(
-        section(
-          "还没有世界",
-          paragraph("辅助写作挂在一个世界上：先创建，或从样例开始，再回来写。"),
-          el(
-            "div",
-            { class: "u-row" },
-            primary("从样例开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
-            button("创建世界", () => this.ctx.navigate({ pane: "create" })),
-          ),
+      // 连世界都没有时也给标题带：这一页的「我在哪」不该因为空态而消失（同一次审查：标题纵向位置三种）
+      host.appendChild(pageHead("辅助写作", "把大纲、素材、建议和正文放在一条线上"));
+      const emptyWorld = panel(
+        "还没有世界",
+        paragraph("辅助写作挂在一个世界上：先创建，或从样例开始，再回来写。"),
+        el(
+          "div",
+          { class: "u-row" },
+          primary("从样例开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
+          button("创建世界", () => this.ctx.navigate({ pane: "create" })),
         ),
       );
+      emptyWorld.classList.add("u-fill");
+      host.appendChild(emptyWorld);
       return;
     }
     if (!this.instanceId) this.instanceId = instances[0].id;
-    if (this.selectionHint) host.appendChild(paragraph(this.selectionHint, "u-hint"));
     try {
       const info = await this.ctx.api.instanceInfo(this.instanceId);
       const timelines = (info.timelines as Json[]) ?? [];
@@ -181,22 +192,24 @@ export class WritingPane implements Pane {
       await this.loadState();
       await this.refreshCandidates();
       this.rememberWriting(instances, timelines, outlineList);
-      // 分栏条排在页首（世界 / 时间线选择器之前）：内容再长它也贴在视口顶部，
-      // 排在中间时它落在页尾附近，sticky 没有可吸附的行程，等于没锚定
+      this.renderHead(instances);
+      // 回落说明紧贴标题带（在工具带之前）：它说的是「这一页在用哪个世界」，不是某个分区的状态
+      if (this.selectionHint) host.appendChild(paragraph(this.selectionHint, "u-hint"));
+      // 工具带排在选择器之前：内容再长它也贴在视口顶部；排在中间时 sticky 没有可吸附的行程，等于没锚定
       this.renderTabs(host);
       this.renderHeader(instances, timelines, characters, outlineList);
-      if (!this.state) {
-        if (this.stateError) {
-          // 读取失败优先：不许拿「还没有绑定大纲」冒充一次没读到的状态
-          host.appendChild(errorCard(this.stateError, [{ label: "重试", run: () => void this.render() }]));
-        } else {
-          host.appendChild(
-            paragraph(
-              "这条时间线上还没有绑定大纲：选一份大纲点「绑定到大纲」开始；已经绑定的线会保留各自进度。",
-              "u-hint",
-            ),
-          );
-        }
+      if (!this.state && !this.stateError) {
+        // 空态只说一次、只点一次：下拉里只有「（还没有大纲）」时，header 那份下拉与状态
+        // 已经说清「没绑」，这里不再重复整句解释与那排动作（2026-10-08 审查：同一件事说了三遍）
+        const emptyOutline = panel(
+          "这条世界线还没有大纲",
+          paragraph("下拉里选一份已建好的，或点右上角「新建大纲…」。", "u-hint"),
+        );
+        emptyOutline.classList.add("u-fill");
+        host.appendChild(emptyOutline);
+      } else if (this.stateError) {
+        // 读取失败优先：不许拿「还没有绑定大纲」冒充一次没读到的状态
+        host.appendChild(errorCard(this.stateError, [{ label: "重试", run: () => void this.render() }]));
       }
       if (this.tab === "outline") this.renderOutline(host);
       else if (this.tab === "material") await this.renderMaterial(host);
@@ -227,7 +240,7 @@ export class WritingPane implements Pane {
       const timelines = (info.timelines as Json[]) ?? [];
       const storedTimeline = String(stored?.timeline_id ?? "");
       if (storedTimeline && timelines.some((item) => String(item.id) === storedTimeline)) this.timelineId = storedTimeline;
-      else if (storedTimeline) this.selectionHint = hint(this.selectionHint, "上次的时间线已经不在这个世界：已回落到现有的第一条。");
+      else if (storedTimeline) this.selectionHint = hint(this.selectionHint, "上次的世界线已经不在这个世界：已回落到现有的第一条。");
       const outlines = ((await this.ctx.api.waOutlines()).outlines as Json[]) ?? [];
       const storedOutline = String(stored?.outline_id ?? "");
       if (storedOutline && outlines.some((item) => String(item.outline_id ?? item.id) === storedOutline)) this.outlineId = storedOutline;
@@ -288,12 +301,37 @@ export class WritingPane implements Pane {
       this.candidates = ((result.public as Json)?.candidates as Json[]) ?? [];
     } catch (error) {
       this.candidates = [];
-      // 没绑大纲时同一个 not_found 也是「真没有候选」；其它失败不能显示成「没有建议」
+      // 没绑大纲时同一个 not_found 也是「真没有建议」；其它失败不能显示成「没有建议」
       if (error instanceof MgmtError && error.code === "not_found") return;
-      this.candidatesError = uiError(error, { module: "辅助写作", action: "读取推进建议候选" });
+      this.candidatesError = uiError(error, { module: "辅助写作", action: "读取推进建议" });
     }
   }
 
+  /**
+   * ① 标题带（每页固定第一条）：页面名 + 一句定位语 + 右侧主操作。
+   * 两个动作在整页只出现这一次——以前盒子里一排、盒子下面又一排，用户不知道该按哪一个
+   * （2026-10-08 视觉体系审查第 7 节）。
+   */
+  private renderHead(instances: Array<{ id: string; name: string }>): void {
+    const host = this.host!;
+    const world = instances.find((item) => item.id === this.instanceId)?.name ?? "";
+    const actions: Child[] = [
+      primary("新建大纲…", () => void this.newOutline()),
+      // 按钮名固定成同一套：页内提示说的「绑定 / 更新绑定」必须与屏幕上的字逐字对上
+      button("绑定 / 更新绑定", () => void this.bindOutline()),
+    ];
+    // 绑的是哪个世界是定位信息：留在标题带，换分区也不会跟丢
+    if (world) actions.push(chip(`世界：${world}`, "muted"));
+    host.appendChild(
+      pageHead(
+        "辅助写作",
+        "把大纲、素材、建议和正文放在一条线上；在跑团里打开时这里是主持视图，结果默认不发给玩家。",
+        actions,
+      ),
+    );
+  }
+
+  /** 绑定状态（谁绑着、章节、进度）与两条空态说明：③ 内容带的第一块 */
   private renderHeader(
     instances: Array<{ id: string; name: string }>,
     timelines: Json[],
@@ -301,6 +339,9 @@ export class WritingPane implements Pane {
     outlines: Json[],
   ): void {
     const host = this.host!;
+    // 本页新开的试演线立刻进选择：不并进来的话，用户回来在这页找不到刚建的那条线（P1-5）
+    const known = new Set(timelines.map((item) => String(item.id)));
+    const timelineOptions = [...timelines, ...this.extraTimelines.filter((item) => !known.has(item.id))];
     const picker = (
       label: string,
       id: string,
@@ -314,12 +355,11 @@ export class WritingPane implements Pane {
       select.addEventListener("change", () => onPick(select.value));
       return field(label, select);
     };
+    const state = this.state;
     host.appendChild(
-      section(
-        `辅助写作 · ${instances.find((item) => item.id === this.instanceId)?.name ?? ""}`,
-        paragraph(
-          "一起组织大纲、观察人物、比较推进方案，文字由你决定。在跑团里打开时这是「主持准备」，结果默认不发给玩家。",
-        ),
+      panel(
+        // 分区标题给人话：内容少时这一块也不会只剩一个空盒子
+        "这条线上在写什么",
         el(
           "div",
           { class: "u-row u-row-wrap" },
@@ -331,9 +371,9 @@ export class WritingPane implements Pane {
             void this.render();
           }),
           picker(
-            "时间线",
+            "世界线",
             "u-wa-timeline",
-            timelines.map((item) => [
+            timelineOptions.map((item) => [
               String(item.id),
               `${String(item.name)}（${String(item.state) === "active" ? "运行中" : "暂停"}）`,
             ]),
@@ -361,65 +401,82 @@ export class WritingPane implements Pane {
             },
           ),
         ),
+        // 绑定状态紧跟选择器：选完就能看见「绑没绑上、绑的是哪一份」
         el(
           "div",
           { class: "u-row" },
-          button("新建大纲…", () => void this.newOutline()),
-          button(this.state ? "换观察者 / 章节标签…" : "绑定到大纲", () => void this.bindOutline()),
-          this.state
-            ? chip(`已绑定：${String(this.state.outline_name ?? "")}`, "ok")
+          state
+            ? chip(`已绑定：${String(state.outline_name ?? "")}`, "ok")
             : this.stateError
               ? chip("大纲状态读取失败", "bad")
               : chip("未绑定", "pending"),
-          this.state
-            ? paragraph(`章节：${String(this.state.chapter || "（未命名）")}｜评估水位 ${Number(this.state.evaluated_world ?? 0)}`, "u-hint")
+          state
+            ? paragraph(
+                `章节：${String(state.chapter || "（未命名）")}｜世界已推进到第 ${Number(state.evaluated_world ?? 0)} 个进度点`,
+                "u-hint",
+              )
             : null,
         ),
+        // 下拉为空时补一句空态：只有「（还没有…）」的选项，用户不知道该去哪儿建（P2）
+        timelines.length
+          ? null
+          : paragraph("这个世界还没有世界线：到「世界与素材」新建一条，再回来绑定大纲。", "u-hint"),
+        characters.length
+          ? null
+          : paragraph("这个世界还没有角色卡：到「世界与素材」加一个角色，再回来观察它的素材。", "u-hint"),
       ),
     );
   }
 
+  /**
+   * ② 工具带（分区切换）：用 `tools` 而不是自己拼 `.u-crumbs`。
+   * 形状就是语义——分区是「下划线 + 当前项加重」，与动作按钮、页内锚点不再同形
+   * （2026-10-08 审查根因 2：一套外观对应三种交互）。
+   */
   private renderTabs(host: HTMLElement): void {
-    const tabs = el("nav", { class: "u-crumbs", "aria-label": "写作分区" });
     const entries: Array<[Tab, string]> = [
       ["outline", "大纲"],
       ["material", "当前素材"],
       ["advice", "推进建议"],
       ["draft", "文字草稿"],
     ];
-    for (const [id, label] of entries) {
-      const node = button(label, () => {
-        this.tab = id;
-        void this.render();
-      });
-      node.dataset.tab = id;
-      if (id === this.tab) {
-        node.classList.add("u-nav-active");
-        node.setAttribute("aria-current", "page");
-      }
-      tabs.appendChild(node);
-    }
-    host.appendChild(tabs);
+    host.appendChild(
+      tools(
+        entries.map(([id, label]) => ({
+          label,
+          current: id === this.tab,
+          onSelect: () => {
+            this.tab = id;
+            void this.render();
+          },
+        })),
+        "写作分区",
+      ),
+    );
   }
 
   /* ------------------------------------------------------------ ① 大纲（§7.2） */
 
   private renderOutline(host: HTMLElement): void {
     if (!this.state) {
-      // 读取失败已在页首用错误卡说明：这里不再劝「绑定到大纲」，免得把没读到当成没绑定
-      if (this.stateError) return;
-      host.appendChild(el("div", { class: "u-row" }, primary("绑定到大纲", () => void this.bindOutline())));
+      // 大纲页空态已经在上面说过一次（「这条世界线还没有大纲」），这里不再说第二遍：
+      // 同一件事说两遍正是这次审查要消掉的东西（2026-10-08 审查第 7 节）。
+      // 读取失败则由调用方出错误卡 + 重试，也不在这里补话。
       return;
     }
     const items = ((this.state.items as Json[]) ?? []).slice();
+    const achieved = items.filter((item) => String(item.status) === "achieved").length;
     host.appendChild(
-      section(
+      panel(
         "进度概览",
         paragraph(
-          `这条线上共 ${items.length} 条约束与目标。状态是记下来的事实，不是会自动涨的进度条：偏离会被留着，不会被抹掉。`,
+          `这条线上共 ${items.length} 条约束与目标。状态是记下来的事实，不是会自动涨的进度条：没有按大纲走的会被留着，不会被抹掉。`,
           "u-hint",
         ),
+        // 一句话说不清「六类里哪一类没有按大纲走」：给一条比例条，图例带数值
         statusBar(items, true) ?? paragraph("这份大纲还没有条目。", "u-hint"),
+        // 再给一个读数：一眼看出走了几分之几，不用去数条目
+        items.length ? meter(achieved, items.length, "已达成的条目") : null,
       ),
     );
     const groups = el("div", { class: "u-cards" });
@@ -442,7 +499,7 @@ export class WritingPane implements Pane {
         );
         row.appendChild(button("决定…", () => void this.decideItem(item)));
         card.appendChild(row);
-        if (item.scope === "world") card.appendChild(paragraph("范围：整个世界（跨时间线）", "u-hint"));
+        if (item.scope === "world") card.appendChild(paragraph("范围：整个世界（所有世界线）", "u-hint"));
         if (item.reason) card.appendChild(paragraph(`理由：${String(item.reason)}`, "u-hint"));
         const evidence = (item.evidence_refs as string[]) ?? [];
         if (evidence.length) card.appendChild(paragraph(`依据：${evidence.join("、")}`, "u-hint"));
@@ -471,16 +528,16 @@ export class WritingPane implements Pane {
             "div",
             { class: "u-row" },
             chip(`缺口 ${gaps.length}`, gaps.length ? "bad" : "ok"),
-            chip(`偏离 ${deviations.length}`, deviations.length ? "bad" : "ok"),
+            chip(`没有按大纲走 ${deviations.length}`, deviations.length ? "bad" : "ok"),
             chip(`可用依据 ${evidence.length}`, evidence.length ? "ok" : "muted"),
           ),
           gaps.length ? bulletList(gaps.map((item) => `缺口：${String(item.detail ?? item)}`), "u-list") : paragraph("硬约束没有缺口。", "u-hint"),
           deviations.length
-            ? bulletList(deviations.map((item) => `偏离：${String(item.detail ?? item)}｜需要：${String(item.need ?? "")}`), "u-list")
-            : paragraph("没有偏离项。", "u-hint"),
+            ? bulletList(deviations.map((item) => `没有按大纲走：${String(item.detail ?? item)}｜需要：${String(item.need ?? "")}`), "u-list")
+            : paragraph("没有这类问题。", "u-hint"),
           evidence.length
             ? paragraph(`世界里已经有 ${evidence.length} 条可用依据，标记达成时可以直接引用。`, "u-hint")
-            : paragraph("世界里暂时没有能对上条目的依据：必要时先提出世界变化候选。", "u-hint"),
+            : paragraph("世界里暂时没有能对上条目的依据：必要时先提出一条世界变化建议。", "u-hint"),
           paragraph("缺口 = 还缺什么；依据 = 世界对得上的东西；决定 = 你来定。三者分开看，不用一个进度条代替。", "u-hint"),
         ),
       );
@@ -499,7 +556,7 @@ export class WritingPane implements Pane {
       this.state = { ...(this.state ?? {}), items: result.items };
       setNote(
         this.note,
-        `检查完成：${((result.gaps as Json[]) ?? []).length} 条缺口、${((result.deviations as Json[]) ?? []).length} 条偏离`,
+        `检查完成：${((result.gaps as Json[]) ?? []).length} 条缺口、${((result.deviations as Json[]) ?? []).length} 条没有按大纲走`,
         "ok",
       );
       await this.render();
@@ -513,15 +570,15 @@ export class WritingPane implements Pane {
     const status = String(item.status);
     const choices: Array<[string, string]> =
       status === "unstarted"
-        ? [["in_progress", "开始推进"], ["deviated", "直接记偏离"], ["abandoned", "放弃"]]
+        ? [["in_progress", "开始推进"], ["deviated", "直接记为没有按大纲走"], ["abandoned", "放弃"]]
         : status === "in_progress"
-          ? [["achieved", "标记达成"], ["deviated", "接受偏离"], ["abandoned", "放弃"]]
+          ? [["achieved", "标记达成"], ["deviated", "接受这次没有按大纲走"], ["abandoned", "放弃"]]
           : status === "deviated"
             ? [["in_progress", "回到推进"], ["achieved", "标记达成"], ["abandoned", "放弃"]]
-            : [["deviated", "接受偏离"]];
+            : [["deviated", "接受这次没有按大纲走"]];
     if (layer === "forbidden") {
       choices.length = 0;
-      choices.push(["deviated", "已触发（记偏离）"], ["abandoned", "放弃这条禁止事项"]);
+      choices.push(["deviated", "已触发（记为没有按大纲走）"], ["abandoned", "放弃这条禁止事项"]);
     }
     const target = el("select", { class: "u-input", id: "u-wa-target" }) as HTMLSelectElement;
     for (const [value, text] of choices) target.appendChild(el("option", { value, text }));
@@ -555,29 +612,30 @@ export class WritingPane implements Pane {
       [
         {
           label: "记下这个决定",
-          run: () => {
-            void (async () => {
-              if (!reason.value.trim()) {
-                setNote(note, "决定必须写理由：偏离可以被接受，不能被静默掩盖", "bad");
-                return;
-              }
-              try {
-                const result = await this.ctx.api.waItemDecide({
-                  instance_id: this.instanceId,
-                  timeline_id: this.timelineId,
-                  outline_id: this.outlineId,
-                  item_id: String(item.id),
-                  status: target.value,
-                  reason: reason.value.trim(),
-                  evidence_refs: refs(evidence.value),
-                });
-                this.state = (result.state as Json) ?? this.state;
-                setNote(this.note, `已记下决定：${String(item.title || item.id)} → ${STATUS_TEXT[target.value] ?? target.value}`, "ok");
-                await this.render();
-              } catch (error) {
-                setNote(note, uiError(error, { module: "大纲", action: "记下决定" }).message, "bad");
-              }
-            })();
+          // 失败返回 false：`dialog` 因此不关窗，校验与错误提示留在用户正看着的这张窗里（P0-1）
+          run: async () => {
+            if (!reason.value.trim()) {
+              setNote(note, "决定必须写理由：没有按大纲走可以被接受，不能被静默掩盖", "bad");
+              return false;
+            }
+            try {
+              const result = await this.ctx.api.waItemDecide({
+                instance_id: this.instanceId,
+                timeline_id: this.timelineId,
+                outline_id: this.outlineId,
+                item_id: String(item.id),
+                status: target.value,
+                reason: reason.value.trim(),
+                evidence_refs: refs(evidence.value),
+              });
+              this.state = (result.state as Json) ?? this.state;
+              setNote(this.note, `已记下决定：${String(item.title || item.id)} → ${STATUS_TEXT[target.value] ?? target.value}`, "ok");
+              await this.render();
+              return true;
+            } catch (error) {
+              setNote(note, uiError(error, { module: "大纲", action: "记下决定" }).message, "bad");
+              return false;
+            }
           },
         },
         { label: "取消", run: () => undefined },
@@ -612,31 +670,34 @@ export class WritingPane implements Pane {
       [
         {
           label: "加进大纲",
-          run: () => {
-            void (async () => {
-              if (!statement.value.trim()) {
-                setNote(note, "至少要写清楚这一条要求什么", "bad");
-                return;
-              }
-              try {
-                const current = await this.ctx.api.waOutlineGet(this.outlineId);
-                const outline = ((current.outline as Json) ?? {}) as Json;
-                const items = [...((outline.items as Json[]) ?? [])];
-                items.push({
-                  id: `it-${Date.now().toString(36)}`,
-                  layer: layer.value,
-                  title: title.value.trim() || "条目",
-                  statement: statement.value.trim(),
-                  scope: "timeline",
-                  success_criteria: criteria.value.trim(),
-                });
-                await this.ctx.api.waOutlineSave({ ...outline, items });
-                setNote(this.note, "已加进大纲；重新绑定这条线之后它才会进入进度", "ok");
-                await this.render();
-              } catch (error) {
-                setNote(note, uiError(error, { module: "大纲", action: "加条目" }).message, "bad");
-              }
-            })();
+          // 失败返回 false：条目没存进去时弹窗要留着，重试不用重新填一遍（P0-1）
+          run: async () => {
+            if (!statement.value.trim()) {
+              setNote(note, "至少要写清楚这一条要求什么", "bad");
+              return false;
+            }
+            try {
+              // 改的是这条线真正绑着的那份大纲：下拉里选中的可能是另一份，别把条目加错地方
+              const editId = String((this.state?.outline_id as string | undefined) ?? "") || this.outlineId;
+              const current = await this.ctx.api.waOutlineGet(editId);
+              const outline = ((current.outline as Json) ?? {}) as Json;
+              const items = [...((outline.items as Json[]) ?? [])];
+              items.push({
+                id: `it-${Date.now().toString(36)}`,
+                layer: layer.value,
+                title: title.value.trim() || "条目",
+                statement: statement.value.trim(),
+                scope: "timeline",
+                success_criteria: criteria.value.trim(),
+              });
+              await this.ctx.api.waOutlineSave({ ...outline, items });
+              setNote(this.note, "已加进大纲；点「绑定 / 更新绑定」之后它才会进入进度", "ok");
+              await this.render();
+              return true;
+            } catch (error) {
+              setNote(note, uiError(error, { module: "大纲", action: "加条目" }).message, "bad");
+              return false;
+            }
           },
         },
         { label: "取消", run: () => undefined },
@@ -664,35 +725,36 @@ export class WritingPane implements Pane {
       [
         {
           label: "保存大纲",
-          run: () => {
-            void (async () => {
-              if (!name.value.trim() || !statement.value.trim()) {
-                setNote(note, "名称与主题约束都要写", "bad");
-                return;
-              }
-              try {
-                const outline = {
-                  id: `ol-${Date.now().toString(36)}`,
-                  name: name.value.trim(),
-                  items: [
-                    {
-                      id: `it-${Date.now().toString(36)}`,
-                      layer: "theme",
-                      title: "主题约束",
-                      statement: statement.value.trim(),
-                      scope: "world",
-                      success_criteria: criteria.value.trim(),
-                    },
-                  ],
-                };
-                await this.ctx.api.waOutlineSave(outline);
-                this.outlineId = outline.id;
-                setNote(this.note, `大纲「${outline.name}」已保存：点「绑定到大纲」把它绑到这条线`, "ok");
-                await this.render();
-              } catch (error) {
-                setNote(note, uiError(error, { module: "大纲", action: "保存" }).message, "bad");
-              }
-            })();
+          // 失败返回 false：保存没成时弹窗不关，窗内提示才看得见（P0-1）
+          run: async () => {
+            if (!name.value.trim() || !statement.value.trim()) {
+              setNote(note, "名称与主题约束都要写", "bad");
+              return false;
+            }
+            try {
+              const outline = {
+                id: `ol-${Date.now().toString(36)}`,
+                name: name.value.trim(),
+                items: [
+                  {
+                    id: `it-${Date.now().toString(36)}`,
+                    layer: "theme",
+                    title: "主题约束",
+                    statement: statement.value.trim(),
+                    scope: "world",
+                    success_criteria: criteria.value.trim(),
+                  },
+                ],
+              };
+              await this.ctx.api.waOutlineSave(outline);
+              this.outlineId = outline.id;
+              setNote(this.note, `大纲「${outline.name}」已保存：点「绑定 / 更新绑定」把它绑到这条线`, "ok");
+              await this.render();
+              return true;
+            } catch (error) {
+              setNote(note, uiError(error, { module: "大纲", action: "保存" }).message, "bad");
+              return false;
+            }
           },
         },
         { label: "取消", run: () => undefined },
@@ -708,7 +770,7 @@ export class WritingPane implements Pane {
     }
     if (this.stateError && !this.state) {
       // 读不到状态时不能按「首次绑定」处理：先重试读取，再决定绑定还是更新
-      setNote(this.note, "这条时间线的大纲状态还没读到：先重试读取，再决定绑定还是更新", "bad");
+        setNote(this.note, "这条世界线的大纲状态还没读到：先重试读取，再决定绑定还是更新", "bad");
       return;
     }
     const bound = Boolean(this.state);
@@ -720,11 +782,11 @@ export class WritingPane implements Pane {
     }) as HTMLInputElement;
     const note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
     const modal = dialog(
-      bound ? "换观察者 / 章节标签" : "绑定到大纲",
+      "绑定 / 更新绑定",
       [
         paragraph(
           bound
-            ? "这里只改观察者、章节标签与绑定元数据：这条线上的进度原样保留。"
+            ? "这里只改观察者、章节标签与绑定信息：这条线上的进度原样保留。"
             : "首次绑定让条目从「未开始」起算；已经绑定过的大纲只会更新观察者与章节。",
           "u-hint",
         ),
@@ -735,27 +797,28 @@ export class WritingPane implements Pane {
       [
         {
           label: bound ? "保存这些选择" : "绑定",
-          run: () => {
-            void (async () => {
-              try {
-                const result = await this.ctx.api.waBind({
-                  instance_id: this.instanceId,
-                  timeline_id: this.timelineId,
-                  outline_id: this.outlineId,
-                  observers: refs(observers.value),
-                  chapter: chapter.value.trim(),
-                });
-                this.state = (result.state as Json) ?? null;
-                setNote(
-                  this.note,
-                  result.updated ? "已更新观察者 / 章节：进度原样保留" : "已绑定：条目从未开始起算",
-                  "ok",
-                );
-                await this.render();
-              } catch (error) {
-                setNote(note, uiError(error, { module: "大纲", action: bound ? "更新绑定" : "绑定" }).message, "bad");
-              }
-            })();
+          // 失败返回 false：绑定没成时弹窗不关，用户原地看到原因再改（P0-1）
+          run: async () => {
+            try {
+              const result = await this.ctx.api.waBind({
+                instance_id: this.instanceId,
+                timeline_id: this.timelineId,
+                outline_id: this.outlineId,
+                observers: refs(observers.value),
+                chapter: chapter.value.trim(),
+              });
+              this.state = (result.state as Json) ?? null;
+              setNote(
+                this.note,
+                result.updated ? "已更新观察者 / 章节：进度原样保留" : "已绑定：条目从未开始起算",
+                "ok",
+              );
+              await this.render();
+              return true;
+            } catch (error) {
+              setNote(note, uiError(error, { module: "大纲", action: bound ? "更新绑定" : "绑定" }).message, "bad");
+              return false;
+            }
           },
         },
         { label: "取消", run: () => undefined },
@@ -768,15 +831,19 @@ export class WritingPane implements Pane {
 
   private async renderMaterial(host: HTMLElement): Promise<void> {
     host.appendChild(
-      el(
-        "div",
-        { class: "u-row" },
-        primary("读取当前素材", () => void this.loadMaterial()),
-        paragraph(
-          this.observed
-            ? `读取于 ${stamp(this.observedAt)}｜世界时刻 ${String(this.observed.world_time ?? "")}；冻结或追赶时这里只作历史参考。`
-            : "只给所选角色在当前进度上合法可知的材料：亲历 / 看到 / 听说 / 推测都带来源标签。",
-          "u-hint",
+      panel(
+        "只给所选角色合法可知的材料",
+        // 动作与读数分行：以前动作和一句说明挤在同一行里，读起来像同一句话的两个部分
+        el(
+          "div",
+          { class: "u-row u-row-wrap" },
+          primary("读取当前素材", () => void this.loadMaterial()),
+          paragraph(
+            this.observed
+              ? `读取于 ${stamp(this.observedAt)}｜世界时刻 ${String(this.observed.world_time ?? "")}；冻结或追赶时这里只作历史参考。`
+              : "亲历 / 看到 / 听说 / 推测都带来源标签。",
+            "u-hint",
+          ),
         ),
       ),
     );
@@ -792,12 +859,14 @@ export class WritingPane implements Pane {
       rows.appendChild(row);
     }
     if (!materials.length) rows.appendChild(paragraph("这个角色目前没有能想起来的材料。", "u-hint"));
-    host.appendChild(section("她知道的（来源标签在右）", rows));
+    host.appendChild(
+      section("这个角色知道的（来源标签在右）", materials.length ? dotLine(`${materials.length} 条能想起来的材料`, "ok") : null, rows),
+    );
     const experiences = (view.experiences as Json[]) ?? [];
     const claims = (view.claims as Json[]) ?? [];
     host.appendChild(
       section(
-        "她的经历与说法",
+        "这个角色的经历与说法",
         experiences.length || claims.length
           ? bulletList(
               [
@@ -815,11 +884,11 @@ export class WritingPane implements Pane {
         bulletList(
           [
             ...((next.gaps as Json[]) ?? []).map((item) => `缺口：${String(item.detail ?? item)}`),
-            ...((next.deviations as Json[]) ?? []).map((item) => `偏离：${String(item.detail ?? item)}`),
+            ...((next.deviations as Json[]) ?? []).map((item) => `没有按大纲走：${String(item.detail ?? item)}`),
           ].slice(0, 12),
           "u-list",
         ),
-        paragraph("作者身份不等于能读整个世界真值：这里只有她合法知道的东西，加上你这份大纲的缺口与偏离。", "u-hint"),
+        paragraph("作者身份不等于能读整个世界真值：这里只有这个角色合法知道的东西，加上你这份大纲的缺口与没有按大纲走的地方。", "u-hint"),
       ),
     );
   }
@@ -854,6 +923,8 @@ export class WritingPane implements Pane {
   /* ------------------------------------------------------------ ③ 推进建议（§7.3 下半 + 三个动作） */
 
   private renderAdvice(host: HTMLElement): void {
+    // 未配置 AI 这类「有下一步可做」的失败：页首出一张带动作的错误卡，不只写一行提示（P1-7）
+    if (this.aiActionError) host.appendChild(this.aiActionError);
     const goal = el("textarea", {
       class: "u-textarea", rows: "2", id: "u-wa-goal", placeholder: "这一章想让故事走到哪一步（可留空）",
     }) as HTMLTextAreaElement;
@@ -869,20 +940,30 @@ export class WritingPane implements Pane {
       this.limit = Math.min(5, Math.max(1, Number.isFinite(value) ? Math.round(value) : 3));
     });
     host.appendChild(
-      el(
-        "div",
-        { class: "u-row" },
-        goal,
-        field("建议数量（1–5）", limit),
-        primary("给我推进建议", () => void this.suggest()),
+      panel(
+        "要一组建议",
+        el(
+          "div",
+          { class: "u-row" },
+          goal,
+          field("建议数量（1–5）", limit),
+          primary("给我推进建议", () => void this.suggest()),
+        ),
+        paragraph(
+          "建议只是还没写进世界的稿子：不写世界、不推状态。改世界要走「预览世界变化 → 确认应用」；只想留作文字就「以此起草」。",
+          "u-hint",
+        ),
       ),
     );
-    host.appendChild(
-      paragraph(
-        "建议是候选：不写世界、不推状态。改世界要走「预览世界变化 → 确认应用」；只想留作文字就「以此起草」。",
-        "u-hint",
-      ),
-    );
+    // 「有几条还没定、几条已经进世界」是一段比例：画出来比数候选卡快（审查：几乎零图形，全靠文字顶）
+    const committedCount = this.candidates.filter((item) => Boolean(item.effective)).length;
+    const pendingCount = Math.max(0, this.candidates.length - committedCount);
+    const compared = this.candidates.length
+      ? stackBar([
+          { label: "还没定 / 还没进世界", value: pendingCount, tone: "pending" },
+          { label: "已进世界", value: committedCount, tone: "ok" },
+        ])
+      : null;
     const rows = el("div", { class: "u-rows" });
     // 依据三条：先给 ✓/✗ 一眼看全不全，原文照旧在旁边（缺哪条比缺什么更该先看见）
     const basisRow = (name: string, value: string): HTMLElement =>
@@ -902,7 +983,7 @@ export class WritingPane implements Pane {
           ["方案", String(item.summary ?? "")],
           ["待定问题", ((item.unsolved as string[]) ?? []).join("、") || "（没有列出的待定问题）"],
           ["是否改世界", item.has_world_change ? "含世界变化（要预览后确认）" : "不改世界（只作文字）"],
-          ["受众", String(item.audience) === "player" ? "可给玩家看" : "仅作者 / 主持人"],
+          ["能不能给玩家看", String(item.audience) === "player" ? "可给玩家看" : "只给你 / 主持人看"],
         ]),
       );
       card.appendChild(
@@ -920,10 +1001,11 @@ export class WritingPane implements Pane {
           { class: "u-row" },
           chip(STATUS_TEXT[String(item.status)] ?? String(item.status), item.uncommitted ? "pending" : "muted"),
           item.locked ? chip("正文已锁定", "ok") : null,
+          // 「提交依据」这种内部说法换成用户能问出口的三个问题：进世界了吗、有据可查吗、我批了吗
           item.effective
-            ? chip(`已生效 · 提交 ${String(item.effective_basis).slice(0, 10)}`, "ok")
+            ? chip("已进世界", "ok")
             : String(item.status) === "committed"
-              ? chip("缺少提交依据（不显示为已生效）", "bad")
+              ? chip("缺少可作为依据的记录（不显示为已生效）", "bad")
               : null,
         ),
       );
@@ -932,7 +1014,7 @@ export class WritingPane implements Pane {
       actions.appendChild(button("以此起草", () => this.startDraft(item)));
       if (item.has_world_change) {
         actions.appendChild(button("预览世界变化", () => void this.previewChange(item)));
-        actions.appendChild(button("另开分支试演", () => void this.trialBranch()));
+        actions.appendChild(button("另开分支试演", () => void this.trialBranch(item)));
       } else {
         actions.appendChild(button("采用这段文字", () => void this.decideCandidate(item, "approved", String(item.text ?? item.summary ?? ""))));
       }
@@ -945,22 +1027,60 @@ export class WritingPane implements Pane {
         // 读失败与「没有建议」不可分：有错就出错误卡 + 重试
         rows.appendChild(errorCard(this.candidatesError, [{ label: "重试", run: () => void this.render() }]));
       } else {
-        rows.appendChild(paragraph("还没有建议：点上面的按钮要一组（每次生成各有独立标识，不会覆盖已采用的内容）。", "u-hint"));
+        rows.appendChild(paragraph("还没有建议：点上面的按钮要一组；这一次生成不会覆盖已经采用的内容。", "u-hint"));
       }
     }
-    host.appendChild(section("待决定的建议", rows));
+    host.appendChild(section("待决定的建议", compared, rows));
+  }
+
+  /** 是否已配好 AI 服务：判定与 contact.ts / home.ts 同一来源（`readiness.ai.configured`），不新造 */
+  private aiReady(): boolean {
+    return Boolean(((this.ctx.readiness.ai as Json | undefined) ?? {}).configured);
+  }
+
+  /**
+   * 「有下一步可做」的失败升级成错误卡 + 按钮（P1-7）：
+   * 未配置 AI 是典型——只写一行「还没有配置 AI 服务」，用户不知道去哪配。
+   */
+  private showActionError(message: string, action: string, retry: () => void): void {
+    const info: UiError = {
+      module: "辅助写作",
+      action,
+      target: "",
+      stage: "",
+      code: "llm_not_configured",
+      message,
+      retryable: true,
+      done: "没有任何改动，世界里什么都没发生",
+      unknown: "这次操作是否已生效",
+      field: "",
+      requestId: "",
+    };
+    const actions = [{ label: "去设置 AI 服务", run: () => this.ctx.navigate({ pane: "settings", sub: "ai" }) }];
+    // AI 已经配好时再给「重试」：再点一次有意义，不然只是重复同一句错误
+    if (this.aiReady()) actions.unshift({ label: "重试", run: retry });
+    this.aiActionError = errorCard(info, actions);
   }
 
   private async suggest(): Promise<void> {
     if (!this.state) {
       setNote(
         this.note,
-        this.stateError ? "这条时间线的大纲状态还没读到：先重试读取，再要建议" : "先绑定一份大纲：建议要挂在大纲与角色上",
+        this.stateError ? "这条世界线的大纲状态还没读到：先重试读取，再要建议" : "先绑定一份大纲：建议要挂在大纲与角色上",
         "bad",
       );
       return;
     }
-    setNote(this.note, "正在要一组建议（一次便宜调用）…", "pending");
+    if (!this.aiReady()) {
+      // 未配置 AI：别等请求失败才说，直接给可点的下一步，省掉一次白等的等待
+      this.aiActionError = null;
+      this.showActionError("还没有配置 AI 服务，所以没法生成推进建议", "生成推进建议", () => void this.suggest());
+      setNote(this.note, "还没有配置 AI 服务：配好后再回来要建议", "bad");
+      await this.render();
+      return;
+    }
+    this.aiActionError = null;
+    setNote(this.note, "正在要一组建议…", "pending");
     try {
       const result = await this.ctx.api.waSuggest({
         instance_id: this.instanceId,
@@ -981,7 +1101,7 @@ export class WritingPane implements Pane {
       } else if (status === "ok" && !made.length) {
         setNote(this.note, `这一轮确实没有建议：${String(result.reason ?? "模型没有给出方案")}`, "pending");
       } else if (status === "ok") {
-        setNote(this.note, `拿到 ${made.length} 条建议（未采用，不影响世界）`, "ok");
+        setNote(this.note, `拿到 ${made.length} 条建议（还没写进世界，不影响它）`, "ok");
       } else {
         setNote(this.note, `这次没有拿到建议：${String(result.reason ?? status)}`, "bad");
       }
@@ -989,7 +1109,13 @@ export class WritingPane implements Pane {
       this.tab = "advice";
       await this.render();
     } catch (error) {
-      setNote(this.note, uiError(error, { module: "推进建议", action: "要一组建议" }).message, "bad");
+      const info = uiError(error, { module: "推进建议", action: "要一组建议" });
+      setNote(this.note, info.message, "bad");
+      // 核心也会以 llm_not_configured 拒掉这次调用：同样升级成带「去设置 AI 服务」的错误卡
+      if (info.code === "llm_not_configured" || !this.aiReady()) {
+        this.showActionError(info.message, "生成推进建议", () => void this.suggest());
+        await this.render();
+      }
     }
   }
 
@@ -1007,7 +1133,7 @@ export class WritingPane implements Pane {
         status !== "approved"
           ? "已拒绝：这条不会进世界"
           : candidate.has_world_change
-            ? "已采用；它含世界变化，尚未生效——要去「预览世界变化 → 确认应用」才会提交"
+            ? "已采用；它含世界变化，还没进世界——要走「预览世界变化 → 确认应用」才会提交"
             : "已采用：它只是一段文字，不改世界",
         status === "approved" && candidate.has_world_change ? "pending" : "ok",
       );
@@ -1020,9 +1146,13 @@ export class WritingPane implements Pane {
 
   private startDraft(item: Json): void {
     this.draftId = String(item.id);
-    this.draftTitle = String(item.title || "未命名草稿");
+    this.draftTitle = String(item.title || "文字草稿");
     this.draftBody = String(item.text || item.summary || "");
     this.draftKey = `text:${this.instanceId}:${item.id}`;
+    // 这份内容还没成为「文字草稿」：草稿列表要显示一条「正在编辑（未保存）」占位（P1-10）
+    this.draftFromSuggestion = !this.candidates.some(
+      (entry) => String(entry.id) === this.draftId && String(entry.kind) === "text",
+    );
     this.tab = "draft";
     void this.render();
   }
@@ -1033,7 +1163,7 @@ export class WritingPane implements Pane {
     const modal = dialog(
       "预览世界变化",
       [
-        paragraph(`候选：${String(item.title || item.summary || item.id)}`),
+        paragraph(`这条建议：${String(item.title || item.summary || "")}`),
         changes.length
           ? bulletList(
               changes.map(
@@ -1042,53 +1172,54 @@ export class WritingPane implements Pane {
               ),
               "u-list",
             )
-          : paragraph("这条候选没有附带世界变化：它只能作为文字采用。", "u-hint"),
+          : paragraph("这条建议没有附带世界变化：它只能作为文字采用。", "u-hint"),
         paragraph(
-          "预览只列要发生什么，不改世界。确认应用 = 采用这条候选并提交到当前时间线（会留下版本点）；采用与提交是两步，界面一起做，缺一步都不算生效。",
+          "预览只列要发生什么，不改世界。确认应用 = 采用这条建议并提交到这条世界线（会留下本次提交记录）；采用与提交是两步，界面一起做，缺一步都不算生效。",
           "u-hint",
         ),
         note,
       ],
       [
         {
-          label: "确认应用到此时间线",
-          run: () => {
-            void (async () => {
-              if (!changes.length) {
-                setNote(note, "这条候选没有世界变化可用", "bad");
-                return;
+          label: "确认应用到这条世界线",
+          // 失败返回 false：建议没进世界时窗要留着，理由写在窗内（P0-1）
+          run: async () => {
+            if (!changes.length) {
+              setNote(note, "这条建议没有世界变化可用", "bad");
+              return false;
+            }
+            try {
+              // 先「采用」（approved），再提交：核心要求只有已批准的建议才能进世界
+              if (String(item.status) !== "approved") {
+                const adopted = await this.ctx.api.waCandidateDecide(
+                  { candidate_id: String(item.id), status: "approved", reason: "作者确认应用", text: String(item.text ?? "") },
+                  this.instanceId,
+                  this.timelineId,
+                );
+                // 决定接口返回的是建议本身（不带顶层 status）：采用成没成看它自己那一个
+                if (String((adopted.candidate as Json)?.status ?? "") !== "approved") {
+                  setNote(note, `没能采用这条建议：${String((adopted.candidate as Json)?.reason ?? "核心没有采用它")}`, "bad");
+                  return false;
+                }
               }
-              try {
-                // 先「采用」（approved），再提交：核心要求只有已批准的候选才能进世界
-                if (String(item.status) !== "approved") {
-                  const adopted = await this.ctx.api.waCandidateDecide(
-                    { candidate_id: String(item.id), status: "approved", reason: "作者确认应用", text: String(item.text ?? "") },
-                    this.instanceId,
-                    this.timelineId,
-                  );
-                  // 决定接口返回的是候选本身（不带顶层 status）：采用成没成看候选上那一个
-                  if (String((adopted.candidate as Json)?.status ?? "") !== "approved") {
-                    setNote(note, `没能采用这条候选：${String((adopted.candidate as Json)?.reason ?? "核心没有采用它")}`, "bad");
-                    return;
-                  }
-                }
-                const result = await this.ctx.api.waCandidateCommit(String(item.id), this.instanceId, this.timelineId);
-                const status = String(result.status);
-                if (status === "ok" || status === "duplicate") {
-                  setNote(
-                    this.note,
-                    `已生效（${status === "duplicate" ? "重复提交，世界未再变化" : "已提交"}）：提交标识 ${String(result.commit_id ?? result.revision ?? "").slice(0, 12) || "（无）"}`,
-                    "ok",
-                  );
-                } else {
-                  setNote(this.note, `没有生效：${status}｜${String(result.reason ?? "")}（候选还在，可以检查后重来）`, "bad");
-                }
+              const result = await this.ctx.api.waCandidateCommit(String(item.id), this.instanceId, this.timelineId);
+              const status = String(result.status);
+              if (status === "ok" || status === "duplicate") {
+                setNote(
+                  this.note,
+                  status === "duplicate" ? "这份变化之前已经提交过：世界没有再变一次" : "已提交：世界里已经按它变化",
+                  "ok",
+                );
                 await this.refreshCandidates();
                 await this.render();
-              } catch (error) {
-                setNote(note, uiError(error, { module: "世界变化", action: "确认应用", done: "候选还在，没有被改写" }).message, "bad");
+                return true;
               }
-            })();
+              setNote(note, `没有生效：${String(result.reason ?? status)}（这条建议还在，可以检查后重来）`, "bad");
+              return false;
+            } catch (error) {
+              setNote(note, uiError(error, { module: "世界变化", action: "确认应用", done: "这条建议还在，没有被改写" }).message, "bad");
+              return false;
+            }
           },
         },
         { label: "取消", run: () => undefined },
@@ -1097,7 +1228,7 @@ export class WritingPane implements Pane {
     document.body.appendChild(modal.node);
   }
 
-  private async trialBranch(): Promise<void> {
+  private async trialBranch(item?: Json): Promise<void> {
     const name = el("input", { class: "u-input", id: "u-wa-branch-name", placeholder: "例如：试演·封堤" }) as HTMLInputElement;
     const note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
     let head = "";
@@ -1107,40 +1238,98 @@ export class WritingPane implements Pane {
     } catch {
       head = "";
     }
+    // 来源版本写人话：内部版本号只收进技术详情，正文里说「用了哪个时间点的版本」
+    const headRow = el("p", { class: "u-hint", text: head ? "来源版本：这条线最近保存的那个版本" : "" });
     const modal = dialog(
       "另开分支试演",
       [
-        paragraph("从当前版本另开一条暂停的新线，在这条线上试；主线不被污染（项目不提供世界线合并）。"),
-        field("新时间线名称", name),
-        paragraph(head ? `来源版本：${head.slice(0, 16)}` : "这条线还没有版本点：先在「世界与素材 → 版本记录」保存一个，再从它分支。", "u-hint"),
+        paragraph(
+          item
+            ? `要试演的是「${String(item.title || item.summary || "这条建议")}」：从当前进度另开一条暂停的新线，在这条线上试；主线不受影响（项目不提供把两条线合回一起）。`
+            : "从当前进度另开一条暂停的新线，在这条线上试；主线不受影响（项目不提供把两条线合回一起）。",
+        ),
+        field("新世界线名称", name),
+        head
+          ? headRow
+          : paragraph("这条线还没有保存过版本：先点下面的「保存当前版本点」，再从它分支。", "u-hint"),
         note,
       ],
       [
+        // 用户不必为了「试演」先跑去别的页面存版本点：这一步就放在窗里（P1-5）
+        ...(head
+          ? []
+          : [
+              {
+                label: "保存当前版本点",
+                // 保存失败返回 false：不关窗，原因写在窗内；成功则就地补上版本点并留在窗里继续分支
+                run: async (): Promise<boolean> => {
+                  try {
+                    // runtime.commit 回的是 { commit: {...} }：编号在 commit.id 上（不是 commits 列表）
+                    const saved = await this.ctx.api.saveVersion(this.instanceId, this.timelineId, "试演前保存当前进度");
+                    head = String((saved.commit as Json | undefined)?.id ?? saved.commit_id ?? "");
+                    if (!head) {
+                      // 回包里没有编号就再读一次提交列表：拿到就继续，拿不到就如实说保存没成功
+                      const again = await this.ctx.api.commits(this.instanceId, this.timelineId);
+                      head = String(((again.commits as Json[]) ?? [])[0]?.id ?? "");
+                    }
+                    if (!head) {
+                      setNote(note, "版本点没有保存成功：请重试一次", "bad");
+                      return false;
+                    }
+                    this.ctx.rememberRecent({
+                      pane: "writing",
+                      label: `写作 · 已保存的版本（${this.draftTitle || "当前正文"}）`,
+                      key: `writing:${this.instanceId}:${this.timelineId}:versions`,
+                    });
+                    setNote(note, "已保存当前版本点：现在可以「建立暂停分支」了", "ok");
+                    return false; // 步骤还没走完：留着窗让用户点下一步
+                  } catch (error) {
+                    setNote(note, uiError(error, { module: "试演", action: "保存当前版本点" }).message, "bad");
+                    return false;
+                  }
+                },
+              },
+            ]),
         {
           label: "建立暂停分支",
-          run: () => {
-            void (async () => {
-              if (!head) {
-                setNote(note, "先保存一个版本点，再从它分支", "bad");
-                return;
-              }
-              try {
-                const result = await this.ctx.api.waBranch({
-                  instance_id: this.instanceId,
-                  timeline_id: this.timelineId,
-                  commit_id: head,
-                  name: name.value.trim() || "试演线",
+          // 失败返回 false：分支没建起来时窗不关，原因看得见（P1-5 与 P0-1）
+          run: async () => {
+            if (!head) {
+              // 已经有「保存当前版本点」按钮：提示直接点名屏幕上的字，不再让用户去别的页面找
+              setNote(note, "先点左边的「保存当前版本点」，再从它分支", "bad");
+              return false;
+            }
+            try {
+              const result = await this.ctx.api.waBranch({
+                instance_id: this.instanceId,
+                timeline_id: this.timelineId,
+                commit_id: head,
+                name: name.value.trim() || "试演线",
+              });
+              const timeline = (result.timeline as Json) ?? {};
+              const newId = String(timeline.id ?? "");
+              const newName = String(timeline.name ?? name.value.trim() ?? "试演线");
+              if (newId) {
+                // 记进本页选择：用户回来还能在这页的下拉里找到刚建的试演线（P1-5）
+                this.extraTimelines = [...this.extraTimelines, { id: newId, name: newName, state: "paused" }];
+                this.timelineId = newId;
+                this.ctx.rememberRecent({
+                  pane: "writing",
+                  label: `写作 · 试演线「${newName}」`,
+                  key: `writing:${this.instanceId}:${newId}`,
                 });
-                setNote(
-                  this.note,
-                  `已建立暂停分支「${String(((result.timeline as Json) ?? {}).name ?? "")}」：到「世界与素材」启动它，再回来取得预览并应用；建立分支本身不算试演完成。`,
-                  "ok",
-                );
-                await this.render();
-              } catch (error) {
-                setNote(note, uiError(error, { module: "试演", action: "建立分支" }).message, "bad");
               }
-            })();
+              setNote(
+                this.note,
+                `已建立暂停分支「${newName}」，并切到它上面：先在这条线上「得到预览并应用」，再回到原来的线；建立分支本身不算试演完成。`,
+                "ok",
+              );
+              await this.render();
+              return true;
+            } catch (error) {
+              setNote(note, uiError(error, { module: "试演", action: "建立分支" }).message, "bad");
+              return false;
+            }
           },
         },
         { label: "取消", run: () => undefined },
@@ -1154,9 +1343,19 @@ export class WritingPane implements Pane {
   private renderDraft(host: HTMLElement): void {
     const drafts = this.candidates.filter((item) => String(item.kind) === "text");
     const list = el("div", { class: "u-rows" });
+    // 「以此起草」打开的内容还没成为草稿：列表先给它一条占位行，不然这里写「还没有文字草稿」（P1-10）
+    const editingUnsaved =
+      Boolean(this.draftId) && this.draftFromSuggestion && !drafts.some((item) => String(item.id) === this.draftId);
+    if (editingUnsaved) {
+      const row = el("div", { class: "u-row-line" });
+      row.appendChild(el("span", { class: "u-grow", text: `${this.draftTitle || "正在编辑的正文"}（正在编辑，未保存）` }));
+      row.appendChild(chip("未保存", "pending"));
+      row.appendChild(button("继续编辑", () => void this.render()));
+      list.appendChild(row);
+    }
     for (const item of drafts) {
       const row = el("div", { class: "u-row-line" });
-      row.appendChild(el("span", { class: "u-grow", text: String(item.title || item.id) }));
+      row.appendChild(el("span", { class: "u-grow", text: String(item.title || "（没有标题的草稿）") }));
       row.appendChild(
         chip(
           item.locked ? "已锁定" : STATUS_TEXT[String(item.status)] ?? String(item.status),
@@ -1170,7 +1369,7 @@ export class WritingPane implements Pane {
       );
       list.appendChild(row);
     }
-    if (!drafts.length) {
+    if (!drafts.length && !editingUnsaved) {
       if (this.candidatesError) {
         list.appendChild(errorCard(this.candidatesError, [{ label: "重试", run: () => void this.render() }]));
       } else {
@@ -1178,7 +1377,7 @@ export class WritingPane implements Pane {
       }
     }
     host.appendChild(
-      section(
+      panel(
         "草稿列表",
         list,
         button("新建空白草稿", () =>
@@ -1202,14 +1401,21 @@ export class WritingPane implements Pane {
     });
     const current = drafts.find((item) => String(item.id) === this.draftId);
     const locked = Boolean(current?.locked);
+    // 没保存过的内容没有可锁定的稿子：先说清「要先保存」，别让用户点了只得到「没有该草稿」（P1-3）
+    const savedDraft = Boolean(current);
+    const unsaved = Boolean(this.draftId) && !savedDraft;
     const status = el("p", {
       class: "u-note",
       role: "status",
       "aria-live": "polite",
-      text: this.draftId ? `正在编辑：${this.draftId}${locked ? "（已锁定）" : ""}` : "还没有选中的草稿",
+      text: this.draftId
+        ? unsaved
+          ? `正在编辑「${this.draftTitle || "（没有标题）"}」：还没保存过，点「保存文字草稿」才会进草稿列表`
+          : `正在编辑「${this.draftTitle || "（没有标题）"}」${locked ? "（已锁定）" : ""}`
+        : "还没有选中的草稿",
     });
     host.appendChild(
-      section(
+      panel(
         "正文",
         field("标题", title),
         field("正文", body),
@@ -1217,12 +1423,21 @@ export class WritingPane implements Pane {
           "div",
           { class: "u-row" },
           primary("保存文字草稿", () => void this.saveDraft()),
-          locked ? button("解锁并编辑", () => void this.lockDraft(false)) : button("锁定正文", () => void this.lockDraft(true)),
-          button("复制为新稿", () => void this.copyDraft()),
+          locked
+            ? button("解锁并编辑", () => void this.lockDraft(false))
+            : button("锁定正文", () => void this.lockDraft(true), { disabled: unsaved }),
+          button("另存为新稿", () => void this.copyDraft()),
           button("导出所选文字…", () => void this.exportDraft()),
         ),
+        unsaved
+          ? paragraph("「锁定正文」要先把这份内容保存成草稿：先点「保存文字草稿」。", "u-hint")
+          : null,
         paragraph(
-          "保存文字不等于世界已改变。锁定后新生成永远另起一稿，世界恢复也不会改写它；导出只含标题与正文。",
+          "保存文字不等于世界已改变。连续保存会就地更新同一份草稿；要留一份新的，用「另存为新稿」。锁定后新生成永远另起一稿，世界恢复也不会改写它。",
+          "u-hint",
+        ),
+        paragraph(
+          `导出范围：只导出标题与正文，导出文件是 Markdown（.md）；依据、幕后材料与大纲都不在导出内容里。`,
           "u-hint",
         ),
         status,
@@ -1258,10 +1473,16 @@ export class WritingPane implements Pane {
       setNote(this.note, "正文还是空的：先写点东西再保存", "bad");
       return;
     }
+    if (!this.outlineId) {
+      // 保存要挂在大纲上：没绑大纲时说清先做哪一步，别等核心报 not_found
+      setNote(this.note, "先绑定一份大纲：文字草稿要挂在大纲上，才能进草稿列表", "bad");
+      return;
+    }
     const current = this.candidates.find((item) => String(item.id) === this.draftId);
-    // 已采用 / 已锁定 / 已提交的稿子不动：保存成一份新的待审候选（§7.5、§11.1）
+    // 已锁定 / 已提交的稿子不动：只有「还是 proposed 的同一份」才就地覆盖（§7.5、§11.1）
     const fresh = !current || Boolean(current.locked) || String(current.status) !== "proposed";
-    const targetId = fresh ? `${this.draftId || "draft"}-${Date.now().toString(36)}` : this.draftId;
+    // 就地覆盖的目标：正在编辑的这一份（哪怕它只是「以此起草」打开的、还没保存过）
+    const targetId = !fresh ? this.draftId : `${this.draftId || "draft"}-${Date.now().toString(36)}`;
     setNote(this.note, "正在保存文字草稿…", "pending");
     try {
       await this.ctx.api.waCandidatePropose(
@@ -1284,9 +1505,19 @@ export class WritingPane implements Pane {
         this.timelineId,
       );
       await this.flushDraft();
+      const name = this.draftTitle || "未命名草稿";
+      const replaced = targetId === this.draftId;
       this.draftId = targetId;
+      this.draftFromSuggestion = false;
       await this.refreshCandidates();
-      setNote(this.note, `文字草稿已保存（${targetId}）：不等于世界已改变`, "ok");
+      // 提示说清「这份被更新了」还是「新存了一份」：不印内部编号，用户要认的是标题
+      setNote(
+        this.note,
+        replaced
+          ? `已保存「${name}」：连续保存更新的是这一份，不等于世界已改变`
+          : `已另存为「${name}」：新的那一份进草稿列表，不等于世界已改变`,
+        "ok",
+      );
       await this.render();
     } catch (error) {
       setNote(this.note, uiError(error, { module: "文字草稿", action: "保存", done: "文字还在编辑区里，没有丢" }).message, "bad");
@@ -1296,6 +1527,11 @@ export class WritingPane implements Pane {
   private async lockDraft(locked: boolean): Promise<void> {
     if (!this.draftId) {
       setNote(this.note, "先打开或保存一份草稿", "bad");
+      return;
+    }
+    // 没保存过的内容锁不了：核心按草稿编号找它，找不到只会回「没有该草稿」（P1-3）
+    if (locked && !this.candidates.some((item) => String(item.id) === this.draftId)) {
+      setNote(this.note, "这份内容还没保存过：先点「保存文字草稿」，再点「锁定正文」", "bad");
       return;
     }
     try {
@@ -1319,7 +1555,9 @@ export class WritingPane implements Pane {
     this.draftId = `${this.draftId || "draft"}-copy-${Date.now().toString(36)}`;
     this.draftTitle = `${this.draftTitle || "草稿"}（副本）`;
     this.draftKey = `text:${this.instanceId}:${this.draftId}`;
-    setNote(this.note, "已复制为新稿：这是新的待保存草稿，原来那份不动", "muted");
+    // 副本还没保存过：让草稿列表给它一条「正在编辑（未保存）」占位，也让它先保存再锁定
+    this.draftFromSuggestion = true;
+    setNote(this.note, "已另存为新稿：这是还没保存的副本，点「保存文字草稿」才会进草稿列表；原来那份不动", "muted");
     await this.render();
   }
 
@@ -1339,7 +1577,7 @@ export class WritingPane implements Pane {
         setNote(this.note, "已取消导出", "muted");
         return;
       }
-      setNote(this.note, `已导出：${path}（只有标题与正文，不含依据与幕后材料）`, "ok");
+      setNote(this.note, `已导出：${path}（Markdown 文件，只有标题与正文，不含依据、幕后材料与大纲）`, "ok");
     } catch (error) {
       setNote(this.note, uiError(error, { module: "文字草稿", action: "导出" }).message, "bad");
     }

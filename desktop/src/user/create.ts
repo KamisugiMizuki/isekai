@@ -20,31 +20,49 @@ import {
   facts,
   field,
   fill,
+  pageHead,
+  panel,
   paragraph,
   primary,
   section,
   setNote,
 } from "./dom";
-import { stackBar } from "./graphics";
+import { flowRail, stackBar } from "./graphics";
 
 type Step = "source" | "world" | "cards" | "review" | "create" | "start";
 
+/**
+ * 向导的六步：进度轨与标题带共用一份名字（只写一遍，免得两处说成两件事）。
+ * 后五步同时也是页面里的一级分区（panel）标题。
+ */
+const STEP_LABELS: Array<[Step, string]> = [
+  ["source", "选择来源"],
+  ["world", "世界设定"],
+  ["cards", "准备角色"],
+  ["review", "检查与确认"],
+  ["create", "创建世界"],
+  ["start", "开始方式"],
+];
+
 /** 分区名的用户说法（内核用点分路径，界面不暴露路径本身） */
 const SECTION_LABELS: Record<string, string> = {
-  "world.axioms": "世界公理",
+  // `world` 这两个标量没有自己的条目列表，但校验问题会点名它们（评审 P0-4）
+  world: "世界本身",
+  "world.axioms": "世界的基本设定",
   "world.institutions": "制度与职位",
   "world.customs": "惯例",
+  "world.lexicon.terms": "命名语汇",
   "environment.types": "环境状态",
   sources: "信息来源",
-  canon: "实情",
-  narratives: "说法",
-  entities: "人物与地点",
+  canon: "世界里真实发生的",
+  narratives: "她听说的版本",
+  entities: "人物名册",
   races: "种族",
-  historiography: "史料",
+  historiography: "来源与记载",
   "events.families": "事件族",
   "events.calendar": "节庆",
   life: "生活安排",
-  roles: "角色位",
+  roles: "可扮演的角色类型",
   "comms.mechanisms": "联络方式",
   "initial_state.mysteries": "谜题",
   "initial_state.rumors": "流言",
@@ -52,6 +70,53 @@ const SECTION_LABELS: Record<string, string> = {
   "calendar.months": "月份",
   "calendar.segments": "时段",
 };
+
+/**
+ * 固定入口的分区（评审 P0-4）：核心把地理、社会结构、命名语汇、人物名册与史料都判为必填/阻断项，
+ * 而空数组分区进不了分区目录（原来的目录只收录「非空数组且每项有 id」的条目），
+ * 于是「自己填写」这条路永远过不了校验。这里把空格子的落点和第一条的骨架写死，
+ * 「添加一条」不再要求分区里已经有一条。
+ *
+ * 骨架里的关联字段写成 `@ref:<顶层数组>`：添加时替换成包里真实存在的那个 id
+ * （写死 src-1 这类会在这份设定换过标识时变成悬空引用）。
+ */
+const DECLARED_SECTIONS: Array<{ path: string; item: Json }> = [
+  { path: "world.lexicon.terms", item: { term: "", meaning: "" } },
+  { path: "environment.types", item: { id: "env-1", name: "天气", initial: "晴", unit: "天", values: ["晴", "雨"], observe: "抬头可见", expiry: "自然转晴", scope: "整个地区", sources: ["@ref:sources"] } },
+  { path: "entities", item: { id: "ent-1", name: "", kind: "person", race_id: "@ref:races" } },
+  { path: "historiography", item: { id: "hist-1", title: "", contributors: [{ name: "", role: "记录", period: "初期" }], coverage: { from: 0, to: 0 }, entries: ["@ref:canon"] } },
+  { path: "initial_state.mysteries", item: { id: "my-1", question: "", refs: ["@ref:canon"] } },
+  { path: "initial_state.rumors", item: { id: "ru-1", text: "", source_id: "@ref:sources", canon_ref: "@ref:canon", obtain: [], confidence: "believed" } },
+  { path: "initial_state.events", item: { id: "ev-1", summary: "", family: "@ref:events.families" } },
+];
+
+/** `@ref:<点分路径>` → 包里第一个真实存在的 id（没有就留空，不做悬空引用） */
+function firstIdAt(pkg: Json, path: string): string {
+  let node: unknown = pkg;
+  for (const key of path.split(".")) {
+    if (!node || typeof node !== "object") return "";
+    node = (node as Json)[key];
+  }
+  if (!Array.isArray(node)) return "";
+  const hit = node.find((item) => item && typeof item === "object" && item.id);
+  return String((hit as Json | undefined)?.id ?? "");
+}
+
+/** 把骨架里的 @ref 占位换成真实的 id；空串的关联字段整个去掉（核心只认已登记的标识） */
+function resolveSeedRefs(value: unknown, pkg: Json): unknown {
+  if (typeof value === "string" && value.startsWith("@ref:")) return firstIdAt(pkg, value.slice(5));
+  if (Array.isArray(value)) return value.map((item) => resolveSeedRefs(item, pkg));
+  if (value && typeof value === "object") {
+    const out: Json = {};
+    for (const [key, item] of Object.entries(value as Json)) {
+      const resolved = resolveSeedRefs(item, pkg);
+      if (resolved === "") continue;
+      out[key] = resolved;
+    }
+    return out;
+  }
+  return value;
+}
 
 const FIELD_LABELS: Record<string, string> = {
   name: "名称",
@@ -94,6 +159,8 @@ const FIELD_LABELS: Record<string, string> = {
   entries: "收录条目",
   sleep: "作息类型",
   windows: "时段安排",
+  activity: "活动",
+  unit: "单位",
   description: "说明",
   life_template: "生活安排",
   channels: "联络方式",
@@ -128,14 +195,24 @@ const FIELD_LABELS: Record<string, string> = {
   semantic: "语义",
   driver: "驱动",
   strength: "强度",
-  window: "窗口",
+  window: "时间窗",
   preconditions: "前提",
   effect: "效果",
-  mode: "认知模式",
+  mode: "性格设定",
   sources: "依据来源",
   routine_note: "作息说明",
   appearance: "外貌",
+  // 自己填写时要认得出的几个字段（评审 P0-4 的必填项）
+  geography: "世界地理与空间边界",
+  society: "社会结构",
+  term: "词条",
 };
+
+/** 分区固定入口里那几个标量：核心判为必填，界面上以前根本没有输入控件 */
+const WORLD_SCALARS: Array<{ key: string; label: string; hint: string }> = [
+  { key: "geography", label: "世界地理与空间边界", hint: "这块大陆/城邦在哪、边界是什么、别人怎么到达（必填）" },
+  { key: "society", label: "社会结构", hint: "谁在上谁在下、靠什么维系、普通人一天怎么过（必填）" },
+];
 
 const LONG_KEYS = new Set([
   "text",
@@ -164,39 +241,55 @@ const CHOICES: Record<string, string[]> = {
   sleep: ["true", "false"],
 };
 
+/**
+ * 允许值的中文短标签（评审第六节：英文枚举不上屏）。
+ * 内部值仍然只放 `value`：核心认的是 person / believed / sparse / true 这些原值。
+ */
+const CHOICE_LABELS: Record<string, Record<string, string>> = {
+  kind: { person: "人物", place: "地点", thing: "物件", organization: "组织" },
+  confidence: { true: "确实如此", believed: "她相信是真的", disputed: "有争议", false: "不实" },
+  density: { sparse: "稀疏", normal: "常规", dense: "密集" },
+  sleep: { true: "会睡觉", false: "不睡觉" },
+};
+
+/** 下拉里一项的中文说法（没有登记就退回原值，不装作认出来了） */
+function choiceLabel(key: string, value: string): string {
+  return CHOICE_LABELS[key]?.[value] ?? value;
+}
+
 /** 参数层旋钮（与核心生成器的键同名；这里是生成要求，不是硬约束） */
 const KNOB_TEXT: Array<[string, string]> = [
   ["genre", "体裁"],
   ["tone", "基调"],
   ["supernatural", "超自然在场度"],
-  ["tech", "技术水位"],
+  ["tech", "技术水平"],
   ["naming", "命名风格"],
   ["conflict", "冲突主线"],
   ["era_start", "纪元起点"],
   ["current_year", "当前年"],
-  ["history_depth", "史料深度"],
+  ["history_depth", "记载深度"],
 ];
 const KNOB_COUNT: Array<[string, string]> = [
-  ["axioms", "世界公理"],
+  ["axioms", "世界的基本设定"],
   ["regions", "区域"],
   ["institutions", "制度（含职位）"],
   ["customs", "惯例"],
   ["env_types", "环境类型"],
   ["races", "种族"],
-  ["roles", "角色位"],
+  ["roles", "可扮演的角色类型"],
   ["lexicon", "用词表"],
-  ["sources", "传本"],
-  ["canon", "实情条目"],
-  ["narratives", "说法条目"],
-  ["entities", "登记实体"],
-  ["life", "生活线模板"],
+  ["sources", "信息来源"],
+  ["canon", "真实发生的"],
+  ["narratives", "她听说的"],
+  ["entities", "人物名册"],
+  ["life", "生活安排"],
   ["families", "事件族"],
   ["festivals", "节庆"],
 ];
-/** 段 → 顶层键（与核心 PACKAGE_SEGMENTS 同源：填段重跑要的是键列表） */
+/** 段 → 顶层键（与核心 PACKAGE_SEGMENTS 同源：填段重跑要的是键列表）；段名只用于界面说法 */
 const SEGMENT_KEYS: Array<[string, string[]]> = [
   ["设定核心", ["meta", "calendar", "world"]],
-  ["双轨与名册", ["sources", "canon", "narratives", "races", "entities"]],
+  ["来源与名册", ["sources", "canon", "narratives", "races", "entities"]],
   ["机制与现状", ["historiography", "environment", "events", "life", "roles", "comms", "initial_state"]],
 ];
 
@@ -215,6 +308,10 @@ interface Section {
   items: Json[];
 }
 
+/** 校验问题翻人话（世界与素材列表也要用同一套说法，免得一处说人话一处印点分路径） */
+export { describeProblem };
+export type { Section };
+
 function label(key: string): string {
   const short = key.split(".").pop() ?? key;
   return FIELD_LABELS[short] ?? short;
@@ -231,9 +328,34 @@ const GROUP_LABELS: Record<string, string> = {
   channels: "信息来源",
   initial_knowledge: "初始知道的事",
   comms: "联络方式",
-  initial_units: "性格单元",
+  initial_units: "性格设定",
   intents: "当前意图",
 };
+
+/** 包内全部稳定标识：新增条目的 id 不能和已存在的撞（核心按唯一性判定） */
+function _allIds(pkg: Json): string[] {
+  const out: string[] = [];
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    for (const [key, value] of Object.entries(node as Json)) {
+      if (key === "id" && typeof value === "string" && value) out.push(value);
+      else walk(value);
+    }
+  };
+  walk(pkg);
+  return out;
+}
+
+/** 分区排序：按段排（设定核心 → 双轨与名册 → 机制与现状），段内按路径 */
+function sectionOrder(path: string): number {
+  const top = path.split(".")[0];
+  const index = SEGMENT_KEYS.findIndex(([, keys]) => keys.includes(top));
+  return index < 0 ? SEGMENT_KEYS.length : index;
+}
 
 /** 分区目录：段内所有「有 id 的条目列表」（按路径升序，标签用用户说法） */
 export function sectionsOf(pkg: Json): Section[] {
@@ -253,13 +375,89 @@ export function sectionsOf(pkg: Json): Section[] {
     }
   };
   walk(pkg, "", 0);
-  // 目录按段排（设定核心 → 双轨与名册 → 机制与现状），段内按路径
-  const order = (path: string): number => {
-    const top = path.split(".")[0];
-    const index = SEGMENT_KEYS.findIndex(([, keys]) => keys.includes(top));
-    return index < 0 ? SEGMENT_KEYS.length : index;
-  };
-  return out.sort((a, b) => order(a.path) - order(b.path) || a.path.localeCompare(b.path));
+  return out.sort((a, b) => sectionOrder(a.path) - sectionOrder(b.path) || a.path.localeCompare(b.path));
+}
+
+/** 固定入口分区的第一条骨架（没有登记就现造一条，至少给一个 id） */
+function declaredItem(path: string): Json {
+  const known = DECLARED_SECTIONS.find((item) => item.path === path);
+  if (known) return JSON.parse(JSON.stringify(known.item)) as Json;
+  return { id: `${path.split(".").pop() ?? "item"}-1` };
+}
+
+/** 分区目录要显示的清单：已收集到的分区 + 固定入口里还空着的分区（评审 P0-4：空格子也要有落点） */
+function catalogOf(pkg: Json): Section[] {
+  const collected = sectionsOf(pkg);
+  const known = new Set(collected.map((item) => item.path));
+  const extra: Section[] = DECLARED_SECTIONS.filter((item) => !known.has(item.path)).map((item) => ({
+    path: item.path,
+    label: SECTION_LABELS[item.path] ?? item.path.split(".").pop() ?? item.path,
+    items: [],
+  }));
+  return [...collected, ...extra].sort((a, b) => sectionOrder(a.path) - sectionOrder(b.path) || a.path.localeCompare(b.path));
+}
+
+/** 按点分路径拿到数组本身，缺中间层就补出来（「添加一条」要能落在空分区上） */
+function sectionRef(pkg: Json, path: string): Json[] | null {
+  const keys = path.split(".");
+  let node: Json = pkg;
+  for (const key of keys.slice(0, -1)) {
+    const next = node[key];
+    if (!next || typeof next !== "object" || Array.isArray(next)) {
+      const fresh: Json = {};
+      node[key] = fresh;
+      node = fresh;
+      continue;
+    }
+    node = next as Json;
+  }
+  const last = keys[keys.length - 1];
+  const list = node[last];
+  if (Array.isArray(list)) return list as Json[];
+  const fresh: Json[] = [];
+  node[last] = fresh;
+  return fresh;
+}
+
+/**
+ * 校验问题原文里点名了哪个分区：只认「这一份里真实存在的分区」，
+ * 否则 `canon_ref` 这种字段名会被误判成 `canon` 分区（取最长路径，`world.lexicon.terms` 优先于 `world`）。
+ */
+function sectionPathIn(problem: string, sections: Section[]): string {
+  const paths = [...sections.map((item) => item.path), ...DECLARED_SECTIONS.map((item) => item.path)];
+  return [...new Set(paths)]
+    .filter(
+      (path) =>
+        problem.startsWith(`${path}:`) ||
+        problem.startsWith(`${path}[`) ||
+        problem.startsWith(`${path}.`) ||
+        problem.includes(` ${path}`),
+    )
+    .sort((a, b) => b.length - a.length)[0] ?? "";
+}
+
+/** 问题原文 → 人话标题 + 落点（分区 › 条目 › 字段，三段都能对上的才写出来） */
+function describeProblem(problem: string, sections: Section[]): { text: string; section: string; index: number; field: string } {
+  const section = sectionPathIn(problem, sections);
+  if (!section) return { text: problem, section: "", index: -1, field: "" };
+  const rest = problem.slice(section.length);
+  const sectionLabel = SECTION_LABELS[section] ?? section;
+  const indexMatch = /^\[(\d+)\]/.exec(rest);
+  const index = indexMatch ? Number(indexMatch[1]) : -1;
+  const tail = indexMatch ? rest.slice(indexMatch[0].length) : rest;
+  const fieldMatch = /^\.([\w.]+)/.exec(tail);
+  const field = fieldMatch ? fieldMatch[1] : "";
+  const reason = problem
+    .slice(section.length + (indexMatch?.[0].length ?? 0) + (fieldMatch?.[0].length ?? 0) + 1)
+    .replace(/^[:：]\s*/, "");
+  const where = [
+    sectionLabel,
+    index >= 0 ? `第 ${index + 1} 条` : "",
+    field ? `「${field.split(".").map((part) => label(part)).join(" › ")}」` : "",
+  ]
+    .filter(Boolean)
+    .join(" › ");
+  return { text: `${where}：${reason || "这一项没有填完整"}`, section, index, field };
 }
 
 /** 引用候选：把包内各个 id 的（id → 可读名）摊平，供关联字段选择 */
@@ -311,7 +509,7 @@ function controlFor(
   }
   if (CHOICES[key]) {
     const box = el("select", { class: "u-input" }) as HTMLSelectElement;
-    for (const option of CHOICES[key]) box.appendChild(el("option", { value: option, text: option }));
+    for (const option of CHOICES[key]) box.appendChild(el("option", { value: option, text: choiceLabel(key, option) }));
     if (value !== null && value !== undefined) box.value = String(value);
     box.addEventListener("change", () => set(key === "sleep" ? box.value === "true" : box.value));
     return box;
@@ -411,14 +609,22 @@ export class CreatePane implements Pane {
   readonly id = "create" as const;
   private step: Step = "source";
   private root: HTMLElement | null = null;
+  /** 进度轨的宿主：它在固定骨架里，换一步只重画它（见 refreshRail） */
+  private railHost: HTMLElement | null = null;
   private note: HTMLElement | null = null;
   /** 草稿状态行：DraftKeeper 往这里写「未保存 / 正在保存 / 已保存 / 保存失败」，不跟主 note 抢 */
   private draftSlot: HTMLElement | null = null;
   private candidate: Json | null = null;
   private locks: Record<string, string[]> = {};
   private errors: string[] = [];
+  /** 这一份到底检查过没有：空缓存 ≠ 没有问题（评审：载入骨架后不能报「没有校验问题」） */
+  private errorsChecked = false;
+  /** 校验问题 → 分区路径的缓存（目录每一行都要问一遍同一批问题） */
+  private problemSections: Map<string, string> | null = null;
   private usage: Json | null = null;
   private base: string = ""; // 素材标识（应用管理；用户只填显示名）
+  /** 正在编辑的那份设定文件（空 = 新建）：确认时覆盖它，不再堆同名副本 */
+  private savedPath = "";
   private name = "";
   private brief = "";
   private source = "";
@@ -435,39 +641,27 @@ export class CreatePane implements Pane {
   private cardErrors: string[] = [];
   private worldName = "";
   private created: Json | null = null;
+  /** 刚建好的世界的第一条线：出口（去和角色联络 / 打开这个世界）都指向它 */
+  private createdTimelineId = "";
   private busy = false;
 
   constructor(private readonly ctx: AppContext) {}
 
   mount(host: HTMLElement): void {
     this.root = el("div", { class: "u-create" });
-    const nav = el("nav", { class: "u-crumbs", "aria-label": "创建步骤" });
-    for (const [id, text] of [
-      ["source", "选择来源"],
-      ["world", "世界设定"],
-      ["cards", "准备角色"],
-      ["review", "检查与确认"],
-      ["create", "创建世界"],
-      ["start", "开始方式"],
-    ] as Array<[Step, string]>) {
-      const step = button(text, () => {
-        // 只允许回到已经走到的步骤，避免跳过检查
-        if (this.allowed(id)) {
-          this.step = id;
-          void this.render();
-        }
-      });
-      step.disabled = id !== this.step && !this.allowed(id);
-      step.dataset.step = id;
-      if (id === this.step) {
-        step.classList.add("u-nav-active");
-        step.setAttribute("aria-current", "step");
-      }
-      nav.appendChild(step);
-    }
     this.note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
     this.draftSlot = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
-    fill(host, section("创建世界", nav), this.note, this.draftSlot, this.root);
+    // 骨架固定三带：标题带（页面名 + 一句定位语）→ 进度轨 → 内容。
+    // 以前步骤条是一排和「动作」同形的按钮，既不说明走到哪一步，也学不到「这个形状 = 这个行为」
+    // （2026-10-08 视觉体系审查根因 2/3）
+    const railHost = el("div");
+    // 用 .u-page 包起来：标题 / 进度轨 / 内容之间的间距与其它页同一套（以前这三段各靠默认外边距）
+    fill(
+      host,
+      el("div", { class: "u-page" }, pageHead("创建世界", "从样例改，或从空白开始", []), railHost, this.note, this.draftSlot, this.root),
+    );
+    this.railHost = railHost;
+    this.refreshRail();
     const sub = this.ctx.route.sub ?? "";
     if (sub.startsWith("edit:")) {
       void this.openExisting(sub.slice(5));
@@ -478,12 +672,59 @@ export class CreatePane implements Pane {
     }
   }
 
+  /**
+   * 真进度轨：带编号圆点 + 连线（走过的打勾、当前反白、没到的置灰），
+   * 一眼看出走了几分之几 —— 文字加下划线说明不了这件事（同一次审查）。
+   *
+   * 走过的步骤点得回去（守卫仍是 `allowed`：没走到的步骤不放行，跳过校验会让人以为前面已经过了）。
+   * flowRail 画的是 div（不可聚焦），这里补 role / tabindex / 键盘处理，鼠标、键盘与读屏都能用。
+   */
+  private stepper(): HTMLElement {
+    const index = STEP_LABELS.findIndex(([id]) => id === this.step);
+    const rail = flowRail(STEP_LABELS.map(([, text]) => ({ label: text })), Math.max(0, index));
+    if (!rail) {
+      // 画不出来（步骤表为空这类不可能的情况）也要说清在第几步：退回一行文字，不返回 null
+      return el("p", { class: "u-hint u-wizard-rail", text: STEP_LABELS.map(([, text]) => text).join("　") });
+    }
+    rail.classList.add("u-wizard-rail"); // 探针 / 样式认这一类：向导的进度轨
+    Array.from(rail.querySelectorAll<HTMLElement>(".u-rail-step")).forEach((node, position) => {
+      const entry = STEP_LABELS[position];
+      if (!entry) return;
+      const [id, text] = entry;
+      // 当前这一步不动：flowRail 已经给它标了 aria-current="step"
+      if (id === this.step) return;
+      node.setAttribute("role", "button");
+      node.setAttribute("aria-label", `回到第 ${position + 1} 步：${text}`);
+      if (!this.allowed(id)) {
+        node.setAttribute("aria-disabled", "true");
+        return;
+      }
+      node.tabIndex = 0;
+      const jump = (): void => this.goto(id);
+      node.addEventListener("click", jump);
+      node.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        jump();
+      });
+    });
+    return rail;
+  }
+
+  /** 重画进度轨（挂在固定骨架里，不随 this.root 一起被清掉） */
+  private refreshRail(): void {
+    if (this.railHost) fill(this.railHost, this.stepper());
+  }
+
   /** 切页 / 退出：把在途草稿落盘（壳层导航前也会 flush 一次，这里补一道保险） */
   unmount(): void {
     void this.ctx.drafts.flush();
   }
 
-  /** 从「世界与素材」进来的：编辑一份已有设定（改完另存/覆盖都由确认那一步统一处理） */
+  /**
+   * 从「世界与素材」进来的：编辑一份已有设定。
+   * 打开前会看一眼那份「填到一半」的草稿（向导只有一份草稿槽）：有就先问保留还是替换（评审 P1）。
+   */
   private async openExisting(file: string): Promise<void> {
     if (!file) {
       void this.render();
@@ -492,13 +733,40 @@ export class CreatePane implements Pane {
     setNote(this.note, "正在打开这份世界设定…", "pending");
     try {
       const loaded = await this.ctx.api.packageLoad(file);
-      this.absorbPackage((loaded.package as Json) ?? {});
-      this.base = file;
-      this.source = this.source || "manual";
-      this.queueDraft();
-      setNote(this.note, `正在编辑「${this.name}」：这份设定用于以后创建的世界，已有的世界不会变`, "ok");
-      this.step = "world";
-      await this.render();
+      const start = (): void => {
+        this.absorbPackage((loaded.package as Json) ?? {});
+        this.base = file;
+        this.savedPath = file;
+        this.source = this.source || "manual";
+        this.queueDraft();
+        setNote(this.note, `正在编辑「${this.name}」：确认后会覆盖这份设定文件；已有的世界不会变`, "ok");
+        this.step = "world";
+        void this.render();
+      };
+      const pending = await this.ctx.drafts.load(CREATE_DRAFT_KEY);
+      const hasDraft = Boolean(pending && (pending.text.trim() || Object.keys(pending.payload ?? {}).length));
+      if (!hasDraft) {
+        start();
+        return;
+      }
+      const note = el("p", { class: "u-note" });
+      const modal = dialog(
+        "还有一份填到一半的世界设定",
+        [
+          paragraph(`草稿「${pending?.text || "未命名世界"}」还没确认。编辑这份已有设定会把它覆盖掉。`),
+          paragraph("选「保留草稿」会先停下，让你回「世界与素材 → 未完成内容」把它处理掉。", "u-hint"),
+          note,
+        ],
+        [
+          {
+            label: "替换草稿，继续编辑",
+            primary: true,
+            run: () => start(),
+          },
+          { label: "保留草稿（先不打开）", run: () => void this.render() },
+        ],
+      );
+      document.body.appendChild(modal.node);
     } catch (error) {
       setNote(this.note, uiError(error, { module: "世界设定", action: "打开" }).message, "bad");
       void this.render();
@@ -520,9 +788,14 @@ export class CreatePane implements Pane {
         this.absorbPackage(payload.package as Json);
         this.locks = (payload.locks as Record<string, string[]>) ?? {};
         this.errors = ((payload.errors as string[]) ?? []).slice();
+        // 草稿里存着上一次的检查结果：有记录才算「检查过」，空数组不代表没问题
+        this.errorsChecked = this.errors.length > 0;
+        this.problemSections = null;
         this.brief = String(payload.brief ?? "");
         this.knobs = (payload.knobs as Record<string, unknown>) ?? {};
         this.source = String(payload.source ?? "manual");
+        this.savedPath = String(payload.savedPath ?? "");
+        if (this.savedPath) this.base = this.savedPath;
       }
       this.queueDraft(); // absorbPackage 之后才补上 locks / errors / brief / knobs / source，这里重排一次
       setNote(this.note, "草稿已读回：接着改，确认后才成为正式设定", "ok");
@@ -562,6 +835,8 @@ export class CreatePane implements Pane {
       brief: this.brief,
       knobs: this.knobs,
       source: this.source,
+      // 正在编辑的那份设定文件：草稿读回后仍要覆盖它，而不是又另存一份
+      savedPath: this.savedPath,
     };
   }
 
@@ -569,15 +844,21 @@ export class CreatePane implements Pane {
    * 把当前进度交给 DraftKeeper（它负责防抖与「未保存 / 正在保存 / 已保存 / 保存失败」状态）。
    * 只在「有内容可恢复」时写：名字 / 简介 / 参数 / 设定对象全空就不产生空草稿
    * （首页与素材页的列表按 text 非空过滤，空草稿读回来也没东西可接着改）。
+   *
+   * 草稿槽上的名词由这里的 target 决定：草稿的自动保存不等于「设定已确认」，
+   * 所以写清是「世界设定草稿」，别让用户以为正式设定文件已经生成（评审 P1）。
    */
   private queueDraft(): void {
     if (!this.candidate && !this.name.trim() && !this.brief.trim() && !Object.keys(this.knobs).length) return;
     const text = this.name.trim() || "未命名世界";
-    this.ctx.drafts.watch(CREATE_DRAFT_KEY, this.draftSlot, "create", text, text, this.draftPayload());
+    this.ctx.drafts.watch(CREATE_DRAFT_KEY, this.draftSlot, "create", `世界设定草稿（${text}）`, text, this.draftPayload());
   }
 
   private async render(): Promise<void> {
     if (!this.root) return;
+    // 进度轨要跟着步骤走（当前格反白、走过的打勾）：它挂在固定骨架里、不随 this.root 重画，
+    // 所以每次渲染都重画一遍
+    this.refreshRail();
     fill(this.root);
     try {
       if (this.step === "source") this.renderSource();
@@ -612,7 +893,10 @@ export class CreatePane implements Pane {
   /* ------------------------------------------------------------ 步骤一：来源 */
 
   private renderSource(): void {
-    const host = this.root!;
+    // 每一步是一个一级分区（panel），里面才放二级卡片：以前所有 section 平铺，
+    // 一屏里全是同重量的盒子，眼睛找不到落点（2026-10-08 视觉体系审查根因 1）
+    const host = panel("来源");
+    this.root!.appendChild(host);
     const make = (title: string, body: string, run: () => void): HTMLElement => {
       const card = el("article", { class: "u-card" });
       card.appendChild(el("h3", { text: title }));
@@ -620,7 +904,7 @@ export class CreatePane implements Pane {
       card.appendChild(primary("用这个", run));
       return card;
     };
-    host.appendChild(paragraph("世界设定是创建世界的底稿：先建一份设定，再由它创建出会保存进展的世界。改设定只影响以后创建的世界。"));
+    host.appendChild(paragraph("世界设定是底稿：先建一份设定，再由它创建出会保存进展的世界；改设定只影响以后创建的世界。"));
     host.appendChild(
       el(
         "div",
@@ -642,8 +926,7 @@ export class CreatePane implements Pane {
             this.source = "sample";
             void this.startFromSample();
           },
-        ),
-        make("导入已有设定", "已经在别处有世界设定或角色卡：到「世界与素材 → 导入」带进来，再回来创建。", () =>
+        ),        make("导入已有设定", "已经在别处有世界设定或角色卡：到「世界与素材 → 导入」带进来，再回来创建。", () =>
           this.ctx.navigate({ pane: "worlds" }),
         ),
       ),
@@ -676,14 +959,44 @@ export class CreatePane implements Pane {
     try {
       const list = await this.ctx.api.packages();
       const items = (list.packages as Json[]) ?? [];
-      const sample = items.find((item) => String(item.file ?? "").startsWith("huichao")) ?? items[0];
+      const sample = items.find((item) => String(item.file ?? "").toLowerCase().startsWith("huichao"));
       if (!sample) {
-        setNote(this.note, "创作目录里还没有样例：先到「世界与素材 → 从样例开始」装一份", "bad");
+        // 以前这里静默拿第一份设定兜底：用户以为在用灰潮纪，其实拿到的是别的东西（评审 P2）
+        setNote(this.note, "样例（灰潮纪）还没有安装：先装一份，或改用「让 AI 起草 / 自己填写」", "bad");
+        const note = el("p", { class: "u-note" });
+        const modal = dialog(
+          "样例还没安装",
+          [
+            paragraph("「用样例设定」要用随程序提供的灰潮纪，但这台机器上还没装它。"),
+            paragraph("装的时候不会覆盖你自己的设定，装完回到这一步就能用。", "u-hint"),
+            note,
+          ],
+          [
+            {
+              label: "去安装样例",
+              primary: true,
+              run: () => {
+                setNote(note, "正在打开安装入口…", "pending");
+                this.ctx.navigate({ pane: "onboarding", sub: "sample" });
+              },
+            },
+            {
+              label: "改用自己填写",
+              run: () => {
+                this.source = "manual";
+                void this.startManual();
+              },
+            },
+            { label: "取消", run: () => undefined },
+          ],
+        );
+        document.body.appendChild(modal.node);
         return;
       }
       const loaded = await this.ctx.api.packageLoad(String(sample.file));
       this.absorbPackage((loaded.package as Json) ?? {});
-      setNote(this.note, `已载入样例设定「${String(sample.name ?? sample.file)}」：改完另存为自己的`, "ok");
+      this.source = "sample";
+      setNote(this.note, `已载入样例设定「${String(sample.name ?? sample.file)}」：改完确认成自己的一份`, "ok");
       this.goto("world");
     } catch (error) {
       setNote(this.note, uiError(error, { module: "创建世界", action: "载入样例设定" }).message, "bad");
@@ -699,14 +1012,17 @@ export class CreatePane implements Pane {
     if (!this.name.trim()) this.name = String(meta.original_name ?? meta.display_name ?? "");
     if (!this.brief.trim()) this.brief = String(meta.description ?? "");
     this.errors = [];
-    const sections = sectionsOf(pkg);
+    this.errorsChecked = false; // 刚载入的这份还没检查过：不能报「没有校验问题」
+    this.problemSections = null;
+    const sections = catalogOf(pkg);
     this.section = sections[0]?.path ?? "";
     this.entryId = "";
     this.queueDraft();
   }
 
   private renderWorld(): void {
-    const host = this.root!;
+    const host = panel("世界设定");
+    this.root!.appendChild(host);
     const pkg = this.candidate!;
     const nameInput = el("input", { class: "u-input", value: this.name, id: "u-create-name" }) as HTMLInputElement;
     nameInput.addEventListener("input", () => {
@@ -726,7 +1042,17 @@ export class CreatePane implements Pane {
         { class: "u-row" },
         button("返回来源", () => this.goto("source")),
         button("保存草稿", () => void this.saveDraft()),
+        // 编辑已有设定时，想留一份新的就明确问一次（默认是覆盖原来那份）
+        this.savedPath ? button("另存为新的一份…", () => void this.saveAsNew()) : null,
         primary("确认世界设定，去选角色", () => void this.confirmWorld()),
+      ),
+    );
+    host.appendChild(
+      paragraph(
+        this.savedPath
+          ? "草稿自动保存；点「确认世界设定」会覆盖这份设定文件，想留一份用「另存为新的一份」。"
+          : "草稿自动保存；点「确认世界设定」才生成正式文件。",
+        "u-hint",
       ),
     );
     host.appendChild(field("世界名", nameInput));
@@ -745,13 +1071,17 @@ export class CreatePane implements Pane {
         ),
       );
     }
-    host.appendChild(paragraph("锁定 = AI 不覆盖这一条；改锁定条目要先点「解锁」。校验始终按最终内容判定，锁定不放宽要求。"));
+    // 「锁定 = AI 不覆盖」这句要说全：下面条目行的勾选框与表单里的锁定状态都靠它解释
+    host.appendChild(paragraph("锁定 = AI 不覆盖这一条；校验按最终内容判定，锁定不放宽要求。"));
+    // 地理与社会结构没有条目列表可点，核心却判为必填：给两个固定输入口（评审 P0-4：不留走不通的路）
+    host.appendChild(this.worldScalars(pkg));
 
     // 分区目录 + 当前分区的条目 + 条目表单
-    const sections = sectionsOf(pkg);
+    const sections = catalogOf(pkg);
     const columns = el("div", { class: "u-create-body" });
-    const catalog = el("div", { class: "u-card u-create-catalog" });
-    catalog.appendChild(el("h3", { text: "分区目录" }));
+    // 二级卡片：分区目录与条目列表各是一张浅描边卡（一级底色由上面的 panel 给）
+    const catalog = section("分区目录", paragraph("每一行是一个分区，点「打开」看里面的条目，点「添加一条」加第一条。", "u-hint"));
+    catalog.classList.add("u-create-catalog"); // 探针按这个类找目录行
     for (const item of sections) {
       const row = el("div", { class: "u-row-line" });
       row.appendChild(el("span", { class: "u-grow", text: item.label }));
@@ -769,6 +1099,10 @@ export class CreatePane implements Pane {
       });
       pick.dataset.section = item.path;
       row.appendChild(pick);
+      // 空分区以前连「添加一条」都点不到（添加要求分区已存在）：这里给第一条的入口
+      if (!item.items.length) {
+        row.appendChild(button("添加一条", () => this.addEntry(item.path)));
+      }
       const bar = stackBar(
         [
           { label: "已锁定", value: locked, tone: "accent" },
@@ -789,14 +1123,24 @@ export class CreatePane implements Pane {
     columns.appendChild(catalog);
 
     const current = sections.find((item) => item.path === this.section) ?? sections[0];
-    const entries = el("div", { class: "u-card u-create-entries" });
-    entries.appendChild(el("h3", { text: current ? `${current.label}（${current.items.length} 条）` : "当前分区" }));
+    const entries = section(current ? `${current.label}（${current.items.length} 条）` : "当前分区");
+    entries.classList.add("u-create-entries"); // 探针按这个类找条目行
     if (current) {
-      for (const item of current.items) {
+      // 没有 id 的条目（命名语汇这类）不进「条目」列表：它们按字段直接编辑
+      const rows = current.items.filter((item) => item && typeof item === "object" && item.id);
+      if (rows.length) {
+        entries.appendChild(
+          paragraph("最左边的勾选框是「锁定」：勾上以后，AI 重新生成不会覆盖这一条。", "u-hint"),
+        );
+      }
+      for (const item of rows) {
         const row = el("div", { class: "u-row-line" });
         const tick = el("input", { type: "checkbox" }) as HTMLInputElement;
         tick.checked = (this.locks[current.path] ?? []).includes(String(item.id));
         tick.dataset.lock = String(item.id);
+        // 没有文字标签的复选框用户不知道是什么（评审 P2）：给读屏与悬停都说清是「锁定」
+        tick.setAttribute("aria-label", "锁定这一条（AI 不覆盖）");
+        tick.title = "锁定这一条（AI 不覆盖）";
         tick.addEventListener("change", () => this.toggleLock(current.path, String(item.id), tick.checked));
         row.appendChild(tick);
         row.appendChild(el("span", { class: "u-grow", text: this.entryTitle(item) }));
@@ -840,6 +1184,34 @@ export class CreatePane implements Pane {
       }
     }
     host.appendChild(this.checkPanel());
+  }
+
+  /** 世界级的两个标量：核心判为必填，但界面上以前没有输入控件（评审 P0-4） */
+  private worldScalars(pkg: Json): HTMLElement {
+    const world = (pkg.world as Json) ?? {};
+    pkg.world = world;
+    const card = section("世界本身（这两项必填）");
+    const refs = refIndex(pkg);
+    for (const item of WORLD_SCALARS) {
+      const current = world[item.key];
+      const node = controlFor(item.key, current ?? "", refs, (next) => {
+        world[item.key] = next;
+        this.queueDraft();
+      });
+      node.dataset.scalar = item.key;
+      card.appendChild(field(item.label, node, item.hint));
+    }
+    const terms = sectionsOf(pkg).find((entry) => entry.path === "world.lexicon.terms");
+    const filled = (terms?.items.length ?? 0) > 0;
+    card.appendChild(
+      paragraph(
+        filled
+          ? "命名语汇在下面的「命名语汇」分区里逐条填。"
+          : "「命名语汇」也是必填：到分区目录里点「命名语汇 → 添加一条」，至少填一个词条。",
+        "u-hint",
+      ),
+    );
+    return card;
   }
 
   private knobPanel(): HTMLElement {
@@ -900,16 +1272,24 @@ export class CreatePane implements Pane {
   }
 
   private entryForm(sectionRef: Section, item: Json): HTMLElement {
-    const card = el("div", { class: "u-card u-create-form" });
+    const card = section(`正在编辑：${this.entryTitle(item)}`);
+    card.classList.add("u-create-form"); // 探针按这个类找条目表单
     const locked = (this.locks[sectionRef.path] ?? []).includes(String(item.id));
-    card.appendChild(el("h3", { text: `正在编辑：${this.entryTitle(item)}` }));
     card.appendChild(
       el(
         "div",
         { class: "u-row" },
         chip(locked ? "已锁定（AI 不覆盖）" : "未锁定", locked ? "ok" : "muted"),
         button(locked ? "解锁并编辑" : "锁定此条", () => this.toggleLock(sectionRef.path, String(item.id), !locked)),
-        paragraph(`稳定标识 ${String(item.id)}（系统生成，改名字不影响引用）`, "u-hint"),
+      ),
+    );
+    // 内部标识不摆在正文里（评审第六节）：要看时展开
+    card.appendChild(
+      el(
+        "details",
+        { class: "u-error-detail" },
+        el("summary", { text: "技术详情" }),
+        paragraph(`内部标识 ${String(item.id)}（系统生成，改名字不影响引用）`, "u-hint"),
       ),
     );
     const refs = refIndex(this.candidate!);
@@ -927,14 +1307,30 @@ export class CreatePane implements Pane {
   }
 
   private checkPanel(): HTMLElement {
-    const card = el("div", { class: "u-card u-create-check" });
-    card.appendChild(el("h3", { text: "检查与预览" }));
-    if (!this.errors.length) {
-      card.appendChild(paragraph("这一份目前没有校验问题。", "u-hint"));
+    const card = section("检查与预览");
+    card.classList.add("u-create-check");
+    if (!this.errorsChecked) {
+      // 空缓存不等于「没有问题」（评审：载入骨架后 this.errors = [] 被渲染成「这一份没有校验问题」）
+      card.appendChild(paragraph("还没检查过：点「重新检查」看这一份还缺什么。", "u-hint"));
+      card.appendChild(
+        el("div", { class: "u-row" }, primary("重新检查", () => void this.validate())),
+      );
+    } else if (!this.errors.length) {
+      card.appendChild(paragraph("刚检查过：这一份目前没有校验问题。", "u-hint"));
+      card.appendChild(el("div", { class: "u-row" }, button("重新检查", () => void this.validate())));
     } else {
-      card.appendChild(paragraph(`还有 ${this.errors.length} 项需要处理：`));
+      card.appendChild(paragraph(`还有 ${this.errors.length} 项需要处理（点一条就能跳到它说的位置）：`));
       const list = el("ul", { class: "u-list" });
-      for (const item of this.errors.slice(0, 20)) list.appendChild(el("li", { text: item }));
+      for (const item of this.errors.slice(0, 20)) {
+        const entry = describeProblem(item, catalogOf(this.candidate!));
+        list.appendChild(
+          el(
+            "li",
+            {},
+            button(entry.text, () => this.locate(item), { class: "u-link" }),
+          ),
+        );
+      }
       card.appendChild(list);
       card.appendChild(
         el(
@@ -956,17 +1352,47 @@ export class CreatePane implements Pane {
     return card;
   }
 
-  /** 这一段里有多少条校验问题（与 locate() 同一条匹配规则：问题原文里出现条目标识） */
+  /** 这一段里有多少条校验问题（与 locate() 同一条匹配规则：先按分区路径，再按条目标识） */
   private errorsFor(sectionRef: Section): number {
     const ids = sectionRef.items.map((item) => String(item.id ?? "")).filter((id) => id.length > 2);
-    if (!ids.length) return 0;
-    return this.errors.filter((problem) => ids.some((id) => problem.includes(id))).length;
+    const pkg = this.candidate!;
+    return this.errors.filter(
+      (problem) =>
+        this.problemSection(problem, pkg) === sectionRef.path ||
+        (ids.length > 0 && ids.some((id) => problem.includes(id))),
+    ).length;
   }
 
-  /** 校验问题定位：把问题里提到的标识对到分区与条目上（对不上就明说） */
+  /**
+   * 问题原文 → 分区路径（一次渲染里同一条问题只算一次：目录每一行都要问一遍）。
+   * 键是问题原文：同一个 key 只会得到同一个答案。
+   */
+  private problemSection(problem: string, pkg: Json): string {
+    const cache = (this.problemSections ??= new Map());
+    const key = `${problem}`;
+    const hit = cache.get(key);
+    if (hit !== undefined) return hit;
+    const section = sectionPathIn(problem, catalogOf(pkg));
+    cache.set(key, section);
+    return section;
+  }
+
+  /** 写校验结果：顺手把「问题 → 分区」的缓存清掉（它只对同一份结果有效） */
+  private setErrors(list: string[]): void {
+    this.errors = list.slice();
+    this.errorsChecked = true;
+    this.problemSections = null;
+  }
+
+  /**
+   * 校验问题定位（评审：以前多数问题只能回一句「先看原文」）。
+   * 落点顺序：问题里点名的条目 → 分区里第 N 条 → 分区本身；都对不上才说「先看问题清单」。
+   */
   private locate(problem: string): void {
     const pkg = this.candidate!;
-    for (const item of sectionsOf(pkg)) {
+    const sections = catalogOf(pkg);
+    const info = describeProblem(problem, sections);
+    for (const item of sections) {
       for (const entry of item.items) {
         if (entry.id && problem.includes(String(entry.id))) {
           this.section = item.path;
@@ -977,7 +1403,22 @@ export class CreatePane implements Pane {
         }
       }
     }
-    setNote(this.note, `这条问题没有直接指向某个条目，先看原文：${problem.slice(0, 120)}`, "pending");
+    if (info.section) {
+      this.section = info.section;
+      const target = sections.find((item) => item.path === info.section);
+      const entry = info.index >= 0 ? target?.items[info.index] : target?.items[0];
+      this.entryId = String(entry?.id ?? "");
+      const label = SECTION_LABELS[info.section] ?? info.section;
+      const where = entry ? `「${label} › ${this.entryTitle(entry)}」` : `「${label}」这个分区`;
+      setNote(
+        this.note,
+        `已定位到${where}${entry ? "" : `（这一区目前 ${target?.items.length ?? 0} 条，要加一条点分区行上的「添加一条」）`}`,
+        "ok",
+      );
+      void this.render();
+      return;
+    }
+    setNote(this.note, `这条问题没有点名某个分区里的某一条，先看问题清单里的原文：${problem.slice(0, 120)}`, "pending");
   }
 
   private toggleLock(path: string, ident: string, on: boolean): void {
@@ -992,32 +1433,48 @@ export class CreatePane implements Pane {
 
   private addEntry(path: string): void {
     const pkg = this.candidate!;
-    const sectionRef = sectionsOf(pkg).find((item) => item.path === path);
-    if (!sectionRef) return;
-    const prefix = String(sectionRef.items[0]?.id ?? "x-1").split("-")[0] || "x";
-    let index = sectionRef.items.length + 1;
-    while (sectionRef.items.some((item) => String(item.id) === `${prefix}-新${index}`)) index += 1;
-    const blank: Json = { id: `${prefix}-新${index}` };
-    for (const [key, value] of Object.entries(sectionRef.items[0] ?? {})) {
+    const items = sectionRef(pkg, path);
+    if (!items) return;
+    // 空白骨架的第一条：优先照分区里已有的形状补字段，没有就照固定入口的骨架给
+    // （「添加一条」不再要求分区里已经有一条 —— 评审 P0-4 的死路就堵在这里）
+    const seed = items[0] ? { ...items[0] } : (resolveSeedRefs(declaredItem(path), pkg) as Json);
+    const blank: Json = {};
+    for (const [key, value] of Object.entries(seed)) {
       if (key === "id") continue;
-      blank[key] = Array.isArray(value) ? [] : typeof value === "number" ? 0 : typeof value === "boolean" ? value : "";
+      if (Array.isArray(value)) {
+        // 数组是「引用」与「取值域」这类必填内容：新的一条也照抄一份，别留空数组去撞核心的阻断项
+        blank[key] = JSON.parse(JSON.stringify(value));
+        continue;
+      }
+      if (value && typeof value === "object") {
+        blank[key] = JSON.parse(JSON.stringify(value));
+        continue;
+      }
+      // 标量留空给用户填：seed 里的占位值（默认天气 / 默认角色标识）不该被当成用户写的内容
+      blank[key] = typeof value === "boolean" ? false : typeof value === "number" ? 0 : "";
     }
-    sectionRef.items.push(blank);
-    this.entryId = String(blank.id);
+    const taken = new Set(_allIds(pkg));
+    let index = items.length + 1;
+    let id = String(blank.id ?? `${path.split(".").pop()}-${index}`);
+    while (taken.has(id)) id = `${path.split(".").pop()}-${(index += 1)}`;
+    blank.id = id;
+    items.push(blank);
+    this.section = path;
+    this.entryId = id;
     this.queueDraft();
-    setNote(this.note, "已添加一条：填完记得重新检查", "pending");
+    setNote(this.note, "已添加一条：填完记得点「重新检查」", "pending");
     void this.render();
   }
 
   private duplicateEntry(path: string, item: Json): void {
-    const sectionRef = sectionsOf(this.candidate!).find((row) => row.path === path);
-    if (!sectionRef) return;
+    const items = sectionRef(this.candidate!, path);
+    if (!items) return;
     const prefix = String(item.id).split("-")[0] || "x";
-    let index = sectionRef.items.length + 1;
-    while (sectionRef.items.some((row) => String(row.id) === `${prefix}-副本${index}`)) index += 1;
+    let index = items.length + 1;
+    while (items.some((row) => String(row.id) === `${prefix}-副本${index}`)) index += 1;
     const copy: Json = { ...JSON.parse(JSON.stringify(item)), id: `${prefix}-副本${index}` };
     if (typeof copy.name === "string") copy.name = `${copy.name}（副本）`;
-    sectionRef.items.push(copy);
+    items.push(copy);
     this.entryId = String(copy.id);
     this.queueDraft();
     setNote(this.note, "已复制一条（新身份）：其他条目对原条目的引用不会跟着变", "muted");
@@ -1051,8 +1508,8 @@ export class CreatePane implements Pane {
       );
       return;
     }
-    const sectionRef = sectionsOf(pkg).find((row) => row.path === path);
-    if (!sectionRef) return;
+    const items = sectionRef(pkg, path);
+    if (!items) return;
     const modal = dialog(
       `删除「${this.entryTitle(item)}」？`,
       [paragraph("没有被引用，删掉不影响其他条目。这一步不能撤销，但可以重新添加。")],
@@ -1060,8 +1517,8 @@ export class CreatePane implements Pane {
         {
           label: "删除",
           run: () => {
-            const index = sectionRef.items.findIndex((row) => String(row.id) === ident);
-            if (index >= 0) sectionRef.items.splice(index, 1);
+            const index = items.findIndex((row) => String(row.id) === ident);
+            if (index >= 0) items.splice(index, 1);
             if (this.entryId === ident) this.entryId = "";
             this.queueDraft();
             setNote(this.note, "已删除一条", "muted");
@@ -1096,11 +1553,11 @@ export class CreatePane implements Pane {
     try {
       const result = await this.ctx.api.packageGenerate(this.aiPayload());
       if (result.candidate) this.candidate = result.candidate as Json;
-      this.errors = ((result.errors as string[]) ?? []).slice();
+      this.setErrors((result.errors as string[]) ?? []); // 起草自带一次校验：结果可以照实报
       this.usage = (result.usage as Json) ?? null;
       const meta = (this.candidate?.meta as Json) ?? {};
       if (!this.name) this.name = String(meta.original_name ?? "");
-      this.section = sectionsOf(this.candidate ?? {}).at(0)?.path ?? "";
+      this.section = catalogOf(this.candidate ?? {}).at(0)?.path ?? "";
       this.queueDraft();
       setNote(
         this.note,
@@ -1129,7 +1586,7 @@ export class CreatePane implements Pane {
         locked: this.locks,
       });
       if (result.candidate) this.candidate = result.candidate as Json;
-      this.errors = ((result.errors as string[]) ?? []).slice();
+      this.setErrors((result.errors as string[]) ?? []);
       this.usage = (result.usage as Json) ?? this.usage;
       this.queueDraft();
       setNote(this.note, "改完了：锁定的条目原样保留", "ok");
@@ -1141,9 +1598,9 @@ export class CreatePane implements Pane {
 
   private async fillSection(): Promise<void> {
     if (!this.candidate || !this.section) return;
-    const sectionRef = sectionsOf(this.candidate).find((item) => item.path === this.section);
+    const current = sectionsOf(this.candidate).find((item) => item.path === this.section);
     const segment = this.segmentOf(this.section);
-    setNote(this.note, `正在重跑「${sectionRef?.label ?? this.section}」所在的那一段…`, "pending");
+    setNote(this.note, `正在重跑「${current?.label ?? this.section}」所在的那一段…`, "pending");
     try {
       const result = await this.ctx.api.packageFill({
         package: this.candidate,
@@ -1152,7 +1609,7 @@ export class CreatePane implements Pane {
         locked: this.locks,
       });
       if (result.candidate) this.candidate = result.candidate as Json;
-      this.errors = ((result.errors as string[]) ?? []).slice();
+      this.setErrors((result.errors as string[]) ?? []);
       this.usage = (result.usage as Json) ?? this.usage;
       this.queueDraft();
       setNote(this.note, "这一段重跑完了：锁定条目保留，其他分区没动", "ok");
@@ -1174,7 +1631,7 @@ export class CreatePane implements Pane {
     setNote(this.note, "正在检查…", "pending");
     try {
       const result = await this.ctx.api.packageValidate({ package: this.candidate });
-      this.errors = ((result.errors as string[]) ?? []).slice();
+      this.setErrors((result.errors as string[]) ?? []);
       this.queueDraft();
       setNote(this.note, this.errors.length ? `还有 ${this.errors.length} 项要处理` : "检查通过", this.errors.length ? "pending" : "ok");
       void this.render();
@@ -1200,8 +1657,10 @@ export class CreatePane implements Pane {
     if (!this.candidate) return;
     const pkg = this.candidate;
     const meta = (pkg.meta as Json) ?? {};
+    const editing = Boolean(this.savedPath);
     if (this.name.trim()) {
-      meta.original_name = this.name.trim();
+      // 原始名称在首次确认时固定（核心语义）：改名字只改显示名，别把「来自哪个设定」改掉
+      if (!editing || !String(meta.original_name ?? "").trim()) meta.original_name = this.name.trim();
       meta.display_name = this.name.trim();
     }
     if (this.brief.trim()) meta.description = this.brief.trim();
@@ -1210,19 +1669,63 @@ export class CreatePane implements Pane {
     setNote(this.note, "正在检查这份设定…", "pending");
     try {
       const checked = await this.ctx.api.packageValidate({ package: pkg });
-      this.errors = ((checked.errors as string[]) ?? []).slice();
+      this.setErrors((checked.errors as string[]) ?? []);
       if (this.errors.length) {
         setNote(this.note, `还有 ${this.errors.length} 项没过：按问题清单改完再确认（可以先「保存草稿」）`, "bad");
         void this.render();
         return;
       }
-      const saved = await this.ctx.api.packageSave(await this.uniqueFile(), pkg);
-      this.base = String(saved.path ?? "");
+      if (editing) {
+        // 编辑已有设定就覆盖原文件：以前每次都 uniqueFile() 另存，反复确认堆出一串同名副本（评审 P1）
+        await this.ctx.api.packageSave(this.savedPath, pkg);
+        this.base = this.savedPath;
+        setNote(this.note, `已更新「${this.name}」这份世界设定（改设定只影响以后创建的世界）`, "ok");
+        this.goto("cards");
+        return;
+      }
+      const file = await this.uniqueFile();
+      const saved = await this.ctx.api.packageSave(file, pkg);
+      this.base = String(saved.path ?? file);
+      this.savedPath = this.base;
       setNote(this.note, `世界设定已确认：${this.name}（改设定只影响以后创建的世界）`, "ok");
       this.goto("cards");
     } catch (error) {
       setNote(this.note, uiError(error, { module: "世界设定", action: "确认设定", done: "没有覆盖任何材料" }).message, "bad");
     }
+  }
+
+  /** 另存为一份新设定：文件名先给用户看清再写（评审：要另存就明确问一次） */
+  private async saveAsNew(): Promise<void> {
+    if (!this.candidate) return;
+    const file = await this.uniqueFile();
+    const note = el("p", { class: "u-note" });
+    const modal = dialog(
+      "另存为一份新的世界设定",
+      [
+        paragraph(`这份内容会写进创作目录里的「${file}」，原来那份保持不动。`),
+        paragraph("以后创建的世界会用新的这一份；已经创建的世界不受影响。", "u-hint"),
+        note,
+      ],
+      [
+        {
+          label: "写进这个文件",
+          primary: true,
+          run: async () => {
+            try {
+              const saved = await this.ctx.api.packageSave(file, this.candidate as Json);
+              this.base = String(saved.path ?? file);
+              this.savedPath = this.base;
+              setNote(this.note, `已另存为「${file}」：以后创建的世界用这一份`, "ok");
+            } catch (error) {
+              setNote(note, uiError(error, { module: "世界设定", action: "另存为", done: "没有改动任何文件" }).message, "bad");
+              return false;
+            }
+          },
+        },
+        { label: "取消", run: () => undefined },
+      ],
+    );
+    document.body.appendChild(modal.node);
   }
 
   /** 素材文件名由应用管理：按显示名生成，撞名就加序号（用户不需要自己起文件名） */
@@ -1239,7 +1742,8 @@ export class CreatePane implements Pane {
   /* ------------------------------------------------------------ 步骤三：角色 */
 
   private async renderCards(): Promise<void> {
-    const host = this.root!;
+    const host = panel("准备角色");
+    this.root!.appendChild(host);
     host.appendChild(
       el(
         "div",
@@ -1278,6 +1782,9 @@ export class CreatePane implements Pane {
       const tick = el("input", { type: "checkbox" }) as HTMLInputElement;
       tick.checked = picked;
       tick.dataset.card = file;
+      // 没有文字标签的复选框用户不知道是干什么的：给读屏与悬停都说清
+      tick.setAttribute("aria-label", `把「${String(item.name ?? file)}」用于这一局`);
+      tick.title = `把「${String(item.name ?? file)}」用于这一局`;
       tick.addEventListener("change", () => {
         if (tick.checked) this.cardFiles = [...new Set([...this.cardFiles, file])];
         else this.cardFiles = this.cardFiles.filter((name) => name !== file);
@@ -1326,7 +1833,8 @@ export class CreatePane implements Pane {
   }
 
   private renderCardEditor(): void {
-    const host = this.root!;
+    const host = panel("准备角色");
+    this.root!.appendChild(host);
     host.appendChild(
       el(
         "div",
@@ -1355,7 +1863,7 @@ export class CreatePane implements Pane {
         "div",
         { class: "u-row" },
         primary(this.card ? "重新起草（整卡）" : "让 AI 起草", () => void this.draftCard()),
-        paragraph("起草会带着当前世界设定：角色卡里的来源、史料与联络方式都从这份设定里选。", "u-hint"),
+        paragraph("起草会带着当前世界设定：角色卡里的信息来源、记载与联络方式都从这份设定里选。", "u-hint"),
       ),
     );
     if (!this.card) {
@@ -1364,8 +1872,7 @@ export class CreatePane implements Pane {
     }
     host.appendChild(this.cardForm());
     host.appendChild(this.cardLockPanel());
-    const check = el("div", { class: "u-card" });
-    check.appendChild(el("h3", { text: "检查" }));
+    const check = section("检查");
     if (this.cardErrors.length) {
       check.appendChild(paragraph(`还有 ${this.cardErrors.length} 项要处理：`));
       check.appendChild(bulletList(this.cardErrors.slice(0, 12), "u-list"));
@@ -1379,11 +1886,11 @@ export class CreatePane implements Pane {
 
   /** 卡片表单：顶层标量 / 分组对象 / 列表（一层深）都渲染成控件 */
   private cardForm(): HTMLElement {
-    const box = el("div", { class: "u-card u-card-form" });
+    const box = section("角色内容");
+    box.classList.add("u-card-form"); // 探针按这个类找角色卡字段
     const card = this.card!;
     const refs = refIndex(this.candidate ?? {});
     const entries = Object.entries(card);
-    box.appendChild(el("h3", { text: "角色内容" }));
     for (const [key, value] of entries) {
       if (key === "meta") continue;
       if (Array.isArray(value)) {
@@ -1573,7 +2080,8 @@ export class CreatePane implements Pane {
   /* ------------------------------------------------------------ 步骤四：检查与确认 */
 
   private renderReview(): void {
-    const host = this.root!;
+    const host = panel("检查与确认");
+    this.root!.appendChild(host);
     const pkg = this.candidate!;
     const sections = sectionsOf(pkg);
     host.appendChild(
@@ -1581,7 +2089,8 @@ export class CreatePane implements Pane {
         "div",
         { class: "u-row" },
         button("返回角色", () => this.goto("cards")),
-        primary("创建世界", () => this.goto("create")),
+        // 动作名带上目标步骤：进度轨只回答「走到哪一步了」，不回答「点哪里去下一步」
+        primary("下一步：创建世界", () => this.goto("create")),
       ),
     );
     host.appendChild(
@@ -1591,8 +2100,8 @@ export class CreatePane implements Pane {
           ["世界名", this.name || "（未命名）"],
           ["设定来源", this.source === "ai" ? "AI 起草" : this.source === "manual" ? "自己填写" : "样例改造"],
           ["设定内容", `${sections.length} 个分区、${sections.reduce((sum, item) => sum + item.items.length, 0)} 条`],
-          ["角色", this.cardFiles.join("、") || "（还没选）"],
-          ["校验", this.errors.length ? `${this.errors.length} 项待处理` : "通过"],
+          ["角色", this.cardFiles.map((file) => file.replace(/\.card\.json$/, "")).join("、") || "（还没选）"],
+          ["校验", this.errorsChecked ? (this.errors.length ? `${this.errors.length} 项待处理` : "通过") : "还没检查"],
         ]),
       ),
     );
@@ -1601,13 +2110,16 @@ export class CreatePane implements Pane {
       this.worldName = nameInput.value;
     });
     host.appendChild(field("这个世界的名字（以后可以重命名）", nameInput));
-    host.appendChild(paragraph("创建会固化这份设定：以后改设定只影响新创建的世界，不会追溯改写这个已存在的世界。"));
+    host.appendChild(
+      paragraph("创建会把这份设定固定下来：以后改设定只影响新创建的世界，不会追溯改写这个已存在的世界。"),
+    );
   }
 
   /* ------------------------------------------------------------ 步骤五 / 六：创建与开始 */
 
   private renderCreate(): void {
-    const host = this.root!;
+    const host = panel("创建");
+    this.root!.appendChild(host);
     host.appendChild(
       el(
         "div",
@@ -1618,7 +2130,7 @@ export class CreatePane implements Pane {
       ),
     );
     host.appendChild(
-      paragraph("创建分两步：先建世界（固化设定），再按你的选择启动或先暂停；任一步失败都会保留已经完成的部分。"),
+      paragraph("创建分两步：先建世界（把设定固定下来），再按你的选择启动或先暂停；任一步失败都会保留已经完成的部分。"),
     );
   }
 
@@ -1644,14 +2156,26 @@ export class CreatePane implements Pane {
       // 正式设定已经落地：把向导草稿丢掉，别让它在「未完成内容」里当第二份残留
       await this.ctx.drafts.discard(CREATE_DRAFT_KEY);
       const instanceId = String(this.created.id ?? "");
-      if (run && instanceId) {
-        const info = await this.ctx.api.instanceInfo(instanceId);
-        const timeline = ((info.timelines as Json[]) ?? [])[0];
-        if (timeline) await this.ctx.api.activate(instanceId, String(timeline.id), 1);
+      const info = instanceId ? await this.ctx.api.instanceInfo(instanceId) : {};
+      const timelines = (info.timelines as Json[]) ?? [];
+      const firstTimeline = timelines.find((item) => String(item.state) !== "archived") ?? timelines[0];
+      this.createdTimelineId = String(firstTimeline?.id ?? "");
+      // 出口指向刚建的世界：不写 sel.contact，「去和角色联络」会落到上次用过的那个世界（评审 P1）
+      if (this.createdTimelineId) {
+        await this.ctx.setPrefs({
+          "sel.contact": {
+            instance_id: instanceId,
+            timeline_id: this.createdTimelineId,
+            timeline_name: String(firstTimeline?.name ?? ""),
+            character_id: "",
+            character_name: "",
+          },
+        });
       }
+      if (run && instanceId && firstTimeline) await this.ctx.api.activate(instanceId, String(firstTimeline.id), 1);
       setNote(
         this.note,
-        run ? "世界已创建并开始运行" : "世界已创建（时间线处于暂停；想开始时到世界与素材里点「启动」）",
+        run ? "世界已创建并开始运行" : "世界已创建（世界线处于暂停；想开始时到世界与素材里点「启动」）",
         "ok",
       );
       this.goto("start");
@@ -1669,8 +2193,38 @@ export class CreatePane implements Pane {
     }
   }
 
+  /** 「去和角色联络」：带上刚建好的那个世界与世界线，别落到别的世界上 */
+  private goContact(): void {
+    const instanceId = String(this.created?.id ?? "");
+    if (!instanceId) {
+      this.ctx.navigate({ pane: "contact" });
+      return;
+    }
+    void this.ctx.setPrefs({
+      "sel.contact": {
+        instance_id: instanceId,
+        timeline_id: this.createdTimelineId,
+        timeline_name: "",
+        character_id: "",
+        character_name: "",
+      },
+    });
+    this.ctx.navigate({ pane: "contact" });
+  }
+
+  /** 「打开这个世界」：入口只认第一条世界，所以先把刚建的这个记成「最近使用」，再进详情 */
+  private goWorlds(): void {
+    const instanceId = String(this.created?.id ?? "");
+    const name = String(this.created?.name ?? this.worldName ?? this.name);
+    if (instanceId) {
+      this.ctx.rememberRecent({ pane: "worlds", label: `世界 · ${name}`, key: `worlds:${instanceId}` });
+    }
+    this.ctx.navigate({ pane: "worlds", sub: "detail" });
+  }
+
   private renderStart(): void {
-    const host = this.root!;
+    const host = panel("开始方式");
+    this.root!.appendChild(host);
     const instanceId = String(this.created?.id ?? "");
     const name = String(this.created?.name ?? this.worldName ?? this.name);
     host.appendChild(
@@ -1678,20 +2232,25 @@ export class CreatePane implements Pane {
         `世界「${name}」已经建好`,
         facts([
           ["里面有什么", `${this.cardFiles.length} 位角色`],
-          ["状态", "可以在世界与素材里看时间线与版本"],
+          ["状态", "可以在世界与素材里看世界线与版本"],
         ]),
         el(
           "div",
           { class: "u-row" },
-          primary("去和角色联络", () => this.ctx.navigate({ pane: "contact" })),
-          button("打开这个世界", () => this.ctx.navigate({ pane: "worlds" })),
+          primary("去和角色联络", () => this.goContact()),
+          button("打开这个世界", () => this.goWorlds()),
           button("再创建一个世界", () => {
             this.step = "source";
             this.candidate = null;
+            this.savedPath = "";
+            this.base = "";
             this.cardFiles = [];
             this.created = null;
+            this.createdTimelineId = "";
             this.usage = null;
             this.errors = [];
+            this.errorsChecked = false;
+            this.problemSections = null;
             this.locks = {};
             void this.render();
           }),
@@ -1699,6 +2258,15 @@ export class CreatePane implements Pane {
         paragraph("同一个设定可以创建多个世界；已有的世界不会因为改设定而变。", "u-hint"),
       ),
     );
-    if (instanceId) host.appendChild(paragraph(`实例标识：${instanceId}`, "u-hint"));
+    if (instanceId) {
+      host.appendChild(
+        el(
+          "details",
+          { class: "u-error-detail" },
+          el("summary", { text: "技术详情" }),
+          paragraph(`这个世界的内部标识：${instanceId}`, "u-hint"),
+        ),
+      );
+    }
   }
 }

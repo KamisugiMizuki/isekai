@@ -160,7 +160,7 @@ export function branchGraph(lanes: BranchLane[]): HTMLElement | null {
     // 按原尺寸画，不拉满容器：viewBox 拉伸会把里面的字一起放大（点少的时候字会有三倍大）
     style: `width:${width}px`,
     role: "img",
-    "aria-label": `版本分叉图：${lanes.length} 条时间线、${columns} 个版本点`,
+    "aria-label": `版本分叉图：${lanes.length} 条世界线、${columns} 个版本点`,
   });
 
   const xOf = (id: string): number => GUTTER + (order.get(id) ?? 0) * DOT_STEP + DOT_STEP / 2;

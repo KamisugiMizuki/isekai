@@ -3,7 +3,7 @@
  *
  * 首次设置与「设置 → 数据与备份」共用这一块：选旧根（原生目录选择器）→ 检查 →
  * 确认目标还没有用户资产 → 迁移（复制到暂存区 → 完整校验 → 启用）。
- * 源目录始终保留；密钥 / 通道凭据 / 进程锁不迁移；迁移后所有时间线暂停。
+ * 源目录始终保留；密钥 / 通道凭据 / 进程锁不迁移；迁移后所有世界线暂停。
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -30,7 +30,7 @@ export function migrateCard(ctx: AppContext): HTMLElement {
       result.appendChild(
         facts([
           ["这个目录", String(inspect.path ?? path)],
-          ["里面有什么", `${String(counts.instances ?? "?")} 个世界、${String(counts.timelines ?? "?")} 条时间线、${String(inspect.assets ?? 0)} 个素材文件`],
+          ["里面有什么", `${String(counts.instances ?? "?")} 个世界、${String(counts.timelines ?? "?")} 条世界线、${String(inspect.assets ?? 0)} 个素材文件`],
           ["要搬的大小", sizeText(Number(inspect.size_bytes ?? 0))],
           ["当前数据根", `${String(target.instances ?? 0)} 个世界、${String(target.assets ?? 0)} 个素材文件`],
         ]),
@@ -53,7 +53,7 @@ export function migrateCard(ctx: AppContext): HTMLElement {
         0,
       );
       if (steps) result.appendChild(steps);
-      result.appendChild(paragraph("迁移完成后，所有时间线处于暂停状态；要接着跑就在世界里逐条启动。", "u-hint"));
+      result.appendChild(paragraph("迁移完成后，所有世界线处于暂停状态；要接着跑就在世界里逐条启动。", "u-hint"));
       result.appendChild(
         el(
           "div",
@@ -96,15 +96,15 @@ export function migrateCard(ctx: AppContext): HTMLElement {
         result,
         el("h3", { text: "迁移完成" }),
         facts([
-          ["搬过来", `${String(counts.instances ?? "?")} 个世界、${String(counts.timelines ?? "?")} 条时间线`],
-          ["时间线状态", "全部暂停"],
+          ["搬过来", `${String(counts.instances ?? "?")} 个世界、${String(counts.timelines ?? "?")} 条世界线`],
+          ["世界线状态", "全部暂停"],
           ["源目录", `${String(migration.kept_source ?? path)}（原样保留）`],
           ["恢复前副本", String(migration.before ?? "")],
           ["偏好", ((migration.prefs_merged as string[]) ?? []).length ? `合并了 ${(migration.prefs_merged as string[]).length} 项（目标已有的值优先）` : "没有需要合并的"],
         ]),
         paragraph("没有搬过来的：API 密钥与通道凭据、进程锁与运行句柄、日志与缓存。", "u-hint"),
       );
-      setNote(note, "迁移完成：请到世界与素材里检查世界，然后逐条启动时间线", "ok");
+      setNote(note, "迁移完成：请到世界与素材里检查世界，然后逐条启动世界线", "ok");
       await ctx.refresh();
     } catch (error) {
       const info = uiError(error, {

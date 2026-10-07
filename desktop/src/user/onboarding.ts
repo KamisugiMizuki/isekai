@@ -12,10 +12,26 @@ import type { Json } from "./api";
 import { uiError } from "./api";
 import type { AppMode } from "./launcher";
 import { migrateCard } from "./migrate";
-import { button, el, errorCard, field, fill, paragraph, primary, section, setNote, stamp } from "./dom";
-import { checkList } from "./graphics";
+import { aiSetup } from "./ai-setup";
+import { button, el, errorCard, field, fill, pageHead, paragraph, primary, section, setNote, stamp } from "./dom";
+import { checkList, flowRail } from "./graphics";
 
 type StepId = "check" | "ai" | "task" | "material" | "start";
+
+/**
+ * 核心给的本机检查标签里还留着内部叫法（「受管目录可写」「单一写入者」）。
+ * 与帮助页同一张表：同一件事在向导和帮助页必须是一个说法。
+ */
+const CHECK_LABELS: Record<string, string> = {
+  受管目录可写: "数据文件夹可写",
+  单一写入者: "只由这个程序写入",
+  数据格式可读: "已有的内容能读",
+};
+
+function checkLabel(label: unknown): string {
+  const text = String(label ?? "");
+  return CHECK_LABELS[text] ?? text;
+}
 
 const STEPS: Array<{ id: StepId; label: string }> = [
   { id: "check", label: "本机检查" },
@@ -34,17 +50,6 @@ const SUB_STEPS: Record<string, StepId> = {
   material: "material",
   start: "start",
 };
-
-const PRESET_SERVICES: Array<{ id: string; label: string; base_url: string; model: string; key_url: string }> = [
-  {
-    id: "deepseek",
-    label: "DeepSeek",
-    base_url: "https://api.deepseek.com",
-    model: "deepseek-v4-flash",
-    key_url: "https://platform.deepseek.com/api_keys",
-  },
-  { id: "other", label: "其他兼容服务（OpenAI 兼容接口）", base_url: "", model: "", key_url: "" },
-];
 
 export class OnboardingPane implements Pane {
   readonly id = "onboarding" as const;
@@ -66,21 +71,24 @@ export class OnboardingPane implements Pane {
   }
 
   /**
-   * 点名的那一步之前，前置（本机检查 / 连接 AI）都过完了才直接落到点名那一步；
-   * 前置还缺就按向导顺序从第一步走——配置好的用户不该被「从样例世界开始」扔回本机检查，
-   * 没配置完的用户也不该被跳过配置。
+   * 点名的那一步之前，前置（本机检查）都过完了才直接落到点名那一步。
+   *
+   * AI 配置不再算「前置」（2026-10-07 可用性评审 P0-2）：安装样例、建世界、写设定全是本机操作，
+   * 一个只想先看看样例的用户点「先看看样例，稍后再配置」，不该被送回「连接 AI」——
+   * 那正是他想躲的一步。没配 AI 也能走到「准备材料」，配置随时能在设置里补。
    */
   private entryStep(asked: StepId): StepId {
     const readiness = this.ctx.readiness ?? {};
-    const configured = Boolean((readiness.ai as Json | undefined)?.configured);
-    return readiness.ready && configured ? asked : "check";
+    return readiness.ready ? asked : "check";
   }
 
   private async render(): Promise<void> {
     const host = this.root;
     if (!host) return;
     const page = el("div", { class: "u-page" });
-    page.appendChild(el("h2", { class: "u-h2", text: "首次设置" }));
+    // 标题带（页面名 + 一句定位语）：以前正文里另有一个 h2「首次设置」，
+    // 与顶栏标题重了一遍（2026-10-08 视觉体系审查）
+    page.appendChild(pageHead("首次设置", "五步就能开始；任何一步都可以跳过 AI", []));
     page.appendChild(this.stepper());
     const body = el("div", { class: "u-step-body" });
     page.appendChild(body);
@@ -103,14 +111,45 @@ export class OnboardingPane implements Pane {
     }
   }
 
+  /**
+   * 真进度轨：带编号圆点 + 连线（以前是「文字 + 一排短下划线」，看不出那是链接还是分隔线、
+   * 也看不出走了几分之几 —— 2026-10-08 视觉体系审查）。
+   *
+   * 圆点可以点着回到某一步：AI 这一步本来就能跳过，「只能往前走」会把回退变成谜题
+   * （连接 AI 那一步以前没有返回上一颗）。flowRail 画的是 div（不可聚焦），
+   * 这里补 role / tabindex / 键盘处理，让鼠标、键盘与读屏都能回到那一步。
+   */
   private stepper(): HTMLElement {
-    const list = el("ol", { class: "u-steps" });
     const index = STEPS.findIndex((item) => item.id === this.step);
-    STEPS.forEach((item, position) => {
-      const state = position === index ? "current" : position < index ? "done" : "todo";
-      list.appendChild(el("li", { class: `u-step u-step-${state}`, text: item.label }));
+    const rail = flowRail(STEPS.map((item) => ({ label: item.label })), Math.max(0, index));
+    if (!rail) {
+      // 画不出来（步骤表为空这类不可能的情况）也要说清在第几步：退回一行文字，不返回 null
+      return el("p", { class: "u-hint u-wizard-rail", text: STEPS.map((item) => item.label).join("　") });
+    }
+    rail.classList.add("u-wizard-rail"); // 探针 / 样式认这一类：向导的进度轨
+    Array.from(rail.querySelectorAll<HTMLElement>(".u-rail-step")).forEach((node, position) => {
+      const target = STEPS[position];
+      if (!target) return;
+      // 当前这一步不动：flowRail 已经给它标了 aria-current="step"，
+      // 再套一层「按不动的按钮」只会让读屏多念一句废话
+      if (target.id === this.step) return;
+      node.setAttribute("role", "button");
+      node.setAttribute("aria-label", `回到第 ${position + 1} 步：${target.label}`);
+      if (target.id === "start" && !this.ctx.prefs["onboard.instance"]) {
+        // 「开始使用」还没有世界可指：点了只会看到空名字，不做假按钮
+        node.setAttribute("aria-disabled", "true");
+        return;
+      }
+      node.tabIndex = 0;
+      const jump = (): void => void this.goto(target.id);
+      node.addEventListener("click", jump);
+      node.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        jump();
+      });
     });
-    return list;
+    return rail;
   }
 
   private async goto(step: StepId, mode?: AppMode): Promise<void> {
@@ -130,16 +169,24 @@ export class OnboardingPane implements Pane {
     const readiness = this.ctx.readiness ?? {};
     const checks = (readiness.checks as Json[]) ?? [];
     const ok = Boolean(readiness.ready);
+    // 首屏不摊技术项（评审 P1）：过了就一行「这台电脑可以运行」，细节收进折叠。
+    // 用户此刻要的是「能不能开始」，不是「单一写入者」「记录格式」。
     host.appendChild(
       section(
         "本机环境",
-        paragraph("先确认程序和数据位置可用；这一步不涉及 AI 密钥，也不写任何东西。"),
-        checkList(
-          checks.map((item) => ({
-            label: String(item.label),
-            ok: Boolean(item.ok),
-            detail: String(item.detail ?? ""),
-          })),
+        paragraph(ok ? "这台电脑可以运行，数据会放在你自己的用户目录里。" : "这台电脑还有一项没准备好，看下面的原因。"),
+        paragraph("这一步不涉及 AI 密钥，也不写任何东西。", "u-hint"),
+        el(
+          "details",
+          { class: "u-check-detail" },
+          el("summary", { text: "查看检查详情（程序版本、数据位置、存储）" }),
+          checkList(
+            checks.map((item) => ({
+              label: checkLabel(item.label),
+              ok: Boolean(item.ok),
+              detail: String(item.detail ?? ""),
+            })),
+          ),
         ),
       ),
     );
@@ -165,11 +212,21 @@ export class OnboardingPane implements Pane {
         "div",
         { class: "u-row" },
         primary("继续：连接 AI", () => void this.goto("ai")),
+        button("先跳过 AI，直接看样例", () => void this.goto("material")),
         button("重新检查", () => void this.recheck()),
       ),
     );
-    // 已有开发版数据的用户（§3.2）：从旧目录整份搬过来，而不是手动拷文件
-    host.appendChild(migrateCard(this.ctx));
+    // 已有开发版数据的用户（§3.2）：从旧目录整份搬过来，而不是手动拷文件。
+    // 默认折叠：首启第一屏不该先问一个新手答不上来的问题（「开发版」「data/isekai.db」
+    // 「通道凭据」——2026-10-08 审计 P1-1）。老用户知道自己在找什么，会点开。
+    host.appendChild(
+      el(
+        "details",
+        { class: "u-check-detail" },
+        el("summary", { text: "以前用过 isekai 的开发版，想把里面的数据搬过来？" }),
+        migrateCard(this.ctx),
+      ),
+    );
   }
 
   private async recheck(): Promise<void> {
@@ -182,66 +239,23 @@ export class OnboardingPane implements Pane {
   private renderAi(host: HTMLElement): void {
     const ai = ((this.ctx.readiness.ai as Json) ?? {}) as Json;
     const saved = ((this.ctx.settings.llm as Json) ?? {}) as Json;
-    const service = el("select", { class: "u-input", id: "onb-service" }) as HTMLSelectElement;
-    for (const item of PRESET_SERVICES) {
-      service.appendChild(el("option", { value: item.id, text: item.label }));
-    }
-    service.value = String(this.ctx.prefs["onboard.service"] ?? (saved.base_url === PRESET_SERVICES[0].base_url ? "deepseek" : "other"));
-    const baseUrl = el("input", { class: "u-input", id: "onb-base-url", value: String(saved.base_url ?? "") }) as HTMLInputElement;
-    const model = el("input", { class: "u-input", id: "onb-model", value: String(saved.model ?? ""), placeholder: "推荐模型" }) as HTMLInputElement;
-    const key = el("input", { class: "u-input", id: "onb-key", type: "password", autocomplete: "off", placeholder: String(ai.api_key_set ? `已设置（${String(ai.api_key_masked)}）；留空表示不改` : "粘贴访问密钥") }) as HTMLInputElement;
-    const timeout = el("input", { class: "u-input", id: "onb-timeout", type: "number", min: "1", value: String(saved.timeout_s ?? 60) }) as HTMLInputElement;
-    const maxTokens = el("input", { class: "u-input", id: "onb-max-tokens", type: "number", min: "1", value: String(saved.max_tokens ?? 1024) }) as HTMLInputElement;
-    const temperature = el("input", { class: "u-input", id: "onb-temp", type: "number", min: "0", max: "2", step: "0.1", value: String(saved.temperature ?? 0.8) }) as HTMLInputElement;
     const note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
     const results = el("div", { class: "u-test-results" });
-
-    const advanced = el(
-      "details",
-      { class: "u-advanced" },
-      el("summary", { text: "高级选项：服务地址、等待时间、单次输出长度、生成随机程度" }),
-      field("服务地址（接口地址，不是聊天网页网址）", baseUrl),
-      field("等待时间（秒）", timeout),
-      field("单次输出长度（token）", maxTokens),
-      field("生成随机程度（0–2）", temperature),
-    );
-
-    const applyPreset = () => {
-      const preset = PRESET_SERVICES.find((item) => item.id === service.value) ?? PRESET_SERVICES[0];
-      if (preset.base_url) baseUrl.value = preset.base_url;
-      if (preset.model) model.value = preset.model;
-      const hint = host.querySelector("#onb-key-hint");
-      if (hint) {
-        hint.textContent = preset.key_url
-          ? `密钥在服务的官方密钥管理页取得（网页聊天账号登录与接口密钥可能不是一回事）。`
-          : "自定义服务：地址、模型与密钥都按服务提供方的说明填写。";
-      }
-    };
-    service.addEventListener("change", () => {
-      void this.ctx.setPrefs({ "onboard.service": service.value });
-      applyPreset();
-    });
-
-    const collect = (): Json => ({
-      base_url: baseUrl.value.trim(),
-      model: model.value.trim(),
-      ...(key.value.trim() ? { api_key: key.value.trim() } : {}),
-      timeout_s: Number(timeout.value || 60),
-      max_tokens: Number(maxTokens.value || 1024),
-      temperature: Number(temperature.value || 0),
+    // 与设置页共用同一份控件与校验：两处各写一遍必然分叉（评审 P0-1 / P1-1）
+    const setup = aiSetup({
+      saved,
+      apiKeySet: Boolean(ai.api_key_set),
+      apiKeyMasked: String(ai.api_key_masked ?? ""),
+      servicePref: String(this.ctx.prefs["onboard.service"] ?? ""),
+      onServicePref: (id) => void this.ctx.setPrefs({ "onboard.service": id }),
+      notify: (text, kind) => setNote(note, text, kind),
     });
 
     const save = async (verified: boolean): Promise<boolean> => {
+      const invalid = setup.validate(note);
+      if (invalid) return false;
       try {
-        const payload = collect();
-        if (!payload.base_url || !payload.model) {
-          setNote(note, "服务地址与模型是必填项", "bad");
-          return false;
-        }
-        if (baseUrl.value.trim() && !/^https?:\/\//.test(baseUrl.value.trim())) {
-          setNote(note, "服务地址要以 http:// 或 https:// 开头（这是接口地址，不是聊天网页网址）", "bad");
-          return false;
-        }
+        const payload = setup.collect();
         await this.ctx.api.saveSettings({ llm: payload });
         await this.ctx.refresh();
         await this.ctx.setPrefs({
@@ -249,39 +263,34 @@ export class OnboardingPane implements Pane {
           "ai.verified": verified,
         });
         setNote(note, verified ? "已保存，基础能力已验证" : "已保存未验证的配置（新生成仍会按运行时错误提示）", verified ? "ok" : "pending");
-        key.value = "";
+        setup.key.value = "";
         return true;
       } catch (error) {
         const info = uiError(error, { module: "设置", action: "保存 AI 配置" });
-        results.appendChild(errorCard(info, [{ label: "返回继续编辑", run: () => key.focus() }]));
+        results.appendChild(errorCard(info, [{ label: "返回继续编辑", run: () => setup.key.focus() }]));
         return false;
       }
     };
 
     const runTest = async (): Promise<void> => {
       if (this.busy) return;
+      if (setup.validate(note)) return;
       this.busy = true;
       fill(results);
       setNote(note, "正在测试：检查地址 / 验证访问 / 检查回复格式…", "pending");
       try {
-        const result = await this.ctx.api.testAi(collect());
+        const result = await this.ctx.api.testAi(setup.collect());
         const checks = (result.checks as Json[]) ?? [];
         fill(
           results,
           checkList(
             checks.map((item) => ({
-              label: String(item.label),
+              label: checkLabel(item.label),
               ok: Boolean(item.ok),
               detail: String(item.detail ?? ""),
             })),
           ),
-          el(
-            "p",
-            { class: "u-hint" },
-            `服务 ${String(result.service ?? "")}｜模型 ${String(result.model ?? "")}`
-              + (result.key_set ? `｜密钥 ${String(result.api_key_masked ?? "")}` : "")
-              + `｜用时 ${String(result.duration_ms ?? 0)} 毫秒｜调用 ${String(result.calls ?? 0)} 次（上限 ${String(result.call_budget ?? 4)}）`,
-          ),
+          el("p", { class: "u-hint" }, `服务 ${String(result.service ?? "")}｜模型 ${String(result.model ?? "")}｜用时 ${String(result.duration_ms ?? 0)} 毫秒`),
         );
         if (result.ok) {
           const ok = await save(true);
@@ -314,22 +323,18 @@ export class OnboardingPane implements Pane {
       section(
         "连接 AI",
         paragraph("生成所需的文字会发送给你选择的服务。测试只发送两段固定测试文字，不发送你的世界与聊天记录，可能产生少量用量。"),
-        field("服务", service),
-        el("p", { class: "u-hint", id: "onb-key-hint", text: "密钥在服务的官方密钥管理页取得。" }),
-        field("模型", model, "名称从服务提供方取得；写错不会被自动纠正"),
-        field("访问密钥", key),
-        advanced,
+        ...setup.nodes,
         el(
           "div",
           { class: "u-row" },
           primary("测试并保存", () => void runTest()),
           button("稍后配置，先整理素材", () => void this.goto("task")),
         ),
+        paragraph("没有密钥也能先用：样例世界、写作与整理素材都在本机完成，随时回来补配置。", "u-hint"),
         note,
         results,
       ),
     );
-    applyPreset();
   }
 
   /* ---------------------------------------------------------------- ③ 选择任务 */
@@ -354,13 +359,13 @@ export class OnboardingPane implements Pane {
       "div",
       { class: "u-cards" },
       choose("chat", "与角色联络", "选一个世界和角色，和生活在其中的人对话。", missing("还缺：一个已创建的世界（这一步会建）"), "开始联络"),
-      choose("writer", "辅助写作", "整理大纲、观察角色能知道的事、比较下一步方案，保存文字草稿。", missing("还缺：世界与观察角色（这一步会建）"), "开始写作"),
-      choose("gm", "进行跑团", "选规则与角色，声明行动，确认后得到裁定与后果。", "还缺：一份已登记的规则插件（在跑团页登记）", "开始跑团"),
+      choose("writer", "辅助写作", "整理大纲、看看角色知道什么、比较下一步怎么写，保存文字草稿。", missing("还缺：一个世界和一个要观察的角色（这一步会建）"), "开始写作"),
+      choose("gm", "进行跑团", "选一套规则和几个角色，声明行动，确认后得到结果。", "还缺：一套跑团规则（可以一键登记随程序附带的样例规则）", "开始跑团"),
     );
     host.appendChild(
       section(
         "选择第一件事",
-        paragraph("任务选择不创建第三套项目数据：世界、时间线、大纲与战役仍由各自模块管理。"),
+        paragraph("三条路共用同一个世界，选哪条都能改。"),
         grid,
         el("div", { class: "u-row" }, button("返回", () => void this.goto("ai"))),
       ),
@@ -419,7 +424,7 @@ export class OnboardingPane implements Pane {
         intro,
         paragraph(String(item.description ?? ""), "u-p"),
         paragraph(
-          "创建后将以默认速度开始运行；退出后再次启动会补算，暂停则不会。",
+          "创建后世界会自己往前走；关掉程序这段时间会在下次打开时补上，暂停就不会。",
           "u-hint",
         ),
       );
@@ -551,7 +556,7 @@ export class OnboardingPane implements Pane {
           action: "启动世界",
           target: world,
           done: "世界已经创建（不会重复创建）",
-          unknown: "时间线是否已经运行",
+          unknown: "世界线是否已经运行",
         });
         details.appendChild(errorCard(info, [{ label: "重试启动", run: () => void begin(true) }]));
       }
@@ -561,7 +566,7 @@ export class OnboardingPane implements Pane {
       section(
         "开始使用",
         paragraph(
-          `世界「${world}」已经创建；这个世界设定与角色设定已经固化，之后改模板不会追溯改写它。`,
+          `世界「${world}」已经创建。它的设定与角色已经定稿：以后改模板也不会倒回去改这一个世界。`,
         ),
         el(
           "div",

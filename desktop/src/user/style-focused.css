@@ -27,7 +27,10 @@
   overflow-y: auto;
 }
 
-/* 顶栏:固定高度 56px（user.css 的 .u-topbar 靠 padding 撑高、还带 flex-wrap） */
+/* 顶栏:固定高度 56px（user.css 的 .u-topbar 靠 padding 撑高、还带 flex-wrap）
+   颜色一律走主题变量：这里曾经写死 `background: white; border-bottom: #e0e0e0`，
+   深色覆盖却挂在 @media (prefers-color-scheme: dark) 上，而应用自己的主题是 html[data-theme]——
+   结果是「系统浅色 + 应用深色」时顶栏白底白字，实测对比度 1.12:1（2026-10-08 审计 P0-2）。 */
 .u-topbar.u-topbar-focused {
   display: flex;
   justify-content: space-between;
@@ -35,8 +38,9 @@
   height: 56px;
   min-height: 56px;
   padding: 0 24px;
-  border-bottom: 1px solid #e0e0e0;
-  background: white;
+  border-bottom: 1px solid var(--u-border-soft);
+  background: var(--u-bg);
+  color: var(--u-fg);
   flex-wrap: nowrap;
 }
 
@@ -48,18 +52,19 @@
   gap: 12px;
 }
 
-/* 返回按钮只有 emoji，不要 user.css 的 .u-btn 边框 */
+/* 返回按钮：文字（← 返回xx），不是 emoji —— 字号跟着主题字号走，别写死 24px */
 .u-btn.u-btn-back {
-  font-size: 24px;
-  padding: 8px 12px;
+  font-size: 1em;
+  padding: 10px 12px;
   min-width: auto;
+  min-height: 44px;
   border: none;
   background: transparent;
   cursor: pointer;
 }
 
 .u-btn.u-btn-back:hover {
-  background: #f5f5f5;
+  background: var(--u-sunken);
   border-radius: 4px;
 }
 
@@ -95,28 +100,27 @@
   display: block;
   width: 100%;
   text-align: left;
-  padding: 8px 12px;
+  padding: 10px 12px;
+  min-height: 44px;
   border: none;
   background: transparent;
+  color: inherit;
   cursor: pointer;
   border-radius: 4px;
-  font-size: 14px;
+  font-size: 1em; /* 跟随用户字号（浮层容器已补 --u-font-size），不再写死 14px */
 }
 
 .u-more-menu-item:hover,
 .u-more-menu-item:focus {
   background: var(--u-sunken);
-  outline: none;
 }
 
-/* 深色模式 */
-@media (prefers-color-scheme: dark) {
-  .u-topbar.u-topbar-focused {
-    background: #1e1e1e;
-    border-bottom-color: #444;
-  }
-
-  .u-btn.u-btn-back:hover {
-    background: #2a2a2a;
-  }
+/* 菜单里分组：页面入口与「返回选择应用」不是一类东西，用一条分隔线分开 */
+.u-more-menu-sep {
+  height: 1px;
+  background: var(--u-border-soft);
+  margin: 4px 6px;
 }
+
+/* 深色不再单独处理：颜色全部来自 html[data-theme] 的变量（原来这一段只认系统深色，
+   应用内选深色而系统是浅色时完全不生效，正是 P0-2 的成因） */

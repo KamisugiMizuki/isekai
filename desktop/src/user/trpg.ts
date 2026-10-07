@@ -1,8 +1,8 @@
 /*
  * 跑团工作区（USER_INTERFACE_DESIGN §8.1–§8.5）。
  *
- * 三块：继续 / 新建战役（§8.1）、场景与行动（§8.2–8.3）、主持面（§8.4）。
- * 一条硬规矩贯穿：没有真实裁定就不显示骰点、不说成功；世界变化只有真实提交过才算发生。
+ * 三块：继续 / 新建战役（§8.1）、场景与行动（§8.2–8.3）、主持视图（§8.4）。
+ * 一条硬规矩贯穿：没有按规则算出来的真实结果就不显示骰点、不说成功；世界变化只有真实提交过才算发生。
  * 规则与「外部聊天通道」分开：规则走 rules.* 登记簿（§8.5），不碰通道插件安装。
  */
 
@@ -19,18 +19,21 @@ import {
   facts,
   field,
   fill,
+  pageHead,
+  panel,
   paragraph,
   primary,
   section,
   setNote,
+  tools,
 } from "./dom";
-import { flowRail, type FlowStep } from "./graphics";
+import { dotLine, flowRail, type FlowStep } from "./graphics";
 
 type View = "list" | "create" | "play";
 
 /**
- * 跑团工作区自己的上下文（§3.3）：世界 / 时间线 / 战役分别记住，形状照抄 `sel.contact`。
- * `campaign_id` 为空表示只记了「世界 + 时间线」（从世界详情点「在此跑团」进入的情形）。
+ * 跑团工作区自己的上下文（§3.3）：世界 / 世界线 / 战役分别记住，形状照抄 `sel.contact`。
+ * `campaign_id` 为空表示只记了「世界 + 世界线」（从世界详情点「在此跑团」进入的情形）。
  */
 interface TrpgSelection {
   instance_id: string;
@@ -43,9 +46,35 @@ interface TrpgSelection {
 const ACTION_STEPS: FlowStep[] = [
   { label: "写下行动", hint: "行动、行动者与目标齐了才能打开确认卡" },
   { label: "确认卡齐备", hint: "改任何关键项都会让旧确认失效" },
-  { label: "规则裁定", hint: "不取消后自动重掷；切页不会发第二次裁定" },
+  { label: "按规则算结果", hint: "不取消后自动重掷；切页不会算第二次" },
   { label: "写入世界", hint: "规则状态与世界后果同批成功或同批失败" },
 ];
+
+/** 场景类型的中文名：界面上不给英文枚举（P1-9）。值是提交给核心的原始标识，不能改 */
+const SCENE_KINDS: Array<[string, string]> = [
+  ["exploration", "探索"],
+  ["conflict", "冲突"],
+  ["social", "社交"],
+  ["downtime", "日常 / 间隙"],
+];
+
+/**
+ * 核心阶段名 → 人话（P1-9）：只在正文里出现，值仍然是原始标识。
+ * 这里查不到才回落到原始字符串，免得核心新增阶段时界面变空。
+ */
+const STAGE_TEXT: Record<string, string> = {
+  needs_input: "等待你补充信息",
+  awaiting_confirmation: "等待你确认",
+  submitting: "正在提交",
+  resolving: "正在按规则计算",
+  unknown: "结果还没确认",
+  plugin_failed: "规则包出错",
+  committed: "已经进入世界",
+};
+
+function stageText(stage: string): string {
+  return STAGE_TEXT[stage] ?? stage;
+}
 
 /** 结果的固定顺序（§8.3）：行动结果 → 世界后果 → 谁知道 → 下一步 */
 const RESULT_STEPS: FlowStep[] = [
@@ -80,6 +109,26 @@ function displayName(name: unknown, id: string, fallback: string): string {
   const text = String(name ?? "").trim();
   if (text) return text;
   return id ? `${fallback}（${shortId(id)}）` : fallback;
+}
+
+/**
+ * 技术详情折叠区（P1-9）：内部标识、规则状态编号这类东西收在这里，正文只留名字与人话。
+ * 没有内容时返回 null，不摆一个空折叠块。
+ */
+function techDetails(rows: Array<[string, string]>): HTMLElement | null {
+  const kept = rows.filter(([, value]) => value);
+  if (!kept.length) return null;
+  return el("details", { class: "u-hint" }, el("summary", { text: "技术详情（排错时才需要看）" }), facts(kept));
+}
+
+/** 规则清单里有没有「已登记但不能用」的项：用来区分「没登记」与「登记了但停用 / 缺依赖」（P1-6） */
+function registeredUnusableHint(plugins: Json[], rulesetId: string): boolean {
+  return plugins.some((item) => {
+    const status = String(item.status);
+    if (status === "available" || status === "unregistered") return false;
+    // 传了具体规则就只认它；没传（在列表里拦人）就看有没有任何一条不能用的
+    return !rulesetId || String(item.ruleset_id) === rulesetId;
+  });
 }
 
 /** 可重试的界面错误：给「随发行样例规则」这类有明确下一步的失败用（替代只有一句话的死路提示）。 */
@@ -211,7 +260,7 @@ export class TrpgPane implements Pane {
     } catch {
       this.draft.instanceId = instance.id;
       this.draft.timelineId = timelineId;
-      this.selectionHint = "没能确认上次的战役是否还在：已回到战役列表（世界与时间线已带入新建战役）。";
+      this.selectionHint = "没能确认上次的战役是否还在：已回到战役列表（世界与世界线已带入新建战役）。";
     }
   }
 
@@ -272,6 +321,35 @@ export class TrpgPane implements Pane {
   /* ------------------------------------------------------------ §8.1 继续 / 新建 */
 
   private async renderList(host: HTMLElement): Promise<void> {
+    const newCampaign = (): void => {
+      this.view = "create";
+      void this.render();
+    };
+    // ① 标题带：与其它页同一个纵向位置。有世界可挂时主操作才是「新建战役」——
+    // 一个世界都没有时它点进去只会是个死向导，那种情形交给下面的空态说清先做什么
+    host.appendChild(
+      pageHead(
+        "跑团",
+        "声明行动，按规则得到结果；没算出真实结果就不说成功",
+        this.ctx.instances().length ? [primary("新建战役", newCampaign)] : [],
+      ),
+    );
+    // 连世界都没有：先说这件事，不然「新建战役」会点进一个没有世界可选的向导
+    if (!this.ctx.instances().length) {
+      const emptyWorld = panel(
+        "先有一个世界",
+        paragraph("战役要挂在一个世界上：先创建，或从样例开始。"),
+        el(
+          "div",
+          { class: "u-row" },
+          primary("从样例开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
+          button("创建世界", () => this.ctx.navigate({ pane: "create" })),
+        ),
+      );
+      emptyWorld.classList.add("u-fill");
+      host.appendChild(emptyWorld);
+      return;
+    }
     if (!this.plugins.length && !this.pluginsError) await this.loadPlugins();
     if (!this.campaigns.length && !this.campaignsFailed) await this.loadCampaigns();
     const rows = el("div", { class: "u-rows" });
@@ -290,12 +368,27 @@ export class TrpgPane implements Pane {
         ),
       );
       rows.appendChild(head);
+      // 正文只留人话：世界名 / 时间线名 / 规则名与版本 / 你是玩家还是主持；内部标识收进技术详情
+      const plugin = this.plugins.find(
+        (entry) =>
+          String(entry.ruleset_id) === String(item.ruleset_id) &&
+          String(entry.ruleset_version) === String(item.ruleset_version),
+      );
+      const rulesetName = String(plugin?.name ?? "") || String(item.ruleset_id || "（未声明）");
       rows.appendChild(
         paragraph(
-          `${String(item.instance_name ?? "")}｜${String(item.timeline_id)}｜规则 ${String(item.ruleset_id || "（未声明）")} ${String(item.ruleset_version || "")}｜主持模式 ${String(item.host_mode ?? "")}`,
+          `${String(item.instance_name ?? "")}｜世界线 ${String(item.timeline_name ?? item.timeline_id ?? "")}`
+            + `｜规则 ${rulesetName} ${String(item.ruleset_version || "")}`
+            + `｜${String(item.host_mode ?? "") === "assisted" ? "辅助主持（AI 给建议，你来定）" : "主持模式未声明"}`,
           "u-hint",
         ),
       );
+      const tech = techDetails([
+        ["战役编号", String(item.campaign_id ?? "")],
+        ["世界线编号", String(item.timeline_id ?? "")],
+        ["规则标识", String(item.ruleset_id ?? "")],
+      ]);
+      if (tech) rows.appendChild(tech);
     }
     if (this.campaignsFailed && !this.campaigns.length) {
       // 一条都没读到：别让「读取失败」看起来像「还没有战役」
@@ -305,55 +398,99 @@ export class TrpgPane implements Pane {
       rows.appendChild(
         this.loadFailure(`另有 ${this.campaignsFailed} 个世界读取失败`, this.campaignsError, () => void this.retryCampaigns()),
       );
-    } else if (!this.campaigns.length) {
-      rows.appendChild(paragraph("还没有战役。可以新建一局，或用随发行的样例材料先跑一局。", "u-hint"));
     }
-    host.appendChild(
-      section(
-        "继续已有战役",
-        rows,
-        el(
-          "div",
-          { class: "u-row" },
-          primary("新建战役", () => {
-            this.view = "create";
-            void this.render();
-          }),
-          button("从样例开始", () => void this.startFromSample()),
-        ),
-        paragraph(
-          "玩家 / 主持是进入后的操作视图，不是账号或联网权限；首版新建固定采用辅助裁定。",
-          "u-hint",
-        ),
-      ),
+    // 三块内容各归一块一级分区：列表 / 本机规则 / 外部聊天扩展。以前它们是同重量的盒子平铺
+    const emptyCampaigns = !this.campaigns.length && !this.campaignsFailed;
+    const campaignsPanel = panel(
+      "继续已有战役",
+      rows,
+      // 一条战役都没有时，这两个动作就在下面的空态里，这里不再重复摆一排
+      emptyCampaigns
+        ? null
+        : el("div", { class: "u-row" }, button("从样例开始", () => void this.startFromSample())),
+      // 空态：说明压成一行 + 两个按钮，并把这块撑到主要视口高度，不在 663px 的页面里只画 200px
+      emptyCampaigns
+        ? el(
+            "div",
+            { class: "u-rows" },
+            paragraph("还没有战役：新建一局，或先用随发行的样例材料跑一局。", "u-hint"),
+            el(
+              "div",
+              { class: "u-row" },
+              primary("新建战役", newCampaign),
+              button("从样例开始", () => void this.startFromSample()),
+            ),
+          )
+        : null,
     );
+    if (emptyCampaigns) campaignsPanel.classList.add("u-fill");
+    host.appendChild(campaignsPanel);
     const pluginRows = el("div", { class: "u-rows" });
     for (const item of this.plugins) {
       const line = el("div", { class: "u-row-line" });
       line.appendChild(el("span", { class: "u-grow", text: `${String(item.name || item.ruleset_id)} ${String(item.ruleset_version)}` }));
-      line.appendChild(chip(String(item.status_text ?? item.status), String(item.status) === "available" ? "ok" : "muted"));
+      const status = String(item.status);
+      line.appendChild(
+        chip(
+          // 停用 / 依赖缺失是两回事：前者用户自己能在设置里启用，后者要修规则本身（P1-6）
+          status === "available" ? "已启用" : status === "disabled" ? "已登记但停用" : String(item.status_text ?? status),
+          status === "available" ? "ok" : status === "disabled" ? "pending" : "bad",
+        ),
+      );
       if (item.referenced_count) line.appendChild(chip(`被 ${Number(item.referenced_count)} 局使用`, "muted"));
+      if (status === "disabled") {
+        // 已登记但停用：这里就能启用，不用把用户支去别的页面
+        line.appendChild(button("启用这条规则", () => void this.enableRule(String(item.ruleset_id ?? ""), String(item.ruleset_version ?? ""))));
+      }
       pluginRows.appendChild(line);
     }
     if (this.pluginsError && !this.plugins.length) {
-      // 读取失败与「本机还没有登记规则插件」是两回事：有错就不能显示原空态
+      // 读取失败与「本机还没有登记规则」是两回事：有错就不能显示原空态
       pluginRows.appendChild(this.loadFailure("规则清单读取失败", this.pluginsError, () => void this.retryPlugins()));
     } else if (!this.plugins.length) {
-      pluginRows.appendChild(paragraph("本机还没有登记规则插件。", "u-hint"));
+      pluginRows.appendChild(paragraph("本机还没有登记规则：可以先登记随发行的样例规则，或从本机选择规则目录。", "u-hint"));
     }
+    // 规则包与「外部聊天扩展」不是一件事：用两块的标题 + 各自一个动作说清，不再写一句解释
+    // （2026-10-08 审查第 8 节：用句子解释本可以用布局表达的概念）
     host.appendChild(
-      section(
-        "本机规则",
+      panel(
+        "本机规则（跑团规则包）",
+        this.plugins.length
+          ? dotLine(`${this.plugins.filter((item) => String(item.status) === "available").length} 条可用 / 共 ${this.plugins.length} 条已登记`, "ok")
+          : null,
         pluginRows,
         el(
           "div",
           { class: "u-row" },
           button("从本机选择规则目录…", () => void this.addRuleFromDisk()),
-          button("打开设置里的扩展页", () => this.ctx.navigate({ pane: "settings", sub: "extensions" })),
         ),
-        paragraph("规则与「外部聊天通道」是两件事：这里登记的是跑团规则插件，通道在设置里单独管。", "u-hint"),
       ),
     );
+    host.appendChild(
+      panel(
+        "外部聊天扩展",
+        paragraph("聊天通道、机器人这类扩展与跑团规则分开管，在设置里单独装与停用。", "u-hint"),
+        el(
+          "div",
+          { class: "u-row" },
+          button("打开设置里的扩展页", () => this.ctx.navigate({ pane: "settings", sub: "extensions" })),
+        ),
+      ),
+    );
+  }
+
+  /** 启用一条已登记但停用的规则（P1-6）：失败如实说，成功重读清单让它回到可选状态 */
+  private async enableRule(rulesetId: string, rulesetVersion: string): Promise<void> {
+    if (!rulesetId) return;
+    setNote(this.note, "正在启用这条规则…", "pending");
+    try {
+      await this.ctx.api.rulesEnable(true, rulesetId, rulesetVersion);
+      await this.loadPlugins();
+      setNote(this.note, "这条规则已启用：新建战役时可以选它了", "ok");
+      await this.render();
+    } catch (error) {
+      setNote(this.note, uiError(error, { module: "跑团", action: "启用规则" }).message, "bad");
+    }
   }
 
   private async startFromSample(): Promise<void> {
@@ -446,18 +583,32 @@ export class TrpgPane implements Pane {
     const modal = dialog(
       "登记随发行样例规则",
       [
+        // 字段名标错的地方一并修：state_schema 是「状态数据格式」，不是「规则状态」（评审第六节）
         facts([
           ["名称", String(item.name ?? "")],
           ["规则标识与版本", `${String(item.ruleset_id ?? "")} ${String(item.ruleset_version ?? "")}`],
-          ["规则状态", String(item.state_schema ?? "")],
         ]),
         paragraph("这是随发行附带的样例规则，登记后本机可用；之后可以在设置里停用或移除。选择清单本身不执行它。", "u-hint"),
+        techDetails([
+          ["状态数据格式", String(item.state_schema ?? "")],
+          ["清单位置", manifestPath],
+        ]),
       ],
       [
         {
           label: "登记并继续",
           primary: true,
-          run: () => void this.registerBundledSample(manifestPath, thenPrefill),
+          // 失败返回 false：登记没成时窗不关，窗内说清楚（P0-1）
+          run: async (): Promise<boolean> => {
+            try {
+              await this.registerBundledSample(manifestPath, thenPrefill);
+              return true;
+            } catch {
+              // registerBundledSample 自己已经写了失败提示（页内错误卡）：这里只负责不关窗
+              setNote(this.note, "登记没有完成：按上面的说明重试，或换一个规则目录", "bad");
+              return false;
+            }
+          },
         },
         { label: "取消", run: () => setNote(this.note, "已取消登记随发行样例规则", "muted") },
       ],
@@ -465,6 +616,7 @@ export class TrpgPane implements Pane {
     document.body.appendChild(modal.node);
   }
 
+  /** 登记随发行样例规则；失败往外抛，由调用方决定是关窗还是留在窗里 */
   private async registerBundledSample(manifestPath: string, thenPrefill: boolean): Promise<void> {
     setNote(this.note, "正在登记随发行样例规则…", "pending");
     try {
@@ -482,6 +634,7 @@ export class TrpgPane implements Pane {
         uiError(error, { module: "跑团", action: "登记随发行样例规则" }),
         () => void this.registerBundledSample(manifestPath, thenPrefill),
       );
+      throw error;
     }
   }
 
@@ -503,7 +656,7 @@ export class TrpgPane implements Pane {
     setNote(this.note, "正在打开目录选择…", "pending");
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const picked = await invoke<string | null>("pick_dir", { title: "选择规则插件所在目录" });
+      const picked = await invoke<string | null>("pick_dir", { title: "选择规则包所在目录" });
       if (!picked) {
         setNote(this.note, "已取消选择", "muted");
         return;
@@ -511,39 +664,42 @@ export class TrpgPane implements Pane {
       const scanned = await this.ctx.api.rulesScan(picked);
       const candidates = (scanned.candidates as Json[]) ?? [];
       if (!candidates.length) {
-        setNote(this.note, `这个位置没有找到规则插件清单：${String(scanned.reason ?? "")}`, "bad");
+        setNote(this.note, `这个位置没有找到规则包清单：${String(scanned.reason ?? "")}`, "bad");
         return;
       }
       const item = candidates[0];
       const note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
       const modal = dialog(
-        "添加并启用规则插件",
+        "添加并启用规则",
         [
           facts([
-            ["来源目录", picked],
             ["名称", String(item.name ?? "")],
             ["规则标识与版本", `${String(item.ruleset_id ?? "")} ${String(item.ruleset_version ?? "")}`],
-            ["协议", String(item.protocol ?? "")],
-            ["入口", ((item.entry as string[]) ?? []).join(" ")],
             ["状态", String(item.status ?? "")],
           ]),
-          paragraph("登记之后核心会在裁定阶段把这份规则作为本地扩展程序运行；进程隔离不是完整安全沙箱。选择文件本身不执行它。", "u-hint"),
+          paragraph("登记之后，规则会在按规则算结果时作为本地扩展程序运行；进程隔离不是完整安全沙箱。选择文件本身不执行它。", "u-hint"),
+          techDetails([
+            ["来源目录", picked],
+            ["协议", String(item.protocol ?? "")],
+            ["入口", ((item.entry as string[]) ?? []).join(" ")],
+          ]),
           note,
         ],
         [
           {
             label: "添加并启用",
-            run: () => {
-              void (async () => {
-                try {
-                  const result = await this.ctx.api.rulesRegister(String(item.manifest_path ?? picked));
-                  await this.loadPlugins();
-                  setNote(this.note, `已登记并启用：${String((result.plugin as Json)?.name ?? "")}（新建战役时可选）`, "ok");
-                  await this.render();
-                } catch (error) {
-                  setNote(note, uiError(error, { module: "规则登记", action: "添加并启用" }).message, "bad");
-                }
-              })();
+            // 失败返回 false：注册没成时窗不关，原因写在窗内（P0-1）
+            run: async () => {
+              try {
+                const result = await this.ctx.api.rulesRegister(String(item.manifest_path ?? picked));
+                await this.loadPlugins();
+                setNote(this.note, `已登记并启用：${String((result.plugin as Json)?.name ?? "")}（新建战役时可选）`, "ok");
+                await this.render();
+                return true;
+              } catch (error) {
+                setNote(note, uiError(error, { module: "规则登记", action: "添加并启用" }).message, "bad");
+                return false;
+              }
             },
           },
           { label: "取消", run: () => undefined },
@@ -559,19 +715,27 @@ export class TrpgPane implements Pane {
 
   private async renderCreate(host: HTMLElement): Promise<void> {
     const instances = this.ctx.instances();
+    host.appendChild(
+      pageHead("跑团", "声明行动，按规则得到结果；没算出真实结果就不说成功", [
+        button("返回", () => {
+          this.view = "list";
+          void this.render();
+        }),
+      ]),
+    );
     if (!instances.length) {
-      host.appendChild(
-        section(
-          "先有一个世界",
-          paragraph("战役要挂在一个世界上：先创建或从样例开始。"),
-          el(
-            "div",
-            { class: "u-row" },
-            primary("从样例开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
-            button("创建世界", () => this.ctx.navigate({ pane: "create" })),
-          ),
+      const emptyWorld = panel(
+        "先有一个世界",
+        paragraph("战役要挂在一个世界上：先创建或从样例开始。"),
+        el(
+          "div",
+          { class: "u-row" },
+          primary("从样例开始", () => this.ctx.navigate({ pane: "onboarding", sub: "sample" })),
+          button("创建世界", () => this.ctx.navigate({ pane: "create" })),
         ),
       );
+      emptyWorld.classList.add("u-fill");
+      host.appendChild(emptyWorld);
       return;
     }
     if (!this.plugins.length) await this.loadPlugins();
@@ -615,6 +779,11 @@ export class TrpgPane implements Pane {
 
     const rulePicker = el("select", { class: "u-input", id: "u-trpg-rule" }) as HTMLSelectElement;
     const usable = this.plugins.filter((item) => String(item.status) === "available");
+    // 已登记但停用 / 依赖缺失的规则：规则栏里要区分它们与「根本没登记」（P1-6）
+    const registeredUnusable = this.plugins.filter((item) => {
+      const status = String(item.status);
+      return status !== "available" && status !== "unregistered";
+    }).length;
     for (const item of usable) {
       rulePicker.appendChild(
         el("option", {
@@ -668,8 +837,9 @@ export class TrpgPane implements Pane {
     const sceneBrief = el("textarea", { class: "u-textarea", rows: "2", id: "u-trpg-scene-brief", placeholder: "公开简介（玩家可见）" }) as HTMLTextAreaElement;
     sceneBrief.value = this.draft.sceneBrief;
     const sceneKind = el("select", { class: "u-input", id: "u-trpg-scene-kind" }) as HTMLSelectElement;
-    for (const kind of ["exploration", "conflict", "social", "downtime"]) {
-      sceneKind.appendChild(el("option", { value: kind, text: kind }));
+    // 提交给核心的仍是原始标识（option 的 value），屏幕上只给中文（P1-9）
+    for (const [kind, label] of SCENE_KINDS) {
+      sceneKind.appendChild(el("option", { value: kind, text: label }));
     }
     sceneKind.value = this.draft.sceneKind;
     const sceneLocation = el("input", { class: "u-input", id: "u-trpg-scene-location", value: this.draft.sceneLocation, placeholder: "地点（世界里的登记对象标识或名称）" }) as HTMLInputElement;
@@ -685,37 +855,62 @@ export class TrpgPane implements Pane {
     });
 
     host.appendChild(
-      section(
+      panel(
         "新建战役",
-        paragraph("按顺序走完五项就能开始：名称 → 世界与时间线 → 规则 → 角色 → 开场场景。中间任何一步都可以先「保存为准备中」。"),
-        field("战役名称", name),
-        field("世界", instancePicker),
-        field("时间线", timelinePicker),
-        String(timeline.state) === "active"
-          ? paragraph(
-              "这条时间线正在运行：同线的联络与其他战役都会受影响。默认建议另开一条跑团时间线（新线先暂停）。",
-              "u-hint",
-            )
-          : paragraph("新分支与新时间线都先暂停；「开始战役」会同时启动这条线。", "u-hint"),
-        String(timeline.state) === "active"
-          ? button("另开一条跑团时间线…", () => void this.forkTimelineForPlay())
-          : null,
-        field("规则与版本", rulePicker),
-        usable.length
-          ? paragraph("登记过的规则都在这里；规则名与版本分别登记，缺失或不适配的不会出现在这一栏。", "u-hint")
-          : paragraph("本机还没有可用规则：可以登记随发行样例规则，或从本机选择规则目录。", "u-hint"),
-        el(
-          "div",
-          { class: "u-row" },
-          button("从本机选择规则目录…", () => void this.addRuleFromDisk()),
-          usable.length ? null : button("登记随发行样例规则", () => void this.useBundledRule(false)),
+        // 一级只包一层（panel）：五个阶段各是一张二级浅描边卡片，顺序一眼可见，
+        // 而不是五个同重量盒子平铺（2026-10-08 审查根因 1：全站只有一个视觉重量）
+        paragraph("按顺序走完五项就能开始：中间任何一步都可以先「保存为准备中」。"),
+        section("① 名称", field("战役名称", name)),
+        section(
+          "② 世界与世界线",
+          field("世界", instancePicker),
+          field("世界线", timelinePicker),
+          String(timeline.state) === "active"
+            ? paragraph(
+                "这条世界线正在运行：同线的联络与其他战役都会受影响。默认建议另开一条跑团世界线（新线先暂停）。",
+                "u-hint",
+              )
+            : paragraph("新分支与新世界线都先暂停；「开始战役」会同时启动这条线。", "u-hint"),
+          String(timeline.state) === "active"
+            ? button("另开一条跑团世界线…", () => void this.forkTimelineForPlay())
+            : null,
         ),
-        paragraph(
-          "角色属性来自规则插件自己声明的初始化材料；没有适配的插件时这里不做自动建卡，只按已登记的角色参与。",
-          "u-hint",
+        section(
+          "③ 规则",
+          field("规则与版本", rulePicker),
+          // 「没登记」与「登记了但停用」是两种下一步：后者不该再劝用户去找规则目录（P1-6）
+          usable.length
+            ? paragraph(
+                registeredUnusable
+                  ? `还有 ${registeredUnusable} 条已登记的规则不能选：它们被停用或缺少依赖。要在这里用上，去设置里启用。`
+                  : "登记过的规则都在这里；规则名与版本分别登记，缺失或不适配的不会出现在这一栏。",
+                "u-hint",
+              )
+            : paragraph("本机还没有可用的规则：可以登记随发行样例规则，或从本机选择规则目录。", "u-hint"),
+          el(
+            "div",
+            { class: "u-row" },
+            button("从本机选择规则目录…", () => void this.addRuleFromDisk()),
+            usable.length ? null : button("登记随发行样例规则", () => void this.useBundledRule(false)),
+            registeredUnusable ? button("去设置里启用规则", () => this.ctx.navigate({ pane: "settings", sub: "extensions" })) : null,
+          ),
         ),
-        charBox,
-        section("开场场景", field("场景名称", sceneName), field("公开简介", sceneBrief), field("场景类型", sceneKind), field("地点", sceneLocation), field("仅主持说明", scenePrivate)),
+        section(
+          "④ 角色",
+          paragraph(
+            "角色属性来自规则自己声明的初始化材料；没有适配的规则时这里不做自动建卡，只按已登记的角色参与。",
+            "u-hint",
+          ),
+          charBox,
+        ),
+        section(
+          "⑤ 开场场景",
+          field("场景名称", sceneName),
+          field("公开简介", sceneBrief),
+          field("场景类型", sceneKind),
+          field("地点", sceneLocation),
+          field("仅主持说明", scenePrivate),
+        ),
         (() => {
           const box = el("div", { id: "u-trpg-summary" });
           const paint = (): void => {
@@ -724,7 +919,10 @@ export class TrpgPane implements Pane {
               facts([
                 ["战役名称", displayName(this.draft.name, "", "（还没写名字）")],
                 ["世界", instances.find((item) => item.id === this.draft.instanceId)?.name ?? ""],
-                ["时间线", `${String(this.draft.timelineId)}`],
+                // 摘要里写世界线的名字：内部编号对用户没有意义（P1-9）
+                ["世界线", String(this.draft.timelineId
+                  ? timelines.find((entry) => String(entry.id) === this.draft.timelineId)?.name ?? ""
+                  : "") || "（还没选）"],
                 ["规则与版本", this.draft.rulesetId ? `${String(this.draft.rulesetId)} ${String(this.draft.rulesetVersion)}` : "（还没选）"],
                 ["活动角色", this.draft.participants.length ? this.draft.participants.join("、") : "（还没选）"],
                 ["开场场景", displayName(this.draft.sceneName, "", "（还没写名字）")],
@@ -740,10 +938,6 @@ export class TrpgPane implements Pane {
           { class: "u-row" },
           primary("开始战役", () => void this.createCampaign("active")),
           button("保存为准备中", () => void this.createCampaign("preparing")),
-          button("返回", () => {
-            this.view = "list";
-            void this.render();
-          }),
         ),
       ),
     );
@@ -752,10 +946,20 @@ export class TrpgPane implements Pane {
   private async forkTimelineForPlay(): Promise<void> {
     try {
       const commits = await this.ctx.api.commits(this.draft.instanceId, this.draft.timelineId);
-      const head = String(((commits.commits as Json[]) ?? [])[0]?.id ?? "");
+      let head = String(((commits.commits as Json[]) ?? [])[0]?.id ?? "");
       if (!head) {
-        setNote(this.note, "这条线还没有版本点：先在世界与素材里保存一个，再从它另开跑团线", "bad");
-        return;
+        // 就地补上「保存版本点」：不让用户为了一步操作跑去另一个页面（与写作页同一套做法）
+        const saved = await this.ctx.api.saveVersion(this.draft.instanceId, this.draft.timelineId, "另开跑团线前保存当前进度");
+        // runtime.commit 回的是 { commit: {...} }：编号在 commit.id 上
+        head = String((saved.commit as Json | undefined)?.id ?? saved.commit_id ?? "");
+        if (!head) {
+          const again = await this.ctx.api.commits(this.draft.instanceId, this.draft.timelineId);
+          head = String(((again.commits as Json[]) ?? [])[0]?.id ?? "");
+        }
+        if (!head) {
+          setNote(this.note, "这条线还没有可用的进度记录：这个版本没能保存成功，请重试一次", "bad");
+          return;
+        }
       }
       const result = await this.ctx.api.waBranch({
         instance_id: this.draft.instanceId,
@@ -765,10 +969,10 @@ export class TrpgPane implements Pane {
       });
       const timeline = (result.timeline as Json) ?? {};
       this.draft.timelineId = String(timeline.id ?? "");
-      setNote(this.note, `已另开一条跑团时间线「${String(timeline.name ?? "")}」（暂停，开始战役时启动）`, "ok");
+      setNote(this.note, `已另开一条跑团世界线「${String(timeline.name ?? "")}」（暂停；点「开始战役」时会同时启动它）`, "ok");
       await this.render();
     } catch (error) {
-      setNote(this.note, uiError(error, { module: "跑团", action: "另开时间线" }).message, "bad");
+      setNote(this.note, uiError(error, { module: "跑团", action: "另开世界线" }).message, "bad");
     }
   }
 
@@ -778,10 +982,17 @@ export class TrpgPane implements Pane {
       return;
     }
     if (!this.draft.rulesetId) {
-      setNote(this.note, "先选规则与版本：核心只在规则版本、参与者、初始状态和场景都合法时才允许开始", "bad");
+      setNote(
+        this.note,
+        registeredUnusableHint(this.plugins, this.draft.rulesetId)
+          ? "这条规则已被停用或缺少依赖：先在下面点「去设置里启用规则」，或在上面选一条已启用的规则"
+          : "先选规则与版本：核心只在规则版本、参与者、初始状态和场景都合法时才允许开始",
+        "bad",
+      );
       return;
     }
     setNote(this.note, status === "active" ? "正在创建战役…" : "正在保存准备中的战役…", "pending");
+    let activateError: string | null = null;
     try {
       const created = await this.ctx.api.trpgCampaignCreate({
         instance_id: this.draft.instanceId,
@@ -804,21 +1015,26 @@ export class TrpgPane implements Pane {
             }
           : null,
       });
-      if (status === "active" && String(this.draft.timelineId) && String((this.campaigns[0] ?? {}).status ?? "") !== "") {
-        // 开始战役同时明确启动目标线（§8.1）：冻结线要显式激活，不然世界不动
-        try {
-          await this.ctx.api.activate(this.draft.instanceId, this.draft.timelineId);
-        } catch {
-          /* 已经是运行中的线：不影响战役本身 */
-        }
+      if (status === "active" && this.draft.timelineId) {
+        // 「开始战役」承诺同时启动这条线：忘掉这一步会让战役建成、世界却不动（P0-2）
+        activateError = await this.activateTimeline(this.draft.instanceId, this.draft.timelineId);
       }
-      setNote(
-        this.note,
-        status === "active"
-          ? `战役「${String(created.name ?? this.draft.name)}」已开始：${String(created.status ?? "")}`
-          : `已保存为准备中：${String(created.name ?? this.draft.name)}（核心只在规则版本、参与者、初始状态与场景都合法时才允许开始）`,
-        "ok",
-      );
+      // 提示必须与真实状态一致：线没启动就不能说「战役已开始」
+      if (status === "active") {
+        setNote(
+          this.note,
+          activateError
+            ? `战役「${String(created.name ?? this.draft.name)}」已建成，但这条世界线没有启动：${activateError}。世界里现在不会推进，请重试，或到「世界与素材」启动它。`
+            : `战役「${String(created.name ?? this.draft.name)}」已开始，这条世界线也已启动`,
+          activateError ? "bad" : "ok",
+        );
+      } else {
+        setNote(
+          this.note,
+          `已保存为准备中：${String(created.name ?? this.draft.name)}（核心只在规则版本、参与者、初始状态与场景都合法时才允许开始）`,
+          "ok",
+        );
+      }
       await this.open(this.draft.instanceId, this.draft.timelineId, String(created.campaign_id), String(created.name ?? this.draft.name));
     } catch (error) {
       setNote(
@@ -830,6 +1046,22 @@ export class TrpgPane implements Pane {
         }).message,
         "bad",
       );
+    }
+  }
+
+  /**
+   * 明确启动目标线（§8.1）：冻结的线要显式启动，不然世界里什么都不会动。
+   * 返回 null 表示已经启动或启动成功；返回字符串表示启动失败的真实原因（由调用方如实报出）。
+   */
+  private async activateTimeline(instanceId: string, timelineId: string): Promise<string | null> {
+    try {
+      await this.ctx.api.activate(instanceId, timelineId);
+      return null;
+    } catch (error) {
+      const message = uiError(error, { module: "跑团", action: "启动世界线" }).message;
+      // 已经是运行中的线：核心会拒一次，这不算失败（它本来就是我们要的结果）
+      if (/已在运行|正在运行|already|active/i.test(message)) return null;
+      return message;
     }
   }
 
@@ -905,7 +1137,7 @@ export class TrpgPane implements Pane {
       const violations = (gates.violations as Json[]) ?? [];
       setNote(
         this.note,
-        violations.length ? `这一面有 ${violations.length} 处不该出现的内容，已按受众契约拦下` : "局面已读取",
+        violations.length ? `这个视图里有 ${violations.length} 处不该出现的内容，已按「能不能给玩家看」的约定拦下` : "局面已读取",
         violations.length ? "bad" : "ok",
       );
       await this.render();
@@ -920,32 +1152,52 @@ export class TrpgPane implements Pane {
     const campaign = (faces.campaign as Json) ?? {};
     const scene = (faces.scene as Json) ?? {};
     const next = (faces.next as Json) ?? {};
+    // ① 标题带：战役名 + 一句定位语。世界时间与现实时间分开这件事收进定位语，不再单占一行
+    host.appendChild(
+      pageHead(
+        displayName(campaign.display_name ?? campaign.name, this.campaignId, "未命名战役"),
+        `当前是${this.mode === "gm" ? "主持视图" : "玩家视图"}：这里是故事里的进度，不是真实钟表时间`
+          + `｜${STATUS_TEXT[String(campaign.status)] ?? String(campaign.status)}`,
+        [
+          button("刷新局面", () => void this.refresh()),
+          button("返回战役列表", () => {
+            this.view = "list";
+            this.campaigns = [];
+            // 清单要按离开后的世界重新读：连失败标记一起清掉，避免拿旧失败冒充本次结果
+            this.campaignsFailed = 0;
+            this.campaignsError = null;
+            void this.render();
+          }),
+        ],
+      ),
+    );
+    // ② 工具带：玩家视图 / 主持视图就是这一页的两个看法。用选中态表达「你现在在哪一面」，
+    // 不再要求用户读一句话再自己换算（2026-10-08 审查第 8 节）
+    host.appendChild(
+      tools(
+        [
+          { label: "玩家视图", current: this.mode === "player", onSelect: () => void this.switchMode("player") },
+          { label: "主持视图", current: this.mode === "gm", onSelect: () => void this.switchMode("gm") },
+        ],
+        "跑团视图",
+      ),
+    );
+    // 世界线编号与世界内进度（无单位的大数字）收进技术详情：正文里对用户没有意义（P1-9）
+    const world = (faces.world as Json) ?? {};
+    const worldTech = techDetails([
+      ["世界线编号", this.timelineId],
+      ["世界内进度", String(world.revision ?? "") ? `已推进 ${String(world.revision)} 个进度点` : ""],
+    ]);
     host.appendChild(
       el(
         "div",
         { class: "u-row u-row-wrap" },
-        el("h2", { class: "u-h2 u-grow", text: displayName(campaign.display_name ?? campaign.name, this.campaignId, "未命名战役") }),
-        chip(`视角：${this.mode === "gm" ? "主持" : "玩家"}`, "muted"),
+        chip(`当前是${this.mode === "gm" ? "主持视图" : "玩家视图"}`, "muted"),
         chip(STATUS_TEXT[String(campaign.status)] ?? String(campaign.status), "pending"),
-        button("主持准备", () => void this.switchMode(this.mode === "gm" ? "player" : "gm")),
-        button("刷新局面", () => void this.refresh()),
-        button("返回战役列表", () => {
-          this.view = "list";
-          this.campaigns = [];
-          // 清单要按离开后的世界重新读：连失败标记一起清掉，避免拿旧失败冒充本次结果
-          this.campaignsFailed = 0;
-          this.campaignsError = null;
-          void this.render();
-        }),
+        worldTech,
       ),
     );
-    host.appendChild(
-      paragraph(
-        `时间线 ${this.timelineId}｜世界时刻 ${String(((faces.world as Json) ?? {}).revision ?? "")}；世界时间与现实时间分开看。`,
-        "u-hint",
-      ),
-    );
-    // 现在走到哪一步：核心只给阶段名，用一条轨把「写下行动 → 确认卡 → 裁定 → 写入世界」画出来
+    // 现在走到哪一步：核心只给阶段名，用一条轨把「写下行动 → 确认卡 → 按规则算结果 → 写入世界」画出来
     const rail = this.actionRail(bundle);
     if (rail) host.appendChild(rail);
     host.appendChild(
@@ -962,7 +1214,7 @@ export class TrpgPane implements Pane {
           ],
           ["场地", ((scene.scene as Json)?.location_refs as string[])?.join("、") || "（未注明）"],
           ["在场者", ((scene.scene as Json)?.participants as string[])?.join("、") || "（未注明）"],
-          ["推进节拍", NEXT_KIND[String((scene.scene as Json)?.advance_mode ?? "")] ?? String((scene.scene as Json)?.advance_mode ?? "")],
+          ["节奏", NEXT_KIND[String((scene.scene as Json)?.advance_mode ?? "")] ?? String((scene.scene as Json)?.advance_mode ?? "")],
         ]),
         paragraph(String((scene.scene as Json)?.description ?? "") || "（没有公开简介）", "u-hint"),
         bulletList(((scene.public_facts as Json[]) ?? []).map((item) => `已知：${String(item.text ?? item.summary ?? item)}`), "u-list"),
@@ -979,8 +1231,9 @@ export class TrpgPane implements Pane {
           : paragraph("没有等待处理的选择。", "u-hint"),
         ((scene.unfinished_actions as Json[]) ?? []).length
           ? bulletList(
+              // 按顺序编号：行动的内部编号对用户没有意义（P1-9）
               ((scene.unfinished_actions as Json[]) ?? []).map(
-                (item) => `行动 ${shortId(String(item.action_id))}：${String((item.state as Json)?.label ?? item.status)}`,
+                (item, index) => `行动 ${index + 1}：${String((item.state as Json)?.label ?? stageText(String(item.status ?? "")))}`,
               ),
               "u-list",
             )
@@ -993,7 +1246,7 @@ export class TrpgPane implements Pane {
         ((scene.action_results as Json[]) ?? []).length
           ? bulletList(
               ((scene.action_results as Json[]) ?? []).map(
-                (item) => `行动 ${shortId(String(item.action_id))}：${String((item.state as Json)?.label ?? item.status)}`,
+                (item, index) => `行动 ${index + 1}：${String((item.state as Json)?.label ?? stageText(String(item.status ?? "")))}`,
               ),
               "u-list",
             )
@@ -1044,8 +1297,8 @@ export class TrpgPane implements Pane {
         el(
           "div",
           { class: "u-row" },
-          primary("查看行动确认卡", () => void this.declareAction(false)),
-          button("确认并裁定", () => void this.declareAction(true)),
+          primary("查看这次行动", () => void this.declareAction(false)),
+          button("确认并算结果", () => void this.declareAction(true)),
         ),
         this.draftCard(),
       ),
@@ -1066,13 +1319,13 @@ export class TrpgPane implements Pane {
     return flowRail(ACTION_STEPS, current);
   }
 
-  /** 行动确认卡（§8.2/§8.3）：行动者 / 目标 / 方法 / 已知代价 / 缺什么，缺了就不给确认。 */
+  /** 这次行动的表（§8.2/§8.3）：行动者 / 目标 / 方法 / 已知代价 / 缺什么，缺了就不给确认。 */
   private draftCard(): HTMLElement {
     const draft = ((this.bundle?.draft as Json) ?? null) as Json | null;
     if (!draft) {
       return section(
-        "行动确认卡",
-        paragraph("还没有草稿：写下行动、填上行动者与目标，点「查看行动确认卡」。", "u-hint"),
+        "这次行动",
+        paragraph("还没有可确认的行动：写下行动、填上行动者与目标，点「查看这次行动」。", "u-hint"),
       );
     }
     const fields = ((draft.fields as Json) ?? {}) as Json;
@@ -1084,19 +1337,19 @@ export class TrpgPane implements Pane {
       return where === "user" ? "你填的" : where === "model" ? "由 AI 补的" : where === "uncertain" ? "待你确认" : "";
     };
     return section(
-      "行动确认卡",
+      "这次行动",
       facts([
         ["行动者", `${String(fields.actor ?? "") || "（未定）"}${sourceText("actor") ? `｜${sourceText("actor")}` : ""}`],
         ["目标", `${String(fields.target ?? "") || "（未定）"}${sourceText("target") ? `｜${sourceText("target")}` : ""}`],
         ["方法", `${String(fields.method ?? "") || "（未定）"}${sourceText("method") ? `｜${sourceText("method")}` : ""}`],
         ["打算", String(fields.intent ?? "") || "（未定）"],
-        ["已知代价", risks.length ? "由规则裁定（没有真实裁定就不给估计）" : "（未列出）"],
+        ["已知代价", risks.length ? "由规则算出（没有真实结果就不给估计）" : "（未列出）"],
       ]),
       gaps.length
         ? bulletList(gaps.map((item) => `缺：${item}`), "u-list")
-        : paragraph("确认卡齐了：可以点「确认并裁定」。", "u-hint"),
+        : paragraph("这几项齐了：可以点「确认并算结果」。", "u-hint"),
       paragraph(
-        String(this.bundle?.blocked ?? "") || "没有真实裁定之前，这里不会出现骰点或成功字样，也不会提前写成世界已经改变。",
+        String(this.bundle?.blocked ?? "") || "没有按规则算出真实结果之前，这里不会出现骰点或「成功」，也不会提前写成世界已经改变。",
         "u-hint",
       ),
     );
@@ -1143,7 +1396,7 @@ export class TrpgPane implements Pane {
       setNote(this.note, "先写下你想做什么", "bad");
       return;
     }
-    setNote(this.note, confirm ? "正在确认并裁定…" : "正在整理行动确认卡…", "pending");
+    setNote(this.note, confirm ? "正在确认并算结果…" : "正在整理这次行动…", "pending");
     try {
       const actorId = String(
         (this.host?.querySelector("#u-trpg-actor") as HTMLSelectElement | null)?.value ?? this.actorId,
@@ -1181,22 +1434,22 @@ export class TrpgPane implements Pane {
       // 「阶段」这个词对用户没意义：把「现在停在哪一步」说人话，理由用核心给的原文
       const committed = Boolean(result.committed);
       const rail = this.actionRail(result);
-      const stopped = String(rail?.querySelector(".u-rail-current .u-rail-label")?.textContent ?? "") || stage;
+      const stopped = String(rail?.querySelector(".u-rail-current .u-rail-label")?.textContent ?? "") || stageText(stage);
       const why = String(result.skipped ?? "") || String(((result.errors as string[]) ?? [])[0] ?? "");
       setNote(
         this.note,
         confirm
           ? committed
-            ? "裁定与后果已固化；世界里已经按它变化"
-            : `规则给了结果，世界还没变：这一轮停在「${stopped}」${why ? `——${why}` : "（没有真实裁定就不显示骰点，也不说成功）"}`
-          : `行动确认卡已就绪（阶段 ${stage}）`,
+            ? "结果已经写进世界：这次变化已经生效"
+            : `规则给了结果，世界还没变：这一轮停在「${stopped}」${why ? `——${why}` : "（没有真实结果就不显示骰点，也不说成功）"}`
+          : `这次行动可以确认了（现在停在「${stageText(stage)}」）`,
         confirm ? (committed ? "ok" : "pending") : "muted",
       );
       await this.render();
     } catch (error) {
       setNote(
         this.note,
-        uiError(error, { module: "跑团", action: confirm ? "确认并裁定" : "整理行动" }).message,
+        uiError(error, { module: "跑团", action: confirm ? "确认并算结果" : "整理这次行动" }).message,
         "bad",
       );
     }
@@ -1209,15 +1462,16 @@ export class TrpgPane implements Pane {
     const push = (missing: boolean, name: string, guarantee: string): void => {
       if (missing) rows.push([name, guarantee]);
     };
-    push(stage === "needs_input", "补充行动", "模型只补空项；你填过的行动者、目标与方法不被静默替换");
-    push(stage === "awaiting_confirmation", "确认并裁定", "改任何关键项都会让旧确认失效");
-    push(stage === "submitting" || stage === "resolving", "查看阶段", "不取消后自动重掷；切页不会发第二次裁定");
-    push(stage === "unknown", "查询原结果", "同操作身份核验；结果未明时不重新裁定");
-    push(stage === "plugin_failed", "恢复已保存结果 / 重新裁定", "有结果先恢复；重做可能改变随机结果，需要你明确确认");
-    push(Boolean((bundle.faces as Json)?.stale), "重新读取并确认", "旧结果留作记录，重新检查后生成新的确认卡");
+    // 阶段名只用来判断，不直接上屏：正文里一律走 stageText 的中文（P1-9）
+    push(stage === "needs_input", "补充行动", "AI 只补空项；你填过的行动者、目标与方法不被静默替换");
+    push(stage === "awaiting_confirmation", "确认并算结果", "改任何关键项都会让旧确认失效");
+    push(stage === "submitting" || stage === "resolving", `查看进度（${stageText(stage)}）`, "不取消后自动重掷；切页不会算第二次");
+    push(stage === "unknown", "查询原结果", "用同一次操作去核对；结果还没确认时不重新算一次");
+    push(stage === "plugin_failed", "恢复已保存结果 / 重新算一次", "有结果先恢复；重做可能改变随机结果，需要你明确确认");
+    push(Boolean((bundle.faces as Json)?.stale), "重新读取并确认", "旧结果留作记录，重新检查后生成新的行动确认");
     if (!rows.length) {
       host.appendChild(
-        section("这一步能做什么", paragraph("按上面的按钮走：声明行动 → 查看确认卡 → 确认并裁定；有待选择时先处理选择。", "u-hint")),
+        section("这一步能做什么", paragraph("按上面的按钮走：写下行动 → 查看这次行动 → 确认并算结果；有待选择时先处理选择。", "u-hint")),
       );
       return;
     }
@@ -1230,7 +1484,7 @@ export class TrpgPane implements Pane {
     );
   }
 
-  /* ------------------------------------------------------------ §8.4 主持面 */
+  /* ------------------------------------------------------------ §8.4 主持视图 */
 
   private async switchMode(mode: "player" | "gm"): Promise<void> {
     try {
@@ -1242,7 +1496,7 @@ export class TrpgPane implements Pane {
       this.workspace = (result.workspace as Json) ?? this.workspace;
       const faces = ((result.faces as Json) ?? {}) as Json;
       if (mode === "gm" && !faces.gm) {
-        // 切换没带回主持面：老老实实再读一次局面，而不是拿玩家面冒充主持面
+        // 切换没带回主持视图：老老实实再读一次局面，而不是拿玩家视图冒充主持视图
         await this.refresh();
         return;
       }
@@ -1250,13 +1504,13 @@ export class TrpgPane implements Pane {
       setNote(
         this.note,
         mode === "gm"
-          ? "已切到主持视图：这里能看到待审与规则依据，但发布出去的仍是按受众裁过的表达"
-          : "已切回玩家视图：受众投影重新取过，主持缓存已丢",
+          ? "已切到主持视图：这里能看到待审与规则依据，但发出去的内容仍是按能不能给玩家看裁过的"
+          : "已切回玩家视图：给玩家看的内容重新取过，主持视图的缓存已丢",
         "muted",
       );
       await this.render();
     } catch (error) {
-      setNote(this.note, uiError(error, { module: "跑团", action: "切换视角" }).message, "bad");
+      setNote(this.note, uiError(error, { module: "跑团", action: "切换视图" }).message, "bad");
     }
   }
 
@@ -1266,29 +1520,32 @@ export class TrpgPane implements Pane {
     const rows = el("div", { class: "u-rows" });
     for (const item of queue) {
       const row = el("div", { class: "u-row-line" });
-      row.appendChild(el("span", { class: "u-grow", text: `行动 ${shortId(String(item.action_id))}｜${String(item.status ?? "")}` }));
+      // 待审列表按顺序编号：行动的内部编号对用户没有意义（P1-9）
+      row.appendChild(
+        el("span", { class: "u-grow", text: `待审行动 ${rows.childElementCount + 1}｜${stageText(String(item.status ?? ""))}` }),
+      );
       const canApprove = Boolean(item.committable);
       row.appendChild(
         canApprove
           ? button("批准并提交", () => void this.reviewAction(String(item.action_id ?? ""), "approve"))
           : chip("材料不足：只能补充、修改或拒绝", "muted"),
       );
-      row.appendChild(button("暂存待审", () => void this.reviewAction(String(item.action_id ?? ""), "hold")));
+      row.appendChild(button("先放一放", () => void this.reviewAction(String(item.action_id ?? ""), "hold")));
       row.appendChild(button("拒绝", () => void this.reviewAction(String(item.action_id ?? ""), "reject")));
       rows.appendChild(row);
     }
     if (!queue.length) rows.appendChild(paragraph("没有待审行动。", "u-hint"));
     host.appendChild(
       section(
-        "主持准备 · 待处理行动",
+        "主持视图 · 待处理行动",
         rows,
-        paragraph("只有仍有效、且有可提交载荷的结果才显示「批准并提交」；没有万能批准按钮。", "u-hint"),
+        paragraph("只有仍然有效、而且有东西可提交的结果才显示「批准并提交」；没有一键全批准。", "u-hint"),
       ),
     );
     host.appendChild(
       section(
         "直接变化",
-        paragraph("要直接改写世界，走「预览 → 确认」这条路：预览不改世界，确认后才落成事实。"),
+        paragraph("要直接改写世界，走「预览 → 确认提交」这条路：预览不改世界，确认后才落成事实。"),
         el(
           "div",
           { class: "u-row" },
@@ -1300,19 +1557,19 @@ export class TrpgPane implements Pane {
     host.appendChild(
       section(
         "场景准备",
-        paragraph("新场景的开场材料（名称 / 公开简介 / 地点 / 在场者 / 风险 / 可行动作）与「仅主持」说明分开填。"),
+        paragraph("新场景的开场材料（名称 / 公开简介 / 地点 / 在场者 / 风险 / 可行动作）与只给主持人看的说明分开填。"),
         button("准备下一个场景…", () => void this.openSceneForm()),
       ),
     );
     host.appendChild(
       section(
         "暂停战役",
-        paragraph("暂停默认只停这一局的行动；世界仍可能继续运行。同线联络与其他战役会受影响，是否连时间线一起暂停要单独选。"),
+        paragraph("暂停默认只停这一局的行动；世界仍可能继续推进。同一条世界线上的联络与其他战役都会受影响，要不要连这条世界线一起暂停，要单独选。"),
         el(
           "div",
           { class: "u-row" },
           button("只暂停战役", () => void this.setCampaignStatus("paused")),
-          button("暂停战役并暂停这条时间线", () => void this.pauseWithTimeline()),
+          button("暂停战役并暂停这条世界线", () => void this.pauseWithTimeline()),
         ),
       ),
     );
@@ -1329,7 +1586,7 @@ export class TrpgPane implements Pane {
       setNote(this.note, `已记下主持决定：${decision}`, "ok");
       await this.refresh();
     } catch (error) {
-      setNote(this.note, uiError(error, { module: "主持准备", action: "记下决定" }).message, "bad");
+      setNote(this.note, uiError(error, { module: "主持视图", action: "记下决定" }).message, "bad");
     }
   }
 
@@ -1346,55 +1603,61 @@ export class TrpgPane implements Pane {
         field("对象", target),
         field("变化后的值", value),
         field("理由", reason),
-        paragraph("先预览：预览不改世界；确认后走联合提交，世界与规则状态同批成功或同批失败。", "u-hint"),
+        paragraph("先预览：预览不改世界；确认提交时世界与规则状态同批成功或同批失败。", "u-hint"),
         note,
       ],
       [
         {
           label: "预览",
-          run: () => {
-            void (async () => {
-              try {
-                const result = await this.ctx.api.trpgClient("gm_change", {
-                  instance_id: this.instanceId, timeline_id: this.timelineId, campaign_id: this.campaignId,
-                  mode: "gm", workspace: this.workspace, preview_only: true,
-                  form: {
-                    target_ref: target.value.trim(), kind: kind.value.trim(), value: value.value.trim(),
-                    reason: reason.value.trim(), audience: "gm_only",
-                    idempotency_key: `ui-${Date.now().toString(36)}`,
-                  },
-                });
-                setNote(this.note, `预览完成：${String(result.stage ?? "")}（世界未被改动）`, "muted");
-                this.bundle = result;
-                await this.render();
-              } catch (error) {
-                setNote(note, uiError(error, { module: "直接变化", action: "预览" }).message, "bad");
-              }
-            })();
+          // 失败返回 false：预览没成时窗不关，原因写在窗内（P0-1）
+          run: async () => {
+            try {
+              const result = await this.ctx.api.trpgClient("gm_change", {
+                instance_id: this.instanceId, timeline_id: this.timelineId, campaign_id: this.campaignId,
+                mode: "gm", workspace: this.workspace, preview_only: true,
+                form: {
+                  target_ref: target.value.trim(), kind: kind.value.trim(), value: value.value.trim(),
+                  reason: reason.value.trim(), audience: "gm_only",
+                  idempotency_key: `ui-${Date.now().toString(36)}`,
+                },
+              });
+              setNote(this.note, `预览完成（世界未被改动）：现在停在「${stageText(String(result.stage ?? ""))}」`, "muted");
+              this.bundle = result;
+              await this.render();
+              return true;
+            } catch (error) {
+              setNote(note, uiError(error, { module: "直接变化", action: "预览" }).message, "bad");
+              return false;
+            }
           },
         },
         {
           label: "确认提交",
-          run: () => {
-            void (async () => {
-              try {
-                const result = await this.ctx.api.trpgClient("gm_change", {
-                  instance_id: this.instanceId, timeline_id: this.timelineId, campaign_id: this.campaignId,
-                  mode: "gm", workspace: this.workspace,
-                  form: {
-                    target_ref: target.value.trim(), kind: kind.value.trim(), value: value.value.trim(),
-                    reason: reason.value.trim(), audience: "public_party",
-                    idempotency_key: `ui-${Date.now().toString(36)}`,
-                  },
-                });
-                this.workspace = (result.workspace as Json) ?? this.workspace;
-                this.bundle = result;
-                setNote(this.note, "直接变化已提交：世界里已按它变化（同一批成功或同批失败）", "ok");
-                await this.refresh();
-              } catch (error) {
-                setNote(note, uiError(error, { module: "直接变化", action: "确认提交" }).message, "bad");
-              }
-            })();
+          // 失败返回 false：提交没成时窗不关；理由必填，避免「点了没反应」（P0-1）
+          run: async () => {
+            if (!reason.value.trim()) {
+              setNote(note, "要写清为什么这么改：改动会写进世界，理由要留在记录里", "bad");
+              return false;
+            }
+            try {
+              const result = await this.ctx.api.trpgClient("gm_change", {
+                instance_id: this.instanceId, timeline_id: this.timelineId, campaign_id: this.campaignId,
+                mode: "gm", workspace: this.workspace,
+                form: {
+                  target_ref: target.value.trim(), kind: kind.value.trim(), value: value.value.trim(),
+                  reason: reason.value.trim(), audience: "public_party",
+                  idempotency_key: `ui-${Date.now().toString(36)}`,
+                },
+              });
+              this.workspace = (result.workspace as Json) ?? this.workspace;
+              this.bundle = result;
+              setNote(this.note, "直接变化已提交：世界里已按它变化（同一批成功或同批失败）", "ok");
+              await this.refresh();
+              return true;
+            } catch (error) {
+              setNote(note, uiError(error, { module: "直接变化", action: "确认提交" }).message, "bad");
+              return false;
+            }
           },
         },
         { label: "取消", run: () => undefined },
@@ -1414,27 +1677,28 @@ export class TrpgPane implements Pane {
         field("场景名称", name),
         field("公开简介", brief),
         field("地点", location),
-        paragraph("录入场景描述本身不改变世界；真的有世界变化时另外走「直接变化」的预览与确认。", "u-hint"),
+        paragraph("录入场景描述本身不改变世界；真的有世界变化时另外走「直接变化」的预览与确认提交。", "u-hint"),
         note,
       ],
       [
         {
           label: "开这个场景",
-          run: () => {
-            void (async () => {
-              try {
-                await this.ctx.api.trpgSceneOpen({
-                  instance_id: this.instanceId, timeline_id: this.timelineId, campaign_id: this.campaignId,
-                  name: name.value.trim(), brief: brief.value.trim(),
-                  location_refs: location.value.trim() ? [location.value.trim()] : [],
-                  participants: [],
-                });
-                setNote(this.note, "新场景已开；这是战役的编排态，不是世界变化", "ok");
-                await this.refresh();
-              } catch (error) {
-                setNote(note, uiError(error, { module: "场景准备", action: "开新场景" }).message, "bad");
-              }
-            })();
+          // 失败返回 false：场景没开成时窗不关，原因写在窗内（P0-1）
+          run: async () => {
+            try {
+              await this.ctx.api.trpgSceneOpen({
+                instance_id: this.instanceId, timeline_id: this.timelineId, campaign_id: this.campaignId,
+                name: name.value.trim(), brief: brief.value.trim(),
+                location_refs: location.value.trim() ? [location.value.trim()] : [],
+                participants: [],
+              });
+              setNote(this.note, "新场景已开；这是战役自己的安排，不是世界变化", "ok");
+              await this.refresh();
+              return true;
+            } catch (error) {
+              setNote(note, uiError(error, { module: "场景准备", action: "开新场景" }).message, "bad");
+              return false;
+            }
           },
         },
         { label: "取消", run: () => undefined },
@@ -1448,8 +1712,8 @@ export class TrpgPane implements Pane {
       const result = await this.ctx.api.trpgCampaignStatus(this.instanceId, this.timelineId, this.campaignId, status);
       setNote(
         this.note,
-        status === "paused"
-          ? "战役已暂停：世界仍可能继续运行；要连时间线一起停，用旁边那个按钮"
+        status === "paused" && String((result as Json).status ?? status) === "paused"
+          ? "战役已暂停：世界仍可能继续推进；要连这条世界线一起停，点「暂停战役并暂停这条世界线」"
           : `战役状态：${String((result as Json).status ?? status)}`,
         "ok",
       );
@@ -1463,11 +1727,11 @@ export class TrpgPane implements Pane {
     await this.setCampaignStatus("paused");
     try {
       await this.ctx.api.freeze(this.instanceId, this.timelineId);
-      setNote(this.note, "两步都成功：战役已暂停，这条时间线也已冻结（同线联络与其它战役同样受影响）", "ok");
+      setNote(this.note, "两步都成功：战役已暂停，这条世界线也已暂停（同线的联络与其它战役同样受影响）", "ok");
     } catch (error) {
       setNote(
         this.note,
-        `战役已暂停，但时间线没有停：${uiError(error, { module: "跑团", action: "暂停时间线" }).message}`,
+        `战役已暂停，但这条世界线没有停：${uiError(error, { module: "跑团", action: "暂停世界线" }).message}`,
         "bad",
       );
     }

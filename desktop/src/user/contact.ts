@@ -1,15 +1,16 @@
 /*
  * 角色联络工作区（USER_INTERFACE_DESIGN §6）。
  *
- * 只展示：对话、角色公开身份、当前世界与线名、已完成的世界时刻、必要运行状态。
+ * 只展示：对话、角色公开身份、当前世界与线名、世界内时间、必要运行状态。
  * 没有角色活动监控、性格分数、记忆库或世界全知事件表。
  *
- * 发送纪律（§6.2）：点击发送立即保留原文并标「正在提交」；收到受理回执才清空输入并移入历史；
- * 受理前失败原文仍可编辑；受理结果未知先查结果，不重复当新消息发出。
+ * 发送纪律（§6.2）：点击发送立即保留原文并标「正在提交」；收到「已接收」的回执才清空输入并移入历史；
+ * 确认前失败原文仍可编辑；结果未知先查这一条的结果，不重复当新消息发出。
+ * 自己说过的那句话在收到回复后必须留在列表里（评审 P0-3），所以 pending 转成 messages 里的用户那一条。
  */
 
 import type { AppContext, Pane } from "./app";
-import type { ChannelEvent, Json } from "./api";
+import type { ChannelEvent, ChannelState, Json } from "./api";
 import { ChannelLink, uiError, type UiError } from "./api";
 import {
   button,
@@ -19,6 +20,7 @@ import {
   errorCard,
   fill,
   link,
+  panel,
   paragraph,
   primary,
   section,
@@ -49,6 +51,18 @@ interface ContactSelection {
   character_name: string;
 }
 
+/**
+ * 一条已经发出去、还没落定的入站请求。`at` 是发送时刻：等待态的读秒按它算，
+ * 转进 `messages` 时也用它当这条消息的时间。
+ */
+interface PendingMessage {
+  ref: string;
+  text: string;
+  state: string;
+  at: number;
+  error?: UiError;
+}
+
 export class ContactPane implements Pane {
   readonly id = "contact" as const;
   private link: ChannelLink | null = null;
@@ -56,22 +70,34 @@ export class ContactPane implements Pane {
   private connectError: HTMLElement | null = null;
   private selection: ContactSelection | null = null;
   private messages: Message[] = [];
-  private pending: Array<{ ref: string; text: string; state: string; error?: UiError }> = [];
+  private pending: PendingMessage[] = [];
   private thinking = false;
   private characters: Json[] = [];
   private timelines: Json[] = [];
   private worldName = "";
   private worldLabel = "";
   private stateChip: HTMLElement | null = null;
+  /** 世界线运行状态（核心读数）：按钮文案按它取，不用两义标签 */
+  private runState = "";
+  private runBtn: HTMLButtonElement | null = null;
   private statusNote: HTMLElement | null = null;
   private listHost: HTMLElement | null = null;
   private composer: HTMLTextAreaElement | null = null;
   private sendButton: HTMLButtonElement | null = null;
   /** 「AI 未配置」的发送闸提示（只在未配置时显示，含去设置页的入口） */
   private aiGateHint: HTMLElement | null = null;
+  /** 「连接没建立」的发送闸提示（就地给「重新连接」，评审 P1「断线不重连」） */
+  private linkGateHint: HTMLElement | null = null;
+  /** 连接的真实状态（来自 ChannelLink，不再用 `this.link` 非空当已连接） */
+  private linkState: ChannelState = "idle";
+  /** 这一轮首次连接是否已经完成过：用来区分「重连」与「刚打开」，只有重连才需要补历史 */
+  private hasConnected = false;
+  /** 等待态读秒：计时器每秒刷一次状态行，收到回复 / 失败 / 换对象时停掉（不能泄漏定时器） */
+  private waitTimer: number | null = null;
+  private waitSince = 0;
   private draftSlot: HTMLElement | null = null;
   private draftKey = "";
-  /** 下一条发送是否带「仅作为联络发送」意图（§6.3）；发出后复位 */
+  /** 下一条发送是否带「只把这句话告诉她」的意图（§6.3）；发出后复位 */
   private asContact = false;
   private handoffHint: HTMLElement | null = null;
   private host: HTMLElement | null = null;
@@ -95,7 +121,10 @@ export class ContactPane implements Pane {
     fill(host, layout);
     this.listHost = left;
     this.clueHost = right;
-    const heading = el("h2", { class: "u-h2", text: paneTitle("contact") });
+    // 三栏的顶边要对齐：中栏的第一个元素就是这张头部卡。
+    // 原来最上面是一个 h2 页面标题，于是中栏比左右两栏各低一个标题的高度
+    // （2026-10-08 视觉体系审查：「三栏读起来不平衡，中栏比两侧低」）。
+    // 顶栏已经写着应用名与「角色联络」，这里不再重复一个页面标题。
     const header = el("div", { class: "u-contact-head" });
     const scroll = el("div", { class: "u-messages", tabindex: "0" });
     scroll.addEventListener("scroll", () => {
@@ -119,7 +148,7 @@ export class ContactPane implements Pane {
     const composerNote = el("p", { class: "u-note" });
     this.statusNote = composerNote;
     this.draftSlot = el("p", { class: "u-note", id: "u-contact-draft", role: "status", "aria-live": "polite" });
-    // 「仅作为联络发送」的输入框附近提示（§6.3）：只在她这句话送达时出现，发送后复位
+    // 「只把这句话告诉她」的输入框附近提示（§6.3）：只在她这句话送达时出现，发送后复位
     this.handoffHint = el("p", { class: "u-note", id: "u-contact-handoff", role: "status", "aria-live": "polite" });
     // 发送闸的「AI 未配置」提示（审计 Q1 2.5#4）：与按钮同源，别等点了发送才报 llm_not_configured
     const aiGateHint = el("p", {
@@ -132,6 +161,18 @@ export class ContactPane implements Pane {
     aiGateHint.appendChild(el("span", { text: "还没有配置 AI 服务，暂时不能发送。" }));
     aiGateHint.appendChild(link("去「设置 → AI 服务」配置", () => this.ctx.navigate({ pane: "settings", sub: "ai" })));
     this.aiGateHint = aiGateHint;
+    // 连接闸的就地提示（评审 P1「断线不重连」）：未连上时不能只在状态行说一句，
+    // 输入框旁边就要有可点的「重新连接」
+    const linkGateHint = el("p", {
+      class: "u-note u-note-bad",
+      id: "u-contact-link-gate",
+      role: "status",
+      "aria-live": "polite",
+      hidden: true,
+    });
+    linkGateHint.appendChild(el("span", { text: "连接没建立：" }));
+    linkGateHint.appendChild(link("重新连接", () => void this.connect()));
+    this.linkGateHint = linkGateHint;
     const textarea = el("textarea", {
       class: "u-input u-textarea",
       rows: "3",
@@ -142,7 +183,22 @@ export class ContactPane implements Pane {
     const send = primary("发送", () => void this.send());
     send.id = "u-contact-send";
     const hint = el("p", { class: "u-note u-muted", text: "Enter 发送 · Shift+Enter 换行" });
-    const form = el("form", { class: "u-composer" }, textarea, el("div", { class: "u-col-actions" }, send), hint);
+    // 状态行与两道发送闸都放进输入区（.u-composer）里、紧挨着「发送」。
+    // 为什么：审查说「已连接，可以开始联络」浮在中间的空洞里，「还没有配置 AI 服务…」用告警色
+    // 放在页面中部，而真正按不动的「发送」在下面隔着一个输入框——「为什么按不动」必须和按钮在一起。
+    // 顺序：输入框 → 状态 / 草稿 / 意图 → 两道闸 → 发送 → 键盘提示（闸紧邻按钮）。
+    const form = el(
+      "form",
+      { class: "u-composer" },
+      textarea,
+      composerNote,
+      this.draftSlot,
+      this.handoffHint,
+      aiGateHint,
+      linkGateHint,
+      el("div", { class: "u-col-actions" }, send),
+      hint,
+    );
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.send();
@@ -160,20 +216,15 @@ export class ContactPane implements Pane {
     textarea.addEventListener("input", () => this.queueDraft());
     const more = link("加载更早的记录", () => void this.loadOlder());
     more.id = "u-contact-more";
-    fill(
-      center,
-      heading,
-      header,
-      el("div", { class: "u-row" }, more),
-      scroll,
-      newHint,
-      live,
-      composerNote,
-      this.draftSlot,
-      this.handoffHint,
-      aiGateHint,
-      form,
-    );
+    // 对话区要有容器：左右两栏都有框，中间原来是一个洞（2026-10-08 视觉体系审查）。
+    // panel 是一级重量（只有底色、不描边），白色气泡落在底色上，边界一眼可见。
+    // 「加载更早的记录」与「有新消息 ↓」都属于对话区，一并放进这个容器里。
+    const conversation = panel("对话", el("div", { class: "u-row" }, more), scroll, newHint);
+    // 内联的三条是布局必需，不是外观：.u-messages 要 flex:1 才滚得起来，而 .u-panel 默认按内容撑开；
+    // position:relative 让「有新消息 ↓」按对话区定位——状态行收进输入区之后输入区变高，
+    // 按整列定位的 96px 会盖到输入框上（user.css 是 Lead 的共享契约，不改，所以写在这个节点上）。
+    conversation.classList.add("u-conversation");
+    fill(center, header, conversation, live, form);
     this.composer = textarea;
     this.sendButton = send;
     this.scrollHost = scroll;
@@ -197,6 +248,12 @@ export class ContactPane implements Pane {
   private async resolveSelection(): Promise<void> {
     const stored = (this.ctx.prefs["sel.contact"] as ContactSelection | undefined) ?? undefined;
     const instances = this.ctx.instances();
+    // 读不到世界列表 ≠ 「还没有世界」（评审 P1「读取失败≠空态」）：
+    // 有错误读数就出错误卡 + 重试，别把已有世界的用户再押去装一遍样例
+    if (!instances.length && this.ctx.instancesError) {
+      this.renderReadFailure(this.ctx.instancesError);
+      return;
+    }
     const instance = instances.find((item) => item.id === stored?.instance_id) ?? instances[0];
     if (!instance) {
       this.renderEmpty();
@@ -244,6 +301,8 @@ export class ContactPane implements Pane {
     if (!selection) return;
     this.draftKey = `contact:${selection.instance_id}:${selection.timeline_id}:${selection.character_id}`;
     this.resetAsContact(); // 换对象/重连后不带着上一条的意图（§6.3）
+    this.stopWaitClock(); // 换对象 / 重连不再显示上一条的读秒
+    this.hasConnected = false; // 这次 open 的收尾在下面，connected 时不必再重载一次历史
     this.renderHeader();
     this.renderList();
     this.renderCluePanel();
@@ -251,6 +310,7 @@ export class ContactPane implements Pane {
       this.link?.close();
       this.link = new ChannelLink(this.ctx.endpoint);
       this.link.onEvent((event) => this.onEvent(event));
+      this.link.onStateChange((state, note) => this.onLinkState(state, note));
       await this.link.open(this.ctx.api, selection.instance_id, selection.timeline_id, selection.character_id);
       this.setStatus("已连接，可以开始联络", "muted");
       this.connectError?.remove();
@@ -270,6 +330,28 @@ export class ContactPane implements Pane {
     }
     await this.loadHistory();
     await this.loadDraft();
+  }
+
+  /**
+   * 连接状态播报：状态行说人话，输入闸跟着开合。
+   * 断线时必须当场改口（以前这里一直写着「已连接，可以开始联络」）。
+   */
+  private onLinkState(state: ChannelState, note: string): void {
+    if (state === "idle") return; // 主动关闭（换对象 / 离开页面）不改写状态行
+    const reconnect = state === "connected" && this.hasConnected;
+    this.linkState = state;
+    if (state === "connected") {
+      this.hasConnected = true;
+      this.setStatus("已连接，可以开始联络", "muted");
+      // 重连成功后以核心记录为准补齐断线期间错过的回复（与 main.ts 的重连收尾同一做法）
+      if (reconnect) void this.loadHistory();
+    } else if (state === "reconnecting") {
+      this.setStatus(note || "连接已断开，正在重连…", "pending");
+    } else if (state === "failed" && this.hasConnected) {
+      // 首次连接失败由 connect() 的错误卡说明（这里不抢话）
+      this.setStatus("重连没有成功：核心可能已经退出。点下面的「重新连接」可以再试一次。", "bad");
+    }
+    this.updateGate();
   }
 
   private async loadDraft(): Promise<void> {
@@ -312,6 +394,39 @@ export class ContactPane implements Pane {
     );
   }
 
+  /**
+   * 世界列表读失败：这是「读不到」，不是「没有世界」。
+   * 所以给错误卡 + 重试，不给「从样例世界开始」那种会让人重复安装一遍的入口。
+   */
+  private renderReadFailure(reason: string): void {
+    const info = uiError(new Error(reason), {
+      module: "角色联络",
+      action: "读取世界列表",
+      target: "这台电脑上的世界",
+      unknown: "这里有哪些世界",
+    });
+    fill(
+      this.host as HTMLElement,
+      el(
+        "div",
+        { class: "u-page" },
+        el("h2", { class: "u-h2", text: paneTitle("contact") }),
+        errorCard(info, [
+          {
+            label: "重试读取",
+            run: () => {
+              void (async () => {
+                await this.ctx.reloadReadings();
+                await this.resolveSelection();
+              })();
+            },
+          },
+        ]),
+        paragraph("已创建的世界不会因此消失：这只是一次读取没有成功。"),
+      ),
+    );
+  }
+
   private renderHeader(): void {
     const selection = this.selection;
     if (!selection || !this.headerHost) return;
@@ -327,7 +442,7 @@ export class ContactPane implements Pane {
       el(
         "div",
         { class: "u-row" },
-        button("时间线与版本", () => this.ctx.navigate({ pane: "worlds", sub: "timeline" })),
+        button("世界线与版本记录", () => this.ctx.navigate({ pane: "worlds", sub: "timeline" })),
         button("换角色 / 换世界", () => void this.pickTarget()),
       ),
     );
@@ -341,11 +456,24 @@ export class ContactPane implements Pane {
       const result = await this.ctx.api.clock(selection.instance_id, selection.timeline_id);
       const clock = (result.clock as Json) ?? {};
       const state = String(clock.state ?? "");
-      const world = Number(clock.processed_world ?? 0);
+      const processed = Number(clock.processed_world ?? 0);
+      const target = Number(clock.world_seconds ?? processed);
       this.stateChip.className = `u-chip u-chip-${state === "active" ? "ok" : state === "frozen" ? "pending" : "muted"}`;
-      this.stateChip.textContent = state === "active" ? "运行中" : state === "frozen" ? "已暂停" : state;
-      const label = Number(clock.target_world ?? 0) > world ? `（正在补齐到 ${Number(clock.target_world ?? 0)}）` : "";
-      this.worldLabel = `已完成的世界时刻 ${world}${label}`;
+      // 认不出的取值不上屏（内部枚举名对用户没有意义）
+      this.stateChip.textContent = state === "active" ? "运行中" : state === "frozen" ? "已暂停" : "状态暂时读不出来";
+      // 按钮按真实状态命名：以前写死「暂停 / 启动」，用户看不出点下去会发生哪个（2026-08-08 审计 P2-1）
+      this.runState = state;
+      if (this.runBtn) {
+        this.runBtn.textContent = this.runLabel();
+        this.runBtn.title = this.runLabel();
+      }
+      // 说世界内的时间，不说「已完成的世界时刻 129600000」这种原始数字（评审 P1「状态与术语」）。
+      // `label` 是核心按世界历法给出的说法（如「纪元1年一月3日（上午，09:12）」）；
+      // 冻结的线返回的 `label` 是「已冻结」（状态名，不是时刻），所以只认 active 的那份读数。
+      const worldText = state === "active" && clock.label ? String(clock.label) : `进度点 #${processed}`;
+      // 核心只给「已处理」与「按现实时间应该到的」两个数：还没追平时说清正在补齐
+      const catching = Boolean(clock.catching_up) || target > processed;
+      this.worldLabel = `世界内时间：${worldText}${catching ? "（正在补齐进度）" : ""}`;
       const factsHost = this.headerHost?.querySelector("#u-contact-world");
       if (factsHost) factsHost.textContent = this.worldLabel;
       else
@@ -368,6 +496,11 @@ export class ContactPane implements Pane {
       node.dataset.card = String(character.card_id ?? "");
       list.appendChild(node);
     }
+    const runBtn = button(this.runLabel(), () => void this.toggleRun(), {
+      title: this.runLabel(),
+      id: "u-contact-run",
+    });
+    this.runBtn = runBtn;
     fill(
       this.listHost,
       section("角色", list),
@@ -377,10 +510,18 @@ export class ContactPane implements Pane {
           "div",
           { class: "u-row" },
           button("打开世界", () => this.ctx.navigate({ pane: "worlds", sub: "detail" })),
-          button("暂停 / 启动", () => void this.toggleRun()),
+          runBtn,
         ),
+        el("p", { class: "u-hint", text: "暂停只停这条世界线：她不再往后生活；已经发生过的事不会变。" }),
       ),
     );
+  }
+
+  /** 运行按钮的文案按真实状态取（读不到状态时如实说，不留一个两义的标签） */
+  private runLabel(): string {
+    if (this.runState === "active") return "暂停这条世界线";
+    if (this.runState === "frozen") return "启动这条世界线";
+    return "切换运行状态（状态没读到）";
   }
 
   private renderCluePanel(): void {
@@ -419,11 +560,14 @@ export class ContactPane implements Pane {
       const spoken = nodes.filter((item) => String(item.kind ?? "") === "spoken");
       const held = nodes.filter((item) => String(item.kind ?? "") !== "spoken");
       if (bar) {
+        // 讲过多少 / 还留多少：一句话读不出比例，画成一段条（图例带数值，不看颜色也能读）
         const graph = stackBar([
           { label: "已经讲出口", value: spoken.length, tone: "ok" },
           { label: "还没讲出口", value: held.length, tone: "muted" },
         ]);
-        fill(bar, graph ?? el("span", { class: "u-hint", text: "" }));
+        // 两个数都是 0 时不画空条（graphics.ts 的纪律：不画空数据）——空条会被读成「比例是 0」，
+        // 而这里其实是「还没有可统计的内容」，退回一句文字
+        fill(bar, graph ?? el("span", { class: "u-hint", text: "还没有线索：讲过与没讲过的都是空的。" }));
       }
       fill(
         host,
@@ -473,7 +617,12 @@ export class ContactPane implements Pane {
       .session as Json;
     const page = await this.ctx.api.history(String(session.id), undefined, 50);
     const rows = (page.messages as Json[]) ?? [];
-    this.messages = rows.map((row) => this.fromRow(row));
+    // 核心记录里已经有那一条入站（queued / processing 也进历史），但 pending 里还在等：
+    // 保留 pending 那个带读秒的气泡，别再画第二个「我说的那句话」
+    const waiting = new Set(this.pending.map((item) => item.ref));
+    this.messages = rows
+      .map((row) => this.fromRow(row))
+      .filter((message) => !(message.role === "user" && message.ref && waiting.has(message.ref)));
     this.hasMore = Boolean(page.has_more);
     this.oldestSeq = Number(page.next_before_seq ?? 0);
     this.renderMessages(true);
@@ -519,6 +668,12 @@ export class ContactPane implements Pane {
       // 留在列里当兄弟节点的话，它一长就把消息列表挤没（内容区不能跟操作区抢地方）
       this.systemHost,
     );
+    // 一条对话都没有、也没有系统卡时，在容器里居中给一句提示 + 一个动作：
+    // 以前这里是一大片纯白，既看不出「这里会有内容」，也没有「从哪儿开始写」的出口
+    // （2026-10-08 视觉体系审查：「中间栏是一大片空白，对话区没有容器」）。
+    if (!this.messages.length && !this.pending.length && !this.systemHost?.childElementCount) {
+      this.scrollHost.appendChild(this.emptyConversation());
+    }
     const total = this.messages.length + this.pending.length;
     if (force || wasAtBottom) this.scrollHost.scrollTop = this.scrollHost.scrollHeight;
     else {
@@ -530,6 +685,34 @@ export class ContactPane implements Pane {
     const more = this.host?.querySelector("#u-contact-more") as HTMLButtonElement | null;
     if (more) more.hidden = !this.hasMore;
     this.updateGate();
+  }
+
+  /** 空对话：容器内居中一句提示 + 一个动作（动作就是把光标放到输入框上） */
+  private emptyConversation(): HTMLElement {
+    const box = el(
+      "div",
+      { class: "u-msg-empty" },
+      el("p", { class: "u-hint", text: "还没有对话：写下第一句话，她就会回你。" }),
+      button("写第一句话", () => this.focusComposer(), { class: "u-btn u-ghost" }),
+    );
+    // 居中要自己给：user.css 是 Lead 的共享契约（不改），这里只调这一个节点的外观
+    box.style.margin = "auto";
+    box.style.textAlign = "center";
+    box.style.display = "flex";
+    box.style.flexDirection = "column";
+    box.style.alignItems = "center";
+    box.style.gap = "8px";
+    return box;
+  }
+
+  /** 把光标放到输入框：空态与「保留原文继续编辑」共用同一处出口 */
+  private focusComposer(): void {
+    if (this.composer && !this.composer.disabled) {
+      this.composer.focus();
+      return;
+    }
+    // 连不上时输入框是禁用的，点了没反应：就近说清为什么，别让人以为按钮坏了
+    this.setStatus("现在还不能写：先按输入框旁边的「重新连接」，或者去「设置 → AI 服务」把密钥填好。", "pending");
   }
 
   private renderMessage(message: Message): HTMLElement {
@@ -550,7 +733,7 @@ export class ContactPane implements Pane {
     return node;
   }
 
-  private renderPending(item: { ref: string; text: string; state: string; error?: UiError }): HTMLElement {
+  private renderPending(item: PendingMessage): HTMLElement {
     const node = el("div", { class: "u-bubble u-bubble-me u-bubble-pending" });
     node.appendChild(el("p", { class: "u-bubble-text", text: item.text }));
     const meta = el("div", { class: "u-bubble-meta" });
@@ -560,9 +743,18 @@ export class ContactPane implements Pane {
       node.appendChild(
         errorCard(item.error, [
           { label: "保留原文继续编辑", run: () => this.restoreToComposer(item) },
-          { label: "查询原结果", run: () => void this.queryResult(item.ref) },
+          { label: "查询这条的结果", run: () => void this.queryResult(item.ref) },
         ]),
       );
+    } else if (item.state === "unknown") {
+      // 「结果待确认」只给两条路：等，或查这一条。
+      // 不再劝「继续编辑原文重发」——每次重发在 ump.ts 里都是新的 env_id，等于一条新请求
+      // （与文件头的发送纪律冲突：结果未知先查，不重复当新消息发出）。
+      const note = el("p", { class: "u-note u-note-pending" });
+      note.appendChild(el("span", { text: "还没收到确认：可以再等一会儿，或者" }));
+      note.appendChild(link("查询这条的结果", () => void this.queryResult(item.ref)));
+      note.appendChild(el("span", { text: "。这条已经发出去了，重发会变成一条新消息。" }));
+      node.appendChild(note);
     }
     return node;
   }
@@ -570,22 +762,128 @@ export class ContactPane implements Pane {
   private restoreToComposer(item: { text: string }): void {
     if (!this.composer) return;
     this.composer.value = item.text;
-    this.composer.focus();
+    // 与空态的出口共用一处：连不上时这里也要说清为什么光标进不去输入框
+    this.focusComposer();
     this.queueDraft();
   }
 
+  /* ------------------------------------------------------- 入站的落定与查询 */
+
+  /**
+   * 把 pending 里的这一条转成 `messages` 里的用户记录，并移出 pending。
+   *
+   * 为什么必须转（评审 P0-3）：列表由 `messages + pending` 重建，以前 reply 到达时
+   * 直接把 pending 那项删掉、只 push 角色那条，于是用户刚发的话在回复出现的一刻就消失了。
+   * 同一个 ref 只转一次（转完就不在 pending 里了，另外再按 `ref` 去重兜一层）。
+   */
+  private settleInbound(ref: string, state: string): void {
+    const index = this.pending.findIndex((item) => item.ref === ref);
+    if (index < 0) return;
+    const item = this.pending[index];
+    this.pending.splice(index, 1);
+    if (!item.ref) return;
+    if (this.messages.some((message) => message.role === "user" && message.ref === item.ref)) return;
+    this.messages.push({
+      role: "user",
+      text: item.text,
+      seq: 0,
+      at: item.at,
+      messageId: "",
+      state,
+      ref: item.ref,
+      replyTo: "",
+      parts: [],
+    });
+  }
+
+  /**
+   * 「查询这条的结果」：按这条请求的身份（`ref` = 入站 `env_id`）去会话历史里对那一行。
+   *
+   * 为什么不再调 `storyTurn`（评审 P1）：那是「这个角色最近一轮」的读数，与这条 ref 无关，
+   * 而且以前把 `请求 xx 的状态：${state}` 这种内部话术写上了状态行。这里只查这一条，
+   * 状态码一律走人话映射，认不出的不显示，也不显示 ref 片段。
+   */
   private async queryResult(ref: string): Promise<void> {
+    const selection = this.selection;
+    if (!selection || !ref) return;
     try {
-      const result = await this.ctx.api.storyTurn(
-        this.selection?.instance_id ?? "",
-        this.selection?.timeline_id ?? "",
-        this.selection?.character_id ?? "",
+      const session = (await this.ctx.api.sessionEnsure(
+        selection.instance_id,
+        selection.timeline_id,
+        selection.character_id,
+      )).session as Json;
+      const page = await this.ctx.api.history(String(session.id), undefined, 50);
+      const rows = (page.messages as Json[]) ?? [];
+      const mine = rows.find((row) => String(row.env_id ?? "") === ref);
+      const answered = rows.some(
+        (row) => String(row.role ?? "") === "character" && String(row.reply_to ?? "") === ref,
       );
-      const state = String(result.product_state ?? "");
-      this.setStatus(`请求 ${ref.slice(-6)} 的状态：${state}`, state === "expressed" ? "ok" : "pending");
+      // 最近 50 条里没有这一条（很久以前发的）就退到「这个会话最近一次投递」，并说明是退而查的
+      const latest = [...rows].reverse().find((row) => String(row.role ?? "") === "user");
+      const fallback = Boolean(!mine && latest);
+      const state = String((mine ?? latest)?.state ?? "");
+      const text = deliveryText(state, answered);
+      const prefix = fallback ? "这条在最近的记录里找不到，本会话最近一次投递：" : "这条消息：";
+      this.setStatus(`${prefix}${text}`, deliveryKind(state, answered));
+      // 已经确认有回复：把它从 pending 落进列表，并把核心记录里的回复读回来（不再让用户干等）
+      if (mine && (state === "done" || state === "fixed")) {
+        this.settleInbound(ref, state);
+        this.stopWaitClock();
+        await this.loadHistory();
+      } else if (mine && (state === "queued" || state === "processing" || state === "accepted")) {
+        // 查出来「还在处理」：把读秒接回去（可能刚从「结果待确认」回来），别让用户以为这一条断了
+        const item = this.pending.find((entry) => entry.ref === ref);
+        if (item && item.state === "unknown") {
+          item.state = "accepted";
+          this.refreshWaitClock();
+          this.renderMessages();
+        }
+      }
     } catch (error) {
-      this.setStatus(uiError(error, { module: "角色联络", action: "查询原结果" }).message, "bad");
+      this.setStatus(uiError(error, { module: "角色联络", action: "查询这条的结果" }).message, "bad");
     }
+  }
+
+  /* ------------------------------------------------------- 等待态的读秒 */
+
+  /**
+   * 等待态的一行要有时长预期与已等秒数（评审 P1「等待与连接」）：
+   * 30–120 秒是常态，看不到时间用户会以为程序卡死。计时器只负责这一行，
+   * 收到回复 / 失败 / 换对象都必须停掉（否则定时器会一直挂着）。
+   */
+  private startWaitClock(): void {
+    if (this.waitTimer !== null) return; // 已在读秒：不重置起点，连续等待的秒数才连贯
+    const active = this.pending.filter((item) => item.state === "submitting" || item.state === "accepted");
+    // 起点取「这条真正发出去的时刻」：重连、查询这些动作不该让已等的秒数归零
+    this.waitSince = Math.round((active[0]?.at ?? Date.now() / 1000) * 1000);
+    this.waitTimer = window.setInterval(() => this.renderWaiting(), 1000);
+    this.renderWaiting();
+  }
+
+  private stopWaitClock(): void {
+    if (this.waitTimer !== null) window.clearInterval(this.waitTimer);
+    this.waitTimer = null;
+    this.waitSince = 0;
+  }
+
+  /** 还有在等的请求就保持读秒，没有就停掉（每个改变 pending 的地方都调它） */
+  private refreshWaitClock(): void {
+    const waiting = this.pending.some((item) => item.state === "submitting" || item.state === "accepted");
+    if (waiting) this.startWaitClock();
+    else this.stopWaitClock();
+  }
+
+  private renderWaiting(): void {
+    const submitting = this.pending.some((item) => item.state === "submitting");
+    const waited = Math.max(0, Math.round((Date.now() - this.waitSince) / 1000));
+    if (submitting) {
+      this.setStatus(`正在提交…（已等 ${waited} 秒）`, "pending");
+      return;
+    }
+    this.setStatus(
+      `已接收，正在等待回应（她那边可能正处在休息时段，最长约 2 分钟；已等 ${waited} 秒）`,
+      "pending",
+    );
   }
 
   /* ---------------------------------------------------------------- 发送 */
@@ -593,17 +891,18 @@ export class ContactPane implements Pane {
   private async send(): Promise<void> {
     const selection = this.selection;
     const text = this.composer?.value.trim() ?? "";
-    if (!selection || !text || !this.link) return;
+    if (!selection || !text) return;
     // 与按钮同源的拒发：未配置 AI 服务时不白白发出去再吃 llm_not_configured，并说清去哪儿配
-    if (!this.aiConfigured()) {
+    if (this.aiGate() === "missing") {
       this.setStatus("还没有配置 AI 服务：先去「设置 → AI 服务」填好地址与密钥再发送；写下的内容会保留。", "pending");
       return;
     }
     if (this.thinking) {
-      this.setStatus("还在等上一条的回应；可以先写下一条，发送节拍由会话层排队", "pending");
+      this.setStatus("还在等上一条的回应；可以把下一条先写好，她回完这一条才会收到下一条。", "pending");
     }
     let ref = "";
     try {
+      if (!this.link) throw new Error("还没有连上这个角色：先点「重新连接」");
       ref = this.link.send(text, { asContact: this.asContact });
     } catch (error) {
       this.setStatus(uiError(error, { module: "角色联络", action: "发送" }).message, "bad");
@@ -611,18 +910,20 @@ export class ContactPane implements Pane {
     }
     // 意图只跟着这一条走：发出去就复位，下一次回到普通联络（§6.3）
     this.resetAsContact();
-    this.pending.push({ ref, text, state: "submitting" });
+    this.pending.push({ ref, text, state: "submitting", at: Date.now() / 1000 });
     if (this.composer) this.composer.value = "";
     await this.ctx.drafts.discard(this.draftKey);
     setNote(this.draftSlot, "", "muted");
-    this.setStatus("正在提交…", "pending");
+    this.refreshWaitClock(); // 「正在提交…（已等 N 秒）」
     this.renderMessages();
-    // 受理前失败原文仍可编辑：短暂等待后仍无回执就标记「结果待确认」
+    // 确认前失败原文仍可编辑：等不到确认就标「结果待确认」，并把出口收窄成
+    // 「查这一条」与「再等等」（重发在新请求身份下会变成一条新消息，与发送纪律冲突）
     window.setTimeout(() => {
       const item = this.pending.find((entry) => entry.ref === ref);
       if (item && item.state === "submitting") {
         item.state = "unknown";
-        this.setStatus("这条还没收到受理回执：可以查询原结果，或继续编辑原文重发", "pending");
+        this.refreshWaitClock();
+        this.setStatus("这条还没收到确认：可以点「查询这条的结果」，或者再等一会儿。已经发出去了，不要重复发。", "pending");
         this.renderMessages();
       }
     }, 8000);
@@ -630,6 +931,8 @@ export class ContactPane implements Pane {
 
   private onEvent(event: ChannelEvent): void {
     if (event.kind === "reply") {
+      // 顺序要紧：先把「我说的那句话」从 pending 落进列表，再追加她的回复（评审 P0-3）
+      this.settleInbound(event.replyTo, "done");
       const existing = this.messages.find((item) => item.messageId === event.messageId);
       if (!existing) {
         this.messages.push({
@@ -647,19 +950,24 @@ export class ContactPane implements Pane {
         existing.parts.push(event.batchIndex);
         existing.text += event.parts.join("");
       }
-      const inbound = this.pending.find((item) => item.ref === event.replyTo);
-      if (inbound) {
-        inbound.state = "done";
-        this.pending = this.pending.filter((item) => item.ref !== event.replyTo);
-      }
       this.thinking = false;
       this.link?.confirmDelivery(event.messageId, event.batchIndex, "accepted");
       this.renderMessages();
       if (this.liveHost) this.liveHost.textContent = "收到一条新回复"; // 读屏播报；不朗读全文、不逐秒播报
       this.setStatus("回复已保存", "ok");
+      this.refreshWaitClock(); // 还有别的在等就接着读秒，没有就停掉计时器
       return;
     }
     if (event.kind === "notice") {
+      // 转交说明意味着这一轮不会再给回复：把还在等待的那条先落进列表（同一时刻也停掉读秒），
+      // 这样「我发的那句话」留在对话里，下面这张通知卡也能按 ref 精确对上原文。
+      // 实时通知信封不带 reply_to（核心只给 reply 帧带），只能按转交说明的定性词认。
+      if (this.isHandoffNotice(event.text)) {
+        const waiting = [...this.pending]
+          .reverse()
+          .find((item) => item.state === "accepted" || item.state === "submitting" || item.state === "unknown");
+        if (waiting) this.settleInbound(waiting.ref, "cancelled");
+      }
       this.messages.push({
         role: "notice",
         text: event.text,
@@ -674,13 +982,22 @@ export class ContactPane implements Pane {
       // 说明也要回执（单批）：不回执的话这条永远算未确认，每次重连都会被当成待投递重发一遍
       this.link?.confirmDelivery(event.messageId, 0, "accepted");
       // 只经 messages 流渲染这一次；再补一张卡就是同一通知出现两份
+      this.refreshWaitClock();
       this.renderMessages();
       return;
     }
     if (event.kind === "accepted") {
       const item = this.pending.find((entry) => entry.ref === event.ref);
       if (item) {
-        item.state = event.state === "failed" || event.state === "cancelled" ? "failed" : "accepted";
+        if (event.state === "cancelled") {
+          // 作废是终局（转交到别的工作区，或这一轮被回滚 / 重绑作废）：这一轮不会再有回复。
+          // 落进列表，别留一个永远「等待中」的气泡（转交说明随后到达，按 ref 对上原文）
+          this.settleInbound(event.ref, "cancelled");
+          this.refreshWaitClock();
+          this.renderMessages();
+          return;
+        }
+        item.state = event.state === "failed" ? "failed" : "accepted";
         if (item.state === "accepted") this.setStatus("已接收，正在等待回应", "pending");
         if (item.state === "failed") {
           item.error = uiError(new Error("这次没有生成成功"), {
@@ -690,6 +1007,12 @@ export class ContactPane implements Pane {
             unknown: "她这一轮是否有回复",
           });
         }
+        // 重复投递的已完结请求：核心回带 done，说明这一条早就有了回复——
+        // 同样把它落进列表（同一个 ref 只转一次），免得界面看起来还在等
+        if (event.state === "done" || event.state === "fixed") {
+          this.settleInbound(event.ref, event.state);
+        }
+        this.refreshWaitClock();
         this.renderMessages();
       }
       return;
@@ -697,11 +1020,12 @@ export class ContactPane implements Pane {
     if (event.kind === "status") {
       this.thinking = event.state === "thinking";
       if (this.thinking) this.setStatus("已接收，正在等待回应", "pending");
+      this.refreshWaitClock(); // 等待中的读秒跟着状态走
       return;
     }
     if (event.kind === "binding") {
       if (event.state === "revoked") {
-        this.setStatus("这个绑定被换掉了：界面会重新读取历史", "pending");
+        this.setStatus("这条联络刚刚在别处重新连接过（旧凭据已作废）：正在重新读取记录", "pending");
         void this.loadHistory();
       }
       return;
@@ -719,6 +1043,7 @@ export class ContactPane implements Pane {
         item.error = info;
       }
       this.appendSystem(errorCard(info, [{ label: "重新获取回复", run: () => this.link?.retry(event.ref, "input") }]));
+      this.refreshWaitClock();
       this.renderMessages();
     }
   }
@@ -727,15 +1052,43 @@ export class ContactPane implements Pane {
   private static readonly handoffTargets: Array<{
     key: string;
     /** 与核心通知正文对齐的稳定短语（isekai_core/story/classify.py HANDOFF_NOTICES 开头的定性词）。
-        改核心文案时这里必须一起改——不匹配的后果是按钮整排不渲染（2026-10-07 探针实锤过） */
+        改核心文案时这里必须一起改——匹配是「有没有按钮」的唯一依据（2026-10-07 探针实锤过）。
+        这个字段是匹配用的键，不是给用户看的文案：行话（如「TRPG 行动」）由下面的 body 说成人话 */
     match: string;
     label: string;
+    /** 上屏的正文：核心那份带行话（如「TRPG 行动」），这里换成人话；改核心文案时两处一起看 */
+    body: string;
     pane: "worlds" | "writing" | "contact" | "trpg";
   }> = [
-    { key: "creation", match: "创作请求", label: "草案", pane: "worlds" },
-    { key: "version", match: "版本操作", label: "版本与恢复", pane: "worlds" },
-    { key: "trpg", match: "TRPG 行动", label: "跑团", pane: "trpg" },
+    {
+      key: "creation",
+      match: "创作请求",
+      label: "草案",
+      body: "这条是创作请求，普通对话没有执行它。要改世界请走创作流程：先看影响预览，确认之后才生效。",
+      pane: "worlds",
+    },
+    {
+      key: "version",
+      match: "版本操作",
+      label: "版本与恢复",
+      body: "这条属于版本操作（保存分支 / 恢复版本 / 导入导出），已经交给版本流程。普通对话不会替你回滚或分叉。",
+      pane: "worlds",
+    },
+    {
+      key: "trpg",
+      match: "TRPG 行动",
+      label: "跑团",
+      body: "这条属于跑团里的行动：行动要经过规则裁定，普通对话不会替你掷骰，也不给成功或失败结论。",
+      pane: "trpg",
+    },
   ];
+
+  /** 这条说明是不是「转交」类（按核心的定性词认；核心的兜底话术也认） */
+  private isHandoffNotice(text: string): boolean {
+    return (
+      ContactPane.handoffTargets.some((item) => text.includes(item.match)) || text.includes("不在普通联络里处理")
+    );
+  }
 
   /**
    * role=notice 的呈现：转交类带按钮，其余（追赶、离场等）同款卡但不带任何按钮。
@@ -743,16 +1096,31 @@ export class ContactPane implements Pane {
    */
   private noticeCard(message: Message): HTMLElement {
     const node = el("div", { class: "u-handoff", "data-message": message.messageId });
-    node.appendChild(el("p", { text: message.text }));
     const hit = ContactPane.handoffTargets.find((item) => message.text.includes(item.match));
+    // 认得出是哪一类就说人话（核心正文里的行话不上屏）；认不出就照实显示核心原文
+    node.appendChild(el("p", { text: hit ? hit.body : message.text }));
     if (hit) {
       node.appendChild(el("p", { class: "u-hint", text: "当前世界尚未因这次请求改变。" }));
       const row = el("div", { class: "u-row" });
       row.appendChild(primary(`查看${hit.label}`, () => this.ctx.navigate({ pane: hit.pane })));
       row.appendChild(button("继续联络", () => this.dismissHandoff(node)));
-      row.appendChild(button("仅作为联络发送", () => this.resendAsContact(message)));
+      row.appendChild(button("只把这句话告诉她", () => this.resendAsContact(message)));
+      node.appendChild(row);
+    } else if (this.isHandoffNotice(message.text)) {
+      // 是转交类、但没对上任何一条固定短语（核心改过文案）：也绝不能出现
+      // 「有通知、一个按钮都没有」的空白卡（评审 P1）。退一步说清这条要用户
+      // 自己去对应的工作区处理，并至少留一个可点的出口。
+      node.appendChild(
+        el("p", {
+          class: "u-hint",
+          text: "这条通知属于别的处理环节（世界与素材 / 辅助写作 / 跑团），要你到那个工作区去处理；它没有改变当前世界。",
+        }),
+      );
+      const row = el("div", { class: "u-row" });
+      row.appendChild(primary("继续联络", () => this.dismissHandoff(node)));
       node.appendChild(row);
     }
+    // 其余说明（世界还在追赶、离开期间的进展等）只是通报一句，本来就没有可点的动作：保持无按钮
     const meta = el("div", { class: "u-bubble-meta" });
     meta.appendChild(el("span", { text: stamp(message.at) }));
     node.appendChild(meta);
@@ -777,7 +1145,7 @@ export class ContactPane implements Pane {
     this.restoreToComposer(original);
     this.asContact = true;
     setNote(this.handoffHint, "只把这句话告诉她，不执行其中的操作；可以改。", "pending");
-    this.setStatus("把这句话作为新的联络发送：只作为联络，不执行其中的操作", "pending");
+    this.setStatus("只把这句话告诉她（不执行其中的操作），当作一条新的联络发出去", "pending");
   }
 
   /** 转交通知对应的原文：先按 `reply_to === env_id` 精确对，再退到该通知之前最近一条已作废的入站。 */
@@ -819,19 +1187,31 @@ export class ContactPane implements Pane {
   }
 
   private updateGate(): void {
-    const selection = this.selection;
-    const connected = Boolean(selection && this.link);
-    const aiReady = this.aiConfigured();
+    const connected = Boolean(this.selection && this.link?.connected);
+    const gate = this.aiGate();
     if (this.composer) this.composer.disabled = !connected;
     // 发送闸第三个维度：AI 未配置时按钮不可点（审计 Q1 2.5#4）。只认 readiness.ai.configured，
     // 已配置后的网络 / 生成失败不在这里拦——那些错误照旧在发送后由错误卡就近说明。
-    if (this.sendButton) this.sendButton.disabled = !connected || !aiReady;
-    if (this.aiGateHint) this.aiGateHint.hidden = !(connected && !aiReady);
+    // 「读数失败」不算未配置：那会把能用的用户挡在门外（评审 P1「读取失败≠空态」）。
+    if (this.sendButton) this.sendButton.disabled = !connected || gate === "missing";
+    if (this.aiGateHint) this.aiGateHint.hidden = !(connected && gate === "missing");
+    // 连接闸：连不上时输入框旁边就地给「重新连接」。正在重连 / 首次连接途中不显示
+    //（状态行已经在说「正在重连…」），避免同时出现两句互相打架的话。
+    if (this.linkGateHint) {
+      const idleOrFailed = this.linkState === "idle" || this.linkState === "failed";
+      this.linkGateHint.hidden = !(this.selection && !connected && idleOrFailed);
+    }
   }
 
-  /** 是否已配好 AI 服务：判定与 home.ts / onboarding.ts 同一来源（`readiness.ai.configured`），不新造 */
-  private aiConfigured(): boolean {
-    return Boolean(((this.ctx.readiness.ai as Json | undefined) ?? {}).configured);
+  /**
+   * AI 服务这条闸的三种结论：已配置 / 确实没配置 / 读数失败。
+   * 分开的理由（评审 P1「读取失败≠空态」）：读数失败时不能断言「没有配置」——
+   * 这时不拦发送，让核心在发送后照旧给出 llm_not_configured 那种就近说明。
+   */
+  private aiGate(): "ready" | "missing" | "unreadable" {
+    if (this.ctx.readinessError) return "unreadable";
+    const ai = (this.ctx.readiness.ai as Json | undefined) ?? {};
+    return ai.configured ? "ready" : "missing";
   }
 
   /* ---------------------------------------------------------------- 操作 */
@@ -875,7 +1255,7 @@ export class ContactPane implements Pane {
     instanceSelect.addEventListener("change", () => void loadInto());
     await loadInto();
     box.appendChild(el("label", { class: "u-field" }, el("span", { class: "u-field-label", text: "世界" }), instanceSelect));
-    box.appendChild(el("label", { class: "u-field" }, el("span", { class: "u-field-label", text: "时间线" }), timelineSelect));
+    box.appendChild(el("label", { class: "u-field" }, el("span", { class: "u-field-label", text: "世界线" }), timelineSelect));
     box.appendChild(el("label", { class: "u-field" }, el("span", { class: "u-field-label", text: "角色" }), characterSelect));
     const modal = dialog("换一个联络对象", [box], [
       {
@@ -901,6 +1281,9 @@ export class ContactPane implements Pane {
             await this.ctx.setPrefs({ "sel.contact": this.selection });
             this.rememberContact();
             this.messages = [];
+            // 换对象必须把上一条的等待一起清掉：留着它，回复一到就会把「那个角色的话」
+            // 落进这个角色的对话里（与 switchCharacter 同一处理）
+            this.pending = [];
             await this.connect();
           })();
         },
@@ -973,7 +1356,7 @@ export class ContactPane implements Pane {
     };
     receiver.addEventListener("change", () => void reload());
     body.appendChild(
-      paragraph("转述按**完整消息**授权：下面这些是她讲过、你已经在对话里看过的整条内容。授权不能单独撤回，恢复版本也不保证删除对方已经看到的消息。"),
+      paragraph("转述按整条消息授权：下面这些是她讲过、你已经在对话里看过的整条内容。授权不能单独撤回，恢复版本也不保证删除对方已经看到的消息。"),
     );
     body.appendChild(el("label", { class: "u-field" }, el("span", { class: "u-field-label", text: "转述给" }), receiver));
     body.appendChild(list);
@@ -1011,6 +1394,7 @@ export class ContactPane implements Pane {
   }
 
   unmount(): void {
+    this.stopWaitClock(); // 离开页面必须停掉读秒，别留一个每秒跑一次的定时器
     void this.ctx.drafts.flush(this.draftKey);
     this.link?.close();
     this.link = null;
@@ -1022,6 +1406,28 @@ function stateText(state: string): string {
   if (state === "unknown") return "结果待确认";
   if (state === "accepted" || state === "queued" || state === "processing") return "已接收，正在等待回应";
   if (state === "done" || state === "fixed") return "已回应";
-  if (state === "failed") return "没有成功（可以重试原请求）";
-  return state;
+  if (state === "failed") return "这一轮没有生成成功（可以重新获取回复）";
+  // 转交（创作请求 / 版本操作 / 跑团行动）会让入站以 cancelled 收场：她没有回答这一轮。
+  // 同一种状态也用于回滚 / 重绑作废，所以说法要同时容得下两种原因
+  if (state === "cancelled") return "这一轮没有在这里回答（可能已转交到别的工作区，或这条已经作废）";
+  return "状态待确认"; // 认不出的内部状态不上屏
+}
+
+/**
+ * 「查询这条的结果」的人话映射：只认核心的投递 / 处理状态，认不出就不显示原始码。
+ * `answered` 取自核心记录里有没有对这条的回复，比状态码本身更接近用户关心的事。
+ */
+function deliveryText(state: string, answered: boolean): string {
+  if (answered || state === "done" || state === "fixed") return "已经收到回复";
+  if (state === "queued" || state === "processing" || state === "accepted") return "已提交，正在等她回复";
+  if (state === "failed") return "这一轮没有生成成功（你发的话本身已经存下来了）";
+  if (state === "cancelled") return "这一轮没有在这里回答（可能已转交到别的工作区，或这条已经作废）";
+  return "暂时读不出最新状态，过一会儿再查一次";
+}
+
+function deliveryKind(state: string, answered: boolean): "ok" | "bad" | "pending" | "muted" {
+  if (answered || state === "done" || state === "fixed") return "ok";
+  if (state === "failed") return "bad";
+  if (state === "queued" || state === "processing" || state === "accepted") return "pending";
+  return "muted";
 }

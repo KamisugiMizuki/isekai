@@ -45,6 +45,11 @@ export interface AppContext {
   banner(text: string, kind?: "ok" | "bad" | "pending" | "muted"): void;
   refresh(): Promise<void>;
   instances(): InstanceEntry[];
+  /** 读数失败的原因（读到就是 null）：页面据此出错误卡 + 重试，不把「读不到」画成「真的没有」 */
+  readinessError: string | null;
+  instancesError: string | null;
+  /** 重读本机读数与世界列表（错误卡上的「重试」） */
+  reloadReadings(): Promise<void>;
   openDebug(): void;
   drafts: DraftKeeper;
 }
@@ -195,6 +200,10 @@ export class App {
   private readiness: Json = {};
   private settings: Json = {};
   private instanceCache: InstanceEntry[] = [];
+  /** 读数失败的记账（null = 最近一次读成功）：区分「真的没有」与「没读到」 */
+  private readinessError: string | null = null;
+  private settingsError: string | null = null;
+  private instancesError: string | null = null;
   private exitHandshake = false;
   private topHost!: HTMLElement;
   private mainHost!: HTMLElement;
@@ -238,11 +247,29 @@ export class App {
     }, 1500);
     this.status = await this.waitForCore();
     await this.onCoreStatus();
-    
-    // ponytail: 原型启动选择器，只在首次（还没完成首次设置）或没选过应用时显示
-    if (!this.prefs.app_mode || !this.prefs[PREF_KEYS.onboard]) {
-      const launcher = new Launcher(this.context());
-      launcher.show(true);   // 启动时的自动弹窗：刚选过就不打扰
+
+    // 首次打开直接进「首次设置」：说明书写的就是这个顺序，不该先让人在三个英文应用名里做选择。
+    // 「选择应用」推迟到首次设置走完之后（那时用户已经有世界，选哪个才有意义）。
+    // 只有路由还停在默认的 home 时才接管：启动期间已经有别的导航（深链、探针、用户点击）
+    // 就不要再把人拽回向导（2026-10-08：探针在 boot 期间进 create，被这里盖成了向导）。
+    if (!this.prefs[PREF_KEYS.onboard] && this.route.pane === "home") {
+      const firstRun = ((this.readiness.first_run as Json | undefined) ?? {}) as Json;
+      // 读数失败时按「首次」处理：向导可以随时跳过，而把第一次打开的人扔在首页更糟
+      const hasContent = !this.readinessError && Number(firstRun.instances ?? 0) > 0;
+      if (!hasContent) {
+        // 先把路由定下来再导航：启动期间 core-status 事件会走 onCoreStatus()，
+        // 它在「还没有当前页面」时按 this.route 重排一次导航；路由还是默认的 home 时，
+        // 那一次会把 home 排在向导后面，结果首次打开的人落在首页（探针实测会偶发）。
+        this.route = { pane: "onboarding" };
+        this.navigate(this.route);
+        return;
+      }
+      // 已经有世界的老用户（升级上来的）：别再把人塞回向导，补一个标记就好
+      void this.setPrefs({ [PREF_KEYS.onboard]: true });
+    }
+    // 走完首次设置但还没选过应用：这时问「你想从哪个入口进」是有意义的
+    if (!this.prefs.app_mode) {
+      new Launcher(this.context()).show(true);
     }
   }
 
@@ -264,6 +291,9 @@ export class App {
   /** 上一级页面：应用三页（联络 / 写作 / 跑团）与首页之上是启动选择器，其余页面挂在当前应用下。 */
   private parentTarget(): Route | null {
     if (APP_ROOT_PANES.has(this.route.pane)) return null;
+    // 首次设置还没走完时，「上一级」不能是角色联络：用户根本还没见过那一页（那时它是空的），
+    // 顶栏却写着「← 返回角色联络」（2026-10-08 视觉体系审查）。这时给首页这条真退路。
+    if (this.route.pane === "onboarding" && !this.prefs[PREF_KEYS.onboard]) return { pane: "home" };
     return { pane: appPane(String(this.prefs.app_mode ?? "chat")) };
   }
 
@@ -284,6 +314,17 @@ export class App {
     const moreBtn = button("⋯", () => this.showMoreMenu(), { class: "u-btn u-ghost", id: "u-more-btn", title: "更多选项" });
     moreBtn.setAttribute("aria-label", "更多选项");
 
+    // 「首页」必须有一个看得见的入口：新用户不会去点「⋯」找它（可用性评审 P1）
+    const homeBtn =
+      this.route.pane === "home"
+        ? null
+        : button("首页", () => this.navigate({ pane: "home" }), {
+            class: "u-btn u-btn-home",
+            id: "u-home-btn",
+            title: "回到首页（看还缺什么、下一步做什么）",
+          });
+    if (homeBtn) homeBtn.setAttribute("aria-label", "回到首页");
+
     fill(
       this.topHost,
       el("div", { class: "u-title" }, 
@@ -293,6 +334,7 @@ export class App {
       el(
         "div",
         { class: "u-row" },
+        homeBtn,
         chip(coreStatusText(this.status), this.status.state === "ready" ? "ok" : this.status.state === "starting" ? "pending" : "bad"),
         moreBtn,
       ),
@@ -300,35 +342,68 @@ export class App {
   }
   
   private showMoreMenu(): void {
-    const menu = el("div", { class: "u-more-menu", role: "menu" });
+    const menu = el("div", { class: "u-more-menu", role: "menu", "aria-label": "更多选项" });
     const backdrop = el("div", { class: "u-more-backdrop" });
-    const items = [
-      { label: "首页", action: () => this.navigate({ pane: "home" }) },
-      { label: "设置", action: () => this.navigate({ pane: "settings" }) },
-      { label: "帮助与诊断", action: () => this.navigate({ pane: "help" }) },
-      { label: "世界管理", action: () => this.navigate({ pane: "worlds" }) },
-      { label: "返回选择应用", action: () => new Launcher(this.context()).show() },
+    // 页面入口与动作分开：以前五项平铺，用户分不出「返回选择应用」是个动作
+    const groups: Array<Array<{ label: string; action: () => void }>> = [
+      [
+        { label: "首页", action: () => this.navigate({ pane: "home" }) },
+        { label: "设置", action: () => this.navigate({ pane: "settings" }) },
+        { label: "帮助与诊断", action: () => this.navigate({ pane: "help" }) },
+        { label: "世界管理", action: () => this.navigate({ pane: "worlds" }) },
+      ],
+      [{ label: "返回选择应用", action: () => new Launcher(this.context()).show() }],
     ];
-    
-    // 点条目先关菜单再执行动作（原来只处理「点空白关闭」，浮层会压在新页面上）
-    for (const item of items) {
-      const btn = button(item.label, () => {
-        backdrop.remove();
-        item.action();
-      }, { class: "u-more-menu-item" });
-      btn.setAttribute("role", "menuitem");
-      menu.appendChild(btn);
-    }
-    
-    backdrop.addEventListener("click", () => backdrop.remove());
+    const trigger = document.getElementById("u-more-btn") as HTMLElement | null;
+    const close = (): void => {
+      backdrop.remove();
+      // 焦点还给打开菜单的那颗按钮：不然键盘用户被丢在页面顶部
+      trigger?.focus?.();
+    };
+
+    const items: HTMLButtonElement[] = [];
+    groups.forEach((group, index) => {
+      if (index > 0) menu.appendChild(el("div", { class: "u-more-menu-sep", role: "separator" }));
+      for (const item of group) {
+        const btn = button(item.label, () => {
+          backdrop.remove();
+          item.action();
+        }, { class: "u-more-menu-item" });
+        btn.setAttribute("role", "menuitem");
+        items.push(btn);
+        menu.appendChild(btn);
+      }
+    });
+
+    backdrop.addEventListener("click", () => close());
     backdrop.appendChild(menu);
     document.body.appendChild(backdrop);
-    
-    // 焦点管理
-    (menu.firstElementChild as HTMLElement)?.focus();
-    backdrop.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") backdrop.remove();
+
+    // 键盘：↑↓/Home/End 在菜单内移动，Esc 关闭并把焦点还回去（2026-10-08 审计 P1-4）
+    const move = (delta: number): void => {
+      const current = items.indexOf(document.activeElement as HTMLButtonElement);
+      const next = current < 0 ? 0 : (current + delta + items.length) % items.length;
+      items[next].focus();
+    };
+    backdrop.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        close();
+      } else if (event.key === "ArrowDown") {
+        event.preventDefault();
+        move(1);
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        move(-1);
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        items[0]?.focus();
+      } else if (event.key === "End") {
+        event.preventDefault();
+        items[items.length - 1]?.focus();
+      }
     });
+    items[0]?.focus();
   }
 
   banner(text: string, kind: "ok" | "bad" | "pending" | "muted" = "muted"): void {
@@ -413,29 +488,44 @@ export class App {
   async refresh(): Promise<void> {
     if (!this.apiRef) return;
     const api = this.apiRef;
-    try {
-      const [readiness, settings, instances] = await Promise.all([
-        api.readiness(),
-        api.settings(),
-        api.instances(),
-      ]);
-      this.readiness = readiness;
-      this.settings = settings;
-      this.instanceCache = ((instances.instances as InstanceEntry[]) ?? []).slice();
-    } catch (error) {
-      this.banner(uiError(error, { module: "本机", action: "读取状态" }).message, "bad");
+    // 分别记账：一项读失败不能把另外两项的有效读数抹掉，也不能被页面当成「真的没有」
+    const [ready, settings, instances] = await Promise.allSettled([
+      api.readiness(),
+      api.settings(),
+      api.instances(),
+    ]);
+    if (ready.status === "fulfilled") {
+      this.readiness = ready.value;
+      this.readinessError = null;
+    } else {
+      this.readinessError = uiError(ready.reason, { module: "本机", action: "读取状态" }).message;
     }
+    if (settings.status === "fulfilled") {
+      this.settings = settings.value;
+      this.settingsError = null;
+    } else {
+      this.settingsError = uiError(settings.reason, { module: "设置", action: "读取设置" }).message;
+    }
+    if (instances.status === "fulfilled") {
+      this.instanceCache = ((instances.value.instances as InstanceEntry[]) ?? []).slice();
+      this.instancesError = null;
+    } else {
+      this.instancesError = uiError(instances.reason, { module: "世界", action: "读取世界列表" }).message;
+    }
+    const failure = this.readinessError ?? this.settingsError ?? this.instancesError;
+    if (failure) this.banner(failure, "bad");
     this.renderTop();
   }
 
-  /** 只重读世界列表（切页时用；读不到就保留已有缓存，页面自己会给出错误卡） */
+  /** 只重读世界列表（切页时用；读失败要如实记账，页面据此给错误卡而不是空态） */
   private async refreshInstances(): Promise<void> {
     if (!this.apiRef) return;
     try {
       const instances = await this.apiRef.instances();
       this.instanceCache = ((instances.instances as InstanceEntry[]) ?? []).slice();
-    } catch {
-      /* 保留已有缓存 */
+      this.instancesError = null;
+    } catch (error) {
+      this.instancesError = uiError(error, { module: "世界", action: "读取世界列表" }).message;
     }
   }
 
@@ -457,7 +547,10 @@ export class App {
   }
 
   private async open(target: Route): Promise<void> {
-    if (this.current && target.pane === this.route.pane && !target.sub) return;
+    // 「已经在看这一页」要按**已经挂载的那一页**判断，不能按 this.route：
+    // 启动时 boot() 会先把路由改成 onboarding 再导航，而 onCoreStatus() 可能刚把首页挂上，
+    // 那时 this.route 已经是 onboarding，用 route 比就会误判成「已经在了」，首次打开就停在首页。
+    if (this.current && target.pane === this.current.id && !target.sub) return;
     const token = ++this.navToken;
     this.navLog.push(`${new Date().toISOString().slice(11, 19)} → ${target.pane}${target.sub ? "/" + target.sub : ""}`);
     if (this.navLog.length > 50) this.navLog.shift();
@@ -533,6 +626,9 @@ export class App {
       banner: (text, kind) => this.banner(text, kind),
       refresh: () => this.refresh(),
       instances: () => this.instanceCache,
+      readinessError: this.readinessError,
+      instancesError: this.instancesError,
+      reloadReadings: () => this.refresh(),
       openDebug: () => this.openDebug(),
       drafts: this.drafts,
     };
@@ -584,7 +680,8 @@ export class App {
     box.appendChild(
       paragraph(
         bad
-          ? `核心状态：${state}${this.status.error ? `（${this.status.error}）` : ""}`
+          ? `发生了什么：${coreStatusText(this.status)}${this.status.error ? `（${this.status.error}）` : ""}。`
+            + "下一步：先点「重启后台服务」；还是这样，就打开日志目录把日志发给提供这个程序的人。"
           : "第一次启动会检查本机环境；这一步不需要你操作。",
         "u-p",
       ),
@@ -602,8 +699,8 @@ export class App {
     box.appendChild(row);
     box.appendChild(
       facts([
-        ["核心状态", state],
-        ["原因", this.status.error ?? "—"],
+        ["后台服务", coreStatusText(this.status)],
+        ["直接原因", this.status.error ?? "—"],
         ["程序版本", String(this.status.app ?? "—")],
         ["数据格式", String(this.status.data_format ?? "—")],
         ["规则版本", String(this.status.rules ?? "—")],

@@ -391,6 +391,21 @@ fn open_dir(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 打开外部链接（密钥申请页这类）：只用系统默认浏览器，不引新依赖。
+/// 只收 http/https，挡住把本地路径或别的协议塞进来的用法。
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    let target = url.trim().to_string();
+    if !(target.starts_with("https://") || target.starts_with("http://")) {
+        return Err("只允许打开 http/https 链接".to_string());
+    }
+    Command::new("explorer")
+        .arg(&target)
+        .spawn()
+        .map_err(|error| format!("打开链接失败：{error}"))?;
+    Ok(())
+}
+
 /// 本地配置里的只读设置事实（DESKTOP_SPEC §3.3 记忆向量化 / 提交 / 世界·会话 组）：
 /// 核心 settings 契约只有 llm + core 两段，这几个键由壳读本地配置文件展示可读值；
 /// 凭据只回「是否已配置」，明文不进渲染层（§二.6）。写入仍只走核心契约。
@@ -712,6 +727,7 @@ fn main() {
             core_restart,
             log_dir,
             open_dir,
+            open_url,
             config_facts,
             pick_file,
             pick_dir,

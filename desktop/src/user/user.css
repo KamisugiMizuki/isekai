@@ -77,6 +77,18 @@ body[data-mode="debug"] #user-root {
   display: none;
 }
 
+/* 弹窗 / ⋯ 菜单 / 启动器浮层都挂在 document.body 上（不在 #user-root 里），
+   拿不到字号与前景色的继承。不补这一条，深色主题下它们就是「黑字深底 + 16px 固定字号」：
+   2026-10-08 实测弹窗对比度 1.12:1、菜单 1.27:1，而且用户把字号调到 150% 时它们仍是 16px。 */
+.u-dialog-backdrop,
+.u-more-backdrop,
+.u-launcher-overlay {
+  font-family: var(--u-font);
+  font-size: var(--u-font-size);
+  color: var(--u-fg);
+  line-height: 1.6;
+}
+
 body[data-mode="debug"] #debug-app {
   display: block;
 }
@@ -166,6 +178,30 @@ nav.u-crumbs {
   padding: 10px 0;
 }
 
+/* 「世界与素材」的分栏与动作分开两行：动作按钮（导入 / 从样例开始）和标签页混排会让人
+   以为它们也是分栏（2026-10-07 评审 P2） */
+.u-tabs-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--u-bg);
+  padding: 10px 0;
+}
+
+.u-tabs-row .u-tabs {
+  position: static;
+  padding: 0;
+}
+
+.u-tabs-actions {
+  margin-left: auto;
+}
+
 .u-content {
   display: flex;
   flex-direction: column;
@@ -236,13 +272,164 @@ nav.u-crumbs {
   gap: 20px;
 }
 
+/* ------------------------------------------------------------------ 页面骨架
+ * 每页固定三带：① 标题带（页面名 + 一句定位语 + 右侧主操作）
+ *              ② 工具带（分区 / 筛选，横向，选中态是一条下划线）
+ *              ③ 内容带（卡片）
+ * 立这个骨架是为了让「标题在哪、从哪回去、当前在哪个分区」在每一页都长在同一个位置
+ * （2026-10-08 视觉体系审查：标题纵向位置原来有 77/94/154 三种，眼睛每次都要重找）。
+ */
+.u-page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 52px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--u-border-soft);
+}
+
+.u-page-head-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.u-page-sub {
+  margin: 0;
+  color: var(--u-muted);
+  font-size: 0.85em;
+}
+
+.u-page-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+/* 工具带：分区切换。与「动作按钮」「锚点胶囊」必须长得不一样，
+   否则用户学不到「这个形状 = 这个行为」（同一次审查的根因 2）。 */
+.u-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  border-bottom: 1px solid var(--u-border-soft);
+  margin-top: -8px;
+  /* 分区条吸顶：内容再长也贴住视口，切分区不用先滚回页首
+     （原来这条挂在上一个版本的 .u-tabs/.u-crumbs 上，换成 .u-tools 时必须一起带过来） */
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--u-bg);
+}
+
+.u-tools button {
+  border: none;
+  background: transparent;
+  color: var(--u-muted);
+  font: inherit;
+  padding: 10px 14px;
+  min-height: 44px;
+  cursor: pointer;
+  border-radius: 6px 6px 0 0;
+}
+
+.u-tools button:hover {
+  background: var(--u-sunken);
+  color: var(--u-fg);
+}
+
+.u-tools button[aria-current="page"],
+.u-tools button.u-tool-active {
+  color: var(--u-fg);
+  font-weight: 600;
+  box-shadow: inset 0 -3px 0 0 var(--u-fg);
+}
+
+/* 锚点胶囊：页面内跳转（设置页那种）。小、灰底、无下划线 —— 一眼看上去就知道不是分区 */
+.u-anchors {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.u-anchors button {
+  border: none;
+  background: var(--u-sunken);
+  color: var(--u-muted);
+  font: inherit;
+  font-size: 0.85em;
+  padding: 5px 12px;
+  min-height: 34px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.u-anchors button:hover {
+  color: var(--u-fg);
+  background: var(--u-border-soft);
+}
+
+/* 页面级分区（一级重量）：不描边、只给一层底色，用来把一大块内容分组 */
+.u-panel {
+  background: var(--u-sunken);
+  border-radius: var(--u-radius);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 空态/主要视口块：把「上挤下空」的页面撑起来（内容居中，不设高度上限，不影响外层滚动） */
+.u-panel.u-fill {
+  min-height: min(52vh, 380px);
+  justify-content: center;
+}
+
+/* 对话区（角色联络中栏）：要 flex:1 才滚得起来，而 .u-panel 默认按内容撑开；
+   relative 让「有新消息 ↓」按对话区定位（状态行收进输入区后输入区变高）。 */
+.u-panel.u-conversation {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+}
+
+/* 对话区空态：居中一句提示 + 一个动作，而不是一片空白 */
+.u-msg-empty {
+  margin: auto 0;
+  text-align: center;
+  color: var(--u-muted);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+/* 段内小标题（设置页「各条世界线」「按任务」这类） */
+.u-sub {
+  margin: 0;
+  font-size: 0.95em;
+  font-weight: 600;
+  color: var(--u-muted);
+}
+
+/* 标题带紧接着工具带时不需要再缩进抵消内容盒的间距 */
+.u-page-head + .u-tools {
+  margin-top: 0;
+}
+
 .u-h2 {
   font-size: 1.5rem;
   margin: 0;
 }
 
+/* 内容卡片（二级重量）：浅描边。以前这里是 1px 纯黑 —— 全站每个盒子都那么重，
+   眼睛分不出主次（2026-10-08 视觉体系审查根因 1）。重描边只留给下面这几种：
+   错误卡、当前选中的条目、弹窗。 */
 .u-section {
-  border: 1px solid var(--u-border);
+  border: 1px solid var(--u-border-soft);
   border-radius: var(--u-radius);
   padding: 16px 18px;
   background: var(--u-surface);
@@ -351,6 +538,20 @@ nav.u-crumbs {
   font: inherit;
 }
 
+/* 危险动作不能和「打开 / 重命名 / 导出」长得一模一样（2026-10-08 审计 P1-2） */
+.u-link-danger {
+  color: var(--u-bad);
+}
+
+/* 表格行内动作：给足可点高度，别让「删除」和「打开」挤成一片小字 */
+.u-table .u-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 6px;
+  margin-right: 4px;
+}
+
 .u-link-small {
   font-size: 0.85em;
 }
@@ -432,6 +633,24 @@ nav.u-crumbs {
 .u-list-plain {
   list-style: none;
   padding-left: 0;
+}
+
+/* 常见问题（帮助页）：问题当小标题，答案一句能照做的动作；每条最多一组按钮 */
+.u-faq {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.u-faq-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.u-faq-q {
+  margin: 0;
+  font-weight: 600;
 }
 
 .u-note {
@@ -535,6 +754,14 @@ nav.u-crumbs {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+/* 密钥申请说明块（ai-setup.ts 产出，向导与设置页共用）：里面是多行 u-hint，
+   而 .u-hint 的 margin 是 0——不给这个块间距，三行话会挤成一坨 */
+.u-key-help {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .u-error {
@@ -713,6 +940,10 @@ nav.u-crumbs {
   gap: 10px;
   padding: 4px;
   min-height: 0;
+  /* 放大字号（150%）时，输入区那一叠（状态行 + AI 闸 + 连接闸 + 键盘提示）会占掉大部分高度，
+     对话列表曾经被压成 16px（探针实测）——给一个下限，宁可整块溢出由外层滚动。
+     2026-10-08 视觉体系审查：状态行搬进输入区之后必须同时守住对话区。 */
+  min-height: 140px;
 }
 
 .u-bubble {
@@ -785,6 +1016,12 @@ nav.u-crumbs {
   gap: 8px;
   border-top: 1px solid var(--u-border-soft);
   padding-top: 10px;
+  /* 输入区钉在视口底部：字号放大到 150% 时页头 + 输入区会超过一屏，
+     不钉住的话「发送」会掉到折线外（2026-10-08 审计 P0-1 实测 y=721，视口 720） */
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  background: var(--u-bg);
 }
 
 .u-col-actions {
@@ -814,15 +1051,56 @@ nav.u-crumbs {
   gap: 4px;
 }
 
-@media (max-width: 1100px) {
+/* 窄窗 / 放大字号：三栏改成上下排列。
+   这里以前写的是 grid-template-columns 与 grid-column（对 flex 容器无效），
+   而 .u-contact 是 flex 容器——那两条规则从未生效，中间聊天列继续被两侧固定栏压窄
+   （2026-10-07 可用性评审 §五「窄窗响应式失效」）。flex 容器就用 flex 的规则：
+   方向换成纵向，两侧栏各自限高并自己滚，中间的对话拿剩下的全部高度。
+
+   2026-10-08 复核又发现两个真实问题，这里一并修：
+   1) 阈值 1100px 比应用**自己的默认窗口宽度 1080px** 还宽 —— 开箱即用状态直接进窄窗分支。
+      默认窗口应当是三栏并排（1080 - 240 - 300 - 32 = 508px 的对话列够用），阈值降到 980。
+   2) 堆叠时 .u-col-center { flex: 1 1 0 } 只拿到「剩余高度」（实测 181px），而它的固定子项
+      （页头 + 输入区）本身就超过这个高度，且容器 overflow 是 visible —— 内容直接压在
+      「已讲过的线索」栏上，发送按钮落到视口外（实测 y=711，视口 720）。
+      改成：整块按内容撑开、由外层滚动；两侧栏限高并各自滚动；中间栏给足 min-height，
+      输入区 sticky 在底部，保证「发送」永远看得见。 */
+@media (max-width: 980px) {
   .u-contact {
-    grid-template-columns: 200px minmax(0, 1fr);
+    flex-direction: column;
+    height: auto;
+    min-height: 100%;
+    overflow-y: auto;
+  }
+
+  .u-col-left {
+    flex: 0 0 auto;
+    max-height: 132px;
+    overflow: auto;
+    border-bottom: 1px solid var(--u-border-soft);
+    padding-bottom: 8px;
+  }
+
+  /* 对话列按内容撑开，但至少留够「页头 + 几条消息 + 输入区」的高度 */
+  .u-col-center {
+    flex: 0 0 auto;
+    min-height: 56vh;
   }
 
   .u-col-right {
-    grid-column: 1 / -1;
+    flex: 0 0 auto;
+    max-height: 156px;
+    overflow: auto;
     border-top: 1px solid var(--u-border-soft);
-    padding-top: 10px;
+    padding-top: 8px;
+  }
+
+  /* 输入区钉在视口底部：滚到哪都能发消息（主操作不掉出折线） */
+  .u-composer {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    background: var(--u-bg);
   }
 }
 
@@ -843,8 +1121,17 @@ nav.u-crumbs {
     flex-direction: row;
   }
 
-  .u-contact {
-    grid-template-columns: minmax(0, 1fr);
+  /* 更窄的窗口里两侧栏再各让一点高度给中间：对话区不能比两边的列表还小 */
+  .u-col-left {
+    max-height: 108px;
+  }
+
+  .u-col-right {
+    max-height: 124px;
+  }
+
+  .u-col-center {
+    min-height: 50vh;
   }
 }
 
