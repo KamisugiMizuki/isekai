@@ -157,6 +157,9 @@ fn spawn_core(root: &Path, app: &tauri::AppHandle) -> Result<(), String> {
         .current_dir(&code_root)
         .env_remove("PYTHONPATH")
         .env("PYTHONIOENCODING", "utf-8")
+        // 程序目录只放程序：禁掉字节码落盘，否则核心会在 runtime/isekai_core 留 __pycache__
+        // （审计 Q1 2.4）。打包态与开发态走的是同一处 spawn，两边都生效。
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("ISEKAI_PACKAGED", if packaged { "1" } else { "0" })
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()

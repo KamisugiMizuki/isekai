@@ -6,7 +6,7 @@
  * ponytail: 原型用 CSS 弹窗,正式版改 Tauri native dialog
  */
 
-import type { AppContext } from "./app";
+import type { AppContext, Route } from "./app";
 import { el } from "./dom";
 
 export type AppMode = "chat" | "writer" | "gm";
@@ -34,6 +34,10 @@ const MODE_PANE: Record<AppMode, "contact" | "writing" | "trpg"> = {
 
 export class Launcher {
   private overlay: HTMLElement | null = null;
+  /** 「可退出」形态的上一个落点：从应用里点「返回选择应用」时为当前路由；首启为 null（三选一不变） */
+  private previous: Route | null = null;
+  /** Esc 退路只在「可退出」形态挂着，关闭时必须摘掉（否则会留下指向旧路由的一次性监听） */
+  private escHandler: ((event: KeyboardEvent) => void) | null = null;
 
   constructor(private readonly ctx: AppContext) {}
 
@@ -41,6 +45,9 @@ export class Launcher {
    * 显示应用选择器。
    * `auto` = 启动时的自动弹窗：刚选过应用就直接进去，不重复问（快速重启场景）。
    * 用户自己点「返回选择应用」走的是 `auto=false`——那是明确意图，不能被「刚选过」吞掉。
+   *
+   * 从应用里返回时（`auto=false` 且已经选过应用），`ctx.route` 就是上一个路由：
+   * 这时浮层可退出（Esc / 点空白回到那里）。首位启动没有上一个应用路由，保持「必须选一个」。
    */
   show(auto = false): void {
     const lastMode = this.ctx.prefs.app_mode as AppMode | undefined;
@@ -49,6 +56,8 @@ export class Launcher {
       this.launch(lastMode);
       return;
     }
+
+    this.previous = !auto && lastMode ? this.ctx.route : null;
 
     this.overlay = el("div", { class: "u-launcher-overlay" });
     const dialog = el("div", { class: "u-launcher" });
@@ -69,8 +78,37 @@ export class Launcher {
       dialog.appendChild(card);
     }
 
+    if (this.previous) {
+      // 有退路就说出来，别让「浮层只能三选一」的旧印象把人困住（审计 Q2④#7）
+      dialog.appendChild(el("p", { class: "u-note", text: "按 Esc 或点击空白处返回刚才的页面" }));
+      this.overlay.addEventListener("click", (event) => {
+        if (event.target === this.overlay) this.dismiss();
+      });
+      this.escHandler = (event: KeyboardEvent) => {
+        if (event.key === "Escape") this.dismiss();
+      };
+      document.addEventListener("keydown", this.escHandler);
+    }
+
     this.overlay.appendChild(dialog);
     document.body.appendChild(this.overlay);
+  }
+
+  /** 摘掉监听并移除浮层（不导航、不启动） */
+  private close(): void {
+    if (this.escHandler) {
+      document.removeEventListener("keydown", this.escHandler);
+      this.escHandler = null;
+    }
+    this.overlay?.remove();
+    this.overlay = null;
+  }
+
+  /** 「可退出」形态的退路：回到上一个路由；不改 `app_mode`，也不写「最近使用」 */
+  private dismiss(): void {
+    const previous = this.previous;
+    this.close();
+    if (previous) this.ctx.navigate(previous);
   }
 
   /** 启动选中的应用 */
@@ -81,11 +119,12 @@ export class Launcher {
     this.ctx.rememberRecent({ pane: MODE_PANE[mode], label: app?.title ?? mode, key: `launch:${mode}` });
     
     // 淡出动画
-    if (this.overlay) {
-      this.overlay.style.opacity = "0";
+    const overlay = this.overlay;
+    if (overlay) {
+      overlay.style.opacity = "0";
       await new Promise(resolve => setTimeout(resolve, 200));
-      this.overlay.remove();
     }
+    this.close();
     
     // 根据模式路由到对应页面
     this.ctx.navigate({ pane: MODE_PANE[mode] });

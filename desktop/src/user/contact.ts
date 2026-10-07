@@ -67,6 +67,8 @@ export class ContactPane implements Pane {
   private listHost: HTMLElement | null = null;
   private composer: HTMLTextAreaElement | null = null;
   private sendButton: HTMLButtonElement | null = null;
+  /** 「AI 未配置」的发送闸提示（只在未配置时显示，含去设置页的入口） */
+  private aiGateHint: HTMLElement | null = null;
   private draftSlot: HTMLElement | null = null;
   private draftKey = "";
   /** 下一条发送是否带「仅作为联络发送」意图（§6.3）；发出后复位 */
@@ -119,6 +121,17 @@ export class ContactPane implements Pane {
     this.draftSlot = el("p", { class: "u-note", id: "u-contact-draft", role: "status", "aria-live": "polite" });
     // 「仅作为联络发送」的输入框附近提示（§6.3）：只在她这句话送达时出现，发送后复位
     this.handoffHint = el("p", { class: "u-note", id: "u-contact-handoff", role: "status", "aria-live": "polite" });
+    // 发送闸的「AI 未配置」提示（审计 Q1 2.5#4）：与按钮同源，别等点了发送才报 llm_not_configured
+    const aiGateHint = el("p", {
+      class: "u-note u-note-pending",
+      id: "u-contact-ai-gate",
+      role: "status",
+      "aria-live": "polite",
+      hidden: true,
+    });
+    aiGateHint.appendChild(el("span", { text: "还没有配置 AI 服务，暂时不能发送。" }));
+    aiGateHint.appendChild(link("去「设置 → AI 服务」配置", () => this.ctx.navigate({ pane: "settings", sub: "ai" })));
+    this.aiGateHint = aiGateHint;
     const textarea = el("textarea", {
       class: "u-input u-textarea",
       rows: "3",
@@ -158,6 +171,7 @@ export class ContactPane implements Pane {
       composerNote,
       this.draftSlot,
       this.handoffHint,
+      aiGateHint,
       form,
     );
     this.composer = textarea;
@@ -580,6 +594,11 @@ export class ContactPane implements Pane {
     const selection = this.selection;
     const text = this.composer?.value.trim() ?? "";
     if (!selection || !text || !this.link) return;
+    // 与按钮同源的拒发：未配置 AI 服务时不白白发出去再吃 llm_not_configured，并说清去哪儿配
+    if (!this.aiConfigured()) {
+      this.setStatus("还没有配置 AI 服务：先去「设置 → AI 服务」填好地址与密钥再发送；写下的内容会保留。", "pending");
+      return;
+    }
     if (this.thinking) {
       this.setStatus("还在等上一条的回应；可以先写下一条，发送节拍由会话层排队", "pending");
     }
@@ -798,9 +817,18 @@ export class ContactPane implements Pane {
 
   private updateGate(): void {
     const selection = this.selection;
-    const disabled = !selection || !this.link;
-    if (this.composer) this.composer.disabled = disabled;
-    if (this.sendButton) this.sendButton.disabled = disabled;
+    const connected = Boolean(selection && this.link);
+    const aiReady = this.aiConfigured();
+    if (this.composer) this.composer.disabled = !connected;
+    // 发送闸第三个维度：AI 未配置时按钮不可点（审计 Q1 2.5#4）。只认 readiness.ai.configured，
+    // 已配置后的网络 / 生成失败不在这里拦——那些错误照旧在发送后由错误卡就近说明。
+    if (this.sendButton) this.sendButton.disabled = !connected || !aiReady;
+    if (this.aiGateHint) this.aiGateHint.hidden = !(connected && !aiReady);
+  }
+
+  /** 是否已配好 AI 服务：判定与 home.ts / onboarding.ts 同一来源（`readiness.ai.configured`），不新造 */
+  private aiConfigured(): boolean {
+    return Boolean(((this.ctx.readiness.ai as Json | undefined) ?? {}).configured);
   }
 
   /* ---------------------------------------------------------------- 操作 */
