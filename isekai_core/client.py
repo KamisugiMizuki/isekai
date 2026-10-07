@@ -2,6 +2,8 @@
 
 - `UmpClient`：hello 握手（引导凭据 / 持久凭据）、收发信封、回执与重试。
 - `MgmtClient`：受信管理面（会话选择、绑定、历史分页）。两者可用同一端点。
+- 不走环境代理（`proxy=None`）：Clash 等系统代理会把 `ws://127.0.0.1` 回环连接
+  劫持到代理（websockets 默认读 HTTP_PROXY），与 llm.py 的 `trust_env=False` 同一条规矩。
 """
 
 from __future__ import annotations
@@ -42,7 +44,9 @@ class UmpClient:
     _queue: asyncio.Queue[Envelope] = field(default_factory=asyncio.Queue)
 
     async def connect(self, *, timeout: float = 15.0) -> dict[str, Any]:
-        self._ws = await connect(self.endpoint, max_size=1 << 20, ping_interval=20, ping_timeout=20)
+        self._ws = await connect(
+            self.endpoint, max_size=1 << 20, ping_interval=20, ping_timeout=20, proxy=None
+        )
         auth: dict[str, str] = {}
         if self.credential:
             auth["credential"] = self.credential
@@ -176,7 +180,9 @@ class MgmtClient:
         self.info: dict[str, Any] = {}
 
     async def connect(self, *, timeout: float = 15.0) -> dict[str, Any]:
-        self._ws = await connect(self.endpoint, max_size=1 << 20, ping_interval=20, ping_timeout=20)
+        self._ws = await connect(
+            self.endpoint, max_size=1 << 20, ping_interval=20, ping_timeout=20, proxy=None
+        )
         auth = {"mgmt": "1", "op": "auth", "id": "r-0", "args": {"token": self.token}}
         await self._ws.send(json.dumps(auth, ensure_ascii=False))
         reply = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=timeout))

@@ -54,7 +54,8 @@ async def embed(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     payload: dict[str, Any] = {"model": model, "input": batch}
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    # 不走环境代理（与 llm.py 同一条规矩）：Clash 等系统代理会把回环/直连请求劫持到代理
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
         response = await client.post(url, headers=headers, content=json.dumps(payload).encode("utf-8"))
     if response.status_code >= 400:
         raise EmbeddingError(f"embedding HTTP {response.status_code}")

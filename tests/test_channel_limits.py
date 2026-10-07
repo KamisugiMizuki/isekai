@@ -54,7 +54,7 @@ async def test_connection_limit_refuses_new_and_keeps_online(tmp_path):
         mgmt = await open_mgmt(h)
         first, bound = await bind_thread(h, mgmt, channel_id="a", thread_id="dm-1")
         issued = await mgmt.call("channel.ensure", name="b")
-        raw = await ws_connect(h.endpoint)
+        raw = await ws_connect(h.endpoint, proxy=None)  # 回环直连：带 HTTP_PROXY 的终端下不被代理劫持
         try:
             await raw.send(_hello("b", issued["credential"]))
             refused = json.loads(await asyncio.wait_for(raw.recv(), timeout=5.0))

@@ -246,7 +246,7 @@ async def test_protocol_version_mismatch_is_rejected(tmp_path):
     async with running_core(tmp_path) as h:
         from websockets.asyncio.client import connect
 
-        ws = await connect(h.endpoint)
+        ws = await connect(h.endpoint, proxy=None)  # 回环直连：带 HTTP_PROXY 的终端下不被代理劫持
         await ws.send(json.dumps({"ump": "2.0", "type": "hello", "id": "e-1", "ts": 0.0, "payload": {}}))
         frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
         assert frame["type"] == "error"
