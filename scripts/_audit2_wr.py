@@ -1447,7 +1447,10 @@ async def ws_core_checks() -> None:
                                  and plan_before == plan_after) else "FAIL",
                       code_ref="isekai_core/runtime/environment.py:98-129、session.py:88-147")
 
-                # §2.6 条5：目标时刻远领先时，对话应捕获目标水位并等待推进（或报告追赶中）
+                # §2.6 条5：目标时刻远领先时，对话要么等世界推进到接收时的目标水位，要么明确报「追赶中」。
+                # 2026-10-08 的墙钟时间盒（P0-1）让「小幅滞后」能在一拍内追平，因此判据改为
+                # **记账口径**：直接作答只在「回信时推进器已追平（catching_up/limited 均为 0）」时成立；
+                # 未追平却直接作答（拿目标水位冒充已发生）仍然判 FAIL。
                 await mgmt.call("runtime.rate", instance_id=iid, timeline_id=tl, rate=100000)
                 await asyncio.sleep(1.3)  # 让该倍率命令越过生效整秒，世界目标确实远远领先
                 lag_started = time.time()
@@ -1460,12 +1463,16 @@ async def ws_core_checks() -> None:
                 lag_elapsed = time.time() - lag_started
                 now_view = world.view(iid, tl, now_real=time.time())
                 lag = int(now_view.get("world_seconds") or 0) - int(now_view.get("processed_world") or 0)
+                accounted = runtime.store.clock_get(tl) or {}
+                drained = (int(accounted.get("catching_up") or 0) == 0
+                           and int(accounted.get("limited") or 0) == 0)
                 check("§2.6 条5 目标水位远领先时：对话捕获目标水位、待推进后再取快照；超预算报「追赶中」",
-                      "回复应等待世界推进到接收时的目标水位，或明确报告追赶中",
+                      "直接作答只在推进器已追平时成立；未追平必须报追赶中，不拿目标水位冒充事实",
                       f"目标={now_view.get('world_seconds')} vs 已完成={now_view.get('processed_world')}"
-                      f"（滞后 {lag} 世界秒）；回信耗时={lag_elapsed:.2f}s，信封类型={lagged.type}"
-                      + ("（滞后中仍直接作答、无追赶提示）" if lagged.type == "reply" and lag > 100000 else ""),
-                      "PASS" if (lagged.type != "reply" or lag_elapsed > 30) else "FAIL",
+                      f"（滞后 {lag} 世界秒）；回信耗时={lag_elapsed:.2f}s，信封类型={lagged.type}，"
+                      f"记账追平={drained}（catching_up={accounted.get('catching_up')}、"
+                      f"limited={accounted.get('limited')}）",
+                      "PASS" if (lagged.type != "reply" or drained or lag_elapsed > 30) else "FAIL",
                       code_ref="isekai_core/runtime/service.py:2948-2950、session.py:434")
 
                 # 冻结线：管理面视图只显示已冻结，且冻结线不再推进、不接受对话

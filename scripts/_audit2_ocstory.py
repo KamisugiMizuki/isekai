@@ -398,7 +398,12 @@ async def acceptance_rows() -> None:
             client, bound, instance_id, timeline_id, cards = await room(h, activate=False)
             try:
                 h.world.activate(instance_id, timeline_id, now_real=time.time(), rate=3600)
-                await asyncio.sleep(1.05)
+                # 确定性构造「没追平」：世界时间前跳两天、推进只做一批（与 pytest 同口径）。
+                # 追赶 = 推进器记账，不是「此刻存在未处理区间」——后者每时每刻都成立，
+                # 2026-10-08 的墙钟时间盒（P0-1）让「睡 1.05 秒再看」这种时序构造不再可靠。
+                h.world.consume_time(
+                    instance_id, timeline_id, seconds=2 * DAY, cause="离线回访模拟", max_batches=1
+                )
                 scene = await h.mgmt.call("story.scene", instance_id=instance_id, timeline_id=timeline_id,
                                           character_id=cards[0])
                 home = await h.mgmt.call("story.home", instance_id=instance_id, timeline_id=timeline_id,

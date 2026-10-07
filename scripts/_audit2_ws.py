@@ -1586,18 +1586,19 @@ async def g3_export_watermark(ctx: Ctx) -> tuple[str, str]:
     clock_world = int(ctx.store.clock_get(timeline)["base_world"])
     old_intact = target.read_text(encoding="utf-8") == "旧导出件占位"
 
-    # 中途失败：让校验步骤抛错，先前的导出件不能被破坏、也不能留 .tmp
+    # 中途失败：让构建步骤抛错，先前的导出件不能被破坏、也不能留 .tmp。
+    # 注入点用 `build_container`（P1-13：导出**不再**自我复验，`verify_integrity` 已不在写路径上）。
     import isekai_core.world.portable as portable
 
-    original = portable.verify_integrity
-    portable.verify_integrity = lambda payload: (_ for _ in ()).throw(RuntimeError("探针注入失败"))
+    original = portable.build_container
+    portable.build_container = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("探针注入失败"))
     failed = False
     try:
         write_export(ctx.store, info["id"], target)
     except Exception as exc:  # noqa: BLE001
         failed = "探针注入失败" in str(exc) or isinstance(exc, RuntimeError)
     finally:
-        portable.verify_integrity = original
+        portable.build_container = original
     leftovers = [p.name for p in target.parent.iterdir() if p.name.endswith(".tmp")]
     intact_after = target.read_text(encoding="utf-8")
 

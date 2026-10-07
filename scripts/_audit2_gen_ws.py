@@ -475,7 +475,7 @@ async def section_p3() -> None:
                      "document.getElementById('gw-prompt-box').dispatchEvent(new Event('toggle'))")
         await asyncio.sleep(2.0)
         prompt_ui = await cdp.js("document.getElementById('gw-prompt').textContent")
-        snap = await mgmt_call(cdp, "world.generate.snapshot")
+        snap = await mgmt_call(cdp, "world.generate.snapshot", want_prompt=True)
         progress = (snap.get("progress") or {})
         prompt_core = (snap.get("prompt") or {})
         check("P3-③ §3.4/§六 提示词预览：界面摊开的正是最近一次调用原文（旋钮句在其中）+ 核心进度快照可读",

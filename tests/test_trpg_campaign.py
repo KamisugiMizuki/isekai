@@ -218,6 +218,28 @@ def make_resident_plugin(tmp_path, *, share: bool = False) -> str:
     return str(manifest)
 
 
+#: 零世界后果的插件（§12.4 / P2-3）：只有规则状态 patch，没有 effects / claims / 事件帧
+NOTHING_PLUGIN_SOURCE = '''
+import json, sys
+
+request = json.loads(sys.stdin.readline())
+state = request.get("rule_state") or {}
+base = int(state.get("state_revision") or 0)
+print(json.dumps({
+    "resolution": {"system": "fake-rules", "outcome": "no_change", "mode": "nothing"},
+    "rule_state_patch": {
+        "ruleset_id": state.get("ruleset_id"),
+        "base_state_revision": base,
+        "operations": [{"path": "/actors/pc-1/hp", "op": "add" if base == 0 else "increase", "value": 1}],
+    },
+    "consequences": [],
+    "claims": [],
+    "scene_transition": {},
+    "participants": [],
+}, ensure_ascii=False))
+'''
+
+
 def make_plugin(tmp_path, *, source: str = PLUGIN_SOURCE) -> str:
     folder = tmp_path / "rules"
     folder.mkdir(exist_ok=True)
@@ -1294,3 +1316,140 @@ async def test_plugin_structured_error_response_maps_to_action_status(tmp_path) 
             assert "pc-1" not in json.dumps(state.get("opaque_state") or {}), state
         finally:
             await mgmt.close()
+
+
+@pytest.mark.asyncio
+async def test_zero_consequence_commit_takes_the_fast_path(tmp_path) -> None:
+    """§12.4 / P2-3 快路径：空后果包跳过草稿归一化与制度 / 环境构造，照样落账。
+
+    判据：把「世界管线」的三个入口换成会炸的假函数后，提交仍然 `committed`——
+    说明规则状态 patch、行动、战役与提交台账都落了，而世界管线一次都没被碰；
+    事件行只**引用**行动行（`resolution_ref`），不再复制一份裁定正文（§10.1 / P1-11）。
+    """
+    plugin = make_plugin(tmp_path, source=NOTHING_PLUGIN_SOURCE)
+    async with running_core(tmp_path) as harness:
+        mgmt = await open_mgmt(harness)
+        try:
+            info, timeline_id, _card = make_instance(
+                harness.store, harness.runtime.service.runtime, moment=DAY * 1500
+            )
+            campaign_id = await _campaign(mgmt, info, timeline_id, plugin)
+            action_id, resolved = await _run_action(mgmt, info, timeline_id, campaign_id, plugin=plugin)
+            assert resolved["status"] == "reviewing", resolved
+
+            service = harness.runtime.service.runtime
+            originals = {name: getattr(service, name) for name in
+                         ("_known_targets", "_institution_rows", "_environment_rows")}
+
+            def boom(*_args: object, **_kwargs: object) -> None:
+                raise AssertionError("零后果快路径不该经过世界管线（§12.4）")
+
+            try:
+                for name in originals:
+                    setattr(service, name, boom)
+                committed = await mgmt.call(
+                    "trpg.commit", instance_id=info["id"], timeline_id=timeline_id,
+                    campaign_id=campaign_id, action_id=action_id, idempotency_key="fast-1",
+                )
+            finally:
+                for name, fn in originals.items():
+                    setattr(service, name, fn)
+
+            assert committed["status"] == "committed", committed
+            assert int(committed["effects"]) == 0 and int(committed["claims"]) == 0
+            assert committed.get("fast_path") is True
+
+            # 规则状态照落（只有规则状态 patch 也照样提交，§12.4）
+            state = harness.store.trpg_rule_state_get(
+                info["id"], timeline_id, campaign_id, "fake-rules", scope_ref=""
+            )
+            assert state is not None and int(state["state_revision"]) == 1, state
+
+            # 事件行只记录这次行动本身，并**引用**行动行（不复制裁定正文）
+            events = [row for row in harness.store.event_window(info["id"], timeline_id, until=10**15)
+                      if str(row["source"]).startswith("trpg")]
+            assert events, "行动本身仍要落一条事件（效果数为 0）"
+            detail = json.loads(events[-1]["detail"])
+            assert detail["action_id"] == action_id
+            assert detail["resolution_ref"] == f"{action_id}#1"
+            assert "resolution" not in detail, "裁定正文的唯一持久副本在行动行上（§10.1）"
+            row = harness.store.trpg_get("action", instance_id=info["id"], timeline_id=timeline_id,
+                                         campaign_id=campaign_id, action_id=action_id)
+            assert str(row["status"]) == "transitioned" and str(row["resolution"]) not in ("", "{}")
+        finally:
+            await mgmt.close()
+
+
+def test_rule_state_shard_migration_keeps_old_rows_in_the_global_shard(tmp_path) -> None:
+    """P1-9 老库迁移自证：`trpg_rule_state` 加 `scope_ref` + 重建主键后能读能写。
+
+    判据（规范 §3.4：主键 `(instance, timeline, campaign, ruleset, scope_ref)`，`''` = 全局）：
+    老行落进全局分片且正文不丢；分片各写各的、互不影响；分片头不搬 `opaque_state`；
+    不带 `scope_ref` 的老口径读取仍然能读到该规则系统的行（兼容路径）。
+    """
+    import sqlite3
+
+    from isekai_core.store import Store
+
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE trpg_rule_state(
+          instance_id TEXT NOT NULL, timeline_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+          ruleset_id TEXT NOT NULL, ruleset_version TEXT NOT NULL DEFAULT '',
+          state_revision INTEGER NOT NULL DEFAULT 1, opaque_state TEXT NOT NULL DEFAULT '{}',
+          created_world INTEGER NOT NULL DEFAULT 0, updated_world INTEGER NOT NULL DEFAULT 0,
+          updated_real REAL NOT NULL DEFAULT 0,
+          PRIMARY KEY(instance_id, timeline_id, campaign_id, ruleset_id));
+        INSERT INTO trpg_rule_state
+          (instance_id, timeline_id, campaign_id, ruleset_id, ruleset_version, state_revision, opaque_state)
+        VALUES('in-1', 'tl-1', 'cp-1', 'fake-rules', '1.0', 7, '{"actors": {"pc-1": {"hp": 3}}}');
+        CREATE TABLE trpg_action(
+          instance_id TEXT NOT NULL, timeline_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+          action_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'received',
+          PRIMARY KEY(instance_id, timeline_id, campaign_id, action_id));
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    store.ensure_schema()
+    try:
+        # 老行还在，并被归到全局分片（正文一字不动）
+        global_shard = store.trpg_rule_state_get("in-1", "tl-1", "cp-1", "fake-rules", scope_ref="")
+        assert global_shard is not None, "老库的规则状态行在迁移后不该消失"
+        assert str(global_shard["scope_ref"]) == ""
+        assert int(global_shard["state_revision"]) == 7
+        assert json.loads(global_shard["opaque_state"])["actors"]["pc-1"]["hp"] == 3
+        assert str(global_shard["ruleset_version"]) == "1.0"
+
+        # 行动表也补上了新的列（规则输入 context / 确认来源 confirmed_by）
+        action_columns = {row[1] for row in store._conn.execute("PRAGMA table_info(trpg_action)")}
+        assert {"context", "confirmed_by"} <= action_columns
+
+        # 分片读写：新分片各写各的，全局分片不受影响
+        store.trpg_upserts({"rule_state": [{
+            "instance_id": "in-1", "timeline_id": "tl-1", "campaign_id": "cp-1",
+            "ruleset_id": "fake-rules", "scope_ref": "character:pc-1", "ruleset_version": "1.0",
+            "state_revision": 1, "opaque_state": json.dumps({"hp": 9}),
+        }]})
+        shard = store.trpg_rule_state_get("in-1", "tl-1", "cp-1", "fake-rules", scope_ref="character:pc-1")
+        assert shard is not None and int(shard["state_revision"]) == 1
+        assert json.loads(shard["opaque_state"]) == {"hp": 9}
+        assert int(store.trpg_rule_state_get(
+            "in-1", "tl-1", "cp-1", "fake-rules", scope_ref=""
+        )["state_revision"]) == 7, "写别的分片不该动全局分片"
+
+        # 分片头（版本闸 / 状态条用）：只要 revision 与写入版本，不搬正文
+        headers = store.trpg_rule_state_view("in-1", "tl-1", "cp-1", "fake-rules")
+        assert {str(item["scope_ref"]) for item in headers} == {"", "character:pc-1"}
+        assert all("opaque_state" not in item for item in headers)
+
+        # 兼容路径：老口径（不带 scope_ref）的查询照样能读到该规则系统的行
+        legacy = store.trpg_get("rule_state", instance_id="in-1", timeline_id="tl-1",
+                                campaign_id="cp-1", ruleset_id="fake-rules")
+        assert legacy is not None and int(legacy["state_revision"]) in (1, 7)
+    finally:
+        store.close()

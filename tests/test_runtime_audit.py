@@ -460,9 +460,14 @@ def test_cross_day_window_experience_is_harvested_once(store) -> None:
         from_world=DAY * 1501,
         to_world=DAY * 1501 + 25200,  # 跨日睡眠的尾巴落在这一批里
     )
-    wrap = [item for item in experiences if item["id"] == f"xp-{character_id}-{day * DAY + 82800}"]
-    assert len(wrap) == 1, "跨日窗口在次日批次里被收割"
+    # §11 / P1-2：经历按「每角色每世界日一段」收口——跨日窗口的尾巴落在次日，合成**次日**那一段
+    wrap_day = calendar.day_index(DAY * 1501 + 21600)
+    wrap = [item for item in experiences if item["id"] == f"xp-{character_id}-d{wrap_day}"]
+    assert len(wrap) == 1, "跨日窗口在次日批次里被收割（一世界日一段）"
     assert wrap[0]["world_seconds"] == (day + 1) * DAY + 21600
+    assert "：" in str(wrap[0]["summary"]) and "sleep" in str(wrap[0]["summary"]), (
+        "段落摘要保留当天时刻标签与活动（一世界日一段、不丢内容）"
+    )
     assert plans and units is not None
 
     # 同一批重放：同一窗口不重复产成

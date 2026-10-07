@@ -246,8 +246,8 @@ def section_a() -> None:
                 f"label_ok={same_label} actions_ok={same_actions} forbidden_ok={same_forbidden} "
                 f"impl_label={entry['label']}", label.strip(),
             )
-    common.expect("A01 §7.1 覆盖", "规范表里的状态都实现（≥17 行）",
-                  seen >= 17 and len(states.VISIBLE_STATES) == 17,
+    common.expect("A01 §7.1 覆盖", "规范表里的状态都实现（≥16 行；snapshotting 已并入 resolving）",
+                  seen >= 16 and len(states.VISIBLE_STATES) == 16,
                   f"逐条核对 {seen} 行 / 实现 {len(states.VISIBLE_STATES)} 行", f"规范表 {len(rows)} 行")
     unknown = states.user_state("travelling")
     common.expect("A02 未知状态不猜", "如实说未知、不给可操作项",

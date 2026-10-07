@@ -170,3 +170,56 @@ def test_death_abandons_standing_intents(store) -> None:
     )
     assert any("她已不在了" in str(row["note"]) for row in rows if row["stage"] == "abandoned")
     _ = time
+
+
+def test_archive_state_outlives_the_event_window(store) -> None:
+    """§六 / P1-3：归档态是**版本化状态位**，不靠「最近 400 条事件」反推。
+
+    构造：角色寿终 → 状态位与死亡事件同一批落盘；随后灌入 500 条更晚的事件，把死亡事件
+    挤出有界窗口 → 她仍然算归档（不再排新计划、不再产生经历），不会出现「复生」。
+    """
+    world_service = RuntimeService(store)
+    package = sample_package()
+    moment = DAY * 1500
+    card = _dying_card(package, died=moment + DAY)
+    info = create_instance(store, package, [card])
+    timeline_id = store.timeline_list(info["id"])[0]["id"]
+    world_service.ensure_instance(info["id"], now_real=1.7e9)
+    world_service.activate(info["id"], timeline_id, now_real=1.7e9)
+    world_service.advance(info["id"], timeline_id, now_real=1.7e9 + 2 * DAY)
+
+    character_id = str(card["meta"]["card_id"])
+    state = store.character_state_get(info["id"], timeline_id, character_id)
+    assert state is not None and int(state["archived"]) == 1, "寿终与归档态同一批落盘（§六）"
+    assert str(state["basis"]).startswith("ev-") or state["basis"], "归档要留依据引用"
+    assert store.death_exists(info["id"], timeline_id, character_id), "归档判定读状态位"
+    assert character_id in world_service._archived_ids(info["id"], timeline_id)
+
+    # 把死亡事件挤出 400 条窗口：灌 500 条更晚的事件（同刻顺序按 seq）
+    with store._lock, store._conn:
+        for index in range(500):
+            store._conn.execute(
+                """INSERT OR IGNORE INTO event(instance_id, timeline_id, id, world_seconds, seq, kind,
+                       family, template, source, summary, detail, text_source, effects, share_value,
+                       importance, created_real)
+                   VALUES(?,?,?,?,?,'world','','filler','engine','填充事件','','template','[]',0,0.1,0)""",
+                (info["id"], timeline_id, f"fill-{index}", moment + 10 * DAY + index, index),
+            )
+    assert not events.is_dead(
+        info["id"], timeline_id, character_id,
+        store.event_window(info["id"], timeline_id, until=10**12, limit=400),
+    ), "前提：这时窗口判法已经看不见那次寿终"
+
+    plan_before = store.plan_latest(info["id"], timeline_id, character_id)
+    world_service.advance(info["id"], timeline_id, now_real=1.7e9 + 12 * DAY)
+    plan_after = store.plan_latest(info["id"], timeline_id, character_id)
+    assert int(plan_after["day_index"]) == int(plan_before["day_index"]), (
+        "窗口看不见寿终也不能让她复生：不再排新计划"
+    )
+    fresh = [
+        item
+        for item in store.experience_window(info["id"], timeline_id, character_id, until=10**12, limit=600)
+        if int(item["world_seconds"]) > moment + DAY
+    ]
+    assert not fresh, "已归档角色不再产生经历"
+    assert store.death_exists(info["id"], timeline_id, character_id), "窗口失效后状态位仍然作数"

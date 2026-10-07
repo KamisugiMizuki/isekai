@@ -95,8 +95,14 @@ def _events(harness, info, timeline_id) -> list[dict]:
 
 
 def test_visible_state_table_covers_the_spec_and_never_guesses() -> None:
-    """§7.1：状态表是闭集，未知状态如实说未知；受众默认严（未标记 = 仅 GM）。"""
-    assert len(states.VISIBLE_STATES) == 17
+    """§7.1：状态表是闭集，未知状态如实说未知；受众默认严（未标记 = 仅 GM）。
+
+    行数从 17 改为 16：`TRPG_CLIENT_SPEC` §7.1（2026-10-08 / P2-4）把在途合并为单一
+    `resolving`，规范表不再有独立的 `snapshotting` 行（老库在途行的兼容映射在
+    `states.EXTRA_STATES`，读得出来但不计入规范表）。
+    """
+    assert len(states.VISIBLE_STATES) == 16
+    assert states.user_state("snapshotting")["label"] == states.user_state("resolving")["label"]
     assert states.user_state("committed")["label"] == "结果已固化"
     unknown = states.user_state("travelling")
     assert unknown["known"] is False and not unknown["actions"] and "未知状态" in unknown["label"]

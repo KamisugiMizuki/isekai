@@ -53,6 +53,14 @@ async def running_core(
     try:
         yield harness
     finally:
+        # 规则插件会话默认常驻（P1-8）：测试收尾要像 app.py 那样显式关掉，
+        # 否则会话在事件循环关闭后才被 GC，会留下 PytestUnraisableExceptionWarning。
+        campaign = getattr(getattr(runtime, "world", None), "campaign", None)
+        if campaign is not None:
+            try:
+                await campaign.close_rule_sessions()
+            except Exception:  # noqa: BLE001 - 收尾异常不挡测试
+                pass
         await runtime.service.shutdown()
         await runtime.server.close()
         runtime.store.close()
