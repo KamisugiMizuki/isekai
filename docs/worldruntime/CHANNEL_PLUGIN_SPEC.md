@@ -232,7 +232,7 @@
 - 认证材料传递方式已定：核心签发通道凭据后经**该插件自己的环境**交给它（`ISEKAI_PLUGIN_ID` / `ISEKAI_PLUGIN_CREDENTIAL`；
   子进程 env 走白名单，核心的 LLM Key 与管理凭据都不进去）。
 - 附件协议 **2026-09-22 落地**：`user_message.attachments`（能力位 `attachments` + 配额，图像进模型走 `image_url`，
-  其余类型只给文字标注）；未协商该能力的通道给附件仍是 `unsupported_capability`（不静默忽略）。流式仍按「启用时另行扩展」处理：`stream` 字段继续显式拒绝（`ump._reject_unsupported_extensions`）。
+  其余类型只给文字标注）；未协商该能力的通道给附件仍是 `unsupported_capability`（不静默忽略）。流式方面要分清两个名字：早先的保留字段 `stream` 继续显式拒绝（`ump._reject_unsupported_extensions`），而**现役的增量流式是 2026-09-22 落地的 `streaming` 能力位 + `reply_delta` 帧**（见下条），二者不是一回事。
 
 ## 十、行为验收
 

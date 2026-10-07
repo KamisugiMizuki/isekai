@@ -678,7 +678,7 @@ export type ChannelEvent =
       replyTo: string;
       at: number;
     }
-  | { kind: "notice"; text: string; messageId: string; at: number }
+  | { kind: "notice"; text: string; messageId: string; replyTo: string; at: number }
   | { kind: "accepted"; ref: string; state: string; messageId: string }
   | { kind: "status"; state: string }
   | { kind: "error"; code: string; message: string; ref: string; retryable: boolean; stage: string }
@@ -797,6 +797,8 @@ export class ChannelLink {
         kind: "notice",
         text: String(payload.text ?? ""),
         messageId: String(payload.message_id ?? ""),
+        // 转交说明现在不带 reply_to（核心只给 reply 帧带）；留字段让历史行能对上原文（§6.3）
+        replyTo: String(payload.reply_to ?? ""),
         at: Number(env.ts ?? Date.now() / 1000),
       });
       return;
@@ -834,9 +836,9 @@ export class ChannelLink {
   }
 
   /** 发送一条联络：返回这次请求的身份（界面按它查询结果，不重复发） */
-  send(textValue: string): string {
+  send(textValue: string, opts?: { asContact?: boolean }): string {
     if (!this.client || !this.link) throw new Error("还没有连上这个角色");
-    return this.client.userMessage(this.link.threadId, this.link.token, textValue);
+    return this.client.userMessage(this.link.threadId, this.link.token, textValue, opts);
   }
 
   confirmDelivery(messageId: string, batchIndex: number, state: string): void {

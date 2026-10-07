@@ -36,6 +36,8 @@ interface Message {
   messageId: string;
   state: string;
   ref: string;
+  /** 这行指向的入站原文（`reply_to`）：转交说明据此对上要展开的那句话（§6.3） */
+  replyTo: string;
   parts: number[];
 }
 
@@ -67,6 +69,9 @@ export class ContactPane implements Pane {
   private sendButton: HTMLButtonElement | null = null;
   private draftSlot: HTMLElement | null = null;
   private draftKey = "";
+  /** 下一条发送是否带「仅作为联络发送」意图（§6.3）；发出后复位 */
+  private asContact = false;
+  private handoffHint: HTMLElement | null = null;
   private host: HTMLElement | null = null;
   private systemHost: HTMLElement | null = null;
   private clueHost: HTMLElement | null = null;
@@ -112,6 +117,8 @@ export class ContactPane implements Pane {
     const composerNote = el("p", { class: "u-note" });
     this.statusNote = composerNote;
     this.draftSlot = el("p", { class: "u-note", id: "u-contact-draft", role: "status", "aria-live": "polite" });
+    // 「仅作为联络发送」的输入框附近提示（§6.3）：只在她这句话送达时出现，发送后复位
+    this.handoffHint = el("p", { class: "u-note", id: "u-contact-handoff", role: "status", "aria-live": "polite" });
     const textarea = el("textarea", {
       class: "u-input u-textarea",
       rows: "3",
@@ -150,6 +157,7 @@ export class ContactPane implements Pane {
       live,
       composerNote,
       this.draftSlot,
+      this.handoffHint,
       form,
     );
     this.composer = textarea;
@@ -221,6 +229,7 @@ export class ContactPane implements Pane {
     const selection = this.selection;
     if (!selection) return;
     this.draftKey = `contact:${selection.instance_id}:${selection.timeline_id}:${selection.character_id}`;
+    this.resetAsContact(); // 换对象/重连后不带着上一条的意图（§6.3）
     this.renderHeader();
     this.renderList();
     this.renderCluePanel();
@@ -479,6 +488,7 @@ export class ContactPane implements Pane {
       messageId: String(row.message_id ?? row.reply_message_id ?? ""),
       state: String(row.state ?? ""),
       ref: String(row.env_id ?? ""),
+      replyTo: String(row.reply_to ?? ""),
       parts: [],
     };
   }
@@ -575,11 +585,13 @@ export class ContactPane implements Pane {
     }
     let ref = "";
     try {
-      ref = this.link.send(text);
+      ref = this.link.send(text, { asContact: this.asContact });
     } catch (error) {
       this.setStatus(uiError(error, { module: "角色联络", action: "发送" }).message, "bad");
       return;
     }
+    // 意图只跟着这一条走：发出去就复位，下一次回到普通联络（§6.3）
+    this.resetAsContact();
     this.pending.push({ ref, text, state: "submitting" });
     if (this.composer) this.composer.value = "";
     await this.ctx.drafts.discard(this.draftKey);
@@ -609,6 +621,7 @@ export class ContactPane implements Pane {
           messageId: event.messageId,
           state: "fixed",
           ref: "",
+          replyTo: event.replyTo,
           parts: [event.batchIndex],
         });
       } else if (!existing.parts.includes(event.batchIndex)) {
@@ -636,6 +649,7 @@ export class ContactPane implements Pane {
         messageId: event.messageId,
         state: "fixed",
         ref: "",
+        replyTo: event.replyTo,
         parts: [],
       });
       // 说明也要回执（单批）：不回执的话这条永远算未确认，每次重连都会被当成待投递重发一遍
@@ -714,7 +728,7 @@ export class ContactPane implements Pane {
       const row = el("div", { class: "u-row" });
       row.appendChild(primary(`查看${hit.label}`, () => this.ctx.navigate({ pane: hit.pane })));
       row.appendChild(button("继续联络", () => this.dismissHandoff(node)));
-      row.appendChild(button("仅作为联络发送", () => this.dismissHandoff(node)));
+      row.appendChild(button("仅作为联络发送", () => this.resendAsContact(message)));
       node.appendChild(row);
     }
     const meta = el("div", { class: "u-bubble-meta" });
@@ -725,6 +739,48 @@ export class ContactPane implements Pane {
 
   private dismissHandoff(node: HTMLElement): void {
     node.remove();
+  }
+
+  /**
+   * §6.3 的固定出口：把转交说明对应的原文展开回输入框供修改，并说清「只把这句话告诉她，
+   * 不执行其中的操作」。确认后以新的联络请求提交（带 `as_contact`），原转交记录保留在历史与对话里。
+   */
+  private resendAsContact(notice: Message): void {
+    const original = this.handoffOriginal(notice);
+    if (!original) {
+      // 找不到原文不猜、不崩：提示手动重发，仍走同一条受控入口
+      this.setStatus("没找到这条通知对应的原文：请手动重发这句话（只把话告诉她，不执行其中的操作）", "pending");
+      return;
+    }
+    this.restoreToComposer(original);
+    this.asContact = true;
+    setNote(this.handoffHint, "只把这句话告诉她，不执行其中的操作；可以改。", "pending");
+    this.setStatus("把这句话作为新的联络发送：只作为联络，不执行其中的操作", "pending");
+  }
+
+  /** 转交通知对应的原文：先按 `reply_to === env_id` 精确对，再退到该通知之前最近一条已作废的入站。 */
+  private handoffOriginal(notice: Message): { text: string } | null {
+    const ref = notice.replyTo;
+    if (ref) {
+      const fromHistory = this.messages.find((item) => item.role === "user" && item.ref === ref);
+      if (fromHistory) return fromHistory;
+      const fromPending = this.pending.find((item) => item.ref === ref);
+      if (fromPending) return fromPending;
+    }
+    const index = this.messages.indexOf(notice);
+    const before = index >= 0 ? this.messages.slice(0, index) : this.messages;
+    for (let cursor = before.length - 1; cursor >= 0; cursor -= 1) {
+      const item = before[cursor];
+      if (item.role === "user" && item.state === "cancelled") return item;
+    }
+    // 实时流里作废的入站还没进历史：它在 pending 里等这一轮的结局，取最近一条
+    const live = this.pending[this.pending.length - 1];
+    return live ? { text: live.text } : null;
+  }
+
+  private resetAsContact(): void {
+    this.asContact = false;
+    setNote(this.handoffHint, "", "muted");
   }
 
   private appendSystem(node: HTMLElement): void {

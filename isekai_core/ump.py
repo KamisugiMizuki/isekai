@@ -285,6 +285,10 @@ def _validate_payload(
             raise UmpError(Err.PROTOCOL, "user_message.text must be a non-empty string")
         if len(text) > max_text_len:
             raise UmpError(Err.PROTOCOL, f"text exceeds {max_text_len} characters")
+        # 「仅作为联络发送」（USER_INTERFACE_DESIGN §6.3）：只允许 true 或省略。
+        # 这是客户端随新消息带上的明确意图，核心只拿它改变分类，不给任何额外权限（见 session._story_gate）。
+        if "as_contact" in payload and payload["as_contact"] is not True:
+            raise UmpError(Err.PROTOCOL, "user_message.as_contact must be true or omitted")
         _attachments_of(payload, attachments)
     elif env_type == "delivery":
         _require_str(payload, "message_id", max_len=64)

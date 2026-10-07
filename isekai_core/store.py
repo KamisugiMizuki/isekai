@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS message(
   wait_until REAL NOT NULL DEFAULT 0, -- 入站：睡眠期合并批的现实截止点（一次确定，不因后续输入重置）
   model_fingerprint TEXT NOT NULL DEFAULT '',  -- 产出该回复的模型标识（换模型后旧行仍看得出边界）
   attachments TEXT NOT NULL DEFAULT '[]',      -- 入站：附件 JSON 列表 [{name,media_type,size,data(base64)}]（§七 附件项）
+  intent TEXT NOT NULL DEFAULT '',             -- 入站：本轮意图标记（"as_contact" = 用户明确要求「仅作为联络发送」，§6.3）
   state TEXT NOT NULL,
   error_code TEXT,
   created_at REAL NOT NULL
@@ -1796,6 +1797,9 @@ class Store:
         if message_columns and "attachments" not in message_columns:
             log.info("message 增列 attachments（附件随消息持久化，§七）")
             self._conn.execute("ALTER TABLE message ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
+        if message_columns and "intent" not in message_columns:
+            log.info("message 增列 intent（「仅作为联络发送」的入站标记，§6.3）")
+            self._conn.execute("ALTER TABLE message ADD COLUMN intent TEXT NOT NULL DEFAULT ''")
         # TRPG 规则状态兼容性比对需要的规则版本列（早先建的表没有）
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(trpg_rule_state)")}
         if columns and "ruleset_version" not in columns:
@@ -2030,11 +2034,15 @@ class Store:
         binding_version: int,
         text: str,
         attachments: list[dict[str, Any]] | None = None,
+        intent: str = "",
     ) -> tuple[dict[str, Any], bool]:
         """插入入站消息；同键同文返回既有行，同键异文（或附件不同）抛 EnvelopeConflict。
 
         附件以 base64 内联在行里（上限由协商配额兜底，默认单件 512 KiB）：
         ponytail: 内联省一张表与一套导出/回滚管线；附件变大再搬到 data/attachments 的 blob 文件。
+
+        `intent` 是入站意图标记（现仅 "as_contact"）：默认空串，既有调用方不受影响；
+        它不参与同键异文判定——重放时客户端是否带上这个意图不该被当成换文冲突。
         """
         blob = json.dumps(attachments or [], ensure_ascii=False)
         with self._lock, self._conn:
@@ -2048,9 +2056,9 @@ class Store:
                 return _row_to_dict(row), False
             cur = self._conn.execute(
                 """INSERT INTO message(session_id, role, channel_id, thread_id, env_id, binding_version,
-                                       text, attachments, state, created_at)
-                   VALUES(?, 'user', ?,?,?,?,?,?, 'queued', ?)""",
-                (session_id, channel_id, thread_id, env_id, binding_version, text, blob, time.time()),
+                                       text, attachments, intent, state, created_at)
+                   VALUES(?, 'user', ?,?,?,?,?,?,?, 'queued', ?)""",
+                (session_id, channel_id, thread_id, env_id, binding_version, text, blob, str(intent or ""), time.time()),
             )
             seq = cur.lastrowid
             row = self._conn.execute("SELECT * FROM message WHERE seq=?", (seq,)).fetchone()

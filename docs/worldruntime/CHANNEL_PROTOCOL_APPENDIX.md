@@ -34,7 +34,7 @@
 | `hello` | c2s | 否 | 否 | `channel{id,name,version}` 必；`capabilities{segments,status,attachments,streaming,max_text_len,max_parts,max_attachments,max_attachment_bytes}` 否；`auth{bootstrap｜credential}` 必 | 首帧必须是 hello，否则 protocol_error + 关闭 1008；`channel.id` 非空 ≤64，`name`/`version` 缺省取 id / `"0"`；`auth` 须给 bootstrap 或 credential 之一，否则 auth_required；限额须为正整数，缺省 4000 / 10 / 3 / 524288 | ump.py:142-192, 177-179 · channel.py:163-168 |
 | `hello_ack` | s2c | 否 | 否 | `channel_instance`、`name`、`negotiated{segments,status,attachments,streaming,max_text_len,max_parts,max_attachments,max_attachment_bytes}`、`protocol`、`state`∈CORE_STATES、`threads[{id,binding_version,binding_token}]`、`credential`（仅引导首连） | 回协商结果与既有 thread 令牌（重连不必再问管理面）；解析期只校验 `state` 属于 `CORE_STATES` | channel.py:198-218 · ump.py:227-229, 52 |
 | `binding` | s2c | 是 | 否 | `thread_id`、`binding_version`、`binding_token`、`state`∈{active,revoked} | 管理面绑定 / 重绑后推给在线通道：**换代先发 `revoked`（旧版本号 + 旧令牌，发给旧绑定所在连接）再发 `active`**；只发 active 会让客户端拿着旧令牌直到下一次发送才吃 `binding_expired` | channel.py::_thread_bind · ump.py:230-232 |
-| `user_message` | c2s | 是 | 是 | `text` 必：非空且非纯空白、≤协商 max_text_len；`attachments` 可选：数组，每项 `{name≤128, media_type(MIME), data(base64)}`，须协商过 `attachments` 且条数 ≤ `max_attachments`、解码后单件 ≤ `max_attachment_bytes` | 唯一用户输入入口；去重键 = 已认证通道 + thread + `id`（**换附件内容也算冲突**）；附件随消息落库、进历史，图像进模型时给 `image_url`，其余类型只给一行文字标注 | ump.py::_attachments_of · session.py::_user_content · store.py::inbound_put |
+| `user_message` | c2s | 是 | 是 | `text` 必：非空且非纯空白、≤协商 max_text_len；`attachments` 可选：数组，每项 `{name≤128, media_type(MIME), data(base64)}`，须协商过 `attachments` 且条数 ≤ `max_attachments`、解码后单件 ≤ `max_attachment_bytes`；`as_contact` 可选：只允许 `true`（其它值 → `protocol_error`） | 唯一用户输入入口；去重键 = 已认证通道 + thread + `id`（**换附件内容也算冲突**）；附件随消息落库、进历史，图像进模型时给 `image_url`，其余类型只给一行文字标注；`as_contact:true` 表示「仅作为联络发送」（§6.3）：只把这句话告诉角色、不执行其中的操作，核心用它把这一轮从结构性请求改判为普通联络，不改变认知与写入权限 | ump.py::_validate_payload · ump.py::_attachments_of · session.py::_user_content · store.py::inbound_put |
 | `accepted` | s2c | 是 | 否 | `ref` ≤64 必；`state`∈ACCEPT_STATES（queued/processing/done/failed/cancelled）；`message_id`（未固化时为 null）；retry(outbound) 路径另带 `delivery` 汇总 | 「已持久接收」的确认，不等于已生成回复；重复输入返回同一逻辑轮次的最新状态 | ump.py:206-209, 51 · session.py:156-167, 252-260 |
 | `reply` | s2c | 是 | 否 | `message_id` ≤64 必；`parts` 非空数组、每项 `text` 为 str；`batch_index` ≥0；`batch_count` ≥1；另有 `reply_to`（主动消息为 null）与 `covers[]` | 已固化最终回复；批次数与序号发送前确定，重试不重排、不换 `message_id` | ump.py:210-223 · session.py:716-729 |
 | `reply_delta` | s2c | 是 | 否 | `message_id` ≤64 必；`index` 非负整数；`text` 非空 str | **增量预览**（只在通道协商 `streaming` 时发）：与最终 `reply` 同一个 `message_id`、按 `index` 有序；后验检查可能改字，客户端拿最终帧覆盖缓冲区 | ump.py:339-345 · session.py::_stream_reply · channel.py::deliver（能力位闸） |
@@ -160,7 +160,7 @@
 - 每连接发送队列上限 / 背压阈值：**未定义**（channel.py:50 只有串行化发送锁 `send_lock`，缓冲交给 websockets）。
 - 入站文本的**字节**上限：未单独设（只有码点数上限与 1 MiB 帧上限）。
 - 插件 stderr：**容量上限已实现**（`plugins.py:34-35` `STDERR_KEEP_LINES=200` 只留最近 200 行、`STDERR_LINE_CHARS=500` 单行截断；实测 `scripts/_audit2_chan.py` 刷 300 行 stderr 只留上限条数）；**脱敏未做**——只保证容量，不净化插件自行写出的内容（§六 已声明不给这个保证）。
-- 附件与流式的尺寸上限：**附件已落地**（`max_attachments` / `max_attachment_bytes`，见上表与 ④）；流式的尺寸上限随该能力本身一起做（§七 仍后置）。
+- 附件与流式的尺寸上限：**附件已落地**（`max_attachments` / `max_attachment_bytes`，见上表与 ④）；流式（现役的 `reply_delta` 增量，2026-09-22 落地）**至今没有单独的尺寸配额**——单帧只受 1 MiB 帧上限约束，最终正文仍走 `reply` 的文本上限。
 - 客户端重连退避（`desktop/src/main.ts:331` `RECONNECT_DELAYS_MS`）与生成 / 记忆预算类配额不属本文范围（§九 另条、各自 SPEC）。
 
 **已实现（原先记在这一节，2026-09-22 落地，行为验收 `tests/test_channel_limits.py` 5 项 / `tests/test_attachments.py` 4 项）：**
@@ -170,6 +170,6 @@
 - 速率限制 → `core.rate_limit_msgs` / `core.rate_limit_window_s`（默认 60 帧 / 10 秒）：超限帧回 `rate_limited`，持续超限断这条连接。
 - `binding.state=revoked` 产出方 → 换代时先给旧绑定发 revoked 再发 active（`channel.py::_thread_bind`）。
 - `status.state=interrupted` 产出方 → 轮次被打断（回滚 / 重绑 / 冻结 / 删除期间作废）时夹在 thinking 与 idle 之间发出（`session.py` 三处 drop 分支）。
-- 附件 / 富媒体（`attachments` 能力位 + 配额，`message.attachments` 列）→ 见 ② `user_message` 行与 ④；**流式仍未做**（`stream` 字段仍然显式拒绝）。
+- 附件 / 富媒体（`attachments` 能力位 + 配额，`message.attachments` 列）→ 见 ② `user_message` 行与 ④；**这里的「流式仍未做」指早先的保留字段 `stream`（仍然显式拒绝），不是 2026-09-22 落地的现役能力 `reply_delta` / `streaming`**。
 
 复跑对拍：`.venv/Scripts/python.exe scripts/_audit2_proto_doc.py`（比对本文 ②③⑤ 的集合与数值；不一致即 FAIL 并打印两侧差异）。

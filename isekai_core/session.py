@@ -169,6 +169,8 @@ class SessionService:
                 binding_version=thread_row["binding_version"],
                 text=text,
                 attachments=list(env.payload.get("attachments") or []),
+                # 「仅作为联络发送」（§6.3）：把明确意图落到入站行，_story_gate 据此只改分类、不改权限
+                intent="as_contact" if env.payload.get("as_contact") is True else "",
             )
         except EnvelopeConflict as exc:
             raise UmpError(
@@ -372,7 +374,8 @@ class SessionService:
         """分类闸：请求改变世界 / 版本操作 / TRPG 行动停在转交状态，不发送假装执行过的回复。
 
         返回 True 表示这一轮已按转交结算。分类只决定走哪条路、不改变权限：转交也不写世界，
-        只是把这一轮从普通联络里拿出去（§3.4）。
+        只是把这一轮从普通联络里拿出去（§3.4）。带 `as_contact` 意图的批次跳过分类、
+        按联络分享处理（§6.3「仅作为联络发送」）。
         """
         story = getattr(self, "story", None)
         row = rows[0]
@@ -382,6 +385,13 @@ class SessionService:
             return False
         text = _batch_text(rows)
         if not str(text or "").strip():
+            return False
+        # 「仅作为联络发送」（USER_INTERFACE_DESIGN §6.3）：客户端把明确意图随新消息带上，
+        # 核心只拿它改变分类——这一轮按普通联络正常生成回复，不判转交、不执行其中的操作。
+        # 权限不变：认知与写入权限与不带该意图时完全一致。
+        # 取舍（已知边界）：混合批次里只要任一行带该意图，整批都按联络处理（合并批内不做逐行分流）。
+        if any(str(item.get("intent") or "") == "as_contact" for item in rows):
+            self._story_turns[int(row["seq"])] = {"category": "contact_share"}
             return False
         try:
             verdict = await story.classify(

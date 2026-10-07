@@ -129,8 +129,11 @@ export class UmpClient {
     this.ws.send(JSON.stringify(env));
   }
 
-  userMessage(threadId: string, token: string, text: string): string {
-    const env = makeEnvelope("user_message", { text }, { id: threadId, token });
+  userMessage(threadId: string, token: string, text: string, opts?: { asContact?: boolean }): string {
+    const payload: Record<string, unknown> = { text };
+    // 「仅作为联络发送」（USER_INTERFACE_DESIGN §6.3）：明确意图随消息带上，核心只拿它改变分类
+    if (opts?.asContact) payload.as_contact = true;
+    const env = makeEnvelope("user_message", payload, { id: threadId, token });
     this.send(env);
     return env.id;
   }
