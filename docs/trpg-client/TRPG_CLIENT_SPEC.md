@@ -108,6 +108,8 @@ GM 模式中的三类输入必须在入口上分开：
 
 自动主持与共同主持不属于首版的独立后台模式。它们作为未来责任模式扩展保留；新增时必须复用同一行动确认、联合提交和受众边界。
 
+**责任模式的客户端口径（2026-10-08 拍板，C-3）**：客户端恒以辅助裁定工作——不实现低风险自动确认门控，不提供 `host_mode` 设置入口；运行时的 `autonomous` 只对受信调用方（CLI / 管理面）开放。若战役由受信调用方配成 `autonomous` / `cohost`，客户端只把它当只读事实呈现：核心已自动确认的行动显示为「已由主持模式确认」，不显示成用户确认；关键行动的确认闸不受影响（`require_confirmation` 照旧等玩家）。
+
 ## 四、客户端持有的状态
 
 客户端状态是可丢弃、可重建的产品状态，不是真值副本。需要长期恢复的对象由 Campaign Runtime、规则状态附件和 WorldRuntime 持有；客户端只保存当前视角、草稿和显示状态。
@@ -127,6 +129,8 @@ workspace
   selected_choice_id?
   draft_text
   draft_revision
+  draft_parse           解析结果（行动者 / 目标 / 方法 / 意图 / 期望 / 风险 / 前置条件 / context）
+  draft_parse_revision  解析所依据的 draft_revision
   view_revision
 ```
 
@@ -134,7 +138,7 @@ workspace
 
 ### 4.2 服务端权威投影
 
-客户端每次进入战役、切换场景、提交动作或从错误恢复时，重新读取以下投影：
+客户端每次进入战役、切换场景、提交动作或从错误恢复时，重新读取以下投影。**「刷新局面」是 `trpg.client.refresh`：只重读投影，不触发恢复、不重跑裁定**（恢复只属重启、异常中断、导入与回滚，见 §14.1）：
 
 ```text
 campaign_view
@@ -171,6 +175,12 @@ world_view
 ```
 
 规则状态正文和插件原始 `resolution` 默认属于 `gm_only`。玩家界面只能消费规则插件或客户端生成的、明确标记为玩家可见的摘要。
+
+投影是**有界**的：局面按 `campaign_id` 限定，由数据库侧 `LIMIT` + 索引给出 **open 行动 + 最近 5 条裁定**；客户端不取该战役全部行动再在本地切尾，也不把全量事件日志当局面。裁定结果以行动行为准，事件只引用行动行，客户端不从 `event.detail` 复制一份裁定正文。
+
+`rule_view` 只取规则状态的 revision（正文属 `gm_only`）；插件版本从**规则登记簿**（`rules_registry`）读取，客户端不为比较版本扫描插件目录。
+
+裁定等待的表现不依赖「整块等待 + 超时升级 + 结果查询」三件套：若承载层宣告增量能力（`streaming`），客户端可以显示增量预览，但**固化帧仍是唯一事实**——增量预览不得当作裁定结果，也不替代 `refresh` 的有界投影。
 
 ### 4.3 客户端派生状态
 
@@ -274,7 +284,7 @@ world_view
 - **行动结果**：已裁定或已提交的历史；
 - **下一选择**：玩家尚未做出的分支，不是世界事实。
 
-场景面不显示全量事件日志或全量世界内部数据。用户需要复盘时，展开一项行动的裁定摘要即可。
+场景面的行动结果时间线默认显示**最近 5 条裁定**（按 `campaign_id` 限定的有界窗口，更早的按需分页读取），不显示全量事件日志或全量世界内部数据。用户需要复盘时，展开一项行动的裁定摘要即可；裁定正文取自行动行，不从事件详情的副本里读。
 
 ### 5.3 队伍面
 
@@ -334,7 +344,7 @@ C4 加入多角色队伍后，队伍面显示：
 确认状态：待确认
 ```
 
-客户端可以调用一个上层意图解析能力，但解析失败或关键字段不明确时，必须把缺口显示出来，让用户补充。客户端不能用模型猜出行动者、目标或代价后直接进入裁定。
+客户端可以调用一个上层意图解析能力，但解析失败或关键字段不明确时，必须把缺口显示出来，让用户补充。**解析结果随工作区保存**（§4.1 `draft_parse` / `draft_parse_revision`）并按 `draft_revision` 复用：确认卡提交（`confirm`）不得为同一份草稿再解析一次；草稿未改动且字段齐备时由确定性解析直接填充、不调用模型，只有缺字段或模糊时才调用一次。规则输入（属性 / 技能 / DC / 在册目标等）随草稿存进显式 `context`（对象），客户端不解释其内容，也不把 `preconditions`（前置条件字符串列表）当规则输入传。客户端不能用模型猜出行动者、目标或代价后直接进入裁定。
 
 ### 6.2 确认卡
 
@@ -352,7 +362,7 @@ C4 加入多角色队伍后，队伍面显示：
 
 操作：
 
-- **确认行动**：进入 `confirmed`；
+- **确认行动**：进入 `confirmed`；确认卡已批准时用 `declare(confirmed_by="user")` 一次完成声明与确认（等价于 declare + confirm 合并为一次状态写入），仍然只产生一个 `action_id` 与一个确认版本；
 - **修改行动**：提高 `action_revision`，回到解释 / 确认阶段；
 - **放弃行动**：进入 `abandoned`，不调用有状态裁定、不写世界；
 - **补充信息**：保留原始描述，增加或修改可裁定字段。
@@ -361,19 +371,18 @@ C4 加入多角色队伍后，队伍面显示：
 
 ### 6.3 低风险行动
 
-首版不提供“低风险自动确认”开关。所有会进入规则裁定的玩家行动都先经过一次用户确认；C3 之后若真实使用证明低风险自动确认有价值，再作为责任模式扩展设计，并复用同一 action revision 与联合提交语义。
+首版不提供“低风险自动确认”开关：**客户端恒为辅助裁定（`assisted`），不暴露 `host_mode`，也不实现自动确认门控**（§3.1）。所有会进入规则裁定的玩家行动都先经过一次用户确认；若战役由受信调用方（CLI / 管理面）配成 `autonomous`，客户端只把它当只读事实呈现——核心已自动确认的行动显示为「已由主持模式确认」，不显示成用户确认，关键行动的确认闸不受影响。C3 之后若真实使用证明低风险自动确认有价值，再作为责任模式扩展设计（届时必须带授权记录），并复用同一 action revision 与联合提交语义。
 
 ## 七、行动生命周期与客户端状态
 
-状态映射使用 Campaign Runtime 的实际状态集合。`interpreted` 和 `awaiting_confirmation` 都显示为“等待行动确认”；`snapshotting` 与 `resolving` 都显示为“正在裁定”。客户端不创造一个独立的 `interpreting` 状态。
+状态映射使用 Campaign Runtime 的实际状态集合。`interpreted` 和 `awaiting_confirmation` 都显示为“等待行动确认”；在途只有一个持久状态 `resolving`（取得世界 / 规则状态快照是它的第一阶段，2026-10-08 起不再作为独立状态对外），客户端显示为“正在裁定”。客户端不创造一个独立的 `interpreting` 或 `snapshotting` 状态。
 
 ```text
 received
   → interpreted
   → awaiting_confirmation
   → confirmed
-  → snapshotting
-  → resolving
+  → resolving（含取得快照）
   → reviewing
   → awaiting_choice / awaiting_gm_review / committing
   → committed
@@ -387,8 +396,7 @@ received
 | `received` / `interpreted` | 正在理解行动 | 补充、取消 | 显示为已裁定 |
 | `awaiting_confirmation` | 等待确认 | 确认、修改、放弃 | 调插件或提交世界 |
 | `confirmed` | 已确认，等待裁定 | 查看、取消（若状态仍允许） | 修改成另一个 action_id |
-| `snapshotting` | 正在取得当前世界与规则状态 | 等待 | 重新发起随机裁定 |
-| `resolving` | 规则裁定中 | 等待 / 查看阶段说明 | 猜测骰点或结果 |
+| `resolving` | 正在裁定（取得世界与规则状态 → 调用插件） | 等待 / 查看阶段说明 | 重新发起随机裁定、猜测骰点或结果 |
 | `reviewing` | 裁定完成；玩家模式自动尝试提交，GM 模式等待主持操作 | 查看摘要；GM 可提交、拒绝或转待审 | 在提交成功前说成世界已经改变 |
 | `awaiting_choice` | 等待玩家选择 | 只能处理对应 choice | 声明下一关键行动 |
 | `awaiting_gm_review` | 等待主持确认 | 主持批准、修改或拒绝 | 玩家端自行提交 |
@@ -522,7 +530,7 @@ received
 
 ### 10.2 选择提交
 
-选择请求带 `choice_id`、当前 scene revision 和幂等键。成功后：
+选择请求带 `choice_id`、当前 scene revision 和幂等键。场景 revision 不一致返回 `conflict`，客户端重读场景后重新选择；重复提交按幂等键**回放原结果**（不重新裁定、不接受请求里的 revision）。剩余 open choice 用聚合一并读取。成功后：
 
 1. 读取选择结果；
 2. 重新读取战役与场景投影；
@@ -596,7 +604,7 @@ GM 直接变化是主持工具，不是玩家行动的快捷绕过。
 来源：GM 直接裁定
 变化目标：已登记世界实体
 变化类型：公共闭集中的结构化类型
-操作：set / change / reveal / advance / ...
+操作：create / set / change / add / remove / reveal / advance（世界后果动词；规则状态 patch 用 `add` / `replace` / `remove` / `increase` / `decrease`，两套词表的对应关系见 `TRPG_CAMPAIGN_RUNTIME_SPEC` §5.2）
 受众：public_party / character:<id> / gm_only
 原因或主持备注
 幂等键
@@ -623,13 +631,15 @@ GM 直接变化结果必须显示：
 1. 读取 campaign info；
 2. 检查战役状态和规则版本；
 3. 读取当前 scene view；
-4. 读取开放 choice；
-5. 读取未完成 action；
+4. 读取开放 choice（聚合查询）；
+5. 按 `campaign_id` 一次性取出在途集合（`resolving` / `committing` 及其它未闭合行动），不逐条重列提交台账；
 6. 根据状态显示继续、补充、重试或只读入口；
 7. 不自动重跑随机裁定；
 8. 不自动替玩家选择。
 
-`resolving` / `snapshotting` 进入 `interrupted` 后，客户端给“显式重试”而不是“继续上一次骰点”的文案。`reviewing` 重新显示待提交结果，不重跑插件。`committing` 查询联合提交账本，确认是否已经提交。
+`resolving`（含取快照阶段）进入 `interrupted` 后，客户端给“显式重试”而不是“继续上一次骰点”的文案。`reviewing` 重新显示待提交结果，不重跑插件。`committing` 查询联合提交账本，确认是否已经提交。
+
+恢复只在重启、异常中断、导入与回滚路径触发；日常「刷新局面」走 `refresh`（§4.2），不触发恢复、不重跑裁定。
 
 ### 14.2 分支
 
@@ -681,15 +691,16 @@ GM 直接变化结果必须显示：
 | 变更战役状态 | `trpg.campaign.status` | 暂停、恢复、归档、人工接受规则版本 |
 | 打开场景 | `trpg.scene.open` | GM 建立新可行动局面 |
 | 读取场景 | `trpg.scene.view` | 场景面、队伍面、受众投影 |
-| 声明行动 | `trpg.action.declare` | 从自然语言形成行动草稿 |
+| 声明行动 | `trpg.action.declare` | 从自然语言形成行动草稿；带显式 `context`（规则输入）；`confirmed_by="user"` 时声明与确认一次完成 |
 | 确认 / 修改行动 | `trpg.action.confirm` | 确认卡提交 |
 | 放弃行动 | `trpg.action.abandon` | 取消未完成行动 |
-| 调用规则插件 | `trpg.action.resolve` | 仅对已确认行动做裁定；返回后停在待提交 / 待审 |
+| 调用规则插件 | `trpg.action.resolve` | 仅对已确认行动做裁定；下发显式 `context` 与本次 `scope_ref` 的规则状态分片；返回后停在待提交 / 待审 |
 | 联合提交 | `trpg.commit` | 规则状态、世界后果和场景转换一起固化 |
 | 选择分支 | `trpg.choice.select` | 处理当前 open choice，不自动声明下一行动 |
-| 读规则状态 | `trpg.rule_state.read` | 主持视角只读 revision / 版本，默认不向玩家显示正文 |
+| 读规则状态 | `trpg.rule_state.read` | 只取规则状态 revision（另取版本，版本来自规则登记簿）；默认不向玩家显示正文 |
 | GM 直接变化 | `trpg.gm.change` | 不伪造骰点的结构化主持提交 |
-| 恢复在途状态 | `trpg.recover` | 重启 / 恢复页的状态整理 |
+| 恢复在途状态 | `trpg.recover` | 重启 / 恢复页的状态整理；按 `campaign_id` 一次性取在途集合 |
+| 刷新局面 | `trpg.client.refresh` | 只重读投影；不触发恢复、不重跑裁定（§4.2） |
 | 规则版本迁移 | `trpg.campaign.migrate` | 主持人显式转换，不静默变更 |
 | 世界一致视图 | `runtime.scope.inspect` / `runtime.snapshot.read` | 当前世界时刻、revision、公共快照 |
 | 角色视角 | `runtime.cognition.project` | 玩家 / 角色可见事实与未知 |
@@ -847,6 +858,8 @@ TRPG 行动造成的世界后果可以被 OC 角色之后通过合法认知路�
 15. 回滚 / 分支 / 版本迁移是主持或创作操作，不是普通玩家的撤销按钮。
 16. 客户端不依赖某一套规则字段才能完成基础流程。
 17. 客户端连接方式可替换，不能改变上述行动、视角、提交和恢复语义。
+18. 局面读取按 `campaign_id` 有界（open 行动 + 最近 5 条裁定）；日常刷新走 `refresh`，不触发恢复。
+19. 客户端恒为辅助裁定：不暴露 `host_mode`、不实现自动确认门控；核心自动确认的行动不显示成用户确认。
 
 ## 十九、行为验收
 
@@ -857,6 +870,8 @@ TRPG 行动造成的世界后果可以被 OC 角色之后通过合法认知路�
 - `waiting` 战役只显示对应 choice 入口，关键行动输入被锁定。
 - `blocked` / `paused` / `archived` 有明确只读状态，不显示可提交按钮。
 - 当前场景 revision 变化后，旧客户端投影被丢弃并重新读取。
+- 局面投影按 `campaign_id` 限定并由数据库侧 `LIMIT` 给出（open 行动 + 最近 5 条裁定）；客户端不取全量行动、不从事件详情复制裁定正文。
+- 「刷新局面」走 `refresh`，不触发 `trpg.recover`。
 
 ### C1 行动闭环
 
@@ -867,6 +882,9 @@ TRPG 行动造成的世界后果可以被 OC 角色之后通过合法认知路�
 - 真实插件返回裁定后，玩家模式自动发起合法的 `trpg.commit`；GM 模式停在 reviewing，等待 GM 操作。
 - `trpg.commit` 成功后，客户端读取新的 scene view，再显示世界后果和下一局面。
 - 联合提交失败时，客户端不显示规则状态或世界后果已经成立。
+- 确认卡已批准时 `declare(confirmed_by="user")` 一次进 `confirmed`，不产生第二次状态写入。
+- 同一草稿的确认不重复解析：解析结果按 `draft_revision` 复用（§6.1）。
+- 规则输入只走显式 `context`；`preconditions` 不被当规则输入传递。
 
 ### C2 失败、选择与恢复
 
@@ -877,6 +895,8 @@ TRPG 行动造成的世界后果可以被 OC 角色之后通过合法认知路�
 - 世界时间请求非法时，客户端不移动世界时钟。
 - 核心重启后 resolving 行动进入 interrupted，committing 按账本判断，不重跑随机裁定。
 - 规则版本不兼容后，客户端阻止继续裁定并提供转换 / 人工接受 / 只读出口。
+- 选择提交带当前 scene revision 与幂等键；revision 不一致返回 `conflict`，重复提交回放原结果。
+- 规则视图只取 revision；插件版本从登记簿读取，不为比较版本扫描插件目录。
 
 ### C3 GM 与视角
 
@@ -951,3 +971,21 @@ H C5 / F §十八 不变量），`tests/test_trpg_client.py` 12 项；`scripts/_
 2. **「批准」的成立条件**（§7.1 `awaiting_gm_review` 一行）：只有**有裁定**的待提交状态
    （`reviewing` / `conflict` / `stale`）能批准；公共层判死的待审（`needs_review`，没有可提交载荷）
    只能**补充条件重跑裁定或拒绝**——客户端如实说明，不假装批准已发生。
+
+## 本轮修订（2026-10-08）
+
+> 依据 `docs/DESIGN_EFFICIENCY_SCREEN_2026-10-08.md` 的分配发现（P0-7 的 TRPG 相关部分、P1-11、P1-12、P2-4、P2-5、P2-6、P2-7、C-3、C-4）改写规范文本；只动本文，不动实现与其他文档。
+
+| 发现 | 章节 | 原表述 | 新表述 |
+|---|---|---|---|
+| P0-7（TRPG 部分） | §4.2 | 未规定等待/刷新表现，隐含「整块等待 + 超时升级 + 结果查询」补丁 | 若承载层宣告 `streaming` 可显示增量预览，**固化帧仍是唯一事实**；等待表现不依赖该三件套；「刷新局面」是 `refresh` |
+| P1-11 | §4.2 / §5.2 / §15 / §19 | §4.2 只列投影形状，§5.2 只说「不显示全量事件日志」 | 投影按 `campaign_id` 限定、数据库侧 `LIMIT` + 索引（open 行动 + 最近 5 条裁定）；裁定结果只在行动行，不从 `event.detail` 复制；新增 `refresh` 映射行 |
+| P1-12 | §14.1 / §15 / §19 | 恢复逐条读开放 choice 与未完成 action，未限定范围 | 恢复按 `campaign_id` 一次性取在途集合；恢复只属重启 / 异常 / 导入 / 回滚，日常刷新走 `refresh` |
+| P2-4 | §七 / §7.1 | `snapshotting` 与 `resolving` 是两个状态、文案相同 | 在途合并为单一持久状态 `resolving`（取快照是内部阶段），客户端不再有独立 `snapshotting` |
+| P2-5 | §4.1 / §6.1 / §6.2 | 草稿只有文本与 revision；确认时可能再解析一次 | 工作区保存 `draft_parse` / `draft_parse_revision`；确认复用解析结果、不重复解析；字段齐备时跳过模型解析 |
+| P2-6 | §10.2 / §15 / §19 | 「带 revision 与幂等键」「重复提交返回原结果」未写冲突与回放口径（规范已有要求，实现未做到） | **规范已明确，实现待对齐**：revision 不一致 → `conflict`；幂等键回放原结果；剩余候选用聚合查询（锚点 §10.2，运行时侧 `TRPG_CAMPAIGN_RUNTIME_SPEC` §11.3） |
+| P2-7 | §4.2 / §15 / §19 | `rule_view` 混入版本与摘要；版本未说明来源 | 规则视图只取 revision，版本从规则登记簿读取，不为比较版本扫描插件目录 |
+| C-3 | §3.1 / §6.3 / §18 | §3.1 说首版辅助裁定，§6.3 说「不提供低风险自动确认」，但与规则层 `autonomous` 自动确认冲突 | 取「客户端恒为 `assisted`、不暴露 `host_mode`」一支：`autonomous` 只对受信调用方开放，客户端只读呈现；同时允许确认卡已批准时 `declare(confirmed_by="user")` 一次完成（§6.2） |
+| C-4 | §13 / §15 | GM 直接变化只列 `set / change / reveal / advance / ...`，未与 patch 词表对齐 | 列全后果动词闭集并注明与 patch `op` 是两套词表，对应关系见 `TRPG_CAMPAIGN_RUNTIME_SPEC` §5.2 |
+
+> **实现待对齐（本文涉及）**：P2-4 在途状态合并、P2-5 解析结果复用、P2-6 选择提交的 revision 校验与幂等回放、P2-7 revision-only 规则视图与登记簿取版本、C-3 客户端恒 `assisted` 且 `declare(confirmed_by="user")` 单次写入、P1-11/P1-12 的有界投影与 `refresh` 路径；规范锚点分别为 §七、§6.1、§10.2、§4.2、§3.1/§6.2、§4.2/§14.1。§二十一 的 2026-09-22 读数按当时状态记录，不回改。

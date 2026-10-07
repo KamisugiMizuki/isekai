@@ -99,7 +99,8 @@ Campaign Runtime 负责 `action_id`、`action_revision`、战役状态和场景�
   -> 目标 / 对象
   -> 方法
   -> 期望结果
-  -> 前置条件
+  -> 前置条件（字符串列表：描述能否尝试）
+  -> 规则输入 context（属性 / 技能 / DC / 在册目标等；对象，核心原样下发给插件）
   -> 可见风险与可能代价
   -> 是否需要玩家确认
 ```
@@ -151,8 +152,8 @@ GM 开场只能使用玩家角色应知的材料。无法形成可行动局面�
 ### 5.3 调用规则独占转接插件与公共模块
 
 ```text
-已确认行动
-  -> Campaign Runtime 读取世界快照与规则状态快照
+已确认行动（含显式 `context` 规则输入）
+  -> Campaign Runtime 读取世界快照与本次 `scope_ref` 的规则状态快照
   -> 规则独占转接插件
   -> resolution + rule_state_patch + world_consequences + scene_transition
   -> 规则共用模块检查结构、版本、受众和联合提交边界
@@ -224,6 +225,10 @@ idempotency_key
 - 受众只使用闭集：`public_party`、`gm_only`、`player:<id>`、`character:<id>`、`npc:<id>`；多个角色的可见并集必须由上层显式传入，核心不推断 `user:<id>`。
 - 插件声明的 `ruleset_id` / `ruleset_version`、规则状态写入版本、WorldRuntime revision 和运行世代都必须在提交前比对；不兼容就阻断，不静默换规则。
 - `action_id` 标识一次规则行动；`action_revision` 标识该行动的确认版本；`idempotency_key` 标识一次联合提交。三者不能互相替代。
+- 规则输入只走显式 `context`（对象，由客户端或 GM 给出，核心不解释）；`preconditions` 是前置条件的字符串列表，不得当规则输入使用。
+- 规则状态按 `scope_ref` 分片读写：一次裁定只进出一个分片（`scope_ref=""` 为全局分片）；路径不相交合并只是兜底通道。
+- 插件版本以规则登记簿为准；核心与客户端不为比较版本扫描插件目录。
+- 战役裁定器默认常驻（清单显式 `resident: false` 才冷启）；常驻只影响进程生命周期，不改变「状态只经快照进出」。
 
 ### 5.8 插件错误与失败恢复
 
@@ -294,6 +299,8 @@ GM 可以确认、修改、拒绝或分支试演候选。系统不能因为大�
 
 推荐默认辅助裁定。自动主持不得吞掉玩家正在面对的关键选择；共同主持不得把未批准草案写进 WorldRuntime。
 
+三种模式是运行时的闭集能力（§十六 `host_mode`），**但首版客户端恒以辅助裁定工作**：不实现低风险自动确认门控，也不提供 `host_mode` 设置入口；`autonomous` 只对受信调用方（CLI / 管理面）开放。若战役由受信调用方配成 `autonomous` / `cohost`，客户端只把它当只读事实呈现（核心已自动确认的行动显示为「已由主持模式确认」），不假装那是用户确认；关键行动的确认闸不受影响。确认卡已由用户批准时，客户端可以用 `declare(confirmed_by="user")` 一次完成声明与确认，避免两次状态写入。
+
 ## 九、时间与回合
 
 规则层支持四种推进节拍：
@@ -326,13 +333,17 @@ TRPG 层复用 WorldRuntime 的认知、披露和回滚语义，不建立第二�
 - 插件 manifest 明确 id、版本、协议版本和 entry；
 - entry 按参数数组启动，不经过 shell；
 - 请求和响应采用一行 JSON；
-- `context` 对核心保持不透明；
+- `context` 是规则输入的唯一载体（对象，宿主显式传入，核心不解释其内容）；`preconditions` 只表示前置条件（字符串列表）；
 - `resolution` 只作为裁定记录保存；
 - `rule_state_patch` 只写插件自己的版本化命名空间；
 - `world_consequences` 与 claims 先进入规则共用模块，再由 WorldRuntime 校验和原子提交；
 - `scene_transition` 留在 Campaign Runtime，不把待选择分支写入世界事实；
 - 插件不持有 SQLite、不读取核心凭据、不直接写世界；
 - `trpg.action.resolve` 仍是 B0 无状态 resolver 入口，不是完整战斗循环或 GM 文本 API。
+- `rule_state_patch.operations[].op` 为闭集 `add` / `replace` / `remove` / `increase` / `decrease`；相对量形式（`increase` / `decrease`）并发安全，绝对量要求 base revision 严格一致；
+- 规则状态按 `scope_ref` 分片随战役时间线提交、回滚与分叉；一次裁定只读写本分片；
+- 战役裁定器默认常驻（显式 `resident: false` 才冷启）；常驻只省启动与加载，状态仍只经快照进出；
+- 插件版本从规则登记簿读取，版本比较不靠扫描插件目录。
 
 如果第二个真实规则插件证明协议不足，才扩展协议；但在扩展前必须先确认 Campaign Runtime 的状态生命周期、联合提交和版本兼容语义，不把无状态 resolver 的成功误认为完整战役支持。
 
@@ -393,6 +404,9 @@ TRPG 层复用 WorldRuntime 的认知、披露和回滚语义，不建立第二�
 | 主持责任模式（§八） | `trpg_campaign.host_mode` + 声明里的 `require_confirmation` | 2026-09-22 落地 |
 | 推进节拍（§4.1 / §九） | `trpg_scene.advance_mode` | 2026-09-22 落地 |
 | 隐私 / 认知 / 披露（§十） | 受众闭集 + `scene_view` / `action_view` 裁剪 + WorldRuntime 认知链 | 不建第二套秘密库 |
+| 规则输入 `context` 的透传（§4.2 / §5.3 / §5.7） | `trpg.action.declare` / `resolve` 的显式 `context` 字段 | **2026-10-08 规范收紧，实现待对齐**：当前战役路径没有 `context` 入口，实际以 `preconditions` 代用（规范锚点 §4.2 / §5.7） |
+| 规则状态分片（§5.7 / §十二） | `trpg_rule_state` 的 `scope_ref` 主键 | **2026-10-08 规范收紧，实现待对齐**：当前是单份规则状态文档 + 全量读写，路径不相交合并是主路径而非兜底（规范锚点 §5.7） |
+| 插件常驻与版本来源（§十二） | 清单 `resident` 缺省；`rules_registry` 登记簿 | **2026-10-08 规范收紧，实现待对齐**：当前仍需显式 `resident: true`；版本比较仍走 `list_plugins()` 扫目录（规范锚点 §十二） |
 
 §七 的七类结果落到哪：
 
@@ -412,6 +426,8 @@ TRPG 层复用 WorldRuntime 的认知、披露和回滚语义，不建立第二�
 - `autonomous`：**非关键**行动可以直接确认；声明里写了 `require_confirmation` 的行动照旧等玩家确认；
 - `cohost`：同 `assisted`；GM 侧未批准的草案也不会写进世界（走 Writing Assistant 的候选 → 批准 → `gm.change`）。
 
+**客户端口径（C-3，2026-10-08）**：首版客户端恒为 `assisted`，不暴露 `host_mode`、不提供低风险自动确认开关；`autonomous` 只对受信调用方开放。确认卡已批准时允许 `declare(confirmed_by="user")` 一次完成声明与确认（见 `TRPG_CLIENT_SPEC` §3.1 / §6.2 / §6.3）。
+
 推进节拍是**声明**而不是回合：`instant` / `continuous`（缺省）/ `opposed` / `world` 四值闭集，
 核心不据此硬套回合；「世界推进不得替玩家消耗尚未作出的关键行动」由待选择与战役 `waiting` 闸保证。
 
@@ -425,3 +441,15 @@ TRPG 层复用 WorldRuntime 的认知、披露和回滚语义，不建立第二�
 - 多玩家同步、玩家私密频道、复杂队伍权限（§二：首版非默认前提，扩展时必须在现有受众模型上加明确受众）；
 - GM 的「故事意图 / 大纲目标」这一类输入由 Writing Assistant 接（规则层只接规则行动安排与直接世界变化）；
 - 表达层四问（发生了什么 / 为什么这样判 / 世界改变了什么 / 现在能做什么）由客户端与 GM 表达层回答。
+
+## 本轮修订（2026-10-08）
+
+> 依据 `docs/DESIGN_EFFICIENCY_SCREEN_2026-10-08.md` 的分配发现（P1-8、P1-9、P1-10、C-3、C-4）改写规范文本；只动本文，不动实现与其他文档。
+
+| 发现 | 章节 | 原表述 | 新表述 |
+|---|---|---|---|
+| P1-8 | §5.7 / §十二 / §十六 | 未提插件进程生命周期与启动成本 | 战役裁定器默认常驻（显式 `resident: false` 才冷启）；常驻不改变「状态只经快照进出」；§十六 记为**实现待对齐** |
+| P1-9 | §5.3 / §5.7 / §十二 / §十六 | 只写「读取规则状态快照」，未规定分片；`scope_ref` 未进主键 | 规则状态按 `scope_ref` 分片读写，一次裁定只进出一个分片，`""`=全局；路径不相交合并只是兜底；§十六 记为**实现待对齐** |
+| P1-10 | §4.2 / §5.3 / §5.7 / §十二 / §十六 | 行动声明只有「前置条件」；`context` 只写「对核心保持不透明」 | 新增显式规则输入 `context`（对象，客户端与 GM 都可传）；`preconditions` 回归字符串列表语义、不得当规则输入；§十六 记为**实现待对齐** |
+| C-3 | §八 / §十六 | §八 列出 `autonomous` 自动确认，与客户端「首版不提供低风险自动确认」冲突 | 取「客户端恒为 `assisted`、不暴露 `host_mode`」一支：`autonomous` 只对受信调用方开放；同时允许确认卡已批准时 `declare(confirmed_by="user")` 一次完成 |
+| C-4 | §十二 | patch 词表未在本层列出，只有插件示例用 `increase` / `decrease` | 补闭集与相对量语义（并发安全），与 `TRPG_CAMPAIGN_RUNTIME_SPEC` §5.2 对齐 |

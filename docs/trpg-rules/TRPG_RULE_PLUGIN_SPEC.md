@@ -13,6 +13,8 @@
 
 两种形态共享进程边界和 JSON 信封，但不能把无状态 resolver 当成完整战役运行时。
 
+**战役裁定器默认常驻**：一次检定 / 对抗不应支付解释器启动、模块导入与 stdio 握手的成本。`campaign_resolver` 形态缺省以常驻进程服务多次裁定，只有清单显式写 `resident: false` 才退化为「一次请求一个进程」；`stateless_resolver` 缺省冷启。常驻只影响进程生命周期，不改变「状态只能经规则状态快照进出」的规则。
+
 ```text
 TRPG 客户端
   -> trpg.action.resolve
@@ -37,6 +39,8 @@ TRPG 客户端
 ```
 
 `entry` 是参数数组，不经过 shell。无状态 resolver 可以由核心启动、发送一行 JSON、读取一行 JSON，然后退出；战役裁定器同样不得持有 SQLite 或直接改世界，但必须能消费核心提供的规则状态快照，并返回带 `base_state_revision` 的 patch。规则插件不读核心凭据，也不直接写 WorldRuntime。
+
+清单里 `resident` 对 `campaign_resolver` 缺省为 `true`（常驻），显式 `false` 才冷启；`share` 仍为可选，配合常驻使用。插件版本与可用性以**规则登记簿**（`isekai_core/rules_registry.py`）为准：核心与客户端比较版本时读登记簿，不扫描插件目录。
 
 ## 请求
 
@@ -76,6 +80,7 @@ TRPG 客户端
   "rule_state": {
     "ruleset_id": "coc7",
     "ruleset_version": "0.1.0",
+    "scope_ref": "character:investigator-1",
     "state_revision": "rs-12",
     "opaque_state": {}
   },
@@ -83,7 +88,9 @@ TRPG 客户端
 }
 ```
 
-插件不得把客户端传入的 `opaque_state` 或世界快照当作可信写入结果；它们只是本次裁定的输入，提交时必须使用原 revision 做并发校验。
+`scope_ref` 是规则状态的**分片键**：按角色 / 按场景分片，`""` 表示全局分片（规则书级常量、战役级时钟等）。一次检定 / 对抗只读取并回写本次 `scope_ref` 对应的分片，不整份角色表进出。
+
+插件不得把客户端传入的 `opaque_state` 或世界快照当作可信写入结果；它们只是本次裁定的输入，提交时必须使用原 revision 做并发校验。`context` 是**规则输入的唯一载体**（属性、技能、DC、在册目标等在册数值），由宿主的显式 `context` 字段下发；`preconditions` 是行动前置条件的**字符串列表**（描述能否尝试），不是规则输入，插件不得从它取数值。
 
 ## 响应
 
@@ -99,6 +106,7 @@ TRPG 客户端
   },
   "rule_state_patch": {
     "ruleset_id": "coc7",
+    "scope_ref": "character:investigator-1",
     "base_state_revision": "rs-12",
     "operations": [
       {"path": "/actors/investigator-1/san", "op": "decrease", "value": 3}
@@ -130,7 +138,7 @@ TRPG 客户端
 
 `consequences[].kind` 用 TRPG 规则共用模块的**变化意图类别**（`state_change` / `knowledge_change` / `world_event` / `condition` / `location_change` / `time_advance` / `player_choice`），不是 WorldRuntime 的效果名；世界效果名请走 `effects` 兼容字段。单数别名（`subject` / `target` / `cause_ref`）与 `{"audience": [...]}` 形态的 `visibility` 也认，但新插件请写复数与闭集受众。
 
-`resolution` 是规则结果记录，核心原样保存，不解析规则私有字段。`rule_state_patch` 只能写入该插件自己的规则状态命名空间，并以 `base_state_revision` 做并发校验。`consequences` 是规则插件声明的世界后果意图，先由 TRPG 规则共用模块检查，再由 WorldRuntime 校验目标、效果闭集、认知传播、版本和原子事务。`scene_transition` 只改变战役侧场景与待选择，不把未选择分支写成世界事实。规则状态 patch 与必要世界后果必须联合提交。
+`resolution` 是规则结果记录，核心原样保存，不解析规则私有字段。`rule_state_patch` 只能写入该插件自己的规则状态命名空间，只写 `scope_ref` 声明的分片，并以 `base_state_revision` 做并发校验。`operations[].op` 是闭集：`add` / `replace` / `remove` / `increase` / `decrease`；其中 `increase` / `decrease` 是**并发安全的相对量形式**（写入的是差值，可与其他相对量在同一 revision 区间合并），`replace` 是绝对量、要求 base revision 严格一致。`consequences` 是规则插件声明的世界后果意图，先由 TRPG 规则共用模块检查，再由 WorldRuntime 校验目标、效果闭集、认知传播、版本和原子事务。`scene_transition` 只改变战役侧场景与待选择，不把未选择分支写成世界事实。规则状态 patch 与必要世界后果必须联合提交。
 
 ## 错误响应
 
@@ -165,7 +173,7 @@ TRPG 客户端
   `rejected`→`rejected`、`needs_choice`→`awaiting_choice`、`needs_input`/`needs_review`→`awaiting_gm_review`、`plugin_failed`→`plugin_failed`；认不出的 kind 归 `awaiting_gm_review`（让人看，不猜）。
   规约那句「错误响应不得包含半成品」是**硬闸**：错误响应里若出现 `rule_state_patch` / `consequences` / `effects`，一律不采信、状态进待审，且规则状态与世界都留原样（`tests/test_trpg_campaign.py::test_plugin_structured_error_response_maps_to_action_status`）。
 - 清单里 **`share`** 是可选字段（配合 `resident: true`）：`true` = **共享承载**——核心不再直接拿插件的 stdio，而是连一个「中继桥」（本机回环 TCP），桥再以 stdio 托管真插件。桥把端口与令牌写进插件目录里的 `.isekai-plugin-share.json`，于是**核心重启后新核心能接上同一个插件进程**（跨核心复用，省掉重复加载）；插件代码不变，协议也不变（还是一行一个 JSON、`ping`/`pong`、读 EOF 自退）。没人连、静置 `ISEKAI_PLUGIN_IDLE_EXIT` 秒（缺省 600）桥会带着插件一起退出。
-- 清单里 `resident` 是**可选**字段：`true` = 核心保持一个插件进程服务多次裁定（一行一 JSON，`{"type":"ping"}` 必须回 `{"type":"pong"}`，读到 stdin EOF 必须自己退出）。常驻只省进程启动与模块加载——**状态仍然只能经快照进出**，插件不许把状态藏在进程内存里（否则回滚 / 分叉会带着不该有的记忆）。进程死在「还没发请求」时核心会重开一个；**死在半路不重发**（不重跑裁定）。
+- 清单里 `resident` 是**战役裁定器的缺省行为**：`campaign_resolver` 缺省常驻（显式 `resident: false` 才冷启），`stateless_resolver` 缺省冷启。常驻 = 核心保持一个插件进程服务多次裁定（一行一 JSON，`{"type":"ping"}` 必须回 `{"type":"pong"}`，读到 stdin EOF 必须自己退出）。常驻只省进程启动与模块加载——**状态仍然只能经快照进出**，插件不许把状态藏在进程内存里（否则回滚 / 分叉会带着不该有的记忆）。进程死在「还没发请求」时核心会重开一个；**死在半路不重发**（不重跑裁定）。**2026-10-08 规范收紧**：当前实现仍是显式 `resident: true` 才常驻，**实现待对齐**。
 - 清单里 `converters[]` 是**可选**字段：声明状态转换器（`converter_id` / `from_version` / `to_version` / 可选 `converter_version`、`entry`），供 `trpg.campaign.migrate` 调用；响应必须回 `opaque_state` 对象与 `losses[]`。
 - 清单里 `ruleset_version` 是**可选**字段：声明它 = 只有 `opaque_state` 格式变化时才改；不声明则退回 `version`。核心用它做 §十六 第 2 层的版本闸比对（`runtime/rules.py::manifest_identity`）。
 
@@ -180,7 +188,7 @@ TRPG 客户端
 - `action_id`
 - `actor_id`
 - `intent`
-- `context`（可选对象）
+- `context`（**规则输入对象，显式字段**；客户端与 GM 都可传；核心不解释其内容，原样下发给插件）
 - `rule_state_ref`（战役裁定器需要时）
 - `scene_ref`（战役裁定器需要时）
 
@@ -191,3 +199,15 @@ TRPG 客户端
 当前 UMP、Tauri 壳、桌面管理台是 WorldRuntime 的官方参考外壳：UMP 提供受信管理调用与通道承载，Tauri 负责核心进程与窗口生命周期，管理台负责世界创作和运行管理。三者不定义 TRPG 规则；未来 TRPG 客户端只需复用管理面语义或直接调用同一核心入口。
 
 **Campaign Runtime 已实现**（`TRPG_CAMPAIGN_RUNTIME_SPEC.md`：战役 / 场景 / 行动状态机、规则状态附件与版本闸、转换器、联合提交、回滚分叉、重启恢复、常驻插件）。**完整战斗循环、角色表编辑器、骰点 UI、规则书导入、GM 输出编排仍然不属于核心**——那是客户端表达层的事（`TRPG_GM_USER_EVALUATION_DRAFT.md` 里评估），核心只提供管理面语义与裁定 / 提交原语；无状态 resolver 继续为 B0 兼容保留。
+
+## 本轮修订（2026-10-08）
+
+> 依据 `docs/DESIGN_EFFICIENCY_SCREEN_2026-10-08.md` 的分配发现（P1-8、P1-9、P1-10、P2-7、C-4）改写规范文本；只动本文，不动实现与其他文档。
+
+| 发现 | 章节 | 原表述 | 新表述 |
+|---|---|---|---|
+| P1-8 | 定位 / 清单 / 当前实现状态 | 常驻是可选形态，`resident` 需显式声明；战役裁定器与无状态 resolver 都按「一次请求一个进程」为默认 | `campaign_resolver` **默认常驻**，显式 `resident: false` 才冷启；写明一次检定 / 对抗不应支付解释器启动、导入与握手成本；常驻不改变「状态只经快照进出」 |
+| P1-9 | 战役裁定器请求 / 响应 / 响应说明 | `rule_state`、`rule_state_patch` 没有分片字段，规范里的 `scope_ref` 未落成主键语义 | 两处示例与说明补 `scope_ref`；`scope_ref` 是规则状态分片键（`""`=全局），一次检定只读写本分片 |
+| P1-10 | 战役裁定器请求 / 裁定说明 | `context` 是“可选对象”，战役路径没有通路，实际以 `preconditions` 充当 context | `context` 是规则输入的**唯一载体**、显式字段；`preconditions` 回归字符串列表语义（能否尝试），不承载规则输入 |
+| P2-7 | 清单 | 版本信息只从插件清单读取，未规定比较版本的来源 | 明确以**规则登记簿**为版本与可用性来源；核心与客户端不为比较版本扫描插件目录 |
+| C-4 | 响应 `rule_state_patch` | `operations[].op` 未列词表；示例用 `decrease` 而规范他处只写 `add/replace/remove` | 补闭集 `add / replace / remove / increase / decrease`，注明 `increase` / `decrease` 是并发安全的相对量形式、`replace` 是绝对量 |

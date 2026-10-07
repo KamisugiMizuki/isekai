@@ -49,6 +49,7 @@ plugin_manifest
 participants[]
 current_scene_id
 state_revision
+host_mode: assisted / autonomous / cohost
 status: preparing / active / waiting / paused / blocked / archived
 ```
 
@@ -87,12 +88,16 @@ target_refs
 method
 intent
 expected_result
-preconditions
+context                  # 规则输入：属性 / 技能 / DC / 在册目标等（对象），核心原样下发给插件
+preconditions            # 字符串列表：能否尝试的前置条件，不承载规则输入
 visible_risks
 confirmation: pending / confirmed / modified / abandoned
+confirmed_by?            # user：声明时已获用户确认 → 声明与确认一次完成
 ```
 
 行动声明不是事实。未确认的关键行动不得调用会改变规则状态或世界状态的裁定链。
+
+`context` 是规则输入的**唯一通路**：客户端与 GM 都能传，核心不解释其内容、原样下发给插件；`preconditions` 只表示能否尝试的前置条件（字符串列表），不再充当 context 载体。确认卡已由用户批准时，允许 `declare(confirmed_by="user")` 一次进 `confirmed`（等价于声明与确认合并为一次状态写入），仍然只产生一个 `action_id` 和一个确认版本。
 
 ### 3.4 规则状态附件
 
@@ -102,12 +107,14 @@ confirmation: pending / confirmed / modified / abandoned
 ruleset_id
 ruleset_version
 campaign_id
-scope_ref
+scope_ref                # 状态分片：按角色 / 按场景；"" 表示全局分片
 state_revision
 opaque_state
 ```
 
 核心不解析 `opaque_state`，但必须保证：读取带版本、写入带 base revision、重复提交幂等、分叉 / 回滚可恢复、规则版本不兼容时阻断。
+
+规则状态的**主键**是 `(instance_id, timeline_id, campaign_id, ruleset_id, scope_ref)`。一次检定 / 对抗只读取并回写本次 `scope_ref` 对应的分片，不整份角色表进出：按角色分片（`character:<id>`）、按场景分片（`scene:<id>`）各写各的，正常路径下不发生同分片并发；`scope_ref=""` 是全局分片（规则书级常量、战役级时钟等）。路径不相交合并（§二十一）因此降级为**兜底**通道，只在分片信息缺失或跨分片写入时使用。
 
 ## 四、行动生命周期
 
@@ -125,7 +132,7 @@ opaque_state
 
 - `receive`：保存用户或 GM 原始输入。
 - `interpret`：形成行动者、目标、方法、意图和风险。
-- `confirm`：玩家确认、修改或放弃；低风险自动主持必须记录授权边界。
+- `confirm`：玩家确认、修改或放弃；低风险自动主持必须记录授权边界。声明时已带用户确认（`confirmed_by="user"`）的，声明与确认一次完成，仍只产生一个确认版本。
 - `snapshot`：取得 WorldRuntime 世界快照和规则状态快照。
 - `resolve`：调用规则插件。
 - `review`：检查状态 patch、世界后果、受众、版本和待选择。
@@ -161,6 +168,7 @@ scene_transition
 
 ```text
 base_state_revision
+scope_ref?               # 缺省与请求的 rule_state.scope_ref 相同；跨分片 patch 必须逐分片声明
 operations[]
 ```
 
@@ -168,11 +176,23 @@ operations[]
 
 ```text
 path
-op: add / replace / remove
+op: add / replace / remove / increase / decrease
 value?
 ```
 
-patch 只允许写入该插件自己的命名空间。不能借规则状态 patch 写 WorldRuntime 世界事实，也不能把世界事实复制成规则状态的隐藏真值。
+`op` 是闭集。`add` / `replace` / `remove` 是绝对量（新增键、覆盖为给定值、删除键）；`increase` / `decrease` 是**并发安全的相对量形式**——写入的是差值，可与同一 `base..current` 区间内的其他相对量合并，不因 revision 落后就整批重裁。
+
+patch 只允许写入该插件自己的命名空间，且只写 `scope_ref` 对应的分片（§3.4）；跨分片写入必须逐分片声明。patch 的 `op` 与公共后果的 `operation` 是两套词表，对应关系固定：
+
+| patch `op`（规则状态树） | 后果 `operation`（变化意图） | 语义 |
+|---|---|---|
+| `add` | `create` | 新增键 / 登记新对象 |
+| `replace` | `set` | 覆盖为给定值（绝对量） |
+| `remove` | `remove` | 删除键 / 撤销登记 |
+| `increase` / `decrease` | `change` | 相对量增减（可合并） |
+| — | `reveal` / `advance` | 披露说法 / 推进时间，只属于世界后果 |
+
+不能借规则状态 patch 写 WorldRuntime 世界事实，也不能把世界事实复制成规则状态的隐藏真值。
 
 ### 5.3 `world_consequences`
 
@@ -219,7 +239,7 @@ committed         规则状态与世界后果均已固化
 
 - 同一 `action_id` 重试返回原裁定和原联合提交结果。
 - 插件重启后必须能根据核心提供的规则状态快照继续裁定。
-- 规则状态快照随战役所属时间线提交、分叉、回滚和导入导出。
+- 规则状态按 `scope_ref` 分片随战役所属时间线提交、分叉、回滚和导入导出；一次裁定只读写自己那片。
 - 规则版本不兼容时阻断战役继续裁定，不静默替换规则。
 - 回滚会使目标点之后的规则状态、场景派生、待选择和异步裁定失效。
 - 已投递给玩家的表达不保证撤回，但不得在核心状态中继续作为当前结果使用。
@@ -250,7 +270,13 @@ Campaign Runtime 自己持有战役编排状态；WorldRuntime 持有世界真�
 | GM / 玩家表达文本 | 会话 / 消息层 | 按既有会话与外部投递语义处理 |
 | 插件进程、缓存、临时生成文件 | 插件运行环境 | 否；重启后按状态快照恢复 |
 
-战役记录引用 WorldRuntime 的 `commit_id`、`revision` 和事件标识，不复制世界事实正文。场景可以缓存事实摘要，但恢复时必须从引用的世界快照重建；摘要与事实冲突时以 WorldRuntime 为准。
+战役记录引用 WorldRuntime 的 `commit_id`、`revision` 和事件标识，不复制世界事实正文。裁定结果不复制进事件行（§10.1）：事件只引用行动行，行动行是 `resolution` / patch 的唯一持久副本。场景可以缓存事实摘要，但恢复时必须从引用的世界快照重建；摘要与事实冲突时以 WorldRuntime 为准。
+
+### 10.1 投影与查询边界
+
+局面投影按 `campaign_id` 限定，并由数据库侧 `LIMIT` + 索引给出 **open 行动 + 最近 5 条裁定**：`trpg_action` 至少建 `(instance_id, timeline_id, campaign_id, status)` 索引，`trpg_commit` 可按 `campaign_id` 查询。客户端与调用方不得靠「取该战役全部行动再在本地切尾」取得局面，也不得把全量事件日志当局面。
+
+**裁定结果以行动行为准**：核心不把 `resolution` / patch / 世界后果复制进 `event.detail`，事件只引用行动行；复盘时按引用读取，不制造第二份可漂移的副本。
 
 ## 十一、状态机
 
@@ -289,7 +315,7 @@ interpreted -> confirmed       # 自动主持且满足授权边界
 awaiting_confirmation -> confirmed
 awaiting_confirmation -> modified -> interpreted
 awaiting_confirmation -> abandoned
-confirmed -> snapshotting -> resolving
+confirmed -> resolving          # 取得世界 / 规则状态快照是裁定的第一阶段，不单独持久化
 resolving -> reviewing
 resolving -> plugin_failed
 reviewing -> awaiting_choice
@@ -303,6 +329,8 @@ committed -> transitioned
 ```
 
 同一个 `action_id` 只能有一个确认版本。修改行动必须生成新的 `action_revision`；旧版本只能作为历史记录，不能再次提交。
+
+在途态只有一个持久状态 `resolving`：`snapshotting` 不再作为独立状态对外（既不是第二个可分别重试的状态，也不是第二条持久行），只在审计与阶段文案里作为说明出现；取快照与调用插件在一次在途状态内完成。
 
 ### 11.3 待选择
 
@@ -321,7 +349,7 @@ created_revision
 status: open / selected / cancelled / expired
 ```
 
-选择提交必须带 `choice_id`、当前场景 revision 和幂等键。过期或已选择的 choice 重试返回原结果，不重新裁定。
+选择提交必须带 `choice_id`、当前场景 revision 和幂等键。场景 revision 不一致返回 `conflict`，不套用旧选项；过期或已选择的 choice 重试按幂等键**回放**原结果（不重新裁定，也不要求请求里的 revision 与当前一致）。剩余 open choice 由数据库侧聚合查询给出，不逐条列举全表。
 
 ## 十二、联合提交协议
 
@@ -389,6 +417,15 @@ needs_review
 
 `joint_commit_id` 是跨层关联号；WorldRuntime 的 `commit_id` 仍只代表世界提交，不把 Campaign Runtime 私有对象提升为世界事实。
 
+### 12.4 零世界后果的快路径
+
+当一次提交的世界后果包为空——没有 `world_changes`、没有 `knowledge_changes`、没有事件帧（`world_event`）——时，联合提交走**快路径**：
+
+- 跳过草稿归一化与制度 / 环境构造，只落规则状态 patch、场景转换与时间请求；
+- `world_changes[]` 为空是合法提交，「明确无变化」的裁定照样落账；
+- 事件行只记录这次行动本身，效果数为 0；`world_event` 帧并进事件正文（叙述材料），**不产生效果**；
+- 快路径不跳过版本、幂等、受众、命名空间与场景转换校验（§12.2 的 1–5、7–9 步照跑）。
+
 ## 十三、场景恢复与重建
 
 核心重启、导入、回滚和分叉后按以下顺序恢复：
@@ -396,13 +433,13 @@ needs_review
 ```text
 1. 读取战役提交头与当前 campaign_revision
 2. 检查 ruleset_id / ruleset_version 是否可用
-3. 读取对应规则状态附件
+3. 按 `scope_ref` 读取本次恢复需要的规则状态分片（不是全部规则状态）
 4. 读取当前 WorldRuntime revision 和世界快照
 5. 校验 scene.world_snapshot_ref 是否仍可达
 6. 重建场景投影、可行动作和 pending_choice
-7. 未完成 action 按状态恢复：
+7. **按 `campaign_id` 一次性取出在途集合**（`resolving` / `committing` 及其它未闭合行动），再按状态恢复；不在每个行动里重列一遍提交台账：
    - received / interpreted / awaiting_confirmation：继续等待
-   - resolving：标记 interrupted，允许显式 retry
+   - resolving（含取快照阶段）：标记 interrupted，允许显式 retry
    - reviewing：重新做 review，不重跑插件
    - committing：按 idempotency_key 查询原提交结果
    - committed：只恢复 transition / expression
@@ -410,6 +447,8 @@ needs_review
 ```
 
 规则插件进程退出不等于规则行动失败：核心依据裁定记录和提交状态判断。没有完整裁定记录的在途调用只能标记 `plugin_failed` 或 `interrupted`，不得猜测结果。
+
+恢复只属于重启、导入、回滚与分叉路径；客户端日常的「刷新局面」是重新读取投影（`refresh`），不得触发恢复、不得重跑裁定。
 
 ## 十四、规则时间与世界时间的最终语义
 
@@ -589,22 +628,23 @@ created_at / updated_at
   `action→trpg_action` / `gm_declaration→gm_declaration` / `world_process→trpg_world_process`（世界自身的 NPC 与环境推进）/
   `npc_script→trpg_npc_script`（剧本推进）；`trpg.gm.change` 收 `source`（CLI `--source`），非法来源拒并列出合法集；
   世界过程与玩家行动从此在事件流里分得开（RULE_COMMON §200 的要求）；
-- **规则状态 patch 分片合并**（§二十一 残余第 4 条，2026-09-22）：`base_state_revision` 落后但**触及路径（JSON 指针）**
-  与 `base..current` 之间每一次提交记下的 `patch_paths` 完全不相交时，patch 并入当前 revision（记 `merged_from`）；
+- **规则状态 patch 分片合并**（§二十一 残余第 4 条，2026-09-22）：这是**兜底通道**——首选是 `scope_ref` 分片（§3.4 / §5.2）：不同角色 / 场景各写各的分片，正常路径下不发生同分片并发。同分片内 `base_state_revision` 落后但**触及路径（JSON 指针）**
+  与 `base..current` 之间每一次提交记下的 `patch_paths` 完全不相交时，patch 并入当前 revision（记 `merged_from`）；相对量形式（`increase` / `decrease`）按差值合并；
   有交集、或中间任何一次提交没留路径记录（老数据 / 直改状态）→ 照旧 `conflict` 且不落半条（不确定就别猜）；
 - 受众与信息隔离（§十五）：受众闭集（`public_party` / `gm_only` / `player:` / `character:` / `npc:`）校验；
   **上层可显式传一串受众**（`audience=["character:pc-1","character:pc-2"]`）取并集——这就是「用户级归并」的位置：
   核心不把 `user:` 猜成角色（§十五 拍板），`user:` 仍非法；`trpg.scene.view(audience=…)` 按受众裁剪场景材料（`private_views` 只给对应受众，GM 拿全份）与行动（行动材料带自己的受众列）；插件原始 `resolution` 默认 `gm_only`，玩家面拿不到；
 - 幂等重放（`trpg_commit` 账本，同键返回原 `joint_commit_id`）、版本冲突（`base_state_revision` 不符→`conflict`）、世代失效（→`stale`）；
 - 回滚 / 分叉 / 导出导入随件：六张 `trpg_*` 表进 `runtime_dump` / `runtime_load` / `timeline_clear_state` / `instance_delete` / `portable`，回滚按提交快照精确恢复规则状态；
-- 重启恢复 `trpg.recover`：在途 `snapshotting`/`resolving` → `interrupted`，`committing` 按幂等账本判定，不重跑随机裁定；
-- **规则插件常驻形态**（§五）：清单 `resident: true` 时一个插件进程服务多次裁定（心跳 `ping`/`pong`，闲置超时就地收掉，核心退出统一关闭）；
+- 重启恢复 `trpg.recover`：按 `campaign_id` 一次性取出在途集合，在途 `resolving`（含取快照阶段）→ `interrupted`，`committing` 按幂等账本判定，不重跑随机裁定；**2026-10-08 规范收紧**：在途态已合并为单一 `resolving`（§11.2），当前实现仍持久化 `snapshotting` / `resolving` 两个状态，**实现待对齐**；
+- **规则插件常驻形态**（§五 / 插件规范）：战役裁定器**缺省常驻**（清单显式 `resident: false` 才冷启；当前实现仍是显式 `resident: true` 才常驻，**实现待对齐**）；常驻进程服务多次裁定（心跳 `ping`/`pong`，闲置超时就地收掉，核心退出统一关闭）；
   **跨核心复用**（§二十一 残余第 3 条，2026-09-22）：再声明 `share: true` 时改走**共享承载**——核心连本机回环上的「中继桥」（`isekai_core/runtime/plugin_bridge.py`），桥以 stdio 托管真插件并把端口/令牌写进插件目录的 `.isekai-plugin-share.json`；新核心照这份文件**接上同一个插件进程**，插件代码与线协议都不动；核心退出只断开连接（插件留着），静置 `ISEKAI_PLUGIN_IDLE_EXIT` 秒（缺省 600）桥自退不留孤儿；进程死在「还没发请求」时重开一个，**死在半路不重发**（不重跑裁定）；常驻只省启动与加载——状态仍只经快照进出；
 - 管理面 op（16 个：`trpg.campaign.create|list|info|status|migrate`、`trpg.scene.open|view`、`trpg.action.declare|confirm|abandon|resolve`、`trpg.choice.select`、`trpg.rule_state.read`、`trpg.commit`、`trpg.gm.change`、`trpg.recover`，外加 `runtime.time.consume`）与 CLI 同名命令组；
 - **主持责任模式与关键行动闸**（TRPG_RULES_LAYER_SPEC §八，2026-09-22）：战役带 `host_mode`
   （`assisted` 缺省 / `autonomous` / `cohost`，闭集校验）；声明的 `require_confirmation`（§4.2「是否需要玩家确认」）
   让**关键行动**在任何模式下都要玩家确认；只有 `autonomous` 对非关键行动直接确认，`assisted` / `cohost`
-  一律停在 `awaiting_confirmation`——核心不替玩家确认；
+  一律停在 `awaiting_confirmation`——核心不替玩家确认。
+  **客户端口径（C-3，2026-10-08）**：首版客户端恒以 `assisted` 工作，不提供 `host_mode` 设置入口，也不实现低风险自动确认门控；`autonomous` 只对受信调用方（CLI / 管理面）开放。客户端读到非 `assisted` 战役时按只读事实呈现（核心已自动确认的行动显示为「已由主持模式确认」），不显示成用户确认；确认卡已由用户批准时允许 `declare(confirmed_by="user")` 一次完成（§3.3 / §四），避免两次状态写入。见 `TRPG_CLIENT_SPEC` §3.1 / §6.2 / §6.3；
 - **场景推进节拍**（TRPG_RULES_LAYER_SPEC §4.1 / §九，2026-09-22）：场景带 `advance_mode`
   （`instant` / `continuous` 缺省 / `opposed` / `world`，闭集校验）；节拍是声明，核心不硬套回合；
 - **提交闭包里的战役版本**（§12.1，2026-09-22）：`trpg.commit` 收可选的 `campaign_revision`
@@ -613,14 +653,31 @@ created_at / updated_at
   （规则状态 / 世界 / 场景一处不动）；
 - **零世界后果的提交**（§12.1 `world_changes[]` 可以是空的，2026-09-22）：只有规则状态 patch / 说法 /
   场景转换 / 时间请求，或「明确无变化」的裁定，都能提交落账（`drafts.normalize_draft(require_effects=False)`）——
-  事件行记录这次行动本身，效果数为 0；`world_event` 事件帧并进事件正文（叙述材料），**不产生效果**；
+  事件行记录这次行动本身，效果数为 0；`world_event` 事件帧并进事件正文（叙述材料），**不产生效果**；**2026-10-08 规范收紧**：这条路径按 §12.4 走快路径（跳过草稿归一化与制度 / 环境构造），当前实现仍走完整世界管线，**实现待对齐**；
 - **主持拒绝**（TRPG_CLIENT_SPEC §7.1 待审工作区，2026-09-22）：`trpg.action.reject`（CLI `trpg reject`）
   把待提交 / 待审的裁定推成 `rejected`（终态）——裁定载荷原样保留供主持复核，规则状态与世界一律不写；
   拒绝原因只回执给调用方，不往规范化载荷里塞额外字段；
 - **显式重试裁定**（TRPG_CLIENT_SPEC §C2，2026-09-22）：`interrupted` / `plugin_failed` 的行动重新
-  `trpg.action.resolve` 时**直接进 `resolving`**（不经过 `snapshotting`——那两个状态到不了它），
+  `trpg.action.resolve` 时**直接进 `resolving`**（不重复取快照阶段；按本轮修订，取快照已并入 `resolving`），
   这就是「显式重试」的合法路径，仍然不自动重跑不带用户意图的随机裁定；
 - B0 兼容：不带 `campaign_id` 的 `trpg.action.resolve` 语义不变。
 
 **残余项（记账，不充数）**：无。本节原列四条残余已于 2026-09-22 全部落地（来源细分 / 受众显式并集 / 跨核心复用 / patch 分片合并），当前无已知未实现的设计义务项。
+
+## 本轮修订（2026-10-08）
+
+> 依据 `docs/DESIGN_EFFICIENCY_SCREEN_2026-10-08.md` 的分配发现（P1-8、P1-9、P1-10、P1-11、P1-12、P2-3、P2-4、P2-6、C-3、C-4）改写规范文本；只动本文，不动实现与其他文档。
+
+| 发现 | 章节 | 原表述 | 新表述 |
+|---|---|---|---|
+| P1-8 | §二十一 | 常驻需清单 `resident: true`，按可选能力描述 | 战役裁定器缺省常驻、`resident: false` 才冷启；注明当前实现仍需显式 `true`，**实现待对齐**（与 `TRPG_RULE_PLUGIN_SPEC` 一致） |
+| P1-9 | §3.4 / §5.2 / §八 / §二十一 | `scope_ref` 只在对象字段表里出现，规则状态主键不含它；同分片并发靠路径不相交合并兜 | `scope_ref` 落进规则状态主键（按角色 / 场景分片，`""`=全局）；一次检定只读写本分片；路径不相交合并降级为兜底 |
+| P1-10 | §3.3 / §四 | 行动声明只有 `preconditions`，规则输入没有通路 | 新增显式 `context`（对象，规则输入，核心原样下发）；`preconditions` 回归字符串列表语义 |
+| P1-11 | §十（新增 §10.1） | §十 未规定投影查询边界；裁定结果与事件行各存一份 | 投影按 `campaign_id` 限定、数据库侧 `LIMIT` + 索引（open 行动 + 最近 5 条裁定）；裁定结果不复制进 `event.detail`，只引用行动行 |
+| P1-12 | §13 | 恢复逐个读取规则状态附件与未完成 action，在每个 `committing` 行动里重列提交台账 | 恢复按 `scope_ref` 取分片、**按 `campaign_id` 一次性取出在途集合**；恢复只属重启 / 导入 / 回滚 / 分叉，日常「刷新局面」走 `refresh` 不触发恢复 |
+| P2-3 | §12.4（新增）/ §二十一 | 零世界后果仍走完整世界管线（归一化草稿、制度、环境） | 空后果包走快路径：跳过草稿归一化与制度 / 环境构造，`world_changes[]` 为空合法；快路径不跳过版本 / 幂等 / 受众 / 场景转换校验 |
+| P2-4 | §11.2 / §十三 / §二十一 | 在途有 `snapshotting` → `resolving` 两个持久状态，各一次事务 | 在途合并为单一持久状态 `resolving`（取快照是其内部阶段）；注明实现仍持久化两个状态，**实现待对齐** |
+| P2-6 | §11.3 | 「过期或已选择的 choice 重试返回原结果」未写 revision 不符与回放口径 | 场景 revision 不一致 → `conflict` 不套用旧选项；幂等键**回放**原结果；剩余候选用聚合查询（规范原有要求，本次写实口径） |
+| C-3 | §3.1 / §3.3 / §四 / §二十一 | 运行时支持 `autonomous` 自动确认，客户端文档又写「首版不提供低风险自动确认」 | 取「客户端恒为 `assisted`、不暴露 `host_mode`」一支：`autonomous` 只对受信调用方开放，客户端读到非 `assisted` 按只读事实呈现；同时允许确认卡已批准时 `declare(confirmed_by="user")` 一次完成 |
+| C-4 | §5.2 | `op: add / replace / remove`，而插件示例用 `decrease` | 闭集补 `increase` / `decrease` 并注明是并发安全相对量形式；给出 patch `op` ↔ 后果 `operation` 对应表 |
 

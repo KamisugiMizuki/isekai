@@ -77,6 +77,7 @@ scene_transition
 ```text
 ruleset_id
 campaign_id
+scope_ref            # 状态分片：按角色 / 按场景；"" = 全局分片
 base_state_revision
 operations[]
 ```
@@ -84,10 +85,13 @@ operations[]
 公共模块不解释 `operations[].path` 的规则语义，只检查：
 
 - 命名空间属于当前插件；
-- base revision 与读取快照一致；
+- patch 只写本次 `scope_ref` 对应的分片（`scope_ref=""` 为全局分片）；
+- base revision 与**同一分片**的读取快照一致；
 - patch 没有写入 WorldRuntime 世界事实；
 - patch 与必要世界后果进入同一联合提交；
 - 规则版本不兼容时拒绝提交。
+
+`operations[].op` 为闭集 `add` / `replace` / `remove` / `increase` / `decrease`。`add` / `replace` / `remove` 是绝对量（新增键、覆盖为给定值、删除键）；`increase` / `decrease` 是**并发安全的相对量形式**——写入的是差值，可与其他相对量在同一 `base..current` 区间内合并，不因 revision 落后就整批重裁。
 
 规则状态不是世界事实的第二份副本。世界地点、公共事件、认知和持续世界后果必须进入 WorldRuntime。
 
@@ -111,6 +115,8 @@ source_mode          # action / gm_declaration / world_process / npc_script
 ```
 
 `certainty=candidate` 或 `uncertain` 的内容只能进入候选 / 待批准状态，不能直接提交为世界事实。`confirmed` 也必须通过 WorldRuntime 的目标、类型、权限、时间和因果校验。
+
+规则状态 patch 的 `op` 与世界后果的 `operation` 是**两套词表**，不能混写：`add↔create`、`replace↔set`、`remove↔remove`、`increase` / `decrease↔change`；`reveal` / `advance` 只属于世界后果（对应表见 `TRPG_CAMPAIGN_RUNTIME_SPEC` §5.2）。公共层不改写任一侧词表，也不把 patch 操作当世界后果。
 
 ### 3.4 认知与表达材料
 
@@ -166,7 +172,7 @@ normalized_result
 5. 将候选 / 未确认 / 无法映射项分别放入 `needs_review`，不能静默丢弃或升格；
 6. 把规则状态 patch、世界变化和场景转换交回同一联合提交边界。
 
-`source_mode`、`action_ref`、`campaign_id`、`expected_revision` 和 `idempotency_key` 由宿主路径提供，插件不能靠响应自报来源或版本来取得写权限。公共层可以拒绝结构不完整的结果，但目标是否存在、效果是否属于当前世界包闭集、时间是否可推进，最终由 WorldRuntime 判断。
+`source_mode`、`action_ref`、`campaign_id`、`expected_revision` 和 `idempotency_key` 由宿主路径提供，插件不能靠响应自报来源或版本来取得写权限。规则输入 `context`（对象）由宿主路径在调用插件时下发，不进公共层的规范化输出；`preconditions` 是行动前置条件的字符串列表，不作为规则输入。公共层可以拒绝结构不完整的结果，但目标是否存在、效果是否属于当前世界包闭集、时间是否可推进，最终由 WorldRuntime 判断。
 
 ### 3.7 两种兼容输入
 
@@ -270,14 +276,17 @@ world_event     -> event frame
 ```text
 原始裁定记录
   -> 结构化错误 / 响应形状检查
-  -> 规则私有 patch 命名空间与 base revision 检查
+  -> 规则私有 patch 命名空间、分片与 base revision 检查
   -> 通用后果规范化（来源 / 目标 / 受众 / 时间 / 确定性）
-  -> WorldRuntime preview：闭集、目标、权限、因果和版本
+  -> 后果包为空时走快路径：直接 ready（只带规则状态 patch / 场景转换 / 时间请求）
+  -> 非空时 WorldRuntime preview：闭集、目标、权限、因果和版本
   -> Campaign Runtime 联合 commit：规则状态 + 世界后果 + 场景转换
   -> 返回 committed / rejected / needs_review / duplicate / conflict / stale
 ```
 
 公共层检查“能否表达”，WorldRuntime 检查“在这个实例、时间线和水位上能否成立”，Campaign Runtime 检查“这次提交是否属于当前战役和行动”。三个结果不能互相替代。
+
+「明确无变化」是合法结果：后果包为空（没有 `effects` / `claims` / `knowledge_changes` / 事件帧）时，公共层直接判 `ready`，跳过 preview 与草稿归一化，只把规则状态 patch、场景转换与时间请求交给联合提交（对应 `TRPG_CAMPAIGN_RUNTIME_SPEC` §12.4 的快路径）。空后果包不因「没有世界变化」被拒绝，也不是伪造一条效果的理由。
 
 任何一个必要后果非法，整次提交拒绝或进入待审，不落半条状态。`needs_review` 不是失败骰点，而是表示规则与世界边界之间没有足够明确的映射。
 
@@ -385,3 +394,22 @@ GM 输入“守卫已经离开”“城门被毁”时，不应伪装成玩家�
 
 1. 插件响应的 `consequences[].kind` **必须**是变化意图类别（或 `player_choice`）；把 `institution_state` 这类世界效果名写进 `consequences` 会被拒绝并指明去处（世界效果名请放进 `effects` 兼容字段）。
 2. B0 兼容路径的 `effects` 要过同一套确定性 / 受众 / 因果检查：非 `confirmed` 的条目不再能借兼容字段落成事实。
+
+**2026-10-08 规范收紧、实现待对齐**：
+
+1. 规则状态分片（§3.2）：`scope_ref` 进规则状态主键，`op` 闭集含 `increase` / `decrease`（相对量并发安全）；当前实现是单份状态文档 + 全量读写，路径不相交合并是主路径而非兜底，待对齐；
+2. 空后果包快路径（§六）：无 `effects` / `claims` / `knowledge_changes` / 事件帧时直接 `ready`，跳过草稿归一化与制度 / 环境构造；当前实现仍走完整世界管线，待对齐；
+3. 规则输入 `context` 与 `preconditions` 的分工（§3.6）：`context` 是规则输入的唯一载体、`preconditions` 只是字符串列表；当前战役路径没有 `context` 入口，待对齐。
+
+## 本轮修订（2026-10-08）
+
+> 依据 `docs/DESIGN_EFFICIENCY_SCREEN_2026-10-08.md` 的分配发现（P1-9、P2-3、C-4）改写规范文本；只动本文，不动实现与其他文档。
+
+| 发现 | 章节 | 原表述 | 新表述 |
+|---|---|---|---|
+| P1-9 | §3.2 | patch 只有 `ruleset_id / campaign_id / base_state_revision`，检查项不含分片，base revision 比对不分片 | patch 增加 `scope_ref` 分片；检查项明确「只写本分片」「base revision 与同一分片快照一致」 |
+| P1-9 | §3.2 | 检查项未列 `op` 词表 | 补闭集 `add` / `replace` / `remove` / `increase` / `decrease`，注明相对量并发安全 |
+| P1-10 | §3.6 | 只写 `source_mode` 等由宿主提供，未说明规则输入 | 明确 `context`（对象）由宿主下发、不进规范化输出；`preconditions` 只是字符串列表、不作为规则输入 |
+| P2-3 | §六 | 规范化后一律进 WorldRuntime preview | 后果包为空即走快路径直接 `ready`，跳过 preview 与草稿归一化；「明确无变化」是合法结果 |
+| C-4 | §3.3 | 后果 `operation` 与 patch `op` 的关系未说明 | 写明两套词表的固定对应关系（`add↔create`、`replace↔set`、`remove↔remove`、`increase`/`decrease↔change`；`reveal`/`advance` 只属世界后果） |
+| P1-9 / P2-3 / P1-10 | §十二 | 实现状态表只记已落地口径 | 追加「2026-10-08 规范收紧、实现待对齐」三条（分片、快路径、`context`） |

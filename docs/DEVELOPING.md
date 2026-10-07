@@ -174,7 +174,8 @@ python -m isekai_core.world_cli instance import --file packages/saltflat.isekai.
 
 ### 阶段 2 审计补齐（对照 WORLD_RUNTIME_SPEC §2.2–2.8 / §3 / §4 / §11 / §13 与附录 A/B）
 
-- **倍率上限可配置**（§2.2）：`runtime.rate_max` 默认 2592000，全局统一、仅开发者可配置，不进设置 UI；`runtime.max_active_timelines`（同时激活上限）、`catch_up_batches`、`catch_up_lag_seconds` 同为开发者配置。
+- **倍率上限可配置**（§2.2）：`runtime.rate_max` 默认 2592000，全局统一、仅开发者可配置，不进设置 UI；`runtime.max_active_timelines`（同时激活上限）、`catch_up_batches`（直接调用 `advance` 的批数上限）、`catch_up_lag_seconds` 同为开发者配置。
+- **补算用墙钟时间盒**（§2.6，2026-10-08 效率筛查后）：`runtime.catch_up_budget_seconds`（常规时间盒，默认 1.0 s）、`runtime.catch_up_max_budget_seconds`（滞后超 `catch_up_lag_seconds` 时的自愈时间盒，默认 4.0 s，追平即退回常规值）、`runtime.catch_up_tick_batches`（周期 tick 的批数硬闸，默认 4096）。周期 tick 与启动恢复都按「批数硬闸 + 时间盒」推进，多条激活线平分一拍的预算；`rate_max` 必须与排水能力自洽（推导口径见 §2.2，判据：单批成本约 33 ms 是默认上限的触底点）。
 - **上限降低不改写历史**（§2.4）：该线保留原倍率、保持冻结，激活必须确认一个合法倍率（CLI `--rate` / 壳上先填倍率再点激活）；不静默改写、不静默丢历史。
 - **运行世代**（§2.2 / §4）：冻结与激活都递增世代，迟到批次带旧世代一律整批不落盘；重新激活不接收旧世代结果。
 - **一批一提交**（§2.7）：计划、单元衰减、经历与水位的推进在**同一事务**内提交，中途失败整批回到批前水位，不留半批数据。

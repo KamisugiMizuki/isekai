@@ -35,9 +35,16 @@
 | `capabilities` | 本端能力表（`CAPABILITIES`，4 项） | version.py:23-28 |
 | `counts` | `sessions` / `messages` / `timelines` / `commits` 四类计数 | portable.py::build_container |
 
-- 指纹：`integrity = {algorithm: "sha256", digest: sha256(setting + runtime)}`；导入先查兼容、再验指纹，最后才落库（portable.py::_digest/verify_integrity/import_instance）。
+- 指纹（**现状口径**）：`integrity = {algorithm: "sha256", digest: sha256(setting + runtime)}`；导入先查兼容、再验指纹，最后才落库（portable.py::_digest/verify_integrity/import_instance）。→ 本轮修订改为按分节原始字节，见下方「规范要求」块。
 - 上限：**`MAX_CONTAINER_BYTES = 256 MiB`**（容器件自带更大的闸，与单包 1 MiB 分开）；`read_container` 走同一把 `read_json_file`（portable.py:151-163）。
 - 不导出：待生效倍率命令、投递回执、通道绑定（portable.py::build_container 注释，§2.6 / §2.3.6）。
+
+**规范要求（本轮新增，2026-10-08；实现待对齐——以上是现状口径，以下是应当如此）：**
+
+- **摘要按分节原始字节**：`integrity` 对 `setting` / `runtime` **各算一档 sha256**（按该节落盘 / 传输的**原始字节**），允许分节独立校验；不再以「`setting + runtime` 的规范化序列化」为唯一口径——旧口径要求全量物化才能复算，与下一条的增量目标直接冲突（报告 C-10）。
+- **导出不自我复验**：`build_container` 同趟产出 digest，导出**不再**把自己刚构建的容器整体再序列化一遍并重算同一摘要（报告 P1-13）。
+- **按存储形态导出 / 重建**：提交快照在库内与容器内都只保留 `kind` / `base` / `body` 的**存储形态**（delta 链）；导入按存储形态**重建 delta 链**。容器与库体积保持 O(历史 + 变更)，不随「提交数 × 历史」增长，256 MiB 上限不再因正常游玩被逼近（报告 P0-5 / P1-14）。
+- **导入一次过**：复用已在隔离暂存位置完成的校验结果（「已校验」快路径），不重复两轮逐卡校验与包级 id 集重建；**不在导入期先为每条提交合成全量快照、随后又被容器内容整体覆盖**（纯白做功），快照只由容器内容一次性写入。
 
 ## ③ 稳定标识编码
 
@@ -77,7 +84,7 @@
 |---|---|---|
 | `meta` | `schema` `package_id` `original_name` `display_name` `description` `density` | `schema` 必须 == `1.0`；`package_id` / `original_name` 非空；`density` ∈ DENSITIES；`requires`（可选）必须 ⊆ CAPABILITIES |
 | `calendar` | `era` `day_seconds` `months[]` `week{days}` `segments[]` `initial_moment` | `era` 非空；`day_seconds` 正整数；时段 `id/name/start/end` |
-| `world` | `axioms[]` `geography` `society` `lexicon{terms[]}` `institutions[]` `customs[]` | 制度：`mandate` / `scope` / `succession` / `validity` 必填，职位 `id/name/holder`、`vacancy_policy{continues,suspended}` 显式；惯例：`applies_to` / `practice` / `basis` / `variation` 必填，`practice` ∈ `forms` |
+| `world` | `axioms[]` `geography` `society` `lexicon{terms[]}` `institutions[]` `customs[]` `regions[]` | 制度：`mandate` / `scope` / `succession` / `validity` 必填，职位 `id/name/holder`、`vacancy_policy{continues,suspended}` 显式；惯例：`applies_to` / `practice` / `basis` / `variation` 必填，`practice` ∈ `forms`；区域：`regions[]{id,name,description?}`，`id` 在包内唯一（未声明 / 空列表 = 不使用区域标签，不报错） |
 | `environment` | `types[]` | 效果 `environment_state` 只能引用已声明类型与取值域 |
 | `sources` | `id` `name` `kind` `reach` | 说法 `source_id` 必须指向已声明传本 |
 | `canon` | `id` `statement` `tags[]` | 史料条目 `entries` / 事件前置条件只能引用 canon / narratives 标识 |
@@ -85,13 +92,21 @@
 | `entities` | `id` `kind` `name` `race_id` `born` `died` | `kind` ∈ ENTITY_KINDS；**名册非空**（至少一人）；制度在任者必须在这里 |
 | `races` | `id` `name` `lifespan` | `lifespan` 两种形态之一：`{mode: long\|unbounded}` 或 `{min_years,max_years}`（正整数年、min ≤ max），**混写即拒** |
 | `historiography` | `id` `title` `contributors[]` `written_at` `compiled_at` `coverage{from,to}` `genre` `stance` `entries[]` | 贡献者须给 `role` 与 `period`；`entries` 非空 |
-| `events` | `families[]{id,name,templates[]}` `density` | `density` ∈ DENSITY_TARGETS（**体裁必填**）；模板效果 `target` 必须在册、每条效果给 `expiry` ∈ EXPIRY_KINDS |
+| `events` | `families[]{id,name,templates[]}` `density` | `density` ∈ DENSITY_TARGETS（**体裁必填**）；模板效果 `target` 必须在册——解析集合 = 在册实体 ∪ 已登记区域 ∪ 制度 / 职位 / 惯例（`validate.py::_all_ids`），每条效果给 `expiry` ∈ EXPIRY_KINDS |
 | `life` | `id` `name` `sleep` `windows[]{start,end,activity}` | 生活线须显式声明是否睡眠；角色模板 `life_template` 必须指向这里 |
 | `roles` | `id` `name` `description` `life_template` `channels[]` | `channels` 闭合到 `sources` |
 | `comms` | `mechanisms[]{id,name,limits}` | — |
 | `initial_state` | `events[]` `rumors[]` `mysteries[]` | 引用必须闭合到 canon / narratives |
 
 > 未列进上表的子键 = 「模板给了但校验器不强制」，或本附录尚未核实；**不按设计意图补写**。
+
+**区域登记（2026-10-08 已落地；见 `validate.py::_validate_regions` / `cards.py::_validate_region`）：**
+
+- **区域登记为在册对象**：`world` 段登记 `regions[]`，每项含稳定标识 `id`、名称与可选描述；区域只作叙事范围标签，无几何 / 路网。顶层键清单（上文 15 项）不变——`regions` 是 `world` 段内的子键，`scripts/_audit2_pkg_doc.py` 仍 20/20。
+- **引用校验**：角色卡的 `region` 与事件效果的 `target` 引用区域时必须是已登记标识；悬空、拼错、写自由文本（即使与登记名称逐字相同）即校验失败，不再静默失效（报告 P2-11）。
+- **效果目标解析集合**：`target` 的解析集合 = 在册实体 ∪ 已登记区域 ∪ 制度 / 职位 / 惯例（`validate.py::_all_ids`）；上表 `world` / `events` 两行已按此同步。
+- **显示面**：区域标识是引用键，名称才是显示面；运行层渲染「常在」等处必须解析为 `world.regions[].name`（已落地于 `runtime/service.py::region_label`）。
+- **模板落点**：`package.template_package()` 的 `world` 段带 `regions: []`，样例世界（灰潮纪）登记 `pl-1` / `pl-2` 并由两张卡引用。
 
 ## ⑤ 枚举与取值域
 
@@ -120,3 +135,11 @@
 
 > 回填相关的实现参数（分卷 / 批量 / 折半阈值 / 要点人物 / 名册体量）属运行期，见 `WORLD_SETTING_SPEC.md` §十 与
 > `isekai_core/runtime/events.py`，不在本文范围。
+
+## 本轮修订（2026-10-08）
+
+- **C-10**：原表述 §38「指纹：`integrity = {algorithm: "sha256", digest: sha256(setting + runtime)}`」（② 节，原 38 行）→ 新表述（② 节）：该行标为**现状口径**，其后新增「规范要求（本轮新增，实现待对齐）」块——摘要改为**按分节（`setting` / `runtime`）原始字节**各算一档、允许分节独立校验，不再以「规范化序列化」为唯一口径。→ 对应发现 C-10（报告锚点 §38；证据 `portable.py:36-37, 155, 213-219, 227`）。
+- **P1-13**：原表述 §② 只写「先查兼容、再验指纹」，未写导出侧会对自己刚构建的容器重算同一 digest → 新表述（② 节规范要求块）：**导出不自我复验**（`build_container` 同趟产出 digest），导入复用已校验结果、不重复两轮校验。→ 对应发现 P1-13（报告锚点 §38；证据 `portable.py:155-165, 236`、`instances.py:80-86`）。
+- **P2-11**：原表述 §④ 顶层键与强制项表只覆盖既有键，`events` 行「`target` 必须在册」未含区域 → 新表述（④ 节规范要求块）：区域登记为在册对象（`world.regions[]`），卡片 `region` 与效果 `target` 引用区域时校验引用存在；并显式声明 **`regions` 未进顶层键清单**（该清单与 `template_package()` 逐字对拍）与「落地时须同步改 `events` 行 / ⑤ 枚举」。→ 对应发现 P2-11（报告锚点 §88；证据 `validate.py:729-731`）。
+- **P0-5 / P1-14（口径引用）**：新增「按存储形态导出 / 重建」一条，写明容器与库体积为 O(历史 + 变更)、256 MiB 上限不再被正常游玩逼近；正文规范口径在 `WORLD_SETTING_SPEC.md` §7.1 / §7.3。
+- **对拍约束遵守说明**：③ 前缀表、④ 顶层键反引号段落、⑤ 枚举、⑥ 限额表**未增删任何行、未改任何数值**；新增内容一律放在表格 / 段落之后的空白行之后，且 `MAX_CONTAINER_BYTES = 256 MiB`、`MAX_PACKAGE_BYTES` 等字面保持不变。
