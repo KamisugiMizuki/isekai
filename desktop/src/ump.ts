@@ -104,7 +104,11 @@ export class UmpClient {
     this.send(
       makeEnvelope("hello", {
         channel: { id: this.channelId, name: this.name, version: "0.1.0" },
-        capabilities: { segments: true, status: true, max_text_len: 4000, max_parts: 10 },
+        // 流式（P0-7 / CHANNEL_PLUGIN_SPEC §2.1）：宣告它才收得到 `reply_delta` 增量。
+        // 增量只是**临时预览**，固化帧 `reply` 仍是唯一事实——内核按这个能力位分流（session.py
+        // 的 `_caps(...).get("streaming")`），不宣告就永远收不到增量、只能整块等回复。
+        // max_text_len / max_parts 的语义不变（仍是我方能收下的单帧文本上限与分批条数）。
+        capabilities: { segments: true, status: true, streaming: true, max_text_len: 4000, max_parts: 10 },
         auth,
       }),
     );

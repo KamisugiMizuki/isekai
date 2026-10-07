@@ -10,7 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { MgmtClient } from "../ump";
 import { AppApi, uiError, type InstanceEntry, type Json } from "./api";
-import { button, chip, clear, el, errorCard, facts, fill, paragraph, primary, setNote, stamp } from "./dom";
+import { button, chip, clear, dialog, el, errorCard, facts, fill, paragraph, primary, setNote, stamp } from "./dom";
 import { ContactPane } from "./contact";
 import { HelpPane } from "./help";
 import { HomePane } from "./home";
@@ -205,6 +205,8 @@ export class App {
   private settingsError: string | null = null;
   private instancesError: string | null = null;
   private exitHandshake = false;
+  /** 30 秒窗口到期后的三选一弹窗只摆一次（P1-18） */
+  private quitChoiceShown = false;
   private topHost!: HTMLElement;
   private mainHost!: HTMLElement;
   private bannerHost!: HTMLElement;
@@ -240,13 +242,20 @@ export class App {
       void this.onCoreStatus();
     });
     void listen<string>("notice-open", (event) => this.onNotice(event.payload));
+    // 提醒定位（P1-17）：可见时由 `notice-open` 事件驱动（壳在 open_notice 里 emit，取走标志位），
+    // 这里只保留「页面隐藏 / 最小化到托盘」的兜底轮询——那种场景壳的 emit 送不到页面，
+    // 只能由页面自己来取（main.rs 的注释里有实测结论）。可见时不再每秒 1.5 s 空转。
     window.setInterval(() => {
+      if (document.visibilityState !== "hidden") return;
       void invoke<string | null>("take_pending_notice")
         .then((pending) => (pending ? this.onNotice(pending) : undefined))
         .catch(() => undefined);
     }, 1500);
     this.status = await this.waitForCore();
     await this.onCoreStatus();
+    // 启动时补一次「壳是否已经请求退出」：可见状态下已经没有常驻轮询了（P1-17），
+    // 若退出请求发生在这个监听挂上之前，只能靠这一取补上
+    await this.checkExitPending();
 
     // 首次打开直接进「首次设置」：说明书写的就是这个顺序，不该先让人在三个英文应用名里做选择。
     // 「选择应用」推迟到首次设置走完之后（那时用户已经有世界，选哪个才有意义）。
@@ -769,33 +778,122 @@ export class App {
 
   /* ---------------------------------------------------------------- 退出握手 */
 
+  /**
+   * 退出握手（P1-17）：可见时事件驱动，隐藏时才兜底轮询。
+   *
+   * 壳的 `begin_quit` 只是把 `exit_requested` 置位（隐藏到托盘后 emit 送不到页面，见 main.rs 注释），
+   * 页面侧因此有两个入口：
+   *   - 可见 ⇒ 由窗口重新获得焦点 / 从隐藏变可见这些真事件去取一次；启动完成时也取一次；
+   *   - 隐藏（托盘 / 最小化）⇒ 页面的事件收不到，只能靠这个 600 ms 的兜底轮询。
+   * 以前 0.6 s 一次的 `exit_pending` 在可见状态下也一直跑（约 6,000 次/小时的 WebView↔Rust 往返）。
+   */
   private async startExitHandshake(): Promise<void> {
     window.setInterval(() => {
-      if (this.exitHandshake) return;
-      void invoke<boolean>("exit_pending")
-        .then((pending) => (pending ? this.flushAndExit() : undefined))
-        .catch(() => undefined);
+      if (document.visibilityState !== "hidden") return;
+      void this.checkExitPending();
     }, 600);
+    const onVisible = (): void => {
+      if (document.visibilityState === "hidden") return;
+      void this.checkExitPending();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+  }
+
+  /** 取一次「壳是否已请求退出」；取到就进入退出前保存 */
+  private async checkExitPending(): Promise<void> {
+    if (this.exitHandshake) {
+      // 保存还在进行时也可能撞上 30 秒窗口到期：这时把三个选择摆出来（P1-18）
+      await this.checkQuitTimeout();
+      return;
+    }
+    try {
+      if (await invoke<boolean>("exit_pending")) await this.flushAndExit();
+    } catch {
+      /* 壳不可达（已在退出途中）：忽略，下一次事件或轮询再试 */
+    }
+  }
+
+  /**
+   * 30 秒窗口到期（P1-18）：壳等界面选「继续等待 / 查看诊断 / 强制退出」。
+   *
+   * 窗口可见时用户能看见并选择；隐藏 / 最小化时没人能选，壳会在自己的选择窗口到期后按强制退出兜底。
+   */
+  private async checkQuitTimeout(): Promise<void> {
+    if (this.quitChoiceShown) return;
+    let pending = false;
+    try {
+      pending = await invoke<boolean>("quit_timeout_pending");
+    } catch {
+      return;
+    }
+    if (!pending) return;
+    this.quitChoiceShown = true;
+    const modal = dialog(
+      "退出还需要一点时间",
+      [
+        paragraph(
+          "界面还在保存（或正在提交最后一条改动）：现在强制退出可能丢掉还没提交的内容。",
+        ),
+        paragraph("继续等待会再给一轮保存窗口；查看诊断会打开帮助页里的日志与自检。", "u-hint"),
+      ],
+      [
+        {
+          label: "继续等待",
+          run: async () => {
+            await invoke("quit_decision", { choice: "wait" });
+            this.banner("继续等待保存完成…", "pending");
+            return true;
+          },
+        },
+        {
+          label: "查看诊断",
+          run: async () => {
+            await invoke("quit_decision", { choice: "diagnose" });
+            this.banner("正在打开帮助与诊断；保存仍在继续…", "pending");
+            this.navigate({ pane: "help" });
+            return true;
+          },
+        },
+        {
+          label: "强制退出",
+          run: async () => {
+            await invoke("quit_decision", { choice: "force" });
+            return true;
+          },
+        },
+      ],
+    );
+    document.body.appendChild(modal.node);
   }
 
   private async flushAndExit(): Promise<void> {
     if (this.exitHandshake) return;
     this.exitHandshake = true;
     this.banner("正在保存并退出…", "pending");
-    await this.drafts.flush();
-    if (!this.apiRef) {
-      await invoke("exit_ready", { detail: "管理面未连接：按已有持久化水位退出", saved: false });
-      return;
-    }
+    // 保存期间盯住 30 秒窗口是否到期（P1-18）：窗口可见时看不到隐藏态的兜底轮询，
+    // 到期就把「继续等待 / 查看诊断 / 强制退出」摆出来，而不是让壳默默强杀。
+    const timeoutWatch = window.setInterval(() => void this.checkQuitTimeout(), 1000);
     try {
-      const result = await this.apiRef.call("app.shutdown", {}, 10000);
-      const saved = result.saved as { ok?: boolean; bytes?: number } | undefined;
-      await invoke("exit_ready", {
-        detail: saved?.ok ? `退出前备份完成（一致水位）` : "退出前备份未通过完整性校验",
-        saved: Boolean(saved?.ok),
-      });
-    } catch (error) {
-      await invoke("exit_ready", { detail: `退出前保存失败：${String(error)}`, saved: false });
+      await this.drafts.flush();
+      if (!this.apiRef) {
+        await invoke("exit_ready", { detail: "管理面未连接：按已有持久化水位退出", saved: false });
+        return;
+      }
+      try {
+        // 30 秒 = 壳的 `FLUSH_WAIT_MS`（main.rs）与 ONBOARDING §7.2 的退出等待窗口：
+        // 客户端自己的上限不得短于这个窗口，否则会在壳还没杀之前就报「保存失败」（P1-18）
+        const result = await this.apiRef.call("app.shutdown", {}, 30000);
+        const saved = result.saved as { ok?: boolean; bytes?: number } | undefined;
+        await invoke("exit_ready", {
+          detail: saved?.ok ? `退出前备份完成（一致水位）` : "退出前备份未通过完整性校验",
+          saved: Boolean(saved?.ok),
+        });
+      } catch (error) {
+        await invoke("exit_ready", { detail: `退出前保存失败：${String(error)}`, saved: false });
+      }
+    } finally {
+      window.clearInterval(timeoutWatch);
     }
   }
 }

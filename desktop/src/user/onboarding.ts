@@ -277,12 +277,31 @@ export class OnboardingPane implements Pane {
       if (setup.validate(note)) return;
       this.busy = true;
       fill(results);
-      setNote(note, "正在测试：检查地址 / 验证访问 / 检查回复格式…", "pending");
+      setNote(note, "正在测试，已等待 0 秒…", "pending");
+      // 只显示真实阶段与已等待时间（ONBOARDING §4.2 / P2-14）：等待期间报秒数，
+      // 完成后渲染内核返回的 `stages` 与最终检查，不用固定三行假装在跑。
+      const progress = el("div", { class: "u-progress" });
+      const live = el("p", { class: "u-hint", text: "正在测试，已等待 0 秒…" });
+      progress.appendChild(live);
+      results.appendChild(progress);
+      const startedAt = Date.now();
+      const timer = window.setInterval(() => {
+        const waited = Math.floor((Date.now() - startedAt) / 1000);
+        live.textContent = `正在测试，已等待 ${waited} 秒…`;
+        setNote(note, `正在测试，已等待 ${waited} 秒…`, "pending");
+      }, 1000);
       try {
         const result = await this.ctx.api.testAi(setup.collect());
+        const stages = (result.stages as Json[]) ?? [];
         const checks = (result.checks as Json[]) ?? [];
-        fill(
-          results,
+        fill(progress);
+        const stageItems = stages.map((item) => ({
+          label: String(item.label),
+          ok: Boolean(item.ok),
+          detail: String(item.detail ?? ""),
+        }));
+        if (stageItems.length) results.appendChild(checkList(stageItems));
+        results.appendChild(
           checkList(
             checks.map((item) => ({
               label: checkLabel(item.label),
@@ -290,6 +309,8 @@ export class OnboardingPane implements Pane {
               detail: String(item.detail ?? ""),
             })),
           ),
+        );
+        results.appendChild(
           el("p", { class: "u-hint" }, `服务 ${String(result.service ?? "")}｜模型 ${String(result.model ?? "")}｜用时 ${String(result.duration_ms ?? 0)} 毫秒`),
         );
         if (result.ok) {
@@ -315,6 +336,7 @@ export class OnboardingPane implements Pane {
         setNote(note, info.message, "bad");
         results.appendChild(errorCard(info, [{ label: "重新测试连接", run: () => void runTest() }]));
       } finally {
+        window.clearInterval(timer);
         this.busy = false;
       }
     };

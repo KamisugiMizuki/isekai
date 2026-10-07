@@ -221,22 +221,32 @@ export class SettingsPane implements Pane {
 
     const test = async (): Promise<void> => {
       if (setup.validate(note)) return;
-      setNote(note, "正在测试：检查地址 / 验证访问 / 检查回复格式…", "pending");
+      setNote(note, "正在测试，已等待 0 秒…", "pending");
       fill(results);
       const progress = el("div", { class: "u-progress" });
       results.appendChild(progress);
-      
-      const addStep = (label: string, ok: boolean | null) => {
-        const icon = ok === null ? "⏳" : ok ? "✓" : "✗";
-        const line = el("p", { text: `${icon} ${label}` });
-        progress.appendChild(line);
-      };
-      
-      addStep("检查地址", null);
+      // 只显示**真实**阶段与已等待时间（ONBOARDING §4.2）：细阶段内核测完才回，
+      // 等待期间只报已等待秒数，不摆三行假装在跑的固定阶段。
+      const live = el("p", { class: "u-hint", text: "正在测试，已等待 0 秒…" });
+      progress.appendChild(live);
+      const startedAt = Date.now();
+      const timer = window.setInterval(() => {
+        const waited = Math.floor((Date.now() - startedAt) / 1000);
+        live.textContent = `正在测试，已等待 ${waited} 秒…`;
+        setNote(note, `正在测试，已等待 ${waited} 秒…`, "pending");
+      }, 1000);
       try {
         const result = await this.ctx.api.testAi(setup.collect());
+        const stages = (result.stages as Json[]) ?? [];
         const checks = (result.checks as Json[]) ?? [];
         fill(progress);
+        // 内核返回的真实阶段（每个阶段带 label/ok/detail）先行，随后是最终能力检查
+        const stageItems = stages.map((item) => ({
+          label: String(item.label),
+          ok: Boolean(item.ok),
+          detail: String(item.detail ?? ""),
+        }));
+        if (stageItems.length) results.appendChild(checkList(stageItems));
         results.appendChild(
           checkList(
             checks.map((item) => ({
@@ -264,6 +274,8 @@ export class SettingsPane implements Pane {
         );
       } catch (error) {
         setNote(note, uiError(error, { module: "设置", action: "测试 AI 连接" }).message, "bad");
+      } finally {
+        window.clearInterval(timer);
       }
     };
 

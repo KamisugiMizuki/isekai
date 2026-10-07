@@ -52,6 +52,19 @@ interface ContactSelection {
 }
 
 /**
+ * 正在流式到达的一条回复的**预览缓冲**（P0-7：`reply_delta` 增量，未固化）。
+ *
+ * 为什么单独存一份、不写进 `messages`：增量不作数——后验检查可能改字，内核也明确
+ * 「最终正文以固化的 `reply` 帧为准」。所以它只画在待定气泡里，固化帧到达时整段替换。
+ */
+interface PreviewDraft {
+  messageId: string;
+  text: string;
+  /** 已收到的最大段序：用来识别乱序 / 重复段（重复段不重复拼接） */
+  index: number;
+}
+
+/**
  * 一条已经发出去、还没落定的入站请求。`at` 是发送时刻：等待态的读秒按它算，
  * 转进 `messages` 时也用它当这条消息的时间。
  */
@@ -130,6 +143,8 @@ export class ContactPane implements Pane {
     scroll.addEventListener("scroll", () => {
       this.atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 40;
       if (this.atBottom) this.hideNewHint();
+      // 渲染集合有上界（P1-16）：滚到顶部就按需把更早的一页前插回来
+      this.maybeLoadOlderOnScroll();
     });
     const newHint = button(
       "有新消息 ↓",
@@ -229,6 +244,9 @@ export class ContactPane implements Pane {
     this.sendButton = send;
     this.scrollHost = scroll;
     this.headerHost = header;
+    // 系统卡（说明 / 失败卡）属于**对话内容**，跟着消息一起滚（原来每帧重挂一次）：
+    // 挂一次、常驻在滚动区末尾，消息节点再按「待定区之前」插到它前面（P1-16）。
+    scroll.appendChild(this.systemHost);
 
     await this.resolveSelection();
   }
@@ -238,6 +256,26 @@ export class ContactPane implements Pane {
   private newHint: HTMLButtonElement | null = null;
   private liveHost: HTMLElement | null = null;
   private rendered = 0;
+  /**
+   * 已加载消息的节点缓存（P1-16）：`messageId → 气泡节点`。
+   * 以前每个事件都 `fill()` 重建整个列表，现在新消息只建自己的节点并按 messageId 插入；
+   * 历史行没有 message_id 时按 `#seq` 合成键（`nodeKey`）。
+   */
+  private msgNodes = new Map<string, HTMLElement>();
+  /** 已加载渲染集合里的固定消息键，按插入顺序：超界时从最旧一端移除节点 */
+  private msgOrder: string[] = [];
+  /** 待定（未落定）消息的节点：ref → 气泡 */
+  private pendingNodes = new Map<string, HTMLElement>();
+  /** 流式增量预览：messageId → 缓冲。只画在待定气泡里，固化帧到达即整段替换（P0-7） */
+  private previews = new Map<string, PreviewDraft>();
+  private previewNode: HTMLElement | null = null;
+  private previewText: HTMLElement | null = null;
+  /** 渲染集合的上界（§6.1 分页读取 + 返回保留位置）：超出时移除最旧节点，滚到顶再按需前插 */
+  private readonly renderLimit = 200;
+  /** 防止「滚到顶部按需加载」并发重入（同一页只取一次） */
+  private loadingOlder = false;
+  /** 首屏历史还没落定：这段窗口里不触发前插，免得和初始定位打架 */
+  private loadingHistory = false;
 
   private hideNewHint(): void {
     if (this.newHint) this.newHint.hidden = true;
@@ -302,6 +340,7 @@ export class ContactPane implements Pane {
     this.draftKey = `contact:${selection.instance_id}:${selection.timeline_id}:${selection.character_id}`;
     this.resetAsContact(); // 换对象/重连后不带着上一条的意图（§6.3）
     this.stopWaitClock(); // 换对象 / 重连不再显示上一条的读秒
+    this.resetTranscript(); // 节点缓存与未定稿预览也不跨这条连接（P0-7 / P1-16）
     this.hasConnected = false; // 这次 open 的收尾在下面，connected 时不必再重载一次历史
     this.renderHeader();
     this.renderList();
@@ -610,24 +649,49 @@ export class ContactPane implements Pane {
 
   /* ---------------------------------------------------------------- 历史与消息 */
 
+  /**
+   * 读最近一页历史。P1-16：**只追加新出现的消息**，不再整体重建列表。
+   *
+   * 挂载、重连、查询结果这三处都会走到这里，而它们的语义都是「以核心记录为准补齐」：
+   * 所以按 messageId 取差集，只创建并插入差集里的节点（已画过的原样留着）。
+   */
   private async loadHistory(): Promise<void> {
     const selection = this.selection;
     if (!selection) return;
-    const session = (await this.ctx.api.sessionEnsure(selection.instance_id, selection.timeline_id, selection.character_id))
-      .session as Json;
-    const page = await this.ctx.api.history(String(session.id), undefined, 50);
-    const rows = (page.messages as Json[]) ?? [];
-    // 核心记录里已经有那一条入站（queued / processing 也进历史），但 pending 里还在等：
-    // 保留 pending 那个带读秒的气泡，别再画第二个「我说的那句话」
-    const waiting = new Set(this.pending.map((item) => item.ref));
-    this.messages = rows
-      .map((row) => this.fromRow(row))
-      .filter((message) => !(message.role === "user" && message.ref && waiting.has(message.ref)));
-    this.hasMore = Boolean(page.has_more);
-    this.oldestSeq = Number(page.next_before_seq ?? 0);
-    this.renderMessages(true);
+    this.loadingHistory = true;
+    try {
+      const session = (await this.ctx.api.sessionEnsure(selection.instance_id, selection.timeline_id, selection.character_id))
+        .session as Json;
+      const page = await this.ctx.api.history(String(session.id), undefined, 50);
+      const rows = (page.messages as Json[]) ?? [];
+      // 核心记录里已经有那一条入站（queued / processing 也进历史），但 pending 里还在等：
+      // 保留 pending 那个带读秒的气泡，别再画第二个「我说的那句话」
+      const waiting = new Set(this.pending.map((item) => item.ref));
+      const fresh = rows
+        .map((row) => this.fromRow(row))
+        .filter((message) => !(message.role === "user" && message.ref && waiting.has(message.ref)));
+      this.hasMore = Boolean(page.has_more);
+      this.oldestSeq = Number(page.next_before_seq ?? 0);
+      // 差集：老消息在前、新消息在后，按顺序补齐（已在渲染集合里的键跳过）
+      for (const message of fresh) {
+        const key = this.nodeKey(message);
+        if (this.msgNodes.has(key)) continue;
+        this.messages.push(message);
+        this.insertMessageNode(message, "end");
+      }
+      this.renderMessages();
+    } finally {
+      this.loadingHistory = false;
+    }
   }
 
+  /**
+   * 读更早的一页（§6.1 分页读取）：只**前插**旧页的节点，不动已画好的那些。
+   *
+   * 滚动锚点用 `scrollHeight - scrollTop` 重算（P1-16）：前插会改变 scrollHeight，
+   * 补回同样的差值就等于「视口顶部那条还在原处」，而不是整体重建后靠强制滚动找位置。
+   * 滚到顶部时按需加载也是从这里进来的。
+   */
   private async loadOlder(keepAnchor = false): Promise<void> {
     const selection = this.selection;
     if (!selection || !this.hasMore) return;
@@ -635,10 +699,32 @@ export class ContactPane implements Pane {
       .session as Json;
     const page = await this.ctx.api.history(String(session.id), this.oldestSeq, 50);
     const rows = (page.messages as Json[]) ?? [];
-    this.messages = [...rows.map((row) => this.fromRow(row)), ...this.messages];
+    const older = rows.map((row) => this.fromRow(row));
     this.hasMore = Boolean(page.has_more);
     this.oldestSeq = Number(page.next_before_seq ?? 0);
-    this.renderMessages(!keepAnchor);
+    this.messages = [...older, ...this.messages];
+    const host = this.scrollHost;
+    const anchor = host ? host.scrollHeight - host.scrollTop : 0;
+    // 倒序前插：每一页内部仍按时间正序（从这页最后一条往前插到最前面）
+    for (let index = older.length - 1; index >= 0; index -= 1) this.insertMessageNode(older[index], "start");
+    this.trimRendered();
+    if (host) host.scrollTop = host.scrollHeight - anchor; // 锚点重算：前插多少补回多少
+    this.renderMessages(keepAnchor === false && this.atBottom);
+  }
+
+  /**
+   * 滚动到（接近）顶部时按需加载更早的一页（P1-16 的上界配套）：
+   * 渲染集合有上界，被裁掉的旧消息靠这里按需取回，不必一开机就把全部历史画出来。
+   */
+  private maybeLoadOlderOnScroll(): void {
+    const host = this.scrollHost;
+    if (!host || !this.hasMore || this.loadingOlder || !this.selection) return;
+    if (this.loadingHistory) return; // 首屏还没落定：滚动位置还在底部摆，别急着前插
+    if (host.scrollTop > 24) return;
+    this.loadingOlder = true;
+    void this.loadOlder(true).finally(() => {
+      this.loadingOlder = false;
+    });
   }
 
   private fromRow(row: Json): Message {
@@ -656,36 +742,120 @@ export class ContactPane implements Pane {
     };
   }
 
+  /**
+   * 渲染集合里的键（P1-16 要求按 messageId 增量追加）：
+   *   1. 有 message_id 就用它；
+   *   2. 落定的「我说的那句话」用入站 `ref`（同一 ref 只落一次，稳定可复算）；
+   *   3. 其余历史行用 `#seq` 兜底（核心给的历史行带 seq，同页内唯一）。
+   */
+  private nodeKey(message: Message): string {
+    if (message.messageId) return `m:${message.messageId}`;
+    if (message.ref) return `r:${message.ref}`;
+    return `s:${message.seq}:${message.role}`;
+  }
+
+  /** 待定区的插入锚点：第一条 pending 气泡 / 未固化预览；都没有就落到系统卡之前 */
+  private pendingAnchor(): Node | null {
+    for (const node of this.pendingNodes.values()) return node;
+    if (this.previewNode) return this.previewNode;
+    return this.systemHost;
+  }
+
+  /**
+   * 往滚动区里插节点：锚点必须**确实是**它的子节点，否则退化为追加。
+   *
+   * 锚点可能已经被摘掉（待定气泡落定、预览被清、系统卡尚未挂上）：那时 `insertBefore`
+   * 会抛 `Failed to execute 'insertBefore' on 'Node'`，把整条消息链打断——这里就地兜住。
+   */
+  private insertInto(host: HTMLElement, node: HTMLElement, anchor: Node | null): void {
+    if (anchor && anchor.parentNode === host) host.insertBefore(node, anchor);
+    else host.appendChild(node);
+  }
+
+  /**
+   * 把一条固定消息插进列表（不重建）。
+   * `end` = 追加到待定区之前（新消息）；`start` = 插到列表最前（旧页前插）；
+   * `pending` = 接在待定气泡原来的位置上（这一条刚刚落定）。
+   */
+  private insertMessageNode(message: Message, where: "start" | "end" | "pending"): HTMLElement | null {
+    const host = this.scrollHost;
+    if (!host) return null;
+    const key = this.nodeKey(message);
+    const existing = this.msgNodes.get(key);
+    if (existing) return existing; // 同一个键只画一次（重复投递 / 历史与流各来一份）
+    const node = this.renderMessage(message, key);
+    if (where === "start") {
+      if (host.firstChild) host.insertBefore(node, host.firstChild);
+      else host.appendChild(node);
+      this.msgOrder.unshift(key);
+    } else if (where === "pending" && this.pendingNodes.size) {
+      // 这条待定气泡落定：新节点接在它原来的位置上（它是这条消息的「从此处开始」锚点）
+      const seat = this.pendingNodes.values().next();
+      if (!seat.done && seat.value.parentNode === host) seat.value.replaceWith(node);
+      else this.insertInto(host, node, this.pendingAnchor());
+      this.msgOrder.push(key);
+    } else {
+      // 新消息落在待定区之前：pending 是「还没落定」的那些，新固化消息不该排到它们后面
+      this.insertInto(host, node, this.pendingAnchor());
+      this.msgOrder.push(key);
+    }
+    this.msgNodes.set(key, node);
+    this.emptySlot()?.remove();
+    return node;
+  }
+
+  /** 空态提示节点（只应有一个，且只在真的一条都没有时出现） */
+  private emptySlot(): HTMLElement | null {
+    return this.scrollHost?.querySelector<HTMLElement>(".u-msg-empty") ?? null;
+  }
+
+  /** 渲染集合的上界（P1-16）：超界只移除**最旧**的节点（列表前端的那些），不重建剩下的 */
+  private trimRendered(): void {
+    while (this.msgOrder.length > this.renderLimit) {
+      const key = this.msgOrder.shift();
+      if (!key) break;
+      this.msgNodes.get(key)?.remove();
+      this.msgNodes.delete(key);
+    }
+  }
+
+  /**
+   * 渲染收尾：滚动锚点用 `scrollHeight - scrollTop` 重算（不再整体重建），
+   * 「有新消息 ↓」只在内容真的变多、且用户不在底部时出现。
+   */
   private renderMessages(force = false): void {
     if (!this.scrollHost) return;
     const wasAtBottom = this.atBottom;
-    const keep = this.scrollHost.scrollHeight - this.scrollHost.scrollTop;
-    fill(
-      this.scrollHost,
-      ...this.messages.map((message) => this.renderMessage(message)),
-      ...this.pending.map((item) => this.renderPending(item)),
-      // 说明 / 失败卡属于对话内容，跟着消息一起滚：
-      // 留在列里当兄弟节点的话，它一长就把消息列表挤没（内容区不能跟操作区抢地方）
-      this.systemHost,
-    );
+    const before = this.scrollHeight();
+    const wasTop = this.scrollHost.scrollTop;
+    if (force || wasAtBottom) this.scrollHost.scrollTop = this.scrollHeight();
+    else {
+      // 不在底部：按新增高度平移滚动位置，视口内容原地不动；新内容只给一个可点的入口（§6.1）
+      this.scrollHost.scrollTop = this.scrollHeight() - before + wasTop;
+      if (this.totalRendered() > this.rendered && this.newHint) this.newHint.hidden = false;
+    }
+    const total = this.totalRendered();
+    this.rendered = total;
     // 一条对话都没有、也没有系统卡时，在容器里居中给一句提示 + 一个动作：
     // 以前这里是一大片纯白，既看不出「这里会有内容」，也没有「从哪儿开始写」的出口
     // （2026-10-08 视觉体系审查：「中间栏是一大片空白，对话区没有容器」）。
-    if (!this.messages.length && !this.pending.length && !this.systemHost?.childElementCount) {
+    if (!total && !this.systemHost?.childElementCount && !this.emptySlot()) {
       this.scrollHost.appendChild(this.emptyConversation());
     }
-    const total = this.messages.length + this.pending.length;
-    if (force || wasAtBottom) this.scrollHost.scrollTop = this.scrollHost.scrollHeight;
-    else {
-      this.scrollHost.scrollTop = this.scrollHost.scrollHeight - keep;
-      // 用户正在看旧记录：新内容不强制拉到底，给一个可点的入口（§6.1）
-      if (total > this.rendered && this.newHint) this.newHint.hidden = false;
-    }
-    this.rendered = total;
     const more = this.host?.querySelector("#u-contact-more") as HTMLButtonElement | null;
     if (more) more.hidden = !this.hasMore;
     this.updateGate();
   }
+
+  private scrollHeight(): number {
+    return this.scrollHost?.scrollHeight ?? 0;
+  }
+
+  /** 渲染集合的条数（固定消息节点 + 待定气泡 + 预览），空态提示不算 */
+  private totalRendered(): number {
+    return this.msgOrder.length + this.pendingNodes.size + (this.previewNode ? 1 : 0);
+  }
+
 
   /** 空对话：容器内居中一句提示 + 一个动作（动作就是把光标放到输入框上） */
   private emptyConversation(): HTMLElement {
@@ -715,11 +885,13 @@ export class ContactPane implements Pane {
     this.setStatus("现在还不能写：先按输入框旁边的「重新连接」，或者去「设置 → AI 服务」把密钥填好。", "pending");
   }
 
-  private renderMessage(message: Message): HTMLElement {
+  private renderMessage(message: Message, key = ""): HTMLElement {
     // 说明不冒充任何一方：既不进「我」的气泡，也不进她的气泡，统一是系统说明卡
     if (message.role === "notice") return this.noticeCard(message);
     const cls = message.role === "character" ? "u-bubble u-bubble-them" : "u-bubble u-bubble-me";
     const node = el("div", { class: cls, "data-message": message.messageId });
+    // 历史行没有 message_id：给一个稳定的渲染键，增量更新时照旧能按节点对上
+    if (!message.messageId && key) node.setAttribute("data-message-key", key);
     node.appendChild(el("p", { class: "u-bubble-text", text: message.text }));
     const meta = el("div", { class: "u-bubble-meta" });
     meta.appendChild(el("span", { text: stamp(message.at) }));
@@ -733,6 +905,10 @@ export class ContactPane implements Pane {
     return node;
   }
 
+  /**
+   * 待定气泡：每个 ref 一个节点（P1-16 增量更新）。
+   * 状态、错误卡这类变化就地重画这一个节点，不牵动整个列表——以前这里每个事件都重建全表。
+   */
   private renderPending(item: PendingMessage): HTMLElement {
     const node = el("div", { class: "u-bubble u-bubble-me u-bubble-pending" });
     node.appendChild(el("p", { class: "u-bubble-text", text: item.text }));
@@ -762,9 +938,72 @@ export class ContactPane implements Pane {
   private restoreToComposer(item: { text: string }): void {
     if (!this.composer) return;
     this.composer.value = item.text;
-    // 与空态的出口共用一处：连不上时这里也要说清为什么光标进不去输入框
+    // 与空态的出口共用一处：连不上时这里也说清为什么光标进不去输入框
     this.focusComposer();
     this.queueDraft();
+  }
+
+  /* --------------------------------------------------- 流式增量预览（P0-7） */
+
+  /**
+   * 收到一段 `reply_delta`：并入这条 messageId 的预览缓冲，并把它画进**待定气泡**里。
+   *
+   * 三条纪律（CHANNEL_PLUGIN_SPEC §七 / USER_INTERFACE_DESIGN §6.2）：
+   *   - 增量不是已固化正文：只画在 `u-bubble-preview` 这一处，绝不写进 `messages`；
+   *   - 固化帧 `reply` 到达时整段替换（多批回复也照整段走），预览随即消失；
+   *   - 段序只往前走：重复 / 乱序的旧段不重复拼接，免得预览跳字。
+   */
+  private applyDelta(messageId: string, index: number, text: string): void {
+    if (!messageId || !text) return;
+    const draft = this.previews.get(messageId) ?? { messageId, text: "", index: -1 };
+    if (index <= draft.index) return;
+    draft.text += text;
+    draft.index = index;
+    this.previews.set(messageId, draft);
+    this.renderPreview(draft);
+  }
+
+  /** 预览节点就地更新文本（不重建列表）；用户不在底部时保持视口稳定 */
+  private renderPreview(draft: PreviewDraft): void {
+    const host = this.scrollHost;
+    if (!host) return;
+    if (!this.previewNode) {
+      const node = el("div", {
+        class: "u-bubble u-bubble-them u-bubble-preview",
+        role: "status",
+        // 增量逐段到达：这里逐字改文本会不停打断读屏，所以预览自己**不播报**
+        // （固化完成由 `.u-sr-only` 的 liveHost 播「收到一条新回复」，与原来一致）
+        "aria-live": "off",
+      });
+      const body = el("p", { class: "u-bubble-text" });
+      node.appendChild(body);
+      // 未固化要说清：这是她正在说、还没定稿的一句
+      node.appendChild(el("p", { class: "u-note u-note-pending", text: "正在生成…（这段还没定稿）" }));
+      this.previewText = body;
+      this.previewNode = node;
+      // 预览排在待定气泡之后、系统卡之前：它是这一轮正在到达的内容
+      this.insertInto(host, node, this.systemHost);
+    }
+    if (this.previewText) this.previewText.textContent = draft.text;
+    this.renderMessages();
+  }
+
+  /**
+   * 丢一条预览：`messageId` 缺省表示「所有还没定稿的预览」。
+   * 固化帧到达、这一轮失败、或换对象 / 重连时清理；**不**当作正文落进列表。
+   */
+  private clearPreview(messageId?: string): void {
+    if (messageId === undefined) this.previews.clear();
+    else this.previews.delete(messageId);
+    if (!this.previews.size) {
+      this.previewNode?.remove();
+      this.previewNode = null;
+      this.previewText = null;
+      return;
+    }
+    // 还有别的在途回复：把节点换成剩下那条（后到的排在前面会更接近真实到达顺序，这里取第一条）
+    const next = this.previews.values().next();
+    if (!next.done && this.previewText) this.previewText.textContent = next.value.text;
   }
 
   /* ------------------------------------------------------- 入站的落定与查询 */
@@ -772,18 +1011,25 @@ export class ContactPane implements Pane {
   /**
    * 把 pending 里的这一条转成 `messages` 里的用户记录，并移出 pending。
    *
-   * 为什么必须转（评审 P0-3）：列表由 `messages + pending` 重建，以前 reply 到达时
-   * 直接把 pending 那项删掉、只 push 角色那条，于是用户刚发的话在回复出现的一刻就消失了。
-   * 同一个 ref 只转一次（转完就不在 pending 里了，另外再按 `ref` 去重兜一层）。
+   * 为什么必须转（评审 P0-3）：以前 reply 到达时直接把 pending 那项删掉、只 push 角色那条，
+   * 于是用户刚发的话在回复出现的一刻就消失了。现在同一个 ref 只转一次，并把新节点插进列表。
    */
   private settleInbound(ref: string, state: string): void {
     const index = this.pending.findIndex((item) => item.ref === ref);
     if (index < 0) return;
     const item = this.pending[index];
     this.pending.splice(index, 1);
-    if (!item.ref) return;
-    if (this.messages.some((message) => message.role === "user" && message.ref === item.ref)) return;
-    this.messages.push({
+    const pendingNode = this.pendingNodes.get(ref);
+    this.pendingNodes.delete(ref);
+    if (!item.ref) {
+      pendingNode?.remove();
+      return;
+    }
+    if (this.messages.some((message) => message.role === "user" && message.ref === item.ref)) {
+      pendingNode?.remove();
+      return;
+    }
+    const message: Message = {
       role: "user",
       text: item.text,
       seq: 0,
@@ -793,7 +1039,10 @@ export class ContactPane implements Pane {
       ref: item.ref,
       replyTo: "",
       parts: [],
-    });
+    };
+    this.messages.push(message);
+    // 落定的「我说的那句话」接在待定气泡原来的位置上（nodeKey 用 ref，稳定可复算）
+    this.insertMessageNode(message, "pending");
   }
 
   /**
@@ -836,7 +1085,7 @@ export class ContactPane implements Pane {
         if (item && item.state === "unknown") {
           item.state = "accepted";
           this.refreshWaitClock();
-          this.renderMessages();
+          this.refreshPendingNode(item);
         }
       }
     } catch (error) {
@@ -911,6 +1160,7 @@ export class ContactPane implements Pane {
     // 意图只跟着这一条走：发出去就复位，下一次回到普通联络（§6.3）
     this.resetAsContact();
     this.pending.push({ ref, text, state: "submitting", at: Date.now() / 1000 });
+    this.insertPendingNode(ref);
     if (this.composer) this.composer.value = "";
     await this.ctx.drafts.discard(this.draftKey);
     setNote(this.draftSlot, "", "muted");
@@ -924,18 +1174,57 @@ export class ContactPane implements Pane {
         item.state = "unknown";
         this.refreshWaitClock();
         this.setStatus("这条还没收到确认：可以点「查询这条的结果」，或者再等一会儿。已经发出去了，不要重复发。", "pending");
-        this.renderMessages();
+        this.refreshPendingNode(item);
       }
     }, 8000);
   }
 
+  /**
+   * 新建一条待定气泡并插进列表（P1-16：只建这一个节点）。
+   * 位置在系统卡之前、未定稿预览之后——它是刚刚发出去、还没落定的那一条。
+   */
+  private insertPendingNode(ref: string): void {
+    const host = this.scrollHost;
+    const item = this.pending.find((entry) => entry.ref === ref);
+    if (!host || !item) return;
+    const node = this.renderPending(item);
+    // 待定气泡按发送顺序排在待定区末尾（系统卡之前）；后到的排最后，与真实发送顺序一致
+    const anchor = this.previewNode ?? this.systemHost;
+    host.insertBefore(node, anchor);
+    this.pendingNodes.set(ref, node);
+    this.emptySlot()?.remove();
+  }
+
+  /**
+   * 就地把一条待定气泡重画成它的当前状态（确认 / 失败 / 结果待确认）。
+   * 只换这一个节点：以前这类状态变化会把整张消息表重建一遍（P1-16）。
+   */
+  private refreshPendingNode(item: PendingMessage): void {
+    const node = this.pendingNodes.get(item.ref);
+    if (!node) {
+      this.renderMessages();
+      return;
+    }
+    const fresh = this.renderPending(item);
+    node.replaceWith(fresh);
+    this.pendingNodes.set(item.ref, fresh);
+    this.renderMessages();
+  }
+
   private onEvent(event: ChannelEvent): void {
+    if (event.kind === "delta") {
+      // 增量预览（P0-7）：只画在待定气泡里，不落进 `messages`
+      this.applyDelta(event.messageId, event.index, event.text);
+      return;
+    }
     if (event.kind === "reply") {
       // 顺序要紧：先把「我说的那句话」从 pending 落进列表，再追加她的回复（评审 P0-3）
       this.settleInbound(event.replyTo, "done");
+      // 固化帧是唯一事实：整段替换预览（后验检查可能改过字），多批回复也按整段覆盖
+      this.clearPreview(event.messageId);
       const existing = this.messages.find((item) => item.messageId === event.messageId);
       if (!existing) {
-        this.messages.push({
+        const message: Message = {
           role: "character",
           text: event.parts.join(""),
           seq: 0,
@@ -945,10 +1234,16 @@ export class ContactPane implements Pane {
           ref: "",
           replyTo: event.replyTo,
           parts: [event.batchIndex],
-        });
+        };
+        this.messages.push(message);
+        this.insertMessageNode(message, "end");
       } else if (!existing.parts.includes(event.batchIndex)) {
         existing.parts.push(event.batchIndex);
         existing.text += event.parts.join("");
+        // 追加批次：找到这个 messageId 的节点，只换它的正文（不重建整个列表）
+        const node = this.msgNodes.get(this.nodeKey(existing));
+        const body = node?.querySelector<HTMLElement>(".u-bubble-text");
+        if (body) body.textContent = existing.text;
       }
       this.thinking = false;
       this.link?.confirmDelivery(event.messageId, event.batchIndex, "accepted");
@@ -966,9 +1261,12 @@ export class ContactPane implements Pane {
         const waiting = [...this.pending]
           .reverse()
           .find((item) => item.state === "accepted" || item.state === "submitting" || item.state === "unknown");
-        if (waiting) this.settleInbound(waiting.ref, "cancelled");
+        if (waiting) {
+          this.settleInbound(waiting.ref, "cancelled");
+          this.clearPreview();
+        }
       }
-      this.messages.push({
+      const message: Message = {
         role: "notice",
         text: event.text,
         seq: 0,
@@ -978,7 +1276,9 @@ export class ContactPane implements Pane {
         ref: "",
         replyTo: event.replyTo,
         parts: [],
-      });
+      };
+      this.messages.push(message);
+      this.insertMessageNode(message, "end");
       // 说明也要回执（单批）：不回执的话这条永远算未确认，每次重连都会被当成待投递重发一遍
       this.link?.confirmDelivery(event.messageId, 0, "accepted");
       // 只经 messages 流渲染这一次；再补一张卡就是同一通知出现两份
@@ -993,6 +1293,7 @@ export class ContactPane implements Pane {
           // 作废是终局（转交到别的工作区，或这一轮被回滚 / 重绑作废）：这一轮不会再有回复。
           // 落进列表，别留一个永远「等待中」的气泡（转交说明随后到达，按 ref 对上原文）
           this.settleInbound(event.ref, "cancelled");
+          this.clearPreview();
           this.refreshWaitClock();
           this.renderMessages();
           return;
@@ -1011,6 +1312,8 @@ export class ContactPane implements Pane {
         // 同样把它落进列表（同一个 ref 只转一次），免得界面看起来还在等
         if (event.state === "done" || event.state === "fixed") {
           this.settleInbound(event.ref, event.state);
+        } else {
+          this.refreshPendingNode(item);
         }
         this.refreshWaitClock();
         this.renderMessages();
@@ -1180,6 +1483,23 @@ export class ContactPane implements Pane {
     }
     // 卡片现在长在对话里：在底部就跟着滚过去，别让它在屏幕外继续冒出来
     if (this.atBottom && this.scrollHost) this.scrollHost.scrollTop = this.scrollHost.scrollHeight;
+  }
+
+  /** 换对象 / 重连前清掉「上一条连接」的渲染账：节点缓存与未定稿预览都不跨对象 */
+  private resetTranscript(): void {
+    // 节点也要从 DOM 摘掉：只清缓存不摘节点，重连后 loadHistory 会按空缓存再插一遍，
+    // 同一条消息就在列表里出现两份（原来的整体重建不会踩到这一点）
+    for (const node of this.msgNodes.values()) node.remove();
+    for (const node of this.pendingNodes.values()) node.remove();
+    this.msgNodes.clear();
+    this.msgOrder = [];
+    this.pendingNodes.clear();
+    this.previews.clear();
+    // 预览节点在滚动区里：重连时也要摘下来，不然第二条连接会再插一个同样的气泡
+    this.previewNode?.remove();
+    this.previewNode = null;
+    this.previewText = null;
+    this.rendered = 0;
   }
 
   private setStatus(text: string, kind: "ok" | "bad" | "pending" | "muted"): void {

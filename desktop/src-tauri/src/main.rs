@@ -19,8 +19,15 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, State};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// 退出握手①：界面完成「退出前保存」（管理面 op app.shutdown）的上限（DESKTOP_SPEC §五）。
-const FLUSH_WAIT_MS: u64 = 3000;
+/// 退出握手①：界面完成「退出前保存」（管理面 op app.shutdown）的上限。
+///
+/// 与 `ONBOARDING_AND_RECOVERY` §7.2 的退出契约对齐：**等待窗口为 30 秒**，等待期间不丢已接受的
+/// 输入、不丢已提交的回执；30 秒后才给「继续等待 / 查看诊断 / 强制退出」。
+/// 规范同时写明「客户端自身的等待上限不得短于这个窗口——出现比契约更早的强杀就是实现与本节不符」。
+/// 原来这里是 3000 ms，而界面自己的保存上限是 10 s：任何超过 3 s 的正常收尾都会被中途杀掉，
+/// 正是 30 s 契约想避免的损坏窗口（P1-18 / 一致性项 C-2）。
+/// 前端 `App.flushAndExit` 的 app.shutdown 上限与这个常量取同一个值（30 s），两端口径一致。
+const FLUSH_WAIT_MS: u64 = 30_000;
 /// 退出握手②：等核心自行退出的上限；超时才硬杀。
 const EXIT_WAIT_MS: u64 = 3000;
 
@@ -47,6 +54,10 @@ struct AppState {
     quitting: AtomicBool,
     //: 退出请求已发出：界面靠轮询取走（隐藏到托盘时壳叫不动页面）
     exit_requested: AtomicBool,
+    //: 30 秒窗口到期仍未保存完：界面取走后弹「继续等待 / 查看诊断 / 强制退出」（P1-18）
+    quit_timeout: AtomicBool,
+    //: 界面在 quit_timeout 之后的选择：wait | diagnose | force
+    exit_choice: Mutex<Option<String>>,
     //: 提醒点击后待定位的提醒标识：同样由界面轮询取走（§3.1/A17）
     pending_notice: Mutex<Option<String>>,
 }
@@ -245,6 +256,23 @@ fn core_status(state: State<AppState>) -> CoreStatus {
 #[tauri::command]
 fn exit_pending(state: State<AppState>) -> bool {
     state.exit_requested.load(Ordering::SeqCst)
+}
+
+/// 界面轮询用：退出等待窗口已到期，需要用户在「继续等待 / 查看诊断 / 强制退出」里选一个（P1-18）。
+#[tauri::command]
+fn quit_timeout_pending(state: State<AppState>) -> bool {
+    state.quit_timeout.load(Ordering::SeqCst)
+}
+
+/// 界面回传用户在超时后的选择（wait | diagnose | force）；未知值按强制处理。
+#[tauri::command(rename_all = "snake_case")]
+fn quit_decision(state: State<AppState>, choice: String) {
+    let normalized = match choice.as_str() {
+        "wait" => "wait",
+        "diagnose" => "diagnose",
+        _ => "force",
+    };
+    *state.exit_choice.lock().unwrap() = Some(normalized.to_string());
 }
 
 /// 桌面提醒（DESKTOP_SPEC §3.1 / §十.17）：只作「已固化主动消息」的入口。
@@ -641,10 +669,19 @@ fn wait_core_exit(state: &AppState, timeout_ms: u64) -> bool {
     }
 }
 
-/// 显式退出（DESKTOP_SPEC §五）：先保存再停进程，全程有上限。
-/// ① 请界面走管理面 op `app.shutdown`（补做退出前备份 + 请求核心自行退出），上限 3 秒；
-/// ② 等核心自行退出（finally 会收尾会话 / 关服务 / 释放写库锁），上限 3 秒；
-/// ③ 界面不可用、保存失败或②超时，才回落到 taskkill /F /T 硬杀。
+/// 超时后等用户选择的上限（P1-18）：界面不可见时没人能选，到点按强制退出兜底。
+const QUIT_CHOICE_WAIT_MS: u64 = 30_000;
+/// 「继续等待」最多再等几轮：防一个永远保存不完的界面把进程吊死。
+const QUIT_EXTRA_ROUNDS: u32 = 2;
+
+/// 显式退出（DESKTOP_SPEC §五 / ONBOARDING §7.2）：先保存再停进程，全程有上限。
+/// ① 请界面走管理面 op `app.shutdown`（补做退出前备份 + 请求核心自行退出），上限 `FLUSH_WAIT_MS`
+///    = 30 秒（与规范第 7 节的等待窗口同一个值；界面自己的保存上限也是 30 秒）；
+/// ② 到点还没保存完 → 置 `quit_timeout`，界面取走后弹「继续等待 / 查看诊断 / 强制退出」：
+///    「继续等待」再给一轮窗口（最多 `QUIT_EXTRA_ROUNDS` 轮），「查看诊断」提示界面打开帮助页后继续等，
+///    没选或选「强制退出」才走硬杀；
+/// ③ 等核心自行退出（finally 会收尾会话 / 关服务 / 释放写库锁），上限 3 秒；
+/// ④ 界面不可用、保存失败或③超时，才回落到 taskkill /F /T 硬杀。
 fn begin_quit(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
     if state.quitting.swap(true, Ordering::SeqCst) {
@@ -655,17 +692,60 @@ fn begin_quit(app: &tauri::AppHandle) {
     // 而页面自己的定时器与 invoke 照常（2026-09 实测）。所以退出请求放在标志位上，
     // 由界面轮询 exit_pending 取走，再回显式的「退出前保存」结果（§五：先保存再停进程）。
     state.exit_requested.store(true, Ordering::SeqCst);
-    let deadline = Instant::now() + Duration::from_millis(FLUSH_WAIT_MS);
+
     let mut confirmed: Option<(String, bool)> = None;
-    while Instant::now() < deadline {
-        if let Some(value) = state.exit_ready.lock().unwrap().clone() {
-            confirmed = Some(value);
-            break;
+    let mut rounds = 0u32;
+    'windows: loop {
+        let deadline = Instant::now() + Duration::from_millis(FLUSH_WAIT_MS);
+        while Instant::now() < deadline {
+            if let Some(value) = state.exit_ready.lock().unwrap().clone() {
+                confirmed = Some(value);
+                break 'windows;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        if rounds >= QUIT_EXTRA_ROUNDS {
+            break; // 给过足够的等待机会：按已有持久化水位退出
+        }
+        rounds += 1;
+        // 窗口到期：把三个选择交给界面（可见时用户能选；隐藏时没人能选，到点按强制退出兜底）
+        state.quit_timeout.store(true, Ordering::SeqCst);
+        log_line(&state.root, "exit wait window expired: 询问 继续等待 / 查看诊断 / 强制退出");
+        let choice_deadline = Instant::now() + Duration::from_millis(QUIT_CHOICE_WAIT_MS);
+        let mut choice: Option<String> = None;
+        while Instant::now() < choice_deadline {
+            if let Some(value) = state.exit_ready.lock().unwrap().clone() {
+                confirmed = Some(value);
+                break 'windows;
+            }
+            if let Some(value) = state.exit_choice.lock().unwrap().take() {
+                choice = Some(value);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        state.quit_timeout.store(false, Ordering::SeqCst);
+        match choice.as_deref() {
+            Some("wait") => {
+                log_line(&state.root, "exit choice: 继续等待（再给一轮窗口）");
+                continue 'windows;
+            }
+            Some("diagnose") => {
+                log_line(&state.root, "exit choice: 查看诊断（界面打开帮助页后继续等待）");
+                let _ = app.emit("quit-diagnose", ());
+                continue 'windows;
+            }
+            _ => {
+                log_line(&state.root, "exit choice: 强制退出（或超时无人选择）");
+                break;
+            }
+        }
     }
     let (detail, asked) = confirmed.unwrap_or_else(|| {
-        ("界面未在 3 秒内确认（按已有持久化水位退出）".to_string(), false)
+        (
+            "界面未在等待窗口内确认（按已有持久化水位退出）".to_string(),
+            false,
+        )
     });
     log_line(&state.root, &format!("exit save: {detail}"));
 
@@ -702,6 +782,8 @@ fn main() {
         exit_ready: Mutex::new(None),
         quitting: AtomicBool::new(false),
         exit_requested: AtomicBool::new(false),
+        quit_timeout: AtomicBool::new(false),
+        exit_choice: Mutex::new(None),
         pending_notice: Mutex::new(None),
     };
 
@@ -719,6 +801,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             core_status,
             exit_pending,
+            quit_timeout_pending,
+            quit_decision,
             notify_message,
             notice_click,
             take_pending_notice,

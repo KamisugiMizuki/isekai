@@ -52,6 +52,25 @@ interface WritingSelection {
   outline_name: string;
 }
 
+/**
+ * 一次取数的结果（P1-16）：按 `(instance, timeline, outline)` 缓存。
+ *
+ * 为什么缓存：分区切换（大纲 / 素材 / 建议 / 草稿）只换 `tab` 再 `render()`，
+ * 每次重取 `instance.info` + `wa.outline.list` + `wa.state`×2（两次参数完全相同）+ 候选；
+ * 同一份读数在同一对象上不会自己变，只有「换对象」或「内容变更动作」才需要重取。
+ */
+interface WritingWorkspace {
+  /** 世界维度的读数：只要实例没换就还能用 */
+  info: Json | null;
+  outlines: Json[];
+  infoError: UiError | null;
+  /** 对象维度的读数：换实例 / 时间线 / 大纲都必须重取 */
+  state: Json | null;
+  candidates: Json[];
+  stateError: UiError | null;
+  candidatesError: UiError | null;
+}
+
 /** 六类条目：界面说法 + 一句示例（§7.2） */
 const LAYERS: Array<[string, string, string]> = [
   ["theme", "主题约束", "例：主题围绕记住与遗忘"],
@@ -133,6 +152,11 @@ export class WritingPane implements Pane {
   private extraTimelines: Array<{ id: string; name: string; state: string }> = [];
   /** 正在编辑的正文是否还没成为草稿（「以此起草」直接打开的情形）：列表与「锁定正文」都据此说话 */
   private draftFromSuggestion = false;
+  /** 按 `(instance, timeline, outline)` 缓存的取数结果（P1-16）：同一对象不重复取 */
+  private workspace: WritingWorkspace | null = null;
+  private workspaceKey = "";
+  /** 客户端已读到的世界进度点（P1-16）：随「给我推进建议」一起给内核，省掉一次整轮观察 */
+  private observedRevision = 0;
 
   constructor(private readonly ctx: AppContext) {}
 
@@ -175,9 +199,11 @@ export class WritingPane implements Pane {
     }
     if (!this.instanceId) this.instanceId = instances[0].id;
     try {
-      const info = await this.ctx.api.instanceInfo(this.instanceId);
-      const timelines = (info.timelines as Json[]) ?? [];
-      const characters = (info.characters as Json[]) ?? [];
+      let data = await this.loadWorkspace();
+      const info = data.info;
+      if (!info) throw data.infoError ?? new Error("读不到这个世界");
+      let timelines = (info.timelines as Json[]) ?? [];
+      let characters = (info.characters as Json[]) ?? [];
       // 存储的选择已在 adoptStoredSelection 里校验过；这里的回落只服务「换世界 / 选中的线没了」这类界面内变化
       if (!timelines.some((item) => String(item.id) === this.timelineId)) {
         this.timelineId = String(timelines[0]?.id ?? "");
@@ -185,12 +211,17 @@ export class WritingPane implements Pane {
       if (!characters.some((item) => String(item.card_id) === this.cardId)) {
         this.cardId = String(characters[0]?.card_id ?? "");
       }
-      const outlineList = ((await this.ctx.api.waOutlines()).outlines as Json[]) ?? [];
+      let outlineList = data.outlines;
       if (!outlineList.some((item) => String(item.outline_id ?? item.id) === this.outlineId)) {
         this.outlineId = String(outlineList[0]?.outline_id ?? outlineList[0]?.id ?? "");
       }
-      await this.loadState();
-      await this.refreshCandidates();
+      // 上面两个回落可能改掉了时间线 / 大纲：对象变了就按新键取一次（键没变就直接命中缓存，不重复取）
+      data = await this.loadWorkspace();
+      if (data.info) {
+        timelines = (data.info.timelines as Json[]) ?? [];
+        characters = (data.info.characters as Json[]) ?? [];
+      }
+      outlineList = data.outlines;
       this.rememberWriting(instances, timelines, outlineList);
       this.renderHead(instances);
       // 回落说明紧贴标题带（在工具带之前）：它说的是「这一页在用哪个世界」，不是某个分区的状态
@@ -209,7 +240,7 @@ export class WritingPane implements Pane {
         host.appendChild(emptyOutline);
       } else if (this.stateError) {
         // 读取失败优先：不许拿「还没有绑定大纲」冒充一次没读到的状态
-        host.appendChild(errorCard(this.stateError, [{ label: "重试", run: () => void this.render() }]));
+        host.appendChild(errorCard(this.stateError, [{ label: "重试", run: () => this.retryRead() }]));
       }
       if (this.tab === "outline") this.renderOutline(host);
       else if (this.tab === "material") await this.renderMaterial(host);
@@ -236,15 +267,18 @@ export class WritingPane implements Pane {
     }
     this.instanceId = instance.id;
     try {
-      const info = await this.ctx.api.instanceInfo(instance.id);
-      const timelines = (info.timelines as Json[]) ?? [];
+      // P1-16：挂载与 render() 共用同一份缓存，不再各自把 instance.info / wa.outline.list 取一遍
+      const info = await this.loadWorkspace();
+      const timelines = (info.info?.timelines as Json[]) ?? [];
       const storedTimeline = String(stored?.timeline_id ?? "");
       if (storedTimeline && timelines.some((item) => String(item.id) === storedTimeline)) this.timelineId = storedTimeline;
       else if (storedTimeline) this.selectionHint = hint(this.selectionHint, "上次的世界线已经不在这个世界：已回落到现有的第一条。");
-      const outlines = ((await this.ctx.api.waOutlines()).outlines as Json[]) ?? [];
+      const outlines = info.outlines;
       const storedOutline = String(stored?.outline_id ?? "");
       if (storedOutline && outlines.some((item) => String(item.outline_id ?? item.id) === storedOutline)) this.outlineId = storedOutline;
       else if (storedOutline) this.selectionHint = hint(this.selectionHint, "上次的大纲已经不在了：已回落到现有的第一份。");
+      // 选择落定后按新对象补齐对象维度的读数（同一个 key 只会取一次，分区切换不再重复）
+      await this.loadWorkspace();
     } catch {
       // 读不到就先按世界默认渲染：render() 会用错误卡说明这次没读到什么
     }
@@ -275,35 +309,95 @@ export class WritingPane implements Pane {
     this.ctx.rememberRecent({ pane: "writing", label: `写作 · ${world}${line ? ` / ${line}` : ""}`, key });
   }
 
-  private async loadState(): Promise<void> {
-    this.state = null;
-    this.stateError = null;
-    if (!this.instanceId || !this.timelineId || !this.outlineId) return;
-    try {
-      const result = await this.ctx.api.waState(this.instanceId, this.timelineId, this.outlineId);
-      this.state = (result.state as Json) ?? null;
-    } catch (error) {
-      // 核心用 not_found「这条时间线上还没有绑定大纲」表示真空态：只有它走空态。
-      // 核心断开 / 内部错误必须出错误态，不许显示成「还没有绑定大纲」。
-      if (error instanceof MgmtError && error.code === "not_found") return;
-      this.stateError = uiError(error, { module: "辅助写作", action: "读取大纲状态" });
-    }
+  /* ------------------------------------------------ 取数与缓存（P1-16） */
+
+  /** 缓存键：对象三元组。世界维度的读数只看实例，对象维度看三样 */
+  private workspaceKeyFor(instanceId: string, timelineId: string, outlineId: string): string {
+    return `${instanceId}\u0000${timelineId}\u0000${outlineId}`;
   }
 
-  private async refreshCandidates(): Promise<void> {
-    this.candidatesError = null;
-    if (!this.instanceId || !this.timelineId) {
-      this.candidates = [];
-      return;
-    }
+  /** 下一次取数必须重新拉取（换对象、或刚做过内容变更动作之后） */
+  private invalidateWorkspace(): void {
+    this.workspace = null;
+    this.workspaceKey = "";
+  }
+
+  /**
+   * 取这一页要的读数：`instance.info` + `wa.outline.list`（世界维度）+ `wa.state` 一次得到
+   * state 与 candidates（对象维度）。同一个键只取一次，分区切换、挂载与 render 都不重复取。
+   *
+   * 为什么 `wa.state` 只调一次：以前 `loadState()` 与 `refreshCandidates()` 各自调一次，
+   * 参数完全相同——同一份读数的两次网络往返（P1-16）。
+   */
+  private async loadWorkspace(): Promise<WritingWorkspace> {
+    const key = this.workspaceKeyFor(this.instanceId, this.timelineId, this.outlineId);
+    if (this.workspace && this.workspaceKey === key) return this.workspace;
+    const fresh: WritingWorkspace = {
+      info: null,
+      outlines: [],
+      infoError: null,
+      state: null,
+      candidates: [],
+      stateError: null,
+      candidatesError: null,
+    };
     try {
-      const result = await this.ctx.api.waState(this.instanceId, this.timelineId, this.outlineId || "");
-      this.candidates = ((result.public as Json)?.candidates as Json[]) ?? [];
+      fresh.info = await this.ctx.api.instanceInfo(this.instanceId);
+      fresh.outlines = ((await this.ctx.api.waOutlines()).outlines as Json[]) ?? [];
     } catch (error) {
-      this.candidates = [];
-      // 没绑大纲时同一个 not_found 也是「真没有建议」；其它失败不能显示成「没有建议」
-      if (error instanceof MgmtError && error.code === "not_found") return;
-      this.candidatesError = uiError(error, { module: "辅助写作", action: "读取推进建议" });
+      fresh.infoError = uiError(error, { module: "辅助写作", action: "读取世界与大纲清单" });
+    }
+    if (this.instanceId && this.timelineId) {
+      try {
+        // 只调一次 wa.state：state 与 public.candidates 同源
+        const result = await this.ctx.api.waState(this.instanceId, this.timelineId, this.outlineId || "");
+        fresh.state = (result.state as Json) ?? null;
+        fresh.candidates = ((result.public as Json)?.candidates as Json[]) ?? [];
+      } catch (error) {
+        // 核心用 not_found「这条时间线上还没有绑定大纲」表示真空态：只有它走空态。
+        // 核心断开 / 内部错误必须出错误态，不许显示成「还没有绑定大纲」。
+        if (!(error instanceof MgmtError && error.code === "not_found")) {
+          fresh.stateError = uiError(error, { module: "辅助写作", action: "读取大纲状态" });
+          fresh.candidatesError = uiError(error, { module: "辅助写作", action: "读取推进建议" });
+        }
+      }
+    }
+    this.workspace = fresh;
+    this.workspaceKey = key;
+    this.state = fresh.state;
+    this.stateError = fresh.stateError;
+    this.candidates = fresh.candidates;
+    this.candidatesError = fresh.candidatesError;
+    return fresh;
+  }
+
+  /** 内容变更动作之后的重新取数：显式失效再取（不做自动探测）。分区切换不走这里 */
+  private async reloadWorkspace(): Promise<void> {
+    this.invalidateWorkspace();
+    await this.loadWorkspace();
+  }
+
+  /** 读取失败后的「重试」：显式失效再重取，不然重试还是命中那份坏读数 */
+  private retryRead(): void {
+    void (async () => {
+      await this.reloadWorkspace();
+      await this.render();
+    })();
+  }
+
+  /**
+   * 记下客户端刚读到的观察 revision（P1-16）：取世界时钟的已处理水位。
+   *
+   * 读数失败就不传（保持 0）——宁可让内核自己重跑一次观察，也不给一个编造的水位。
+   */
+  private async refreshObservedRevision(): Promise<void> {
+    if (!this.instanceId || !this.timelineId) return;
+    try {
+      const view = await this.ctx.api.clock(this.instanceId, this.timelineId);
+      const row = (view.clock as Json) ?? view;
+      this.observedRevision = Math.max(0, Math.round(Number(row.processed_world ?? 0)));
+    } catch {
+      this.observedRevision = 0;
     }
   }
 
@@ -909,6 +1003,10 @@ export class WritingPane implements Pane {
       });
       this.observed = result;
       this.observedAt = Date.now() / 1000;
+      // 观察结果自带这次依据的水位（内核 `wa.observe` 的 observed_revision）：记下来，
+      // 下一次「给我推进建议」带上它，内核就不必重跑整轮世界观察（P1-16）
+      const revision = Math.round(Number(result.observed_revision ?? result.world_time ?? 0));
+      if (revision > 0) this.observedRevision = revision;
       setNote(
         this.note,
         String(result.status) === "ok" ? "当前素材已读取" : `现在读不到当前素材：${String(result.reason ?? result.status)}（旧材料只作历史参考）`,
@@ -1025,7 +1123,7 @@ export class WritingPane implements Pane {
     if (!this.candidates.length) {
       if (this.candidatesError) {
         // 读失败与「没有建议」不可分：有错就出错误卡 + 重试
-        rows.appendChild(errorCard(this.candidatesError, [{ label: "重试", run: () => void this.render() }]));
+        rows.appendChild(errorCard(this.candidatesError, [{ label: "重试", run: () => this.retryRead() }]));
       } else {
         rows.appendChild(paragraph("还没有建议：点上面的按钮要一组；这一次生成不会覆盖已经采用的内容。", "u-hint"));
       }
@@ -1082,6 +1180,8 @@ export class WritingPane implements Pane {
     this.aiActionError = null;
     setNote(this.note, "正在要一组建议…", "pending");
     try {
+      // 先补一次「我已读到的水位」（读不到就是 0，不编造）；带上它内核就能复用已有投影（P1-16）
+      await this.refreshObservedRevision();
       const result = await this.ctx.api.waSuggest({
         instance_id: this.instanceId,
         timeline_id: this.timelineId,
@@ -1089,6 +1189,10 @@ export class WritingPane implements Pane {
         observer: this.cardId,
         goal: this.goal,
         limit: this.limit,
+        // P1-16：客户端刚读到的观察 revision。**需要内核配合**：`wa.suggest` 目前没有这个参数
+        // （`WritingService.suggest` 每次自行 `observe()` 重跑整轮世界观察），内核侧另一路实现后
+        // 这个字段才会生效；在此之前多带的参数被忽略，行为与现在一致。
+        ...(this.observedRevision ? { observed_revision: this.observedRevision } : {}),
       });
       const status = String(result.status);
       const made = (result.candidates as Json[]) ?? [];
@@ -1105,7 +1209,7 @@ export class WritingPane implements Pane {
       } else {
         setNote(this.note, `这次没有拿到建议：${String(result.reason ?? status)}`, "bad");
       }
-      await this.refreshCandidates();
+      this.invalidateWorkspace(); // 内容变更动作：显式失效，render() 会按新对象重取
       this.tab = "advice";
       await this.render();
     } catch (error) {
@@ -1137,7 +1241,7 @@ export class WritingPane implements Pane {
             : "已采用：它只是一段文字，不改世界",
         status === "approved" && candidate.has_world_change ? "pending" : "ok",
       );
-      await this.refreshCandidates();
+      this.invalidateWorkspace(); // 内容变更动作：显式失效，render() 会按新对象重取
       await this.render();
     } catch (error) {
       setNote(this.note, uiError(error, { module: "推进建议", action: "记下决定" }).message, "bad");
@@ -1210,7 +1314,7 @@ export class WritingPane implements Pane {
                   status === "duplicate" ? "这份变化之前已经提交过：世界没有再变一次" : "已提交：世界里已经按它变化",
                   "ok",
                 );
-                await this.refreshCandidates();
+                this.invalidateWorkspace(); // 内容变更动作：显式失效，render() 会按新对象重取
                 await this.render();
                 return true;
               }
@@ -1241,14 +1345,14 @@ export class WritingPane implements Pane {
     // 来源版本写人话：内部版本号只收进技术详情，正文里说「用了哪个时间点的版本」
     const headRow = el("p", { class: "u-hint", text: head ? "来源版本：这条线最近保存的那个版本" : "" });
     const modal = dialog(
-      "另开分支试演",
+      "试演（不落线）",
       [
         paragraph(
           item
-            ? `要试演的是「${String(item.title || item.summary || "这条建议")}」：从当前进度另开一条暂停的新线，在这条线上试；主线不受影响（项目不提供把两条线合回一起）。`
-            : "从当前进度另开一条暂停的新线，在这条线上试；主线不受影响（项目不提供把两条线合回一起）。",
+            ? `要试演的是「${String(item.title || item.summary || "这条建议")}」：先在**当前线**上看一遍会发生什么（只读预览，不建线、不动世界）；只有你点「应用于试演线」时才真正另开一条线去落它。`
+            : "先在当前线看一遍会发生什么（只读预览，不建线、不动世界）；点「应用于试演线」时才另开一条线去落它。",
         ),
-        field("新世界线名称", name),
+        field("新世界线名称（应用时才用到）", name),
         head
           ? headRow
           : paragraph("这条线还没有保存过版本：先点下面的「保存当前版本点」，再从它分支。", "u-hint"),
@@ -1291,7 +1395,42 @@ export class WritingPane implements Pane {
               },
             ]),
         {
-          label: "建立暂停分支",
+          label: "得到试演预览（不建线）",
+          // 只读预览：`runtime.change.preview` 不写世界、不建线（P2-13）
+          run: async () => {
+            const changes = (item?.changes as Json[]) ?? [];
+            if (!changes.length) {
+              setNote(note, "这条建议没有世界变化可试演：它只能作为文字采用", "bad");
+              return false;
+            }
+            try {
+              const preview = await this.ctx.api.changePreview(changes, this.instanceId, this.timelineId);
+              const rejected = ((preview.rejected_candidates as Json[]) ?? []).map(
+                (entry) => `${String(entry.id)}：${String(entry.reason)}`,
+              );
+              const conflicts = ((preview.conflicts as Json[]) ?? []).map((entry) => String(entry.kind));
+              if (rejected.length || conflicts.length) {
+                setNote(
+                  note,
+                  `这条建议在预览里没通过：${[...rejected, ...conflicts.map((kind) => `版本冲突（${kind}）`)].join("；")}。没有建线，也没有改动世界。`,
+                  "bad",
+                );
+                return false;
+              }
+              setNote(
+                note,
+                `预览通过：这条线现在可以落这条变化（还剩「应用于试演线」这一步）。试演本身不落线——上面预览没有新建任何时间线，也没有改动世界。`,
+                "ok",
+              );
+              return false;
+            } catch (error) {
+              setNote(note, uiError(error, { module: "试演", action: "预览世界变化" }).message, "bad");
+              return false;
+            }
+          },
+        },
+        {
+          label: "应用于试演线（此时才建线）",
           // 失败返回 false：分支没建起来时窗不关，原因看得见（P1-5 与 P0-1）
           run: async () => {
             if (!head) {
@@ -1321,13 +1460,13 @@ export class WritingPane implements Pane {
               }
               setNote(
                 this.note,
-                `已建立暂停分支「${newName}」，并切到它上面：先在这条线上「得到预览并应用」，再回到原来的线；建立分支本身不算试演完成。`,
+                `已建线并切到「${newName}」：这条建议现在在这条试演线上落；主线不受影响，也不提供把两条线合回一起。建线只发生在你点这一下之后。`,
                 "ok",
               );
               await this.render();
               return true;
             } catch (error) {
-              setNote(note, uiError(error, { module: "试演", action: "建立分支" }).message, "bad");
+              setNote(note, uiError(error, { module: "试演", action: "建立试演线" }).message, "bad");
               return false;
             }
           },
@@ -1371,7 +1510,7 @@ export class WritingPane implements Pane {
     }
     if (!drafts.length && !editingUnsaved) {
       if (this.candidatesError) {
-        list.appendChild(errorCard(this.candidatesError, [{ label: "重试", run: () => void this.render() }]));
+        list.appendChild(errorCard(this.candidatesError, [{ label: "重试", run: () => this.retryRead() }]));
       } else {
         list.appendChild(paragraph("还没有文字草稿：在「推进建议」里点「以此起草」，或直接在下面新建一份。", "u-hint"));
       }
@@ -1509,7 +1648,7 @@ export class WritingPane implements Pane {
       const replaced = targetId === this.draftId;
       this.draftId = targetId;
       this.draftFromSuggestion = false;
-      await this.refreshCandidates();
+      this.invalidateWorkspace(); // 内容变更动作：显式失效，render() 会按新对象重取
       // 提示说清「这份被更新了」还是「新存了一份」：不印内部编号，用户要认的是标题
       setNote(
         this.note,
@@ -1544,7 +1683,7 @@ export class WritingPane implements Pane {
           : "已解锁：现在可以改这份稿子（改完记得再保存）",
         "ok",
       );
-      await this.refreshCandidates();
+      this.invalidateWorkspace(); // 内容变更动作：显式失效，render() 会按新对象重取
       await this.render();
     } catch (error) {
       setNote(this.note, uiError(error, { module: "文字草稿", action: locked ? "锁定" : "解锁" }).message, "bad");

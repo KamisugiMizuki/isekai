@@ -146,8 +146,9 @@ export class AppApi {
   }
 
   testAi(llm: Json): Promise<Json> {
-    // 测试要真发请求：给足上限（两层小请求 + 内部重试）
-    return this.call("settings.test", { llm }, 180000);
+    // 上限与内核总预算对齐（onboarding.TEST_TOTAL_BUDGET_S = 120 s）：客户端不得比规范允许的
+    // 内核窗口更久地等待，否则界面会先于内核放弃（ONBOARDING §4.2 / P2-14）。
+    return this.call("settings.test", { llm }, 120000);
   }
 
   /* ---------------- 样例与世界 ---------------- */
@@ -195,6 +196,18 @@ export class AppApi {
 
   packageFill(payload: Json): Promise<Json> {
     return this.call("world.package.fill", payload, 900000);
+  }
+
+  /**
+   * 生成进度快照（`world.generate.snapshot`）：阶段 / 第几步 / 已用调用数。
+   *
+   * P1-16 / P2-15：提示词**不再每秒随回执带回来**（实测 6.7 KB/次）。默认不取，
+   * 只有用户真展开「这次给模型的提示词」时才带 `want_prompt` 单独取一次；
+   * 该参数由内核侧 `world.generate.snapshot` 支持（默认 false）——内核未落地前，
+   * 多带的参数被忽略、`prompt` 仍会回来，界面照旧只在展开时用它，不因此多传。
+   */
+  generationSnapshot(wantPrompt = false): Promise<Json> {
+    return this.call("world.generate.snapshot", wantPrompt ? { want_prompt: true } : {});
   }
 
   // 角色卡这类 op 的路径参数名是 card_path（不是 path）：两处都用错会拿「缺少路径」
@@ -587,6 +600,13 @@ export class AppApi {
     return this.call("wa.branch", args, 120000);
   }
 
+  /** 世界变化预览（只读）：试演不落线靠它——先看会发生什么，采用才建线（P2-13）。 */
+  changePreview(changes: Json[], instanceId: string, timelineId: string): Promise<Json> {
+    return this.call("runtime.change.preview", {
+      instance_id: instanceId, timeline_id: timelineId, changes,
+    }, 120000);
+  }
+
   /* ---------------- 跑团（USER_INTERFACE_DESIGN §8） ---------------- */
 
   trpgClient(op: string, args: Json): Promise<Json> {
@@ -678,6 +698,17 @@ export type ChannelEvent =
       batchCount: number;
       replyTo: string;
       at: number;
+    }
+  | {
+      /**
+       * 流式增量预览（P0-7 / CHANNEL_PLUGIN_SPEC §七）：**不是**已固化正文。
+       * `text` 是本段增量，`index` 是段序（内核从 0 递增）；只有宣告了 `streaming`
+       * 能力的通道才收得到（见 `ump.ts` 的 hello）。最终以 `reply` 帧整段覆盖。
+       */
+      kind: "delta";
+      messageId: string;
+      index: number;
+      text: string;
     }
   | { kind: "notice"; text: string; messageId: string; replyTo: string; at: number }
   | { kind: "accepted"; ref: string; state: string; messageId: string }
@@ -899,6 +930,20 @@ export class ChannelLink {
 
   private onEnvelope(env: Envelope): void {
     const payload = (env.payload ?? {}) as Json;
+    if (env.type === "reply_delta") {
+      // 增量帧（`session._stream_reply` 发）只作预览：逐段交给联络页画在待定气泡里，
+      // 固化帧到达时由联络页整段替换（不在这里累积，避免两处各存一份缓冲）
+      const text = String(payload.text ?? "");
+      if (text) {
+        this.emit({
+          kind: "delta",
+          messageId: String(payload.message_id ?? ""),
+          index: Number(payload.index ?? 0),
+          text,
+        });
+      }
+      return;
+    }
     if (env.type === "reply") {
       const parts = ((payload.parts as Array<{ text?: string }>) ?? []).map((part) => String(part.text ?? ""));
       this.emit({

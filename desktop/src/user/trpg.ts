@@ -264,25 +264,55 @@ export class TrpgPane implements Pane {
     }
   }
 
+  /**
+   * 战役清单：每个世界一次 `trpg.campaign.list`。
+   *
+   * P1-16：以前按世界**串行**逐个 IPC（N 个世界 = N 个往返串起来等），现在并行 fan-out；
+   * 内核目前没有跨世界的聚合 op（`trpg.campaign.list` 按 instance_id 读），一旦有就换成它。
+   * 单条失败不影响别的世界，但汇总成一条失败记录如实说明是哪几个世界没读到（评审 P1「读取失败≠空态」）。
+   */
   private async loadCampaigns(): Promise<void> {
-    const rows: Json[] = [];
-    let failed = 0;
-    let firstError: UiError | null = null;
-    for (const instance of this.ctx.instances()) {
-      try {
-        const result = await this.ctx.api.trpgCampaigns(instance.id);
-        for (const item of ((result.campaigns as Json[]) ?? [])) {
-          rows.push({ ...item, instance_name: instance.name });
+    const instances = this.ctx.instances();
+    const results = await Promise.all(
+      instances.map(async (instance) => {
+        try {
+          const result = await this.ctx.api.trpgCampaigns(instance.id);
+          return {
+            rows: ((result.campaigns as Json[]) ?? []).map((item) => ({ ...item, instance_name: instance.name })),
+            error: null as UiError | null,
+            name: instance.name,
+          };
+        } catch (error) {
+          return {
+            rows: [] as Json[],
+            // 单个世界读不到不影响别的世界；但界面要如实说失败的那部分，不把失败冒充成没战役
+            error: uiError(error, { module: "跑团", action: "读取战役清单", target: instance.name }),
+            name: instance.name,
+          };
         }
-      } catch (error) {
-        // 单个世界读不到不影响别的世界；但界面要如实说失败的那部分，不把失败冒充成没战役
-        failed += 1;
-        firstError = firstError ?? uiError(error, { module: "跑团", action: "读取战役清单", target: instance.name });
+      }),
+    );
+    const rows: Json[] = [];
+    const failedNames: string[] = [];
+    let firstError: UiError | null = null;
+    for (const item of results) {
+      rows.push(...item.rows);
+      if (item.error) {
+        failedNames.push(item.name);
+        firstError = firstError ?? item.error;
       }
     }
     this.campaigns = rows;
-    this.campaignsFailed = failed;
-    this.campaignsError = firstError;
+    this.campaignsFailed = failedNames.length;
+    // 汇总成一条失败记录（P1-16「单条失败汇总为一条失败记录」）：
+    // 带上失败的世界名，用户才知道该去哪个世界重试；原因取第一条（错误卡不逐世界重复一张）
+    this.campaignsError = firstError
+      ? {
+          ...firstError,
+          target: failedNames.join("、"),
+          message: `${firstError.message}（${failedNames.join("、")}）`,
+        }
+      : null;
   }
 
   private async loadPlugins(): Promise<void> {

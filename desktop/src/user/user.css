@@ -987,6 +987,12 @@ nav.u-crumbs {
   outline: 2px solid var(--u-fg);
 }
 
+/* 流式增量预览（P0-7）：还没定稿的一段，虚线边框与待定气泡同一套说法 */
+.u-bubble-preview {
+  border-style: dashed;
+  opacity: 0.9;
+}
+
 /* 说明 / 失败卡：现在是对话内容的一部分（在 .u-messages 里），自己不再需要滚动 */
 .u-system {
   display: flex;

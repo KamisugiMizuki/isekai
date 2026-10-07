@@ -3234,7 +3234,8 @@ function genwsAdoptPrevious(): void {
 async function genwsLoadPrompt(): Promise<void> {
   if (!mgmt) return;
   try {
-    const snap = await mgmt.call("world.generate.snapshot");
+    // want_prompt=true：提示词只在真正要展示时取一次（P1-16：每秒轮询不再搬运完整 prompt）
+    const snap = await mgmt.call("world.generate.snapshot", { want_prompt: true });
     const prompt = (snap.prompt ?? {}) as { label?: string; system?: string; user?: string };
     $("gw-prompt").textContent = prompt.system
       ? `【最近一次调用：${prompt.label ?? ""}】\n\n== system ==\n${prompt.system}\n\n== user ==\n${prompt.user ?? ""}`

@@ -20,6 +20,7 @@ import {
   facts,
   field,
   fill,
+  humanDuration,
   pageHead,
   panel,
   paragraph,
@@ -644,6 +645,17 @@ export class CreatePane implements Pane {
   /** 刚建好的世界的第一条线：出口（去和角色联络 / 打开这个世界）都指向它 */
   private createdTimelineId = "";
   private busy = false;
+  /**
+   * 长任务等待卡（P1-16 / P2-15 / ONBOARDING §7）：阶段 + 已等待时间 + 「停止等待」。
+   * 挂在固定骨架里（不随 `this.root` 一起被清掉），所以轮询期间不必重画整页。
+   */
+  private progressSlot: HTMLElement | null = null;
+  private progressTimer: number | null = null;
+  private progressStarted = 0;
+  /** 内核快照里的真实阶段（拿不到就只显示已等待时间，不推断阶段） */
+  private progressStage = "";
+  /** 「停止等待」：只停本地等待，不声称取消了内核调用（§7 语义） */
+  private progressStopped = false;
 
   constructor(private readonly ctx: AppContext) {}
 
@@ -651,6 +663,8 @@ export class CreatePane implements Pane {
     this.root = el("div", { class: "u-create" });
     this.note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
     this.draftSlot = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
+    // 长任务等待卡：`world.generate.snapshot` 给阶段、页面自己计时、并提供「停止等待」（P2-15）
+    this.progressSlot = el("div", { class: "u-note", role: "status", "aria-live": "polite", hidden: true });
     // 骨架固定三带：标题带（页面名 + 一句定位语）→ 进度轨 → 内容。
     // 以前步骤条是一排和「动作」同形的按钮，既不说明走到哪一步，也学不到「这个形状 = 这个行为」
     // （2026-10-08 视觉体系审查根因 2/3）
@@ -658,7 +672,16 @@ export class CreatePane implements Pane {
     // 用 .u-page 包起来：标题 / 进度轨 / 内容之间的间距与其它页同一套（以前这三段各靠默认外边距）
     fill(
       host,
-      el("div", { class: "u-page" }, pageHead("创建世界", "从样例改，或从空白开始", []), railHost, this.note, this.draftSlot, this.root),
+      el(
+        "div",
+        { class: "u-page" },
+        pageHead("创建世界", "从样例改，或从空白开始", []),
+        railHost,
+        this.note,
+        this.progressSlot,
+        this.draftSlot,
+        this.root,
+      ),
     );
     this.railHost = railHost;
     this.refreshRail();
@@ -718,7 +741,118 @@ export class CreatePane implements Pane {
 
   /** 切页 / 退出：把在途草稿落盘（壳层导航前也会 flush 一次，这里补一道保险） */
   unmount(): void {
+    if (this.progressTimer !== null) window.clearInterval(this.progressTimer);
+    this.progressTimer = null;
     void this.ctx.drafts.flush();
+  }
+
+  /**
+   * 长任务的等待卡（P1-16 / P2-15 / ONBOARDING §7）：
+   *   - 阶段取内核 `world.generate.snapshot` 的真实快照（第 n/总段 · 已用调用数），不自己推断；
+   *   - 已等待时间由页面计时（墙钟），每秒刷新；
+   *   - 「停止等待」只停本地等待，并说清服务可能仍在处理、用量可能已产生（不写「已取消」）。
+   *
+   * 提示词**不随轮询带回来**：进度条只问 progress；用户真展开「这次给模型的提示词」时
+   * 才带 `want_prompt` 单独取一次（`api.generationSnapshot(true)`）。
+   */
+  startGenerationWait(label: string): void {
+    this.stopGenerationWait(true);
+    this.progressStarted = Date.now();
+    this.progressStage = "";
+    this.progressStopped = false;
+    if (!this.progressSlot) return;
+    this.progressSlot.hidden = false;
+    this.renderGenerationWait(label);
+    this.progressTimer = window.setInterval(() => {
+      void this.tickGenerationWait(label);
+    }, 1000);
+  }
+
+  /** 每秒：取一次进度快照（不带提示词）再重画这一张卡 */
+  private async tickGenerationWait(label: string): Promise<void> {
+    try {
+      const snap = await this.ctx.api.generationSnapshot(false);
+      const progress = ((snap.progress ?? {}) as Json) ?? {};
+      if (progress.running) {
+        this.progressStage = String(progress.label ?? "");
+        const step = Number(progress.step ?? 0);
+        const total = Number(progress.total ?? 0);
+        if (this.progressStage && total) this.progressStage += `（第 ${step}/${total} 步）`;
+      } else {
+        this.progressStage = "";
+      }
+    } catch {
+      this.progressStage = ""; // 读不到阶段就只说已等待时间，不编造阶段
+    }
+    this.renderGenerationWait(label);
+  }
+
+  private renderGenerationWait(label: string): void {
+    const slot = this.progressSlot;
+    if (!slot || this.progressStopped) return;
+    const waited = humanDuration(Math.max(0, Math.round((Date.now() - this.progressStarted) / 1000)));
+    const where = this.progressStage ? `　正在：${this.progressStage}` : "";
+    fill(
+      slot,
+      el("span", { text: `${label}生成中：已等待 ${waited}${where}` }),
+      // 展开提示词才取一次（`want_prompt`）——不随每秒回执传输（P1-16）
+      this.promptDetails(),
+      button("停止等待", () => this.stopGenerationWait(false), { class: "u-btn u-btn-ghost" }),
+    );
+  }
+
+  /** 「这次给模型的提示词」：展开时才单独取一次；读不到就说读不到，不留空盒子 */
+  private promptDetails(): HTMLElement {
+    const box = el("details", { class: "u-error-detail" });
+    box.appendChild(el("summary", { text: "这次给模型的提示词" }));
+    let loaded = false;
+    box.addEventListener("toggle", () => {
+      if (!box.open || loaded) return;
+      loaded = true;
+      const body = el("p", { class: "u-hint", text: "正在读取…" });
+      box.appendChild(body);
+      void (async () => {
+        try {
+          const snap = await this.ctx.api.generationSnapshot(true);
+          const prompt = String(snap.prompt ?? "").trim();
+          body.textContent = prompt || "（还没发起过调用：这一次的提示词还没有产生）";
+        } catch (error) {
+          body.textContent = uiError(error, { module: "创建世界", action: "读取提示词" }).message;
+        }
+      })();
+    });
+    return box;
+  }
+
+  /**
+   * 停下等待卡。`silent` = 任务自己结束（成功 / 失败），只收掉卡；
+   * 否则是用户按了「停止等待」，必须说清「服务可能仍在处理、用量可能已产生」，不写「已取消」。
+   */
+  stopGenerationWait(silent = false): void {
+    if (this.progressTimer !== null) window.clearInterval(this.progressTimer);
+    this.progressTimer = null;
+    if (silent) {
+      // 任务自己结束了：等待卡收掉（连同「可能仍在处理」那句）——结果已经落在下面的提示行里，
+      // 两句话同时挂着会让人以为它还在跑
+      if (this.progressSlot && !this.progressSlot.hidden) this.progressSlot.hidden = true;
+      if (this.progressStopped && this.progressSlot) {
+        fill(this.progressSlot);
+        this.progressStopped = false;
+      }
+      return;
+    }
+    this.progressStopped = true;
+    const waited = humanDuration(Math.max(0, Math.round((Date.now() - this.progressStarted) / 1000)));
+    if (this.progressSlot) {
+      fill(
+        this.progressSlot,
+        el("span", {
+          text:
+            `已停止等待（等了 ${waited}）：这次调用可能仍在服务端继续，用量可能已经产生；` +
+            "结果到了会照旧写进这里的草稿，重新进入这一页可以从已保存的草稿继续。",
+        }),
+      );
+    }
   }
 
   /**
@@ -1550,8 +1684,11 @@ export class CreatePane implements Pane {
     }
     this.busy = true;
     setNote(this.note, "正在起草（会调用你的 AI，可能要等一会儿）…", "pending");
+    // 等待卡：阶段 + 已等待时间 + 「停止等待」（P2-15：上限 900 s 的等待不再只给一句「生成中」）
+    this.startGenerationWait("世界设定");
     try {
       const result = await this.ctx.api.packageGenerate(this.aiPayload());
+      this.stopGenerationWait(true);
       if (result.candidate) this.candidate = result.candidate as Json;
       this.setErrors((result.errors as string[]) ?? []); // 起草自带一次校验：结果可以照实报
       this.usage = (result.usage as Json) ?? null;
@@ -1566,6 +1703,7 @@ export class CreatePane implements Pane {
       );
       void this.render();
     } catch (error) {
+      this.stopGenerationWait(true);
       setNote(this.note, uiError(error, { module: "世界设定", action: "起草", done: "没有改动已保存的材料" }).message, "bad");
     } finally {
       this.busy = false;
@@ -1970,6 +2108,8 @@ export class CreatePane implements Pane {
       return;
     }
     setNote(this.note, "正在起草角色卡…", "pending");
+    // 与世界观起草同一张等待卡：角色卡生成同样可能等很久（P2-15）
+    this.startGenerationWait("角色卡");
     try {
       const payload: Json = {
         package_path: String(this.base).split(/[\\/]/).pop() ?? this.base,
@@ -1978,6 +2118,7 @@ export class CreatePane implements Pane {
       };
       if (this.card) payload.base = this.card;
       const result = await this.ctx.api.cardGenerate(payload);
+      this.stopGenerationWait(true);
       if (result.candidate) this.card = result.candidate as Json;
       this.cardErrors = ((result.errors as string[]) ?? []).slice();
       if (!this.cardName) this.cardName = String((this.card?.identity as Json)?.name ?? "");
@@ -1988,6 +2129,7 @@ export class CreatePane implements Pane {
       );
       void this.render();
     } catch (error) {
+      this.stopGenerationWait(true);
       setNote(this.note, uiError(error, { module: "角色卡", action: "起草", done: "没有改动已保存的材料" }).message, "bad");
     }
   }
