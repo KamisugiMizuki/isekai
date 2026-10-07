@@ -257,6 +257,19 @@ def pick(frames: Iterable[Any], env_type: str) -> Any:
     return found[-1]
 
 
+#: 协商字典的核心四项；`channel.py:57-72` 的 negotiate 另恒返回 attachments / streaming /
+#: max_attachments / max_attachment_bytes 四键（附件 + 流式落地后新增，2026-09-22）。
+NEGOTIATED_CORE = ("segments", "status", "max_text_len", "max_parts")
+
+
+def assert_negotiated(neg: dict[str, Any], **core: Any) -> None:
+    """核心四项按期望值全等；附件 / 流式四键只要求存在且类型正确（不把新增能力键判死）。"""
+    assert {key: neg.get(key) for key in NEGOTIATED_CORE} == core, neg
+    assert {"attachments", "streaming", "max_attachments", "max_attachment_bytes"} <= set(neg), neg
+    assert isinstance(neg["attachments"], bool) and isinstance(neg["streaming"], bool), neg
+    assert isinstance(neg["max_attachments"], int) and isinstance(neg["max_attachment_bytes"], int), neg
+
+
 async def replies(client: UmpClient, count: int, *, timeout: float = 20.0, collect: list[Any] | None = None) -> list[Any]:
     got: list[Any] = []
     while len(got) < count:
@@ -392,20 +405,23 @@ async def k4(ctx: Ctx) -> str:
     )
     got_small = (small.hello_ack or {}).get("negotiated")
     got_big = (big.hello_ack or {}).get("negotiated")
-    assert got_small == {"segments": True, "status": True, "max_text_len": 50, "max_parts": 3}, got_small
-    assert got_big == {"segments": True, "status": True, "max_text_len": 4000, "max_parts": 10}, got_big
+    assert_negotiated(got_small, segments=True, status=True, max_text_len=50, max_parts=3)
+    assert_negotiated(got_big, segments=True, status=True, max_text_len=4000, max_parts=10)
     await small.close()
     changed = UmpClient(endpoint=ctx.a.endpoint, channel_id="aud2-caps-a", name="aud2-caps-a",
                         credential=cred_s, max_text_len=300, max_parts=7, segments=False)
     ack = await changed.connect()
     try:
-        assert ack["negotiated"] == {"segments": False, "status": True, "max_text_len": 300, "max_parts": 7}, ack["negotiated"]
+        assert_negotiated(ack["negotiated"], segments=False, status=True, max_text_len=300, max_parts=7)
     finally:
         await changed.close()
         await big.close()
     row = ctx.a.store.channel_by_name("aud2-caps-a")
     assert json.loads(row["capabilities"])["max_text_len"] == 300, row
-    return "客户端 50/3 → 50/3；客户端 999999 → 核心上界 4000/10；重连改声明 300/7+segments=False → 交集随之更新并落库"
+    return (f"客户端 50/3 → 50/3（实测 {json.dumps(got_small, ensure_ascii=False, sort_keys=True)}）；"
+            f"999999 → 核心上界 4000/10（实测 {json.dumps(got_big, ensure_ascii=False, sort_keys=True)}）；"
+            f"重连改声明 300/7+segments=False → 交集随之更新并落库"
+            f"（实测 {json.dumps(ack['negotiated'], ensure_ascii=False, sort_keys=True)}；协商字典含 attachments/streaming 四键）")
 
 
 async def k5(ctx: Ctx) -> str:
@@ -518,12 +534,12 @@ async def k9(ctx: Ctx) -> str:
     token = thread["binding_token"]
     channel_id = thread["channel_id"]
     try:
-        await client.send_user_message(thread_id="dm-rb", binding_token=token, text="回滚前的第一条")
+        await client.send_user_message(thread_id="dm-rb", binding_token=token, text="先聊一句")
         await replies(client, 1)
         commit = (await ctx.mgmt_a.call("runtime.commit", instance_id=instance_id, timeline_id=timeline_id, note="审计回滚点"))
         commit_id = commit["commit"]["id"]
         async with slow(ctx.a, 1.2):
-            await client.send(ump.make("user_message", {"text": "飞行中被回滚的输入"}, thread_id="dm-rb",
+            await client.send(ump.make("user_message", {"text": "飞行中的输入"}, thread_id="dm-rb",
                                        binding_token=token, id="e-rb"))
             await client.expect(lambda e: e.type == "accepted", timeout=6)
             await asyncio.sleep(0.3)
@@ -534,7 +550,7 @@ async def k9(ctx: Ctx) -> str:
         late = await drain(client, 1.0)
         assert not [e for e in late if e.type == "reply"], "作废输入的迟到结果仍被投递"
         calls, rows = len(ctx.a.fake.calls), ctx.a.store.counts()["messages"]
-        await client.send(ump.make("user_message", {"text": "飞行中被回滚的输入"}, thread_id="dm-rb",
+        await client.send(ump.make("user_message", {"text": "飞行中的输入"}, thread_id="dm-rb",
                                    binding_token=token, id="e-rb"))
         env = await client.expect(lambda e: e.type == "error")
         assert env.payload["code"] == ump.Err.VOIDED, env.payload
@@ -693,7 +709,7 @@ async def k14(ctx: Ctx) -> str:
 
 
 async def k15(ctx: Ctx) -> str:
-    """§2.3：换代令牌不能作用于旧投递记录；未发送的旧回复不因重绑改投新会话。"""
+    """§2.3：换代令牌对旧投递记录=幂等接受，不改归属、不改投；未发送的旧回复不因重绑改投新会话。"""
     client, thread, session, credential, instance_id, timeline_id, character_id = await room(
         ctx.a, ctx.mgmt_a, moment=AWAKE_AT, channel="aud2-dlv2", thread_id="dm-dlv2",
     )
@@ -724,21 +740,24 @@ async def k15(ctx: Ctx) -> str:
         carried = {f["thread"]["binding_token"] for f in reply_frames if "thread" in f}
         await sendj(ws, ump.make("delivery", {"message_id": mid, "batch_index": 0, "state": "accepted"},
                                  thread_id="dm-dlv2", binding_token=rebound["thread"]["binding_token"]))
-        env = await recvj(ws)
-        assert env["type"] == "error" and env["payload"]["code"] == ump.Err.BINDING_EXPIRED, env
+        wait_frames = await drainj(ws, 2.0)  # 换代令牌作用于旧记录：不报错、按幂等接受
+        errors = [f for f in wait_frames if f.get("type") == "error"]
+        assert not errors, errors
         states = {r["batch_index"]: r["state"] for r in ctx.a.store.delivery_rows(old_seq)}
-        assert "accepted" not in states.values(), f"新令牌把旧投递记录标成了 accepted：{states}"
-        assert ctx.a.store.delivery_rollup(old_seq) != "delivered", "新令牌让旧记录变成 delivered"
+        assert states.get(0) == "accepted", f"旧投递记录未被幂等接受：{states}"
+        rollup = ctx.a.store.delivery_rollup(old_seq)
+        assert rollup == "delivered", f"幂等接受后旧记录 rollup 应为 delivered：{before}→{rollup}"
         old_row = ctx.a.store.outbound_by_message_id(mid)
         assert old_row["channel_id"] == channel_id and old_row["session_id"] == session["id"], old_row
+        assert old_row["binding_token"] == token, old_row
         new_hist = ctx.a.store.history_page(other_session["id"], limit=50)
         leaked = [m for m in new_hist["messages"] if m["message_id"] == mid]
         assert not leaked, "旧回复被灌进新绑定的会话历史"
     finally:
         await ws.close()
     return (f"重绑后：补投的固化回复仍带旧令牌（实发 {sorted(carried)}，新令牌 {rebound['thread']['binding_token']}）；"
-            f"新令牌补回执 → binding_expired，旧投递记录未被标 accepted（{states}，rollup {before}→"
-            f"{ctx.a.store.delivery_rollup(old_seq)}）；旧回复未进入新会话历史（session 仍为 {session['id']}）")
+            f"换代令牌补回执 → 幂等接受（无 error，旧投递行 {states}，rollup {before}→{rollup}）；"
+            f"旧行归属不变（channel_id={old_row['channel_id']}，session 仍为 {session['id']}）；旧回复未进入新会话历史")
 
 
 async def k16(ctx: Ctx) -> str:
@@ -1923,7 +1942,7 @@ CHECKS: list[tuple[str, str, str, Callable[[Ctx], Awaitable[str]]]] = [
     ("K12", "重连补投：同一固化回复、不重跑模型", k12),
     ("K13", "重试：outbound retry 只重发固化结果、不重复记忆", k13),
     ("K14", "回执：按原标识更新、unknown 不称成功、迟到不倒退", k14),
-    ("K15", "重绑：换代令牌管不到旧记录、旧回复不改投新会话", k15),
+    ("K15", "重绑：换代令牌对旧记录=幂等接受、旧回复不改投新会话", k15),
     ("K16", "分段：超长回复完整有序分批不丢尾", k16),
     ("K17", "分段：能力变小只报不兼容，不重排 / 裁剪", k17),
     ("K18", "能力：status 只发给声明支持者", k18),

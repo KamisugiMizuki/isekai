@@ -197,6 +197,19 @@ def flat_parts(row: dict[str, Any]) -> str:
     return str(row.get("text") or "")
 
 
+#: 协商字典的核心四项；`channel.py:57-72` 的 negotiate 另恒返回 attachments / streaming /
+#: max_attachments / max_attachment_bytes 四键（附件 + 流式落地后新增，2026-09-22）。
+NEGOTIATED_CORE = ("segments", "status", "max_text_len", "max_parts")
+
+
+def assert_negotiated(neg: dict[str, Any], **core: Any) -> None:
+    """核心四项按期望值全等；附件 / 流式四键只要求存在且类型正确（不把新增能力键判死）。"""
+    assert {key: neg.get(key) for key in NEGOTIATED_CORE} == core, neg
+    assert {"attachments", "streaming", "max_attachments", "max_attachment_bytes"} <= set(neg), neg
+    assert isinstance(neg["attachments"], bool) and isinstance(neg["streaming"], bool), neg
+    assert isinstance(neg["max_attachments"], int) and isinstance(neg["max_attachment_bytes"], int), neg
+
+
 # ---------------------------------------------------------------- 条目
 
 
@@ -396,18 +409,19 @@ async def a5(ctx: Ctx) -> str:
 async def a6(ctx: Ctx) -> str:
     client, info = await bind_thread(ctx.h, ctx.mgmt, channel_id="audit-nego", thread_id="dm-nego",
                                      max_text_len=50, max_parts=2)
-    assert info["ack"]["negotiated"] == {"segments": True, "status": True, "max_text_len": 50, "max_parts": 2}, info["ack"]
+    assert_negotiated(info["ack"]["negotiated"], segments=True, status=True, max_text_len=50, max_parts=2)
     await client.close()
     again = UmpClient(endpoint=ctx.h.endpoint, channel_id="audit-nego", name="audit-nego",
                       credential=info["credential"], max_text_len=300, max_parts=7, segments=False)
     ack = await again.connect()
     try:
-        assert ack["negotiated"] == {"segments": False, "status": True, "max_text_len": 300, "max_parts": 7}, ack["negotiated"]
+        assert_negotiated(ack["negotiated"], segments=False, status=True, max_text_len=300, max_parts=7)
     finally:
         await again.close()
     row = ctx.h.store.channel_by_name("audit-nego")
     assert json.loads(row["capabilities"])["max_text_len"] == 300, row
-    return "50/2 → 300/7+segments=False：重连重新协商并覆盖持久记录（不沿用旧交集）"
+    return (f"50/2 → 300/7+segments=False：重连重新协商并覆盖持久记录（不沿用旧交集）；"
+            f"协商字典含 attachments/streaming 四键（实测交集 {json.dumps(ack['negotiated'], ensure_ascii=False, sort_keys=True)}）")
 
 
 # 认证 / 协议永久错误：拒绝 + 关闭，不降级为无认证（§六）
@@ -638,7 +652,7 @@ async def d1(ctx: Ctx) -> str:
     return "回执写入原投递记录：unknown→unknown（不称成功）、accepted→delivered、迟到 unknown 不倒退"
 
 
-# 换绑后的令牌不能作用于旧投递记录（§2.3）
+# 换代令牌作用在旧投递记录上 = 幂等接受：不报错、照常计入 rollup、不改消息行归属（§2.3 / channel.py:425-434）
 async def d2(ctx: Ctx) -> str:
     client, info = await bind_thread(ctx.h, ctx.mgmt, channel_id="audit-dlv2", thread_id="dm-dlv2")
     token = info["thread"]["binding_token"]
@@ -646,18 +660,28 @@ async def d2(ctx: Ctx) -> str:
         await client.send_user_message(thread_id="dm-dlv2", binding_token=token, text="在吗")
         reply = (await replies(client, 1))[0]
         mid = reply.payload["message_id"]
-        seq = ctx.h.store.outbound_by_message_id(mid)["seq"]
+        fixed = ctx.h.store.outbound_by_message_id(mid)
+        seq = fixed["seq"]
         before = ctx.h.store.delivery_rollup(seq)
         rebound = await ctx.mgmt.call("thread.bind", channel="audit-dlv2", thread_id="dm-dlv2",
                                       session_id=info["session"]["id"])
-        await client.report_delivery(thread_id="dm-dlv2", binding_token=rebound["thread"]["binding_token"],
+        new_token = rebound["thread"]["binding_token"]
+        assert new_token != token, rebound["thread"]
+        await client.report_delivery(thread_id="dm-dlv2", binding_token=new_token,
                                      message_id=mid, batch_index=0, state="accepted")
-        env = await client.expect(lambda e: e.type == "error")
-        assert env.payload["code"] == ump.Err.BINDING_EXPIRED, env.payload
-        assert ctx.h.store.delivery_rollup(seq) == before, "旧记录被新令牌改动"
+        frames = await barrier(client)  # ping 顺序屏障：回执已处理完
+        errors = [e for e in frames if e.type == "error"]
+        assert not errors, [e.payload for e in errors]
+        rollup = ctx.h.store.delivery_rollup(seq)
+        assert rollup == "delivered", (before, rollup)
+        after = ctx.h.store.outbound_by_message_id(mid)
+        assert (after["binding_token"], after["channel_id"], after["session_id"]) == (
+            fixed["binding_token"], fixed["channel_id"], fixed["session_id"]
+        ), after
     finally:
         await client.close()
-    return f"换代后的令牌补回执 → binding_expired，原记录 rollup 仍为 {before}"
+    return (f"旧记录 + 换代令牌回执 → 幂等接受（无 error；rollup {before}→{rollup}），"
+            f"消息行归属不变（channel_id={after['channel_id']}，binding_token 仍为固化时的旧令）")
 
 
 # 重连补投：生成完成后断线，重连补投同一固化回复、不重跑模型（§2.3 / §2.2 / SESSION_CORE §4.2）
@@ -980,7 +1004,7 @@ CHECKS: list[tuple[str, str, str, CheckFn]] = [
     ("B2", "绑定：旧令牌的未接收消息被拒", "channel.py:305-308", b2),
     ("B3", "绑定：重绑使迟到结果作废；重发返回取消", "session.py:210-224, 87-90 · store.py:1545-1558", b3),
     ("D1", "回执：按原出站标识更新；unknown 不倒退已确认", "channel.py:347-368 · store.py:1059-1092", d1),
-    ("D2", "回执：换代令牌不能作用于旧投递记录", "channel.py:352-356", d2),
+    ("D2", "回执：换代令牌对旧记录=幂等接受、不改归属", "channel.py:425-434 · store.py:2254-2271", d2),
     ("R1", "重连补投：同一固化回复、不重跑模型", "channel.py:220-221 · session.py:418-424", r1),
     ("R2", "重试：outbound retry 只重发固化结果", "session.py:121-137, 358-400", r2),
     ("X1", "错误模型：五字段齐备且脱敏", "ump.py:67-95, 331-340 · session.py:430-432", x1),
