@@ -12,8 +12,9 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { MgmtError } from "../ump";
 import type { AppContext, Pane } from "./app";
-import type { Json } from "./api";
+import type { Json, UiError } from "./api";
 import { uiError } from "./api";
 import {
   bulletList,
@@ -114,7 +115,10 @@ export class WritingPane implements Pane {
   private draftBody = "";
   private draftKey = "";
   private autoTimer: number | null = null;
-  private busy = false;
+  /** 读大纲状态真失败时的错误（not_found 是真空态，不进这里）：渲染优先于「还没有绑定大纲」 */
+  private stateError: UiError | null = null;
+  /** 读候选真失败时的错误（not_found 是真无候选）：用到候选的地方要如实说读取失败 */
+  private candidatesError: UiError | null = null;
   /** 上次选择读了但对象已不存在时，如实说明回落原因（不静默继承别的域） */
   private selectionHint = "";
   /** 上一次已写入「最近使用 / sel.writing」的 key：同一选择不重复写 */
@@ -182,12 +186,17 @@ export class WritingPane implements Pane {
       this.renderTabs(host);
       this.renderHeader(instances, timelines, characters, outlineList);
       if (!this.state) {
-        host.appendChild(
-          paragraph(
-            "这条时间线上还没有绑定大纲：选一份大纲点「绑定到大纲」开始；已经绑定的线会保留各自进度。",
-            "u-hint",
-          ),
-        );
+        if (this.stateError) {
+          // 读取失败优先：不许拿「还没有绑定大纲」冒充一次没读到的状态
+          host.appendChild(errorCard(this.stateError, [{ label: "重试", run: () => void this.render() }]));
+        } else {
+          host.appendChild(
+            paragraph(
+              "这条时间线上还没有绑定大纲：选一份大纲点「绑定到大纲」开始；已经绑定的线会保留各自进度。",
+              "u-hint",
+            ),
+          );
+        }
       }
       if (this.tab === "outline") this.renderOutline(host);
       else if (this.tab === "material") await this.renderMaterial(host);
@@ -255,17 +264,21 @@ export class WritingPane implements Pane {
 
   private async loadState(): Promise<void> {
     this.state = null;
-    this.busy = false;
+    this.stateError = null;
     if (!this.instanceId || !this.timelineId || !this.outlineId) return;
     try {
       const result = await this.ctx.api.waState(this.instanceId, this.timelineId, this.outlineId);
       this.state = (result.state as Json) ?? null;
-    } catch {
-      this.busy = true;  // 尚未绑定：由界面如实说明，不当成故障
+    } catch (error) {
+      // 核心用 not_found「这条时间线上还没有绑定大纲」表示真空态：只有它走空态。
+      // 核心断开 / 内部错误必须出错误态，不许显示成「还没有绑定大纲」。
+      if (error instanceof MgmtError && error.code === "not_found") return;
+      this.stateError = uiError(error, { module: "辅助写作", action: "读取大纲状态" });
     }
   }
 
   private async refreshCandidates(): Promise<void> {
+    this.candidatesError = null;
     if (!this.instanceId || !this.timelineId) {
       this.candidates = [];
       return;
@@ -273,8 +286,11 @@ export class WritingPane implements Pane {
     try {
       const result = await this.ctx.api.waState(this.instanceId, this.timelineId, this.outlineId || "");
       this.candidates = ((result.public as Json)?.candidates as Json[]) ?? [];
-    } catch {
+    } catch (error) {
       this.candidates = [];
+      // 没绑大纲时同一个 not_found 也是「真没有候选」；其它失败不能显示成「没有建议」
+      if (error instanceof MgmtError && error.code === "not_found") return;
+      this.candidatesError = uiError(error, { module: "辅助写作", action: "读取推进建议候选" });
     }
   }
 
@@ -350,7 +366,11 @@ export class WritingPane implements Pane {
           { class: "u-row" },
           button("新建大纲…", () => void this.newOutline()),
           button(this.state ? "换观察者 / 章节标签…" : "绑定到大纲", () => void this.bindOutline()),
-          this.state ? chip(`已绑定：${String(this.state.outline_name ?? "")}`, "ok") : chip("未绑定", "pending"),
+          this.state
+            ? chip(`已绑定：${String(this.state.outline_name ?? "")}`, "ok")
+            : this.stateError
+              ? chip("大纲状态读取失败", "bad")
+              : chip("未绑定", "pending"),
           this.state
             ? paragraph(`章节：${String(this.state.chapter || "（未命名）")}｜评估水位 ${Number(this.state.evaluated_world ?? 0)}`, "u-hint")
             : null,
@@ -386,6 +406,8 @@ export class WritingPane implements Pane {
 
   private renderOutline(host: HTMLElement): void {
     if (!this.state) {
+      // 读取失败已在页首用错误卡说明：这里不再劝「绑定到大纲」，免得把没读到当成没绑定
+      if (this.stateError) return;
       host.appendChild(el("div", { class: "u-row" }, primary("绑定到大纲", () => void this.bindOutline())));
       return;
     }
@@ -414,7 +436,7 @@ export class WritingPane implements Pane {
         row.appendChild(el("span", { class: "u-grow", text: String(item.title || item.statement || item.id) }));
         row.appendChild(
           chip(
-            STATUS_TEXT[status] ?? (this.busy ? status : status),
+            STATUS_TEXT[status] ?? status,
             status === "achieved" ? "ok" : status === "deviated" || status === "abandoned" ? "bad" : status === "in_progress" ? "pending" : "muted",
           ),
         );
@@ -684,6 +706,11 @@ export class WritingPane implements Pane {
       setNote(this.note, "先选一份大纲（或新建一份）", "bad");
       return;
     }
+    if (this.stateError && !this.state) {
+      // 读不到状态时不能按「首次绑定」处理：先重试读取，再决定绑定还是更新
+      setNote(this.note, "这条时间线的大纲状态还没读到：先重试读取，再决定绑定还是更新", "bad");
+      return;
+    }
     const bound = Boolean(this.state);
     const chapter = el("input", {
       class: "u-input", id: "u-wa-chapter", value: String(this.state?.chapter ?? "第一章"),
@@ -914,14 +941,23 @@ export class WritingPane implements Pane {
       rows.appendChild(card);
     }
     if (!this.candidates.length) {
-      rows.appendChild(paragraph("还没有建议：点上面的按钮要一组（每次生成各有独立标识，不会覆盖已采用的内容）。", "u-hint"));
+      if (this.candidatesError) {
+        // 读失败与「没有建议」不可分：有错就出错误卡 + 重试
+        rows.appendChild(errorCard(this.candidatesError, [{ label: "重试", run: () => void this.render() }]));
+      } else {
+        rows.appendChild(paragraph("还没有建议：点上面的按钮要一组（每次生成各有独立标识，不会覆盖已采用的内容）。", "u-hint"));
+      }
     }
     host.appendChild(section("待决定的建议", rows));
   }
 
   private async suggest(): Promise<void> {
     if (!this.state) {
-      setNote(this.note, "先绑定一份大纲：建议要挂在大纲与角色上", "bad");
+      setNote(
+        this.note,
+        this.stateError ? "这条时间线的大纲状态还没读到：先重试读取，再要建议" : "先绑定一份大纲：建议要挂在大纲与角色上",
+        "bad",
+      );
       return;
     }
     setNote(this.note, "正在要一组建议（一次便宜调用）…", "pending");
@@ -1135,7 +1171,11 @@ export class WritingPane implements Pane {
       list.appendChild(row);
     }
     if (!drafts.length) {
-      list.appendChild(paragraph("还没有文字草稿：在「推进建议」里点「以此起草」，或直接在下面新建一份。", "u-hint"));
+      if (this.candidatesError) {
+        list.appendChild(errorCard(this.candidatesError, [{ label: "重试", run: () => void this.render() }]));
+      } else {
+        list.appendChild(paragraph("还没有文字草稿：在「推进建议」里点「以此起草」，或直接在下面新建一份。", "u-hint"));
+      }
     }
     host.appendChild(
       section(

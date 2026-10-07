@@ -106,6 +106,12 @@ export class TrpgPane implements Pane {
   private view: View = "list";
   private campaigns: Json[] = [];
   private plugins: Json[] = [];
+  /** 读不到战役清单的世界数（0 = 全读到）；部分失败时保留已读到的行，界面上如实说失败的那部分 */
+  private campaignsFailed = 0;
+  /** 最近一次战役清单读取失败的原因：全失败时用它说明，不冒充「还没有战役」 */
+  private campaignsError: UiError | null = null;
+  /** 规则清单读取失败：与「本机还没有登记规则插件」的真空态分开，不混同 */
+  private pluginsError: UiError | null = null;
   /** 「从样例开始」失败时挂出的可行动错误卡（重试后就地替换，避免越堆越多） */
   private sampleErrorCard: HTMLElement | null = null;
 
@@ -211,33 +217,63 @@ export class TrpgPane implements Pane {
 
   private async loadCampaigns(): Promise<void> {
     const rows: Json[] = [];
+    let failed = 0;
+    let firstError: UiError | null = null;
     for (const instance of this.ctx.instances()) {
       try {
         const result = await this.ctx.api.trpgCampaigns(instance.id);
         for (const item of ((result.campaigns as Json[]) ?? [])) {
           rows.push({ ...item, instance_name: instance.name });
         }
-      } catch {
-        /* 单个世界读不到不影响别的世界 */
+      } catch (error) {
+        // 单个世界读不到不影响别的世界；但界面要如实说失败的那部分，不把失败冒充成没战役
+        failed += 1;
+        firstError = firstError ?? uiError(error, { module: "跑团", action: "读取战役清单", target: instance.name });
       }
     }
     this.campaigns = rows;
+    this.campaignsFailed = failed;
+    this.campaignsError = firstError;
   }
 
   private async loadPlugins(): Promise<void> {
     try {
       const result = await this.ctx.api.rulesList();
       this.plugins = (result.plugins as Json[]) ?? [];
-    } catch {
+      this.pluginsError = null;
+    } catch (error) {
       this.plugins = [];
+      this.pluginsError = uiError(error, { module: "跑团", action: "读取规则清单" });
     }
+  }
+
+  /** 规则清单读取失败后的重试：重跑读取再重画 */
+  private async retryPlugins(): Promise<void> {
+    await this.loadPlugins();
+    await this.render();
+  }
+
+  /** 战役清单读取失败后的重试：只重跑清单读取，不假装整页都成功了 */
+  private async retryCampaigns(): Promise<void> {
+    await this.loadCampaigns();
+    await this.render();
+  }
+
+  /** 读取失败的行内说明：固定说法 + 真实原因 + 「重试」，不让失败与空态看起来一样 */
+  private loadFailure(label: string, error: UiError | null, retry: () => void): HTMLElement {
+    return el(
+      "div",
+      { class: "u-row u-row-wrap" },
+      el("span", { class: "u-grow u-hint", text: `${label}：${error?.message ?? "原因未明"}` }),
+      button("重试", retry),
+    );
   }
 
   /* ------------------------------------------------------------ §8.1 继续 / 新建 */
 
   private async renderList(host: HTMLElement): Promise<void> {
-    if (!this.plugins.length) await this.loadPlugins();
-    if (!this.campaigns.length) await this.loadCampaigns();
+    if (!this.plugins.length && !this.pluginsError) await this.loadPlugins();
+    if (!this.campaigns.length && !this.campaignsFailed) await this.loadCampaigns();
     const rows = el("div", { class: "u-rows" });
     for (const item of this.campaigns) {
       const head = el("div", { class: "u-row-line" });
@@ -261,7 +297,15 @@ export class TrpgPane implements Pane {
         ),
       );
     }
-    if (!this.campaigns.length) {
+    if (this.campaignsFailed && !this.campaigns.length) {
+      // 一条都没读到：别让「读取失败」看起来像「还没有战役」
+      rows.appendChild(this.loadFailure("战役清单读取失败", this.campaignsError, () => void this.retryCampaigns()));
+    } else if (this.campaignsFailed) {
+      // 部分成功：已读到的行照常显示，另起一行如实说失败的世界数
+      rows.appendChild(
+        this.loadFailure(`另有 ${this.campaignsFailed} 个世界读取失败`, this.campaignsError, () => void this.retryCampaigns()),
+      );
+    } else if (!this.campaigns.length) {
       rows.appendChild(paragraph("还没有战役。可以新建一局，或用随发行的样例材料先跑一局。", "u-hint"));
     }
     host.appendChild(
@@ -291,7 +335,12 @@ export class TrpgPane implements Pane {
       if (item.referenced_count) line.appendChild(chip(`被 ${Number(item.referenced_count)} 局使用`, "muted"));
       pluginRows.appendChild(line);
     }
-    if (!this.plugins.length) pluginRows.appendChild(paragraph("本机还没有登记规则插件。", "u-hint"));
+    if (this.pluginsError && !this.plugins.length) {
+      // 读取失败与「本机还没有登记规则插件」是两回事：有错就不能显示原空态
+      pluginRows.appendChild(this.loadFailure("规则清单读取失败", this.pluginsError, () => void this.retryPlugins()));
+    } else if (!this.plugins.length) {
+      pluginRows.appendChild(paragraph("本机还没有登记规则插件。", "u-hint"));
+    }
     host.appendChild(
       section(
         "本机规则",
@@ -883,6 +932,9 @@ export class TrpgPane implements Pane {
         button("返回战役列表", () => {
           this.view = "list";
           this.campaigns = [];
+          // 清单要按离开后的世界重新读：连失败标记一起清掉，避免拿旧失败冒充本次结果
+          this.campaignsFailed = 0;
+          this.campaignsError = null;
           void this.render();
         }),
       ),
@@ -969,16 +1021,18 @@ export class TrpgPane implements Pane {
     methodInput.addEventListener("input", () => {
       this.methodText = methodInput.value;
     });
+    // 行动正文同样要边打边记：只在提交时读一次的话，打字中途任何一次重画都会把它回填成旧值
+    const intentInput = el("textarea", {
+      class: "u-textarea", rows: "2", id: "u-trpg-intent", placeholder: "用一句话说清你想做什么",
+    }) as HTMLTextAreaElement;
+    intentInput.value = this.actionText;
+    intentInput.addEventListener("input", () => {
+      this.actionText = intentInput.value;
+    });
     host.appendChild(
       section(
         "我想……",
-        field(
-          "行动",
-          el("textarea", {
-            class: "u-textarea", rows: "2", id: "u-trpg-intent", placeholder: "用一句话说清你想做什么",
-            value: this.actionText,
-          }) as HTMLTextAreaElement,
-        ),
+        field("行动", intentInput),
         el(
           "div",
           { class: "u-row u-row-wrap" },
