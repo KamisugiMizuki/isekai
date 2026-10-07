@@ -209,10 +209,12 @@ def is_open_turn(topic: str) -> bool:
 
 
 def audit(text: str, unit: dict[str, Any], *, activity: str = "") -> list[dict[str, str]]:
-    """最小结构检查（§6.2）：空文本与数字越界。
+    """**确定性**后验检查（§6.2 第一步）：空文本与数字取值范围。
 
-    语义层（来源 / 时间 / 范围 / 关系 / 处境）走 `audit_request` 那一次便宜判断——
-    关键词从来不是唯一判据，判不出来时按通过，不误杀合法叙述。
+    这一步只能**判越界**、不能判「语义上没问题」：结构 / 引用 / 取值范围比对得出来的
+    问题在这里定论（空文本、正文里的数字不在骨架 / 已固化效果 / 已获知事实里）；
+    其余（来源、时间、范围、关系、处境这类要读语义的）留给模型兜底那一次——
+    所以它不是「有数字就免检」：数字先在这里核对，核完该问语义照旧问。
     """
     body = str(text or "").strip()
     if not body:
@@ -226,9 +228,26 @@ def audit(text: str, unit: dict[str, Any], *, activity: str = "") -> list[dict[s
     return []
 
 
-def has_checkable_numbers(text: str) -> bool:
-    """数字护栏能核对的前提：正文里有数字（没有就只剩语义判断那一道）。"""
-    return bool(_NUMBERS.findall(str(text or "")))
+def needs_semantic_audit(unit: dict[str, Any] | None, text: str) -> bool:
+    """确定性规则能否就此收尾（§6.2）：不能就要问一次语义。
+
+    唯一允许**整体跳过**语义审计的情形是「本轮没有注入候选块」（`unit` 为空）——
+    没有候选块就没有可越界的事实面，问也问不出东西；空文本已被 `audit()` 判掉。
+    含数字不再构成免检理由：数字先由 `audit()` 核取值范围，核完仍需语义判断时照常问。
+    """
+    if not str(text or "").strip():
+        return False
+    return bool(unit)
+
+
+def has_checkable_numbers(text: str) -> bool:  # noqa: ARG001 - 保留名字，语义已废止
+    """**口径已废止（2026-10-08，P0-6）**：原本「正文里有数字 → 整体跳过语义审计」。
+
+    数字存在不构成免检理由（SESSION_CORE_SPEC §4.3 / NARRATIVE_LAYER_SPEC §6.2）：
+    数字先由 `audit()` 做确定性取值范围校验，需要语义判断时照常进入审计。
+    调用方一律改走 `needs_semantic_audit()`；这个函数只为兼容旧调用点保留，恒返回 False。
+    """
+    return False
 
 
 def audit_request(unit: dict[str, Any], text: str, *, activity: str = "") -> list[dict[str, str]]:
@@ -258,6 +277,26 @@ def parse_audit(text: str) -> tuple[bool, str] | None:
     if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
         return None
     return bool(payload["ok"]), str(payload.get("why") or "")
+
+
+#: 差异重试的系统段（§4.3「重试只发差异」）：只讲改哪儿、怎么改，不重放上下文。
+RETRY_SYSTEM = """刚才那一版有越界的地方。只改被指出的那一处，其余保持原样。
+不要补上材料里没有的参与者、原因、结果或幕后结论；没把握就用不确定的说法，实在不能说就说不清楚。
+直接输出改后的那一句，不要解释、不要列点、不要复述要求。"""
+
+
+def retry_request(*, previous: str, why: str = "") -> list[dict[str, str]]:
+    """校验失败后的**差异重试**问法（SESSION_CORE_SPEC §4.3 / §6.2）。
+
+    只发两块：① 上一次的产物，② 本次要求改动的具体位置（后验检查指出的越界处）。
+    不重发完整 prompt、不重放已通过的上下文与原始素材——模型侧看得到自己的上一版与改哪儿。
+    """
+    body = str(previous or "").strip()
+    detail = str(why or "").strip() or "超出她只知道的事"
+    return [
+        {"role": "system", "content": f"{RETRY_SYSTEM}\n{strict_note()}"},
+        {"role": "user", "content": f"上一版：{body}\n越界处：{detail}\n只改这一处，其它保持原样。"},
+    ]
 
 
 # ---------- 戏剧性 / 三幕 / 分享欲（§9.5：原「暂不纳入」项的落地口径） ----------
@@ -353,8 +392,8 @@ def map_payload(
     - 边 = 两条线索共享材料引用（同一件事被再提起）；
     - 不含实情层、未获知内容与他人私聊——黑箱与碎片化不变（DESIGN §2.2-9）。
 
-    ponytail: 边是 O(n²) 的引用比对，够用到现在这个量级（每角色每天至多数条）；
-    上百条时改成按 ref 建索引。
+    ponytail: 边不再两两求交——按 `ref → [unit_id]` 倒排索引在同组内连边（§9.4 第 14 条 / P2-2）；
+    节点正文由调用方按收集到的 `message_id` 一次批量取回。上百条时也不用改结构。
     """
     rows = [dict(row) for row in units or ()]
     spoken = sorted(
@@ -399,11 +438,20 @@ def map_payload(
         )
     edges: list[dict[str, Any]] = []
     ids = [str(node["id"]) for node in nodes if node["kind"] == "spoken"]
-    for index, left in enumerate(ids):
-        for right in ids[index + 1 :]:
-            shared = sorted(refs_of.get(left, set()) & refs_of.get(right, set()))
-            if shared:
-                edges.append({"from": left, "to": right, "kind": "同一件事又被提起", "refs": shared})
+    # 边 = 共享材料引用：按 ref 建**倒排索引**，只在同一 ref 的成员之间连边并合并重复对
+    # （§9.4 第 14 条 / P2-2）：复杂度 O(单元数 + 引用数 + 同 ref 组内对数)，不再两两求交。
+    holders: dict[str, list[str]] = {}
+    for identifier in ids:
+        for ref in refs_of.get(identifier, set()):
+            holders.setdefault(str(ref), []).append(identifier)
+    shared_pairs: dict[tuple[str, str], set[str]] = {}
+    for ref, members in holders.items():
+        ordered = sorted(set(members))
+        for index, left in enumerate(ordered):
+            for right in ordered[index + 1 :]:
+                shared_pairs.setdefault((left, right), set()).add(ref)
+    for (left, right), shared in sorted(shared_pairs.items()):
+        edges.append({"from": left, "to": right, "kind": "同一件事又被提起", "refs": sorted(shared)})
     # 同一天讲的两条按先后串起来：图谱至少看得出她那天在说些什么（不额外暴露内容）
     days: dict[int, list[str]] = {}
     for node in nodes:

@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from .package import new_package_id
-from .validate import EXPIRY_KINDS, SUPPORTED_EFFECTS, _all_ids, lifespan_errors
+from .validate import EXPIRY_KINDS, SUPPORTED_EFFECTS, _all_ids, lifespan_errors, region_ids
 
 DRIVERS = ("anchor", "event", "dialog", "time")
 CONFIDENCE_BANDS = {
@@ -184,9 +184,30 @@ def validate_card(card: dict[str, Any], package: dict[str, Any], *, moment: int)
     errors.extend(_validate_units(card))
     errors.extend(_validate_intents(card, package, calendar))
     errors.extend(_validate_life(card, package, day=day))
+    errors.extend(_validate_region(card, package))
     if not isinstance(card.get("first_contact"), dict):
         errors.append("first_contact: 缺少初见设定（姿态与意向）")
     return errors
+
+
+def _validate_region(card: dict[str, Any], package: dict[str, Any]) -> list[str]:
+    """生活区域必须引用世界包登记的区域标识（CHARACTER_CARD_SPEC §5.2 / 附录 B #8，P2-11）。
+
+    - 未填写 = 不声明活动区域，不报错；
+    - 填了就必须是 `world.regions[].id`：悬空、拼错或写成自由文本都不静默降级
+      （区域标识是引用键，显示名不是主键——要加区域就改世界包再重新联合校验）；
+    - 世界包没声明任何区域时无从引用，此时不额外报错（区域登记本身不是必填项）。
+    """
+    region = region_of(card).strip()
+    if not region:
+        return []
+    registered = region_ids(package)
+    if not registered or region in registered:
+        return []
+    return [
+        f"region: 引用的区域 {region!r} 不在世界包登记的区域标识里"
+        f"（world.regions[].id：{'、'.join(sorted(registered))}；未登记即失败，不静默降级成描述文本）"
+    ]
 
 
 def _validate_knowledge(card: dict[str, Any], package: dict[str, Any], *, moment: int) -> list[str]:

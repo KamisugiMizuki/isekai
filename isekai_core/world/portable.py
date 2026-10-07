@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import secrets
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -28,13 +26,32 @@ from ..version import (
 )
 from .cards import validate_assembly
 from .instances import InstanceError, create_instance
-from .package import PackageError, clone_package, read_json_file
+from .package import PackageError, atomic_write_text, clone_package, read_json_file
 from .validate import validate_package
 
 
 def _digest(payload: dict[str, Any]) -> str:
+    """**旧口径**：整容器规范化序列化的 sha256。
+
+    只用于读回旧导出件（它们只带这一档指纹）；新导出一律走 `_section_digest`
+    （分节原始字节，C-10 / §7.1），不再为了算摘要把整包 sort_keys 重排一遍。
+    """
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _section_digest(value: Any) -> str:
+    """分节的原始字节摘要（§7.1 / 附录②，C-10）：只序列化这一节，不做整包规范化。"""
+    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _section_digests(container: dict[str, Any]) -> dict[str, str]:
+    """`setting` / `runtime` 各算一档，允许分节独立校验。"""
+    return {
+        "setting": _section_digest(container.get("setting")),
+        "runtime": _section_digest(container.get("runtime")),
+    }
 
 
 def _writing_payload(store: Store, instance_id: str, timelines: list[dict[str, Any]]) -> dict[str, Any]:
@@ -62,6 +79,33 @@ def _writing_payload(store: Store, instance_id: str, timelines: list[dict[str, A
         if row is not None:
             outlines.append(row)
     return {"outlines": outlines, "states": states, "candidates": candidates}
+
+
+def _commit_entry(store: Store, item: dict[str, Any]) -> dict[str, Any]:
+    """容器里的一条提交：管理元数据 + **存储形态**的提交快照与它的 base（§7.1）。
+
+    快照按库内的存储形态随件（`kind` / `base` / `body` 的 delta 链，或早期库里的裸物化正文），
+    不调 `commit_snapshot_get()` 逐条物化成全量——那会把 O(历史 + 变更) 撑成
+    O(提交数 × 历史)（P0-5）。
+    """
+    from ..runtime import versioning  # 局部导入：版本层在 runtime 层，顶层导入会成环
+
+    commit_id = str(item["id"])
+    raw = store.commit_snapshot_stored(commit_id)
+    snapshot = versioning.parse_snapshot(raw) if raw else None
+    return {
+        "id": item["id"],
+        "timeline_id": item["timeline_id"],
+        "kind": item["kind"],
+        "moment": item["moment"],
+        "note": item["note"],
+        "created_at": item["created_at"],
+        # 提交闭包（§7.1）：没有快照，导入件就回滚不了、也分不出有历史的新线
+        "snapshot": snapshot,
+        # delta 链的依赖（与库内 `commit_snapshot.base_commit_id` 同一口径，取值取正文里的 base——
+        # 库里读列与读正文走的是同一条链，见 `Store.commit_snapshot_get`）：导入按它重建链（§7.3）
+        "base_commit_id": versioning.snapshot_kind(raw)[1] if raw else "",
+    }
 
 
 def build_container(store: Store, instance_id: str) -> dict[str, Any]:
@@ -109,19 +153,7 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
                 }
                 for item in timelines
             ],
-            "commits": [
-                {
-                    "id": item["id"],
-                    "timeline_id": item["timeline_id"],
-                    "kind": item["kind"],
-                    "moment": item["moment"],
-                    "note": item["note"],
-                    "created_at": item["created_at"],
-                    # 提交闭包（§7.1）：没有快照，导入件就回滚不了、也分不出有历史的新线
-                    "snapshot": store.commit_snapshot_get(str(item["id"])),
-                }
-                for item in commits
-            ],
+            "commits": [_commit_entry(store, item) for item in commits],
             "seed": row["seed"],
             "moment": row["moment"],
             # 角色状态按已完成水位导出；不导出待生效倍率命令、投递回执与通道绑定（§2.6 / §2.3.6）
@@ -152,27 +184,21 @@ def build_container(store: Store, instance_id: str) -> dict[str, Any]:
         },
         "setting": payload["setting"],
         "runtime": payload["runtime"],
-        "integrity": {"algorithm": "sha256", "digest": _digest(payload)},
+        # 摘要按分节原始字节各算一档（§7.1 / 附录②，C-10）：构建同趟产出，导出不再自我复验
+        "integrity": {"algorithm": "sha256", "sections": _section_digests(payload)},
     }
 
 
 def write_export(store: Store, instance_id: str, path: str | Path) -> dict[str, Any]:
-    """先写临时文件、完整校验后再原子发布（§7.1）：中途失败不留下伪装成功的包。"""
+    """先写临时文件、原子发布（§7.1）：中途失败不留下伪装成功的包、也不破坏先前导出件。
+
+    导出**不自我复验**：`build_container` 已经同趟算好分节摘要，不再把自己刚构建的容器
+    整体重新规范化序列化一遍、重算同一个 digest（P1-13）。落盘复用包 / 卡片那一条
+    原子写助手（同目录临时文件 → `fsync` → `os.replace`，失败清理临时文件）。
+    """
     container = build_container(store, instance_id)
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(container, ensure_ascii=False, indent=2)
-    verify_integrity(container)
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=str(target.parent), delete=False, suffix=".tmp"
-    )
-    try:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    finally:
-        handle.close()
-    os.replace(handle.name, target)
+    atomic_write_text(target, json.dumps(container, ensure_ascii=False, indent=2))
     return container["container"]
 
 
@@ -211,16 +237,46 @@ def check_compatibility(container: dict[str, Any]) -> tuple[str, str]:
 
 
 def verify_integrity(container: dict[str, Any]) -> None:
+    """校验清单里的完整性摘要，只回答「文件是否完整 / 被改动」（§7.5：不冒充来源认证）。
+
+    两套口径都能读：
+
+    - **分节原始字节**（新导出件）：`setting` / `runtime` 各一档，各自可独立校验
+      （§7.1 / 附录②，C-10）——复算不必把整容器规范化重序列化；
+    - **整包规范化序列化**（旧导出件）：只有 `digest` 一档时照旧验（§7.3 兼容旧容器）。
+
+    同一份清单同时带两档时，任一档对上即通过：两档都是损坏检测，不是来源认证。
+    """
     integrity = container.get("integrity")
-    if not isinstance(integrity, dict) or not integrity.get("digest"):
+    if not isinstance(integrity, dict):
+        raise InstanceError("导入件缺少完整性指纹")
+    sections = integrity.get("sections") if isinstance(integrity.get("sections"), dict) else {}
+    legacy = str(integrity.get("digest") or "")
+    if sections:
+        current = _section_digests(container)
+        mismatched = [name for name, value in current.items() if str(sections.get(name) or "") != value]
+        if not mismatched:
+            return
+        if legacy:
+            payload = {"setting": container.get("setting"), "runtime": container.get("runtime")}
+            if _digest(payload) == legacy:
+                return
+        raise InstanceError("导出件完整性校验失败（文件被改动或不完整），未导入")
+    if not legacy:
         raise InstanceError("导入件缺少完整性指纹")
     payload = {"setting": container.get("setting"), "runtime": container.get("runtime")}
-    if _digest(payload) != integrity.get("digest"):
+    if _digest(payload) != legacy:
         raise InstanceError("导出件完整性校验失败（文件被改动或不完整），未导入")
 
 
 def import_instance(store: Store, container: dict[str, Any], *, display_name: str | None = None) -> dict[str, Any]:
-    """导入 = 校验 → 创建新实例（默认冻结）→ 恢复对话；任一步失败不留半个实例。"""
+    """导入 = 校验 → 创建新实例（默认冻结）→ 恢复对话；任一步失败不留半个实例。
+
+    「一次过」（§7.3 / P1-13 / P1-14）：容器在这里校验**一轮**（结构 + 引用闭包 + 摘要），
+    创建实例时走「已校验」快路径（`validated=True`），不再把同一套逐卡校验与包级 id 集
+    重建跑第二轮；提交快照也不在导入期先合成为全量再由容器内容覆盖——
+    只由容器内容按存储形态一次性写回。
+    """
     status, reason = check_compatibility(container)
     if status != "compatible":
         raise InstanceError(reason)
@@ -233,6 +289,7 @@ def import_instance(store: Store, container: dict[str, Any], *, display_name: st
     cards = setting.get("cards") or []
     moment = int(package.get("calendar", {}).get("initial_moment") or 0)
 
+    # 隔离暂存位置已完成的那一轮校验：这里只复核锁定设定本身（不重复两轮）
     errors = validate_package(package) + validate_assembly(package, cards, moment=moment)
     if errors:
         raise InstanceError(["导入件的锁定设定未通过校验："] + errors)
@@ -249,6 +306,8 @@ def import_instance(store: Store, container: dict[str, Any], *, display_name: st
         extra_setting={"imported_from": {"exported_at": (container.get("container") or {}).get("exported_at")}},
         timelines=timelines,
         commits=commits,
+        validated=True,             # 上面那一轮就是全部校验；创建期不再重跑
+        materialize_snapshots=False,  # 快照由容器内容写入（不先合成再覆盖）
     )
     try:
         session_map = _restore_sessions(store, row["id"], runtime, timeline_map)
@@ -432,6 +491,114 @@ def _prepare_graph(
     return timelines, commits, timeline_map, commit_map
 
 
+def _versioning() -> Any:
+    """版本层（快照的存储形态与物化）在 runtime 层：顶层导入会成环，统一走这一条局部导入。"""
+    from ..runtime import versioning
+
+    return versioning
+
+
+def _is_stored_form(snapshot: Any) -> bool:
+    """容器里的快照是不是**存储形态**（`{kind, base?, body}`）。
+
+    老容器的 `snapshot` 是物化好的全量正文（`note` / `world` / `runtime` / `dialog`…，没有 `kind`），
+    两种形态都要能读（§7.3 兼容旧容器）。
+    """
+    versioning = _versioning()
+    return (
+        isinstance(snapshot, dict)
+        and str(snapshot.get("kind") or "") in (versioning.SNAPSHOT_FULL, versioning.SNAPSHOT_DELTA)
+        and "body" in snapshot
+    )
+
+
+def _relabel_body(
+    body: dict[str, Any], instance_id: str, timeline_id: str, session_map: dict[str, str]
+) -> dict[str, Any]:
+    """物化正文的本地标识改写：运行载荷归到新实例 / 新线，对话行归到新会话。
+
+    会话映射不到的对话行直接丢掉（不往新库里塞指向不存在会话的行）。
+    """
+    rows = dict(body)
+    rows["runtime"] = _relabel_payload(dict(body.get("runtime") or {}), instance_id, timeline_id)
+    dialog: list[dict[str, Any]] = []
+    for row in body.get("dialog") or []:
+        if not isinstance(row, dict):
+            continue
+        session_id = session_map.get(str(row.get("session_id") or ""))
+        if session_id is None:
+            continue
+        dialog.append({**row, "session_id": session_id})
+    rows["dialog"] = dialog
+    return rows
+
+
+def _relabel_delta(
+    body: dict[str, Any], instance_id: str, timeline_id: str, session_map: dict[str, str]
+) -> dict[str, Any]:
+    """delta 正文里的行按同一条规则改写（不物化、不重编码）。
+
+    行键（`id:…` / `message_id:…` / `seq:…`）只由行自己的主键字段算出，改写
+    `instance_id` / `timeline_id` / `session_id` 不改键，所以 `order` / `deleted` 照旧可用；
+    会话映射不到的对话行从 added / replaced 里去掉（与物化正文同一口径）。
+    """
+    out = dict(body)
+    sections: dict[str, Any] = {}
+    for name, part in (body.get("sections") or {}).items():
+        if not isinstance(part, dict):
+            continue
+        piece = dict(part)
+        for bucket in ("added", "replaced"):
+            kept: list[dict[str, Any]] = []
+            for row in part.get(bucket) or []:
+                if not isinstance(row, dict):
+                    continue
+                item = dict(row)
+                if "instance_id" in item:
+                    item["instance_id"] = instance_id
+                if "timeline_id" in item:
+                    item["timeline_id"] = timeline_id
+                if "session_id" in item:
+                    session_id = session_map.get(str(item.get("session_id") or ""))
+                    if session_id is None:
+                        continue  # 会话没导进来，这行不留
+                    item["session_id"] = session_id
+                kept.append(item)
+            piece[bucket] = kept
+        sections[str(name)] = piece
+    out["sections"] = sections
+    return out
+
+
+def _stored_snapshot_payload(
+    snapshot: dict[str, Any],
+    *,
+    base_commit_id: str,
+    commit_map: dict[str, str],
+    instance_id: str,
+    timeline_id: str,
+    session_map: dict[str, str],
+) -> tuple[str, str]:
+    """把容器里的一条快照还原成**库内存储形态**的 `(payload, base_commit_id)`（§7.1 / §7.3）。
+
+    delta 的 base 是导出端的提交标识，这里按 `commit_map` 重映射到新提交标识；
+    base 找不到（提交闭包不完整）即拒绝导入，不静默留一条链断掉的快照。
+    """
+    kind = str(snapshot.get("kind") or _versioning().SNAPSHOT_FULL)
+    if kind == _versioning().SNAPSHOT_DELTA:
+        old_base = str(base_commit_id or snapshot.get("base") or "")
+        new_base = commit_map.get(old_base, "")
+        if not old_base or not new_base:
+            raise InstanceError(
+                f"导入件的提交闭包不完整：提交 {old_base or '（缺失）'} 没有随件（delta 链断在这里）"
+            )
+        body = snapshot.get("body") if isinstance(snapshot.get("body"), dict) else {}
+        relabeled = _relabel_delta(body, instance_id, timeline_id, session_map)
+        return _versioning().dump_snapshot(relabeled, kind=_versioning().SNAPSHOT_DELTA, base=new_base), new_base
+    body = snapshot.get("body") if isinstance(snapshot.get("body"), dict) else snapshot
+    return _versioning().dump_snapshot(_relabel_body(body, instance_id, timeline_id, session_map)), ""
+
+
 def _restore_commit_snapshots(
     store: Store,
     instance_id: str,
@@ -442,8 +609,11 @@ def _restore_commit_snapshots(
 ) -> int:
     """提交快照随件恢复（§7.1 提交闭包）：导入件的回滚 / 分叉不丢历史。
 
-    快照内部的本地标识要按新实例改写：运行载荷走 store 的载荷改写，对话行的会话标识走会话映射；
-    映射不到的对话行直接丢掉（不往新库里塞指向不存在会话的行）。
+    - 容器里是**存储形态**（新导出件）：原样写回并按 base 重建 delta 链（P0-5 / P1-14），
+      不做物化、不重新编码；只把链上的提交标识换成导入端的新标识；
+    - 容器里是**物化正文**（老导出件）：按老口径改写本地标识后整条写回（§7.3 兼容旧容器）；
+    - 容器没带快照的提交（例如只有管理元数据、没有提交的无闭包容器补出的那条初始提交）：
+      就地补一份全量，保证「回滚到创建点 / 从创建提交分叉」在新库里仍然可用。
     """
     written = 0
     for item in runtime.get("commits") or []:
@@ -455,21 +625,35 @@ def _restore_commit_snapshots(
         snapshot = item.get("snapshot")
         if not new_commit or not new_timeline or not isinstance(snapshot, dict):
             continue
-        rows = dict(snapshot)
-        rows["runtime"] = _relabel_payload(
-            dict(snapshot.get("runtime") or {}), instance_id, new_timeline
-        )
-        dialog: list[dict[str, Any]] = []
-        for row in snapshot.get("dialog") or []:
-            if not isinstance(row, dict):
-                continue
-            session_id = session_map.get(str(row.get("session_id") or ""))
-            if session_id is None:
-                continue
-            dialog.append({**row, "session_id": session_id})
-        rows["dialog"] = dialog
-        store.commit_snapshot_put(new_commit, instance_id, json.dumps(rows, ensure_ascii=False))
+        if _is_stored_form(snapshot):
+            payload, base = _stored_snapshot_payload(
+                snapshot,
+                base_commit_id=str(item.get("base_commit_id") or ""),
+                commit_map=commit_map,
+                instance_id=instance_id,
+                timeline_id=new_timeline,
+                session_map=session_map,
+            )
+        else:  # 老容器：物化正文
+            payload, base = _versioning().dump_snapshot(
+                _relabel_body(snapshot, instance_id, new_timeline, session_map)
+            ), ""
+        store.commit_snapshot_put_stored(new_commit, instance_id, payload, base_commit_id=base)
         written += 1
+    # 没有随件快照的提交（极简容器补出的那条）：就地补一份全量——这里运行状态已经装载完，
+    # 快照反映的就是导入后的水位；不补的话该提交回滚 / 分叉都不可用。
+    versioning = _versioning()
+    for row in store.commit_list(instance_id):
+        commit_id = str(row["id"])
+        if store.commit_snapshot_stored(commit_id) is not None:
+            continue
+        store.commit_snapshot_put_stored(
+            commit_id,
+            instance_id,
+            versioning.dump_snapshot(
+                versioning.snapshot_of(store, instance_id, str(row["timeline_id"]))
+            ),
+        )
     return written
 
 

@@ -20,6 +20,11 @@ from . import ump
 from .ump import Envelope, UmpError
 from .version import APP_VERSION, DEFAULT_MAX_PARTS, DEFAULT_MAX_TEXT_LEN
 
+#: 客户端接收队列上限（CHANNEL_PROTOCOL_APPENDIX ⑤）：默认 256 帧。
+#: 标定口径见 `_queue_limit`：取「一条正文最坏分帧数」（协商 `max_text_len`，
+#: 流式最坏一码点一帧）与 256 的较小值。
+DEFAULT_QUEUE_MAX = 256
+
 
 @dataclass
 class UmpClient:
@@ -35,13 +40,20 @@ class UmpClient:
     streaming: bool = False
     max_text_len: int = DEFAULT_MAX_TEXT_LEN
     max_parts: int = DEFAULT_MAX_PARTS
+    #: 接收队列上限（帧）：有界，队满只丢增量，固化帧 / 回执 / error 一律不丢（附录 ⑤）
+    queue_max: int = DEFAULT_QUEUE_MAX
 
     #: 握手结果（含核心签发的持久凭据）
     hello_ack: dict[str, Any] | None = None
     negotiated: dict[str, Any] = field(default_factory=dict)
     _ws: Any = None
     _pump: asyncio.Task[Any] | None = None
-    _queue: asyncio.Queue[Envelope] = field(default_factory=asyncio.Queue)
+    _queue: asyncio.Queue[Envelope] | None = None
+    #: 观测计数：因队满被丢掉的增量帧（固化帧从不计入这里）
+    dropped_deltas: int = 0
+
+    def __post_init__(self) -> None:
+        self._queue = asyncio.Queue(maxsize=max(1, int(self.queue_max)))
 
     async def connect(self, *, timeout: float = 15.0) -> dict[str, Any]:
         self._ws = await connect(
@@ -80,13 +92,37 @@ class UmpClient:
         self.negotiated = ack.payload.get("negotiated", {})
         return ack.payload
 
+    def _queue_limit(self) -> int:
+        """生效的队列上限：`min(queue_max, 一条正文最坏分帧数)`（附录 ⑤ 的标定口径）。
+
+        流式最坏情形是一条正文一码点一帧，所以「最坏分帧数」取协商 `max_text_len`
+        （未协商时取本端声明值）；与 256 取较小值，因此收紧 `max_text_len` 的
+        客户端也不会为一条回复囤更多帧。
+        """
+        worst = int((self.negotiated or {}).get("max_text_len") or self.max_text_len or 0)
+        return max(1, min(int(self.queue_max), worst or int(self.queue_max)))
+
+    async def _enqueue(self, envelope: Envelope) -> None:
+        """入队（附录 ⑤）：队满**只丢增量**，固化 `reply` / `delivery` / `error` 一律不丢。
+
+        非增量帧宁可阻塞读取（`await queue.put`）让发送侧背压，也不「丢掉最新的固化帧」。
+        """
+        queue = self._queue
+        if queue is None:  # pragma: no cover - 仅在手工构造时可能
+            return
+        if envelope.type in ump.DELTA_TYPES and queue.qsize() >= self._queue_limit():
+            self.dropped_deltas += 1
+            return
+        await queue.put(envelope)
+
     async def _read_loop(self) -> None:
         try:
             async for raw in self._ws:
                 try:
-                    await self._queue.put(ump.parse(raw, direction="s2c"))
+                    envelope = ump.parse(raw, direction="s2c")
                 except UmpError:
                     continue
+                await self._enqueue(envelope)
         except ConnectionClosed:
             pass
 
@@ -98,11 +134,12 @@ class UmpClient:
         collect: list[Envelope] | None = None,
     ) -> Envelope:
         """等待满足条件的信封；不满足的照原样放进 collect（供调用方自行处理）。"""
+        queue = self._queue if self._queue is not None else asyncio.Queue()
         deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
         while True:
             remaining = None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
             try:
-                envelope = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                envelope = await asyncio.wait_for(queue.get(), timeout=remaining)
             except asyncio.TimeoutError as exc:
                 raise TimeoutError("等待信封超时") from exc
             if predicate(envelope):

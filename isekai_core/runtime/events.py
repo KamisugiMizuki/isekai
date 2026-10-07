@@ -138,9 +138,12 @@ def draw_slot(
 
 
 def unmet_preconditions(
-    preconditions: Iterable[str], *, events: set[str], effects: set[str]
+    preconditions: Iterable[str], *, events: Any, effects: Any
 ) -> list[str]:
     """前置条件：已登记的背景内容默认成立；指向事件 / 后果的必须有实际记录（§3.1）。
+
+    `events` / `effects` 只做 `in` 判定——可以是 `set`，也可以是补算期按候选查主键的惰性集合
+    （`service._LazyIdSet`，§2.6）：不允许为了判定而预载全部历史 id。
 
     没有合法候选就不发生——不为凑密度凭空添加实体或违反世界规则。
     """
@@ -161,8 +164,8 @@ def plan_day(
     rules_version: str,
     day_index: int,
     calendar: Any,
-    events: set[str],
-    effects: set[str],
+    events: Any,
+    effects: Any,
 ) -> list[dict[str, Any]]:
     """当日候选：固定事件先占名额，再用剩余额度取随机槽；前置条件不足者不发生（§四）。"""
     density = str((package.get("events") or {}).get("density") or "稀疏")

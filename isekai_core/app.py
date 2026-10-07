@@ -277,8 +277,13 @@ async def run_core(cfg: Config, *, print_ready: bool = True, parent_pid: int | N
             if resumed_plugins:
                 log.info("plugins resumed=%s", resumed_plugins)
         if runtime.world is not None:
-            # 恢复：只对中断前激活的线补算，冻结线不补（§2.6）
-            resumed = runtime.world.catch_up_all(now_real=time.time())
+            # 恢复：只对中断前激活的线补算，冻结线不补（§2.6）。
+            # 离线间隔用时间盒一次排完（批数硬闸只防病态输入），不再固定 8 批一批批挪。
+            resumed = runtime.world.catch_up_all(
+                now_real=time.time(),
+                max_batches=runtime.world.catch_up_tick_batches,
+                budget_seconds=runtime.world.catch_up_budget_seconds,
+            )
             if resumed:
                 log.info("resumed timelines=%s", ",".join(resumed))
             ticker = asyncio.create_task(_clock_tick(runtime, stop))
@@ -343,12 +348,17 @@ async def _derived_pass(runtime: Runtime, active: list[tuple[str, str]]) -> None
             )
     except Exception:
         log.exception("intent proposal pass failed")
-    # 证据充分后提取记忆：有界、按现实日预算、失败留待处理（§4.1）
+    # 证据充分后提取记忆：额度按**世界时间**给（MEMORY_SPEC §5.2 第 0 条，积压顺延），
+    # 现实日预算由 reserve_call 在调用时作为安全上限兜住；失败留待处理（§4.1）
     try:
         for instance_id, timeline_id in active:
             runtime.world.queue_world_sources(instance_id, timeline_id)
             await runtime.world.extract_memories(
-                instance_id, timeline_id, llm=runtime.llm, now_real=time.time(), limit=6
+                instance_id,
+                timeline_id,
+                llm=runtime.llm,
+                now_real=time.time(),
+                limit=runtime.world.extraction_allowance(instance_id, timeline_id),
             )
             # 积压汇总：世界时间跑得比现实预算快，没有这一步积压只会越长越大（§4.1）
             await runtime.world.compact_backlog(
@@ -399,7 +409,11 @@ async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float 
                 pair for pair in runtime.world.active_timelines() if runtime.world.compatible(pair[0])
             ]
             try:
-                runtime.world.catch_up_all(now_real=time.time(), max_batches=4)
+                runtime.world.catch_up_all(
+                    now_real=time.time(),
+                    max_batches=runtime.world.catch_up_tick_batches,
+                    budget_seconds=runtime.world.catch_up_budget_seconds,
+                )
             except Exception:  # 推进失败不该让核心退出
                 log.exception("clock tick failed")
             # 自动提交（§5.1）：现实间隔或新增事件数到阈值，可配置可关

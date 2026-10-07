@@ -28,6 +28,22 @@ def _source_name(package: dict[str, Any], source_id: str | None) -> str:
     return "无来源" if not source_id else str(source_id)
 
 
+def region_label(package: dict[str, Any], region: str) -> str:
+    """区域引用键 → 显示名（WORLD_PACKAGE_APPENDIX ④）。
+
+    卡片的 `region` 是**引用键**（`world.regions[].id`），进提示词前必须换成名称；
+    查不到（旧包没有区域登记）就原样返回，不编造、不改写匹配用的标识。
+    """
+    key = str(region or "")
+    if not key:
+        return ""
+    world = package.get("world") if isinstance(package.get("world"), dict) else {}
+    for item in world.get("regions") or []:
+        if isinstance(item, dict) and str(item.get("id") or "") == key:
+            return str(item.get("name") or key)
+    return key
+
+
 def _index(items: Any) -> dict[str, dict[str, Any]]:
     return {str(item.get("id")): item for item in items or [] if isinstance(item, dict)}
 
@@ -163,8 +179,19 @@ def knowledge_slice(
         deduped.append(item)
     out = list(reversed(deduped))
     if topic:
+        # 主题命中**优先保留**（§13.1 只排序不过滤）：命中先占额度，其余按最近补足。
+        # 不能先排序再取末尾切片——那样取走的恰好是非命中项，命中会被整体丢掉。
         needle = topic.strip().lower()
-        out.sort(key=lambda item: 0 if needle and needle in str(item.get("text", "")).lower() else 1)
+        hits: list[dict[str, Any]] = []
+        rest: list[dict[str, Any]] = []
+        for item in out:
+            if needle and needle in str(item.get("text", "")).lower():
+                hits.append(item)
+            else:
+                rest.append(item)
+        if len(hits) >= limit:
+            return hits[-limit:]
+        return hits + rest[-(limit - len(hits)):]
     return out[-limit:]
 
 
@@ -276,7 +303,8 @@ def play_context(
             "gender": str(identity.get("gender") or ""),
             "occupation": str(identity.get("occupation") or ""),
             "self_identity": str(identity.get("self_identity") or ""),
-            "region": str(card.get("region") or ""),
+            "region": region_label(package, str(card.get("region") or ""))
+            or region_label(package, str((card.get("identity") or {}).get("region") or "")),
             "appearance": str(card.get("appearance") or ""),
         },
         "self_knowledge": str((card.get("background") or {}).get("self_knowledge") or ""),

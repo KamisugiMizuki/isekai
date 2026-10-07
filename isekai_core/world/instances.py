@@ -13,7 +13,6 @@ import secrets
 import sqlite3
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 from ..log import get_logger
@@ -23,6 +22,7 @@ from . import converters
 from .cards import validate_assembly
 from .package import (
     PackageError,
+    atomic_write_text,
     clone_package,
     ensure_original_name,
     normalize_name,
@@ -72,18 +72,26 @@ def create_instance(
     extra_setting: dict[str, Any] | None = None,
     timelines: list[dict[str, Any]] | None = None,
     commits: list[dict[str, Any]] | None = None,
+    validated: bool = False,
+    materialize_snapshots: bool = True,
 ) -> dict[str, Any]:
     """从世界包与已确认角色卡创建实例；校验不通过即失败且不留半个实例。
 
     `timelines` / `commits` 预留给导入路径：导入要在同一次原子写入里恢复时间线与提交行。
+
+    - `validated=True`：调用方（导入的隔离暂存阶段）已完成 `validate_package` +
+      `validate_assembly`，这里不把同一套逐卡校验与包级 id 集重建再跑一轮（§7.3 一次过，P1-14）；
+    - `materialize_snapshots=False`：调用方随后按容器内容写入提交快照，创建期不为每条提交
+      现合成一份全量快照再被覆盖（纯白做功，§7.3 / P0-5）。
     """
-    errors = validate_package(package)
-    if errors:
-        raise InstanceError(errors)
+    if not validated:
+        errors = validate_package(package)
+        if errors:
+            raise InstanceError(errors)
+        errors = validate_assembly(package, cards, moment=int(package["calendar"]["initial_moment"]))
+        if errors:
+            raise InstanceError(errors)
     moment = int(package["calendar"]["initial_moment"])
-    errors = validate_assembly(package, cards, moment=moment)
-    if errors:
-        raise InstanceError(errors)
 
     original = ensure_original_name(package)
     # 显示名创建时从**原始名称**复制一次；之后改世界包显示名不生效（§7.2）
@@ -173,19 +181,22 @@ def create_instance(
         else:
             raise InstanceError("实例名称分配失败：并发冲突过多，请重试")
     # 每个提交都要自带快照（§7.1 提交闭包）：创建期的初始提交同样得能回滚 / 分叉，
-    # 否则「回滚到创建点」「从创建提交分叉」在本地实例上就已经不可用
-    from ..runtime import versioning  # 局部导入：versioning 在 runtime 层，顶层导入会成环
+    # 否则「回滚到创建点」「从创建提交分叉」在本地实例上就已经不可用。
+    # 导入路径不在这里合成（materialize_snapshots=False）：快照由容器内容按存储形态一次性写入，
+    # 先合成再被覆盖是纯白做功（§7.3，P1-14 / P0-5）。
+    if materialize_snapshots:
+        from ..runtime import versioning  # 局部导入：versioning 在 runtime 层，顶层导入会成环
 
-    for item in commit_rows:
-        if store.commit_snapshot_get(str(item["id"])) is not None:
-            continue
-        store.commit_snapshot_put(
-            str(item["id"]),
-            instance_id,
-            json.dumps(
-                versioning.snapshot_of(store, instance_id, str(item["timeline_id"])), ensure_ascii=False
-            ),
-        )
+        for item in commit_rows:
+            if store.commit_snapshot_get(str(item["id"])) is not None:
+                continue
+            store.commit_snapshot_put(
+                str(item["id"]),
+                instance_id,
+                json.dumps(
+                    versioning.snapshot_of(store, instance_id, str(item["timeline_id"])), ensure_ascii=False
+                ),
+            )
     created = store.instance_get(instance_id)
     created = store.instance_get(instance_id)
     assert created is not None, f"实例创建后读不回来：{instance_id}"
@@ -414,10 +425,12 @@ def load_cards(package: dict[str, Any], card_paths: list[str]) -> list[dict[str,
 
 
 def save_card(path: str, card: dict[str, Any]) -> None:
-    """角色卡只保存最终确认版本：确认后写入，不保留生成历史。"""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)  # 首次导入时创作目录可能还不存在
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(card, ensure_ascii=False, indent=2))
+    """角色卡只保存最终确认版本：确认后写入，不保留生成历史。
+
+    与包 / 草稿共用同一条原子规则（§2.4，P2-12）：同目录临时文件 → `fsync` → `os.replace`，
+    中途失败不截断、不覆盖已确认版本。
+    """
+    atomic_write_text(path, json.dumps(card, ensure_ascii=False, indent=2))
 
 
 __all__ = [

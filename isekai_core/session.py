@@ -11,6 +11,7 @@ import json
 import random
 import secrets
 import time
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from . import ump
@@ -29,6 +30,24 @@ SEND_TIMEOUT_S = 15.0
 #: 睡眠期等待到点后的状态表述（§4.5）：只进生成上下文，不展示给用户，也不暴露内部睡眠状态。
 SLEEP_REPLY_HINT = "（她此刻还在睡：只答一句短暂、朦胧的话，不要说她起身、做事或者已经清醒。）"
 WAKE_REPLY_HINT = "（她已经醒了：按清醒状态回答，可以回一句刚才还睡着，但不要用睡意否认这段时间里世界已经推进。）"
+
+#: 唤醒调度余量（§4.5）：把等待封顶在「距窗口结束」时留一点点余量，
+#: 免得刚好卡在窗口边界上又要重解析一次（等待本身不承诺送达时刻）。
+WAKE_MARGIN_S = 0.2
+
+
+@dataclass
+class _Gate:
+    """输入分类闸的进行态（SESSION_CORE_SPEC §4.2「确定性判定优先」）。
+
+    - `verdict` 有值：这一轮已经定论（确定性词表命中，或会话作用域里复用到的判定）；
+    - `task` 有值：词表给不出结论，模型判定这一次已经在后台跑（与生成准备并行）；
+    - `active=False`：本轮不走分类闸（占位会话 / 空文本 / 明确「仅作为联络发送」）。
+    """
+
+    verdict: dict[str, Any] | None = None
+    task: "asyncio.Task[Any] | None" = None
+    active: bool = False
 
 #: (channel_id, thread_id, envelope) -> 是否已发出
 Deliver = Callable[[str, str, dict[str, Any]], Awaitable[bool]]
@@ -332,9 +351,19 @@ class SessionService:
             batch = await self._wait_and_collect(row)
             if batch is None:  # 等待期间已失效：不生成、不投递
                 return
-            if await self._story_gate(batch):  # 结构性请求转交：这一轮不生成角色回复
-                return
-            await self._generate(batch[0], batch=batch)
+            # 分类闸：确定性判定当场定论（转交这类结构请求不进生成），
+            # 只有词表给不出结论时才起一次模型判定——那一次与生成准备并行（见 `_generate`）。
+            gate = self._story_gate(batch)
+            try:
+                if gate.verdict is not None and gate.verdict.get("handoff"):
+                    # 结构性请求转交：这一轮不生成角色回复（结算在此完成，不留给后台任务）
+                    await self._story_handoff(batch, gate.verdict)
+                    return
+                await self._generate(batch[0], batch=batch, gate=gate)
+            finally:
+                # 判定还没被消费就出事的路径（状态写失败等）：不留悬空任务
+                if gate.task is not None and not gate.task.done():
+                    gate.task.cancel()
 
     # ---------- OC 故事层（OC_STORY_LAYER_SPEC §3.4 / §五） ----------
 
@@ -370,45 +399,75 @@ class SessionService:
             log.exception("story contract failed session=%s", row.get("session_id"))
             return ""
 
-    async def _story_gate(self, rows: list[dict[str, Any]]) -> bool:
-        """分类闸：请求改变世界 / 版本操作 / TRPG 行动停在转交状态，不发送假装执行过的回复。
+    def _story_gate(self, rows: list[dict[str, Any]]) -> _Gate:
+        """分类闸（§3.4 / §4.2「确定性判定优先」）：**同步**定论 + 必要时起一次模型判定。
 
-        返回 True 表示这一轮已按转交结算。分类只决定走哪条路、不改变权限：转交也不写世界，
-        只是把这一轮从普通联络里拿出去（§3.4）。带 `as_contact` 意图的批次跳过分类、
-        按联络分享处理（§6.3「仅作为联络发送」）。
+        返回 `_Gate`：确定性词表能定论就把结论放进 `verdict`（命中转交类目的当场结算，
+        不生成角色回复）；只有词表给不出结论时才起一次模型判定任务放进 `task`，
+        由 `_generate` 在组装（取快照 / 记忆召回 / 向量）之后等它——**这次调用不构成
+        串行首字延迟**。带 `as_contact` 意图的批次跳过分类、按联络分享处理
+        （§6.3「仅作为联络发送」）。
         """
         story = getattr(self, "story", None)
         row = rows[0]
         session = self.store.session_get(str(row["session_id"])) or {}
         instance_id = str(session.get("instance_id") or "")
         if story is None or not instance_id or instance_id.startswith("ph-"):
-            return False
+            return _Gate()
         text = _batch_text(rows)
         if not str(text or "").strip():
-            return False
+            return _Gate()
         # 「仅作为联络发送」（USER_INTERFACE_DESIGN §6.3）：客户端把明确意图随新消息带上，
         # 核心只拿它改变分类——这一轮按普通联络正常生成回复，不判转交、不执行其中的操作。
         # 权限不变：认知与写入权限与不带该意图时完全一致。
         # 取舍（已知边界）：混合批次里只要任一行带该意图，整批都按联络处理（合并批内不做逐行分流）。
         if any(str(item.get("intent") or "") == "as_contact" for item in rows):
             self._story_turns[int(row["seq"])] = {"category": "contact_share"}
-            return False
-        try:
-            verdict = await story.classify(
+            return _Gate()
+        timeline_id = str(session.get("timeline_id") or "")
+        character_id = str(session.get("character_id") or "")
+        verdict = story.classify_now(
+            text, instance_id=instance_id, timeline_id=timeline_id, character_id=character_id
+        )
+        if verdict is not None:  # 确定性判定 / 会话作用域复用：就此定论，不调模型
+            if not verdict.get("handoff"):
+                self._story_turns[int(row["seq"])] = dict(verdict)
+            return _Gate(verdict=verdict, active=True)
+        task = asyncio.create_task(
+            story.classify(
                 text,
                 llm=self.llm,
                 instance_id=instance_id,
-                timeline_id=str(session.get("timeline_id") or ""),
-                character_id=str(session.get("character_id") or ""),
+                timeline_id=timeline_id,
+                character_id=character_id,
             )
-        except Exception:  # 分类不可用不得阻断对话：分不清就当她听见了
-            log.exception("story classify failed seq=%s", row.get("seq"))
-            return False
-        if not verdict.get("handoff"):
-            self._story_turns[int(row["seq"])] = dict(verdict)
-            return False
-        await self._story_handoff(rows, verdict)
-        return True
+        )
+        return _Gate(task=task, active=True)
+
+    async def _story_gate_settle(
+        self, gate: _Gate | None, rows: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """等后台判定（如果有）并结算转交；返回 (本轮判定, 是否已按转交结算)。
+
+        转交轮不生成角色回复：把入站标 cancelled 并以 system_notice 说明（不冒充她的回复）。
+        判定不可用不得阻断对话（分不清就当她听见了），因此这里不抛错。
+        """
+        if gate is None or not gate.active:
+            return (gate.verdict if gate is not None else None), False
+        verdict = gate.verdict
+        if verdict is None and gate.task is not None:
+            try:
+                verdict = await gate.task
+            except Exception:  # 分类不可用不得阻断对话：分不清就当她听见了
+                log.exception("story classify failed seq=%s", rows[0].get("seq"))
+                return None, False
+        if verdict is None:
+            return None, False
+        if verdict.get("handoff"):
+            await self._story_handoff(rows, verdict)
+            return dict(verdict), True
+        self._story_turns[int(rows[0]["seq"])] = dict(verdict)
+        return dict(verdict), False
 
     async def _story_handoff(self, rows: list[dict[str, Any]], verdict: dict[str, Any]) -> None:
         """转交结算：入站标 cancelled，说明以 system_notice 上线——不冒充她的回复。
@@ -458,7 +517,7 @@ class SessionService:
         session = self.store.session_get(str(row["session_id"])) or {}
         if not self._sleeping_now(session):
             return [row]
-        deadline = self.store.inbound_claim_deadline(int(row["seq"]), delay=self._sleep_delay())
+        deadline = self.store.inbound_claim_deadline(int(row["seq"]), delay=self._sleep_delay(session))
         row = self.store.message_get(int(row["seq"])) or row  # 取回已持久化截止点的行
         remaining = deadline - time.time()
         if remaining > 0:
@@ -478,7 +537,9 @@ class SessionService:
             return None
         return batch
 
-    async def _generate(self, row: dict[str, Any], *, batch: list[dict[str, Any]] | None = None) -> None:
+    async def _generate(
+        self, row: dict[str, Any], *, batch: list[dict[str, Any]] | None = None, gate: _Gate | None = None
+    ) -> None:
         rows = list(batch or [row])
         seqs = [int(item["seq"]) for item in rows]
         started = time.monotonic()
@@ -489,13 +550,23 @@ class SessionService:
         await self._status(row, "thinking")
         try:
             query_vector = await self._query_vector(rows)
-            messages, recalled, unit = self._build_messages(rows, query_vector=query_vector)
+            if gate is None or gate.task is None:
+                # 判定已定论（或本轮不走分类闸）：一次组装到位
+                messages, recalled, unit = self._build_messages(rows, query_vector=query_vector)
+            else:
+                # 判定还在飞：先把重活（一致快照 / 记忆召回 / 向量查询）做完，
+                # 再等判定结果补上表达契约——那次判定调用因此与生成准备并行，不占首字延迟。
+                prompt, recalled, unit = self._system_prompt_with_memory(rows, query_vector=query_vector)
+                _verdict, handed_off = await self._story_gate_settle(gate, rows)
+                if handed_off:
+                    return  # 转交已在结算里完成说明：不生成、不投递角色回复
+                messages = self._finalize_messages(rows, prompt=prompt)
             self._recalled = list(recalled)
             if self._caps(row["channel_id"]).get("streaming") and hasattr(self.llm, "chat_stream"):
                 text = await self._stream_reply(row, message_id=message_id, messages=messages)
             else:
                 text = await self.llm.chat(messages)
-            text, audit_findings = await self._audit_or_retry(unit, text, messages)
+            text, audit_findings = await self._audit_or_retry(unit, text)
         except LLMError as exc:
             log.warning(
                 "generation failed seq=%s stage=%s code=%s elapsed=%.1fs",
@@ -570,10 +641,14 @@ class SessionService:
         await self._send_batches(msg)
         await self._status(row, "idle")
 
-    async def _audit_or_retry(
-        self, unit: dict[str, Any] | None, text: str, messages: list[dict[str, Any]]
-    ) -> tuple[str, list[dict[str, Any]]]:
+    async def _audit_or_retry(self, unit: dict[str, Any] | None, text: str) -> tuple[str, list[dict[str, Any]]]:
         """问答轮的后验检查（NARRATIVE_LAYER §6.2 落地口径）：不过就加严重试一次。
+
+        - **确定性判定优先**：结构与引用可比对的问题在运行层本地判定（`narrative.audit`），
+          模型只在确定性规则无法结论时兜底一次（含数字的正文不再整体跳过语义审计）；
+          跳过整个语义审计只允许「本轮没有注入候选块」——那由上面的 `not unit` 早退覆盖。
+        - **重试只发差异**（SESSION_CORE_SPEC §4.3）：重试只带上一次产物与本次要改的那一处，
+          不重发完整 prompt、不重放已通过的上下文与原始素材（`narrative.retry_request`）。
 
         与主动路径的差别：这里不能拿用户的问题当筹码（拒答比越界更糟），
         所以第二次仍不过时**照发并把检查结果留档**——管理面能看到这条留痕。
@@ -589,11 +664,8 @@ class SessionService:
         if ok:
             return text, []
         findings = [{"kind": "audit", "detail": str(why or "")}]
-        strict = narrative.strict_note()
-        head = str((messages[0] or {}).get("content") or "")
-        retry_messages = [{"role": "system", "content": f"{head}\n\n{strict}"}, *messages[1:]]
         try:
-            second = await self.llm.chat(retry_messages)
+            second = await self.llm.chat(narrative.retry_request(previous=text, why=str(why or "")))
         except Exception:
             log.exception("turn audit retry failed")
             return text, findings
@@ -722,11 +794,54 @@ class SessionService:
             return Err.STATE_BLOCKED  # 角色已归档（身故）：迟到轮次同样不写回、不投递（§5.7）
         return ""
 
-    def _sleep_delay(self) -> float:
-        """等待一拍的长度：区间来自配置（§4.5 起点 30–120 秒），一批只取一次。"""
+    def _sleep_window_remaining(self, session: dict[str, Any]) -> float | None:
+        """距当前生活线窗口结束还有多久（现实秒）；换算不可得回 None（§4.5）。
+
+        窗口已经是**确定的**结束时刻（`life.current_window` 的 `end`，世界秒），
+        现实剩余 = 世界剩余 / 倍率（`timeline_clock.rate` = 世界秒 / 现实秒）。
+        `rate` 缺失或非正（冻结线、时钟不可读）时返回 None：调用方退回随机拍，
+        并在提交前由 `_sleep_hint` 重新解析窗口（到期按真实状态表达）。
+        """
+        runtime = getattr(self, "runtime", None)
+        instance_id = str(session.get("instance_id") or "")
+        timeline_id = str(session.get("timeline_id") or "")
+        character_id = str(session.get("character_id") or "")
+        if runtime is None or not (instance_id and timeline_id and character_id):
+            return None
+        if instance_id.startswith("ph-"):  # 阶段 0 占位会话：没有生活线，也没有倍率可换算
+            return None
+        try:
+            world_seconds = runtime.world_moment(instance_id, timeline_id)
+            plan = self.store.plan_latest(instance_id, timeline_id, character_id)
+            window = life.current_window(plan, world_seconds)
+            if not window:
+                return None
+            remaining_world = int(window["end"]) - int(world_seconds)
+            if remaining_world <= 0:  # 已经不在这个块里了：不按睡眠期等待
+                return None
+            rate = float((runtime.clock_row(timeline_id) or {}).get("rate") or 0.0)
+            if rate <= 0:  # 高倍率 / 长睡眠块也可能换算不出来：退回随机拍
+                return None
+            return remaining_world / rate
+        except Exception:  # 生活线 / 时钟不可读：不凭现实钟猜（§4.5）
+            log.exception("sleep window unreadable session=%s", session.get("id"))
+            return None
+
+    def _sleep_delay(self, session: dict[str, Any]) -> float:
+        """等待一拍的长度：`min(随机拍, 距生活线窗口结束)`（§4.5）。
+
+        随机拍只用于「在窗口内制造自然分布」，不得让回复越过已知的唤醒时刻——
+        唤醒时刻已经算得出来时，禁止凭随机拖满 30–120 秒。剩余足够长取随机拍，
+        剩余不足取剩余时长（外加极小的调度余量）；换算不可得退回随机拍，
+        到期表达与提交前的窗口复核仍走 `_sleep_hint`。
+        """
         low = max(0.0, float(self.cfg.runtime.sleep_wait_min_s))
         high = max(low, float(self.cfg.runtime.sleep_wait_max_s))
-        return random.uniform(low, high)
+        beat = random.uniform(low, high)
+        remaining = self._sleep_window_remaining(session)
+        if remaining is None:
+            return beat
+        return max(0.0, min(beat, remaining + WAKE_MARGIN_S))
 
     def _sleeping_now(self, session: dict[str, Any]) -> bool:
         """该角色此刻是否处于睡眠块；生活线 / 时钟不可读按未就绪处理——不等待，也不凭现实钟猜（§4.5）。"""
@@ -870,17 +985,14 @@ class SessionService:
             dict(unit) if isinstance(unit, dict) else None
         )
 
-    def _build_messages(
-        self, rows: list[dict[str, Any]], *, query_vector: list[float] | None = None
-    ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any] | None]:
-        """返回 (消息序列, 本轮注入的记忆标识, 本轮叙事单元)；记忆简报只进上下文（§5.1）。
+    def _finalize_messages(self, rows: list[dict[str, Any]], *, prompt: str) -> list[dict[str, Any]]:
+        """把扮演定义收敛成消息序列：表达契约 + 到期口吻 + 历史 + 本轮输入。
 
-        合并批（§4.5）：批内各输入按接受顺序保留自己的原文，合成同一轮的用户侧输入；
-        到期的真实状态（仍睡 / 已醒）作为口吻约束随扮演定义一起进上下文。
+        表达契约要在**分类判定定论之后**才拼（`_story_contract` 读 `self._story_turns`）：
+        判定还在飞时先组装重活、等判定回来再拼这一段，判定调用就不占首字延迟（§4.2）。
         """
         head = rows[0]
         history = self.store.context_window(head["session_id"], self.cfg.context_history_max)
-        prompt, recalled, unit = self._system_prompt_with_memory(rows, query_vector=query_vector)
         contract = self._story_contract(rows)
         if contract:
             prompt = f"{prompt}\n\n{contract}"
@@ -899,7 +1011,18 @@ class SessionService:
                 messages.append({"role": "assistant", "content": _flatten(item["parts"])})
         for item in rows:
             messages.append({"role": "user", "content": _user_content(item["text"] or "", item.get("attachments"))})
-        return messages, recalled, unit
+        return messages
+
+    def _build_messages(
+        self, rows: list[dict[str, Any]], *, query_vector: list[float] | None = None
+    ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any] | None]:
+        """返回 (消息序列, 本轮注入的记忆标识, 本轮叙事单元)；记忆简报只进上下文（§5.1）。
+
+        合并批（§4.5）：批内各输入按接受顺序保留自己的原文，合成同一轮的用户侧输入；
+        到期的真实状态（仍睡 / 已醒）作为口吻约束随扮演定义一起进上下文。
+        """
+        prompt, recalled, unit = self._system_prompt_with_memory(rows, query_vector=query_vector)
+        return self._finalize_messages(rows, prompt=prompt), recalled, unit
 
     # ---------- 投递 ----------
 

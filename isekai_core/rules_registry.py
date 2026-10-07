@@ -76,7 +76,10 @@ def inspect(manifest_path: str | Path) -> dict[str, Any]:
         "entry": entry,
         "modes": [str(item) for item in manifest.get("modes") or []],
         "state_schema": str(manifest.get("state_schema") or ""),
-        "resident": bool(manifest.get("resident")),
+        # P1-8：战役裁定器缺省常驻（显式 `resident: false` 才冷启）。这里报**有效**值，
+        # 另记清单有没有显式声明，免得「缺省常驻」被读成「插件声明了常驻」。
+        "resident": rules_mod.resident_default(manifest),
+        "resident_declared": isinstance(manifest.get("resident"), bool),
         "has_converters": bool(manifest.get("converters")),
         "status": "missing" if missing else "available",
         "reason": missing,

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +27,13 @@ log = get_logger("isekai.story")
 
 #: 判断点的预算任务名（档位见 runtime/budget.py：已接受对话的一环，走高优先级档）
 CLASSIFY_TASK = "story_classify"
-#: 判断点超时：判不出来就按预筛 / 默认兜底，不拖住这一轮
-CLASSIFY_TIMEOUT_S = 8.0
+#: 判断点超时：判不出来就按词表 / 默认兜底，不拖住这一轮。
+#: 2026-10-08（P0-6）收紧 8s → 3s：这次调用已与生成准备（取一致快照、记忆召回、向量查询）并行，
+#: 只压在生成调用的尾部；超时只影响分类精度（退回词表 / 默认），不影响回复正确性，
+#: 因此宁可用短超时把首字延迟钉住。
+CLASSIFY_TIMEOUT_S = 3.0
+#: 分类结果的会话作用域复用上限（同一文本重试 / 重放不重复调，见 `_classify_key`）
+CLASSIFY_CACHE_MAX = 256
 #: 首页带出的最近消息条数（§6.1 角色消息与投递状态）
 HOME_MESSAGES = 8
 #: 首次进入步骤（§4.1 的流程顺序）：标签是产品语言，客户端动作键由客户端映射到具体接口
@@ -53,6 +59,10 @@ class StoryService:
         self.runtime = runtime
         #: 核心服务对象：读 `state` 判断存储是否可用（§4.4 被阻断）
         self.server = server
+        #: 分类结果的会话作用域复用（§4.2：判定结果随本轮作用域向下传递，重试 / 重放不重复调）。
+        #: 值是不含世界状态的纯文本判定，因此可以按 `(实例, 线, 角色, 文本)` 复用；
+        #: 有界 LRU，避免长寿命进程里无限增长。
+        self._classify_cache: OrderedDict[tuple[str, str, str, str], dict[str, Any]] = OrderedDict()
 
     # ---------------------------------------------------------------- 基础读数
 
@@ -344,6 +354,61 @@ class StoryService:
         except Exception:
             log.exception("classify settle failed")
 
+    def _classify_key(
+        self, instance_id: str, timeline_id: str, character_id: str, text: str
+    ) -> tuple[str, str, str, str] | None:
+        """复用键 = 会话作用域 + 归一化文本；没有会话作用域（诊断入口）就不复用。
+
+        分类只取决于这句话本身（§3.4：分类不改变权限、也不读世界状态），所以按
+        `(实例, 线, 角色, 文本)` 复用是安全的；没有作用域的调用（`story.classify`
+        诊断入口不带实例）不复用，免得把不同上下文的判定串在一起。
+        """
+        scope = (str(instance_id or ""), str(timeline_id or ""), str(character_id or ""))
+        if not scope[0] or not scope[1]:
+            return None
+        return (*scope, " ".join(str(text or "").split()))
+
+    def _classify_recall(self, key: tuple[str, str, str, str] | None) -> dict[str, Any] | None:
+        if key is None:
+            return None
+        cached = self._classify_cache.get(key)
+        if cached is None:
+            return None
+        self._classify_cache.move_to_end(key)
+        return dict(cached)
+
+    def _classify_remember(self, key: tuple[str, str, str, str] | None, verdict: dict[str, Any]) -> None:
+        if key is None:
+            return
+        self._classify_cache[key] = dict(verdict)
+        self._classify_cache.move_to_end(key)
+        while len(self._classify_cache) > CLASSIFY_CACHE_MAX:
+            self._classify_cache.popitem(last=False)
+
+    def classify_now(
+        self,
+        text: str,
+        *,
+        instance_id: str = "",
+        timeline_id: str = "",
+        character_id: str = "",
+    ) -> dict[str, Any] | None:
+        """**同步**判定（不调模型）：会话作用域里复用过的判定优先，其次确定性词表，否则 None。
+
+        给会话侧在起生成之前「当场定论」用（§4.2 确定性判定优先）：返回 None 表示
+        确定性规则无法结论，调用方再去问一次模型。命中时顺带写进会话作用域缓存，
+        同一文本重试 / 重放不再判定（§4.2 判定结果随本轮作用域复用）。
+        """
+        body = str(text or "")
+        key = self._classify_key(instance_id, timeline_id, character_id, body)
+        cached = self._classify_recall(key)
+        if cached is not None:
+            return cached
+        instant = classify.decide_instant(body)
+        if instant is not None:
+            self._classify_remember(key, instant)
+        return instant
+
     async def classify(
         self,
         text: str,
@@ -353,14 +418,28 @@ class StoryService:
         timeline_id: str = "",
         character_id: str = "",
     ) -> dict[str, Any]:
-        """定这一轮的唯一主类别（§3.4）：结构性请求走预筛，其余问一次模型，失败兜底。
+        """定这一轮的唯一主类别（§3.4 / §4.2）：确定性判定优先，只有它给不出结论才问一次模型。
+
+        顺序与口径：
+
+        1. 会话作用域里复用过的判定（同一文本重试 / 重放）直接返回，不再判定、不再花调用；
+        2. 确定性词表（结构 / 绑定 / 显式命令 / 追问 / 询问）能定论 → 直接返回，**不调模型**；
+        3. 词表给不出结论 → 问一次模型（这次调用由会话侧与生成准备并行，见 `session.py`）；
+        4. 模型不可用 / 判不出来 → 退回词表（若命中）或按联络分享兜底。
 
         分类**不改变权限**：返回值只说明走哪条路，`handoff` 也只是「这一轮不在普通联络里执行」。
         """
         body = str(text or "")
-        if classify.prefilter(body) in classify.HANDOFF_TARGETS:
-            return classify.decide(body)  # 预筛硬命中：省一次调用
+        key = self._classify_key(instance_id, timeline_id, character_id, body)
+        cached = self._classify_recall(key)
+        if cached is not None:
+            return cached
+        instant = classify.decide_instant(body)
+        if instant is not None:
+            self._classify_remember(key, instant)
+            return instant
         model: tuple[str, str] | None = None
+        model_failed = False
         if llm is not None:
             prompt = classify.classify_request(body)
             prompt_text = "\n".join(str(item.get("content") or "") for item in prompt)
@@ -371,11 +450,13 @@ class StoryService:
                 raw = await llm.chat(prompt, temperature=0.0, timeout=CLASSIFY_TIMEOUT_S, thinking="disabled")
             except Exception:
                 log.info("classify call failed instance=%s character=%s", instance_id, character_id)
+                model_failed = True
                 self._settle_classify(reservation, prompt_text=prompt_text, reply="", outcome="error")
             else:
                 self._settle_classify(reservation, prompt_text=prompt_text, reply=str(raw or ""))
                 model = classify.parse_classify(raw)
-        verdict = classify.decide(body, model=model)
+        verdict = classify.decide(body, model=model, model_failed=model_failed)
+        self._classify_remember(key, verdict)
         log.debug(
             "classify category=%s source=%s character=%s", verdict["category"], verdict["source"], character_id
         )

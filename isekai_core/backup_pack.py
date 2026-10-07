@@ -3,12 +3,16 @@
 用户的搬运单位是**一份 ZIP**：一致读的数据库快照 + 受管素材 + 非敏感偏好 + 完整性清单。
 旧格式（数据库 + 配对素材 zip）不由这里产出，只在需要时按「导入旧备份」识别。
 
-一致性怎么来的：
+一致性怎么来的（2026-10-08，P1-20 收窄静默窗口）：
   * 数据库走 SQLite 在线备份 API（`Store.backup_create`），核心在跑也拿到一致快照；
-  * 打包期间用 `quiet()` 挂起世界推进（`app._clock_tick` 看 `PAUSE` 这个旗标），
-    素材与库因此来自同一时点；
-  * 残留窗口：打包的几秒内用户正好经管理面写东西，仍按受管单写者模型处理——
-    库快照始终一致，素材复制是「同一进程内、几乎同时」，不做额外锁。
+  * **静默窗口只覆盖「库快照那一刻」**：`quiet()` 里只做两件元数据 / 顺序拷贝级的事——
+    取库快照 + 把受管素材**复制**成一份只读快照，两者因此严格同一时点；
+  * **素材的压缩在窗口外做**：出窗口后再把库快照与素材快照打成 zip（DEFLATE 是整包里最慢的一段），
+    这段时间世界推进照常（`app._clock_tick` 不再看 `PAUSE`）；
+  * 不用硬链接做素材快照：库里对素材的写入是就地 `"w"` 截断重写（见 P2-12），
+    硬链接与源文件共享同一个 inode，窗口外的重写会污染「已取好的快照」——先复制再压缩才真的同一时点；
+  * 残留窗口：打包期间用户正好经管理面写东西，仍按受管单写者模型处理——
+    库快照与素材快照都取在同一个静默窗口内，之后的新写入属于下一份备份。
 
 切换（§9.2）不是解包覆盖：先暂存并逐件校验，再留恢复前完整副本，然后换单元；
 换完打开失败就回退到恢复前单元并留记录。启动时 `resume_pending` 处理中断的切换。
@@ -105,6 +109,34 @@ def _asset_files(cfg: Any) -> list[tuple[Path, str]]:
             if path.is_file() and not _skip(path):
                 items.append((path, f"assets/{name}/{path.relative_to(root).as_posix()}"))
     return items
+
+
+def _drop_temp_snapshot(path: Path) -> None:
+    """清掉临时库快照（含 SQLite 的 -wal / -shm 边车文件）：备份目录不留半份文件。"""
+    for candidate in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+        candidate.unlink(missing_ok=True)
+
+
+def _snapshot_assets(cfg: Any, dest: Path) -> list[tuple[Path, str]]:
+    """受管素材的**只读快照**：先复制再压缩（在静默窗口内做，保证与库快照同一时点）。
+
+    返回 [(快照件, 包内相对路径)]，压缩阶段（窗口外）只读这些快照件，不再碰现行目录。
+
+    为什么复制而不是硬链接：库里对素材的写入是就地截断重写（`"w"`，见 P2-12），
+    硬链接与源文件共享 inode，窗口外的重写会连带改掉「已经取好的快照」；
+    复制一份目录项级之后的**字节**才是真的同一时点。复制是顺序 I/O，
+    比 DEFLATE 便宜得多——真正慢的那一段（压缩）已经移出窗口。
+    """
+    out: list[tuple[Path, str]] = []
+    for src, rel in _asset_files(cfg):
+        target = dest / rel
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+        except OSError as exc:
+            raise PackError(f"素材快照失败（{rel}）：{exc}") from exc
+        out.append((target, rel))
+    return out
 
 
 # ------------------------------------------------------------------ 打包
@@ -210,7 +242,8 @@ def write_pack_from(
 ) -> dict[str, Any]:
     """把**另一个数据根**打成一个标准备份包（迁移用：不走现行 store，只读那份数据）。
 
-    与 `write_pack` 同一套容器与清单，所以迁移的「启用」可以直接复用恢复的暂存与切换路径。
+    与 `write_pack` 同一套容器与清单（含「静默窗口只覆盖快照那一刻、压缩在窗口外」的口径），
+    所以迁移的「启用」可以直接复用恢复的暂存与切换路径。
     """
     source_root = Path(source_root)
     db_path = source_root / "data" / "isekai.db"
@@ -221,46 +254,59 @@ def write_pack_from(
     name = f"isekai-{kind}-{stamp}.zip"
     target = dest_dir / name
     tmp = dest_dir / f".{name}.part"
+    snap = dest_dir / f".{name}.db"
+    assets_dir = dest_dir / f".{name}.assets"
     parts: list[dict[str, Any]] = []
-    with quiet():
-        snap = dest_dir / f".{name}.db"
-        try:
+    try:
+        with quiet():
             snapshot = snapshot_db(db_path, snap, note=note or kind)
             if not snapshot.get("ok"):
                 raise PackError("旧目录里的数据库没通过完整性检查，先别迁移")
             counts = _snapshot_counts(snap)
-            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-                _add_file(zf, snap, DB_PART, parts)
-                for folder in ("packages", "exports"):
-                    root = source_root / folder
-                    if not root.is_dir():
+            assets: list[tuple[Path, str]] = []
+            for folder in ("packages", "exports"):
+                root = source_root / folder
+                if not root.is_dir():
+                    continue
+                for path in sorted(root.rglob("*")):
+                    if not path.is_file() or _skip(path):
                         continue
-                    for path in sorted(root.rglob("*")):
-                        if path.is_file() and not _skip(path):
-                            _add_file(zf, path, f"assets/{folder}/{path.relative_to(root).as_posix()}", parts)
-                config_text = ""
-                config_path = source_root / "config" / "config.yaml"
-                if config_path.is_file():
-                    config_text = clean_config_text(config_path.read_text(encoding="utf-8"))
-                _add_bytes(zf, CONFIG_PART, config_text.encode("utf-8"), parts)
-                manifest = {
-                    "format": FORMAT,
-                    "kind": kind,
-                    "note": note,
-                    "created_at": time.time(),
-                    "app_version": "0.1.0",
-                    "schema_version": 1,
-                    "counts": counts,
-                    "parts": parts,
-                    "source_root": str(source_root),
-                    "excluded": ["API 密钥与通道凭据", "进程锁与运行句柄", "日志与缓存", "可执行插件"],
-                }
-                zf.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=2))
-        except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
-            tmp.unlink(missing_ok=True)
-            raise PackError(f"打包旧目录失败：{exc}") from exc
-        finally:
-            snap.unlink(missing_ok=True)
+                    rel = f"assets/{folder}/{path.relative_to(root).as_posix()}"
+                    staged = assets_dir / rel
+                    try:
+                        staged.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(path, staged)
+                    except OSError as exc:
+                        raise PackError(f"素材快照失败（{rel}）：{exc}") from exc
+                    assets.append((staged, rel))
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            _add_file(zf, snap, DB_PART, parts)
+            for src, rel in assets:
+                _add_file(zf, src, rel, parts)
+            config_text = ""
+            config_path = source_root / "config" / "config.yaml"
+            if config_path.is_file():
+                config_text = clean_config_text(config_path.read_text(encoding="utf-8"))
+            _add_bytes(zf, CONFIG_PART, config_text.encode("utf-8"), parts)
+            manifest = {
+                "format": FORMAT,
+                "kind": kind,
+                "note": note,
+                "created_at": time.time(),
+                "app_version": "0.1.0",
+                "schema_version": 1,
+                "counts": counts,
+                "parts": parts,
+                "source_root": str(source_root),
+                "excluded": ["API 密钥与通道凭据", "进程锁与运行句柄", "日志与缓存", "可执行插件"],
+            }
+            zf.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=2))
+    except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
+        tmp.unlink(missing_ok=True)
+        raise PackError(f"打包旧目录失败：{exc}") from exc
+    finally:
+        _drop_temp_snapshot(snap)
+        shutil.rmtree(assets_dir, ignore_errors=True)
     os.replace(tmp, target)
     return {
         "name": target.name,
@@ -289,7 +335,11 @@ def _snapshot_counts(db_path: Path) -> dict[str, int]:
 
 
 def write_pack(cfg: Any, store: Store, *, kind: str = "manual", note: str = "") -> dict[str, Any]:
-    """落一份单文件全量备份。失败抛 PackError，且不留下半份文件。"""
+    """落一份单文件全量备份。失败抛 PackError，且不留下半份文件。
+
+    静默窗口只覆盖「库快照 + 素材快照」那一刻；zip 压缩（含素材 DEFLATE）在窗口外做，
+    这段时间世界推进照常（DESKTOP_SPEC §五 / 验收 23）。对外仍是单文件全量格式。
+    """
     folder = packs_dir(cfg)
     folder.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
@@ -298,36 +348,41 @@ def write_pack(cfg: Any, store: Store, *, kind: str = "manual", note: str = "") 
         name = f"isekai-{kind}-{stamp}-{os.getpid()}.zip"
     target = folder / name
     tmp = folder / f".{name}.part"
+    snap = folder / f".{name}.db"
+    assets_dir = folder / f".{name}.assets"
     parts: list[dict[str, Any]] = []
-    with quiet():
-        snap = folder / f".{name}.db"
-        try:
+    try:
+        # ① 静默窗口：只覆盖「库快照那一刻」（外加一次顺序拷贝级的素材快照）。
+        with quiet():
             snapshot = store.backup_create(snap, note=note or kind)
             if not snapshot.get("ok"):
                 raise PackError("数据库快照没通过完整性检查，这一份没有生成")
             counts = _snapshot_counts(snap)
-            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-                _add_file(zf, snap, DB_PART, parts)
-                for src, rel in _asset_files(cfg):
-                    _add_file(zf, src, rel, parts)
-                _add_bytes(zf, CONFIG_PART, _clean_config(cfg).encode("utf-8"), parts)
-                manifest = {
-                    "format": FORMAT,
-                    "kind": kind,
-                    "note": note,
-                    "created_at": time.time(),
-                    "app_version": getattr(cfg, "app_version", "0.1.0"),
-                    "schema_version": 1,
-                    "counts": counts,
-                    "parts": parts,
-                    "excluded": ["API 密钥与通道凭据", "日志与缓存", "可执行插件", "绝对设备路径"],
-                }
-                zf.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=2))
-        except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
-            tmp.unlink(missing_ok=True)
-            raise PackError(f"打包失败：{exc}") from exc
-        finally:
-            snap.unlink(missing_ok=True)
+            assets = _snapshot_assets(cfg, assets_dir)
+        # ② 窗口外打包：素材压缩不再暂停世界推进。
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            _add_file(zf, snap, DB_PART, parts)
+            for src, rel in assets:
+                _add_file(zf, src, rel, parts)
+            _add_bytes(zf, CONFIG_PART, _clean_config(cfg).encode("utf-8"), parts)
+            manifest = {
+                "format": FORMAT,
+                "kind": kind,
+                "note": note,
+                "created_at": time.time(),
+                "app_version": getattr(cfg, "app_version", "0.1.0"),
+                "schema_version": 1,
+                "counts": counts,
+                "parts": parts,
+                "excluded": ["API 密钥与通道凭据", "日志与缓存", "可执行插件", "绝对设备路径"],
+            }
+            zf.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=2))
+    except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
+        tmp.unlink(missing_ok=True)
+        raise PackError(f"打包失败：{exc}") from exc
+    finally:
+        _drop_temp_snapshot(snap)
+        shutil.rmtree(assets_dir, ignore_errors=True)
     os.replace(tmp, target)  # 原子发布：没写完不留半份
     return {
         "name": target.name,

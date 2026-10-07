@@ -88,7 +88,7 @@ def decide(
     row: dict[str, Any],
     *,
     world_seconds: int,
-    events_present: set[str],
+    events_present: Any,
     active_effects: list[dict[str, Any]],
 ) -> str:
     """重议（确定性）：keep / act / wait / defer / abandon（§11.3）。"""

@@ -37,6 +37,15 @@ def example_package(name: str = "灰潮纪", *, moment: int = DAY * 1500) -> dic
         ],
         "geography": "三条沿岸城邦带，内陆为盐碱荒原，通行依赖退潮后的盐滩。",
         "society": "城邦由堤长议会治理，驿站信报是主要的公共消息来源。",
+        # 区域登记（§2.2 / 附录 A，P2-11）：只作叙事范围标签；卡片的 region 与
+        # 事件效果的 target 引用这里的标识，不用自由文本代替。
+        "regions": [
+            {
+                "id": "pl-1",
+                "name": "南堤城邦的盐滩一带",
+                "description": "退潮后可通行的盐滩与旧堤岸，城里只到堤口。",
+            }
+        ],
         "lexicon": {
             "note": "城邦名为两字，人名带堤或潮的偏旁。",
             "terms": [{"term": "堤长", "meaning": "城邦议会的执事者"}],
@@ -253,7 +262,8 @@ def example_card(
             "creator": "她父亲的旧账本里有那份告警的一页抄件，但她从没翻到那一页。",
             "self_knowledge": "十二年前崩堤时她还小，只记得盐味。",
         },
-        "region": "南堤城邦的盐滩一带",
+        # 生活区域引用世界包登记的区域标识（CHARACTER_CARD_SPEC §二 / 附录 A，P2-11）
+        "region": "pl-1",
         "role_id": "rl-1",
         "channels": [{"source_id": "src-1", "conditions": "凭堤务吏身份在驿站取阅信报"}],
         "initial_knowledge": [

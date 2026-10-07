@@ -11,9 +11,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from pathlib import Path
 from typing import Any
 
 from ..log import get_logger
+from ..runtime import rules as rules_mod
 from . import draft as draft_mod
 from . import expression, states, views
 
@@ -22,10 +25,32 @@ log = get_logger("trpg-client")
 MODES = ("player", "gm")
 DRAFT_TIMEOUT_S = 8.0
 
-#: 工作区键（§4.1）：显式作用域 + 可丢弃的界面状态
+
+def _load_modes(value: Any) -> list[str]:
+    """登记簿里的 `modes` 是 JSON 文本：读不出来就当没声明（不猜）。"""
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    try:
+        data = json.loads(str(value or "[]"))
+    except ValueError:
+        return []
+    return [str(item) for item in data] if isinstance(data, list) else []
+
+
+def _context_arg(*sources: Any) -> dict[str, Any]:
+    """规则输入 `context`（§3.3 / P1-10）：显式字段或草稿字段里带的那份，只认对象。"""
+    for source in sources:
+        if isinstance(source, dict) and isinstance(source.get("context"), dict):
+            return dict(source["context"])
+    return {}
+
+#: 工作区键（§4.1）：显式作用域 + 可丢弃的界面状态。
+#: `draft_parse` / `draft_parse_revision` 是**解析结果缓存**（P2-5）：确认卡提交按 revision
+#: 复用它，不为同一份草稿再解析一次（也就不会再付一次模型超时）。
 WORKSPACE_KEYS = (
     "mode", "instance_id", "timeline_id", "campaign_id", "audience", "active_character_id",
     "selected_scene_id", "selected_action_id", "selected_choice_id", "draft_text", "draft_revision",
+    "draft_parse", "draft_parse_revision",
     "view_revision", "scene_revision",
 )
 
@@ -39,6 +64,7 @@ def default_workspace(**overrides: Any) -> dict[str, Any]:
         "mode": "player", "instance_id": "", "timeline_id": "", "campaign_id": "",
         "audience": "public_party", "active_character_id": "", "selected_scene_id": "",
         "selected_action_id": "", "selected_choice_id": "", "draft_text": "", "draft_revision": 0,
+        "draft_parse": {}, "draft_parse_revision": 0,
         "view_revision": 0, "scene_revision": 0,
     }
     ws.update({key: value for key, value in overrides.items() if key in WORKSPACE_KEYS})
@@ -91,36 +117,69 @@ class TrpgClient:
     def _plugin(self, ruleset_id: str, manifest_path: str = "") -> dict[str, Any]:
         """插件身份（id / version / name / modes）。
 
-        版本闸的比对基准是清单声明的 `ruleset_version`（缺省退回插件版本），所以清单读不动时
-        要如实返回空——不能让客户端自己发明一个版本来比对。
-        """
-        if ruleset_id:
-            try:
-                from .. import plugins as plugins_mod
+        版本闸的比对基准是清单声明的 `ruleset_version`（缺省退回插件版本），所以读不到时要
+        如实返回空——不能让客户端自己发明一个版本来比对。
 
-                host = plugins_mod.HOST
-                for item in (host.list_plugins() if host is not None else []) or []:
-                    if isinstance(item, dict) and str(item.get("id") or "") == str(ruleset_id):
-                        return item
-            except Exception:  # noqa: BLE001 —— 插件宿主不可用不该让客户端读不了战役
-                pass
+        来源优先级（P2-7）：**规则登记簿**（`rule_plugin` 表）优先，核心与客户端都不为比较版本
+        扫插件目录；战役自己记录的那份清单文件是兜底（单个文件，不是扫目录），这样未经登记的
+        战役（CLI / 探针直接建的）照样能被闸门看见。
+        """
+        identity = rules_mod.manifest_identity(manifest_path) if str(manifest_path or "").strip() else {}
+        registered = self._registered_plugin(ruleset_id, str(manifest_path or ""))
+        if registered:
+            # 登记簿是权威：名称 / 版本 / 模式都取登记时那一份
+            return {
+                "id": str(registered.get("ruleset_id") or ruleset_id),
+                "version": str(registered.get("ruleset_version") or identity.get("ruleset_version") or ""),
+                "name": str(registered.get("name") or ""),
+                "modes": _load_modes(registered.get("modes")),
+                "source": "registry",
+                "enabled": bool(int(registered.get("enabled") or 0)),
+            }
         path = str(manifest_path or "").strip()
         if not path:
             return {}
-        from ..runtime import rules as rules_mod
-
         data: dict[str, Any] = {}
         try:
             data = rules_mod.load_manifest(path)
         except Exception:  # noqa: BLE001 —— 坏清单按空身份处理，由战役运行时去报错
             data = {}
-        identity = rules_mod.manifest_identity(path)
         return {
             "id": str(data.get("id") or identity.get("ruleset_id") or ""),
             "version": str(identity.get("ruleset_version") or data.get("version") or ""),
             "name": str(data.get("name") or ""),
             "modes": list(data.get("modes") or []),
+            "source": "manifest",
         }
+
+    def _registered_plugin(self, ruleset_id: str, manifest_path: str) -> dict[str, Any]:
+        """登记簿里这条规则（P2-7）：同 ruleset 有多版时，优先与战役记录清单路径一致的那版。"""
+        if not ruleset_id:
+            return {}
+        try:
+            rows = self.store.rule_plugin_list()
+        except Exception:  # noqa: BLE001 —— 登记簿读不到不该让客户端读不了战役
+            return {}
+        candidates = [row for row in rows if str(row.get("ruleset_id") or "") == str(ruleset_id)]
+        if not candidates:
+            return {}
+        if manifest_path:
+            try:
+                target = Path(manifest_path).resolve()
+            except OSError:
+                target = None
+            for row in candidates:
+                recorded = str(row.get("manifest_path") or "")
+                if not recorded:
+                    continue
+                try:
+                    if Path(recorded).resolve() == target:
+                        return row
+                except OSError:
+                    continue
+        if len(candidates) == 1:
+            return candidates[0]
+        return {}
 
     def _plugin_for(self, ws: dict[str, Any], campaign: dict[str, Any] | None = None) -> dict[str, Any]:
         """当前战役的插件身份：规则状态版本要跟清单声明比对（§14.4）。"""
@@ -241,11 +300,16 @@ class TrpgClient:
             raise TrpgClientError("gm_only 受众只能在主持模式里看（§十二：不凭身份提升受众）")
         info = self.campaign.info(instance_id, timeline_id, campaign_id)
         plugin = self._plugin_for(ws, info)
-        state = self.campaign.rule_state(instance_id, timeline_id, campaign_id)
-        block = views.version_block(info, plugin, state_version=str(state.get("state_ruleset_version") or ""))
+        # 版本闸只读分片头（P2-7）：不把 opaque_state 搬给客户端
+        state_view = self.campaign.rule_state_view(instance_id, timeline_id, campaign_id)
+        block = views.version_block(
+            info, plugin,
+            state_versions=[str(item.get("state_ruleset_version") or "") for item in state_view["shards"]],
+        )
         recovery = {"interrupted": 0, "committing_recovered": 0}
         if recover and str(info.get("status") or "") in ("active", "waiting"):
-            recovery = self.campaign.recover(instance_id, timeline_id)
+            # 恢复按 campaign_id 限定（P1-12）：只看本战役的在途集合，不扫整条线
+            recovery = self.campaign.recover(instance_id, timeline_id, campaign_id)
         view = self._view(ws)
         return self._bundle(ws, view=view, stage="enter", plugin=plugin,
                             version_block=block, recovery=recovery)
@@ -262,11 +326,17 @@ class TrpgClient:
 
     async def act(self, *, workspace: Any, text: str = "", fields: dict[str, Any] | None = None,
                   confirm: bool = False, action_id: str = "", abandon: bool = False,
-                  idempotency_key: str = "") -> dict[str, Any]:
+                  idempotency_key: str = "", context: dict[str, Any] | None = None,
+                  scope_ref: str = "") -> dict[str, Any]:
         """一次产品动作（§C1）：草稿 → 确认 → 声明 → 确认 → 裁定（玩家模式自动提交）。
 
         `action_id` 给了就是**修改**已有未确认行动（确认卡的修改语义，revision +1）；
         `abandon=True` 是放弃（不调插件、不写规则状态、不写世界后果）。
+
+        - `context` / `fields["context"]`：规则输入对象（§3.3 / P1-10），客户端不解释，
+          声明与裁定都原样转发；`preconditions` 只是前置条件字符串列表，不当规则输入；
+        - 解析结果按 `draft_revision` 复用（P2-5）：确认不再为同一份草稿解析第二次；
+        - 确认卡已批准 → `declare(confirmed_by="user")` **一次**完成声明与确认（C-3）。
         """
         ws = merge_workspace(workspace)
         if not (ws["instance_id"] and ws["timeline_id"] and ws["campaign_id"]):
@@ -291,11 +361,32 @@ class TrpgClient:
                                 blocked=states.campaign_line(campaign_status),
                                 blocked_status=campaign_status)
         scene = view.get("scene") if isinstance(view.get("scene"), dict) else {}
-        card = await self._draft_card(ws, text=text, fields=fields, scene=scene)
-        ws = merge_workspace(ws, draft_text=str(text or ""),
-                             draft_revision=int(ws["draft_revision"]) + (1 if confirm else 0))
+        # 规则输入（§3.3）：显式参数优先，其次调用方塞在 fields 里的那一份
+        rule_context = context if isinstance(context, dict) else _context_arg(fields)
+        scope = str(scope_ref or (fields.get("scope_ref") if isinstance(fields, dict) else "") or "")
+        # P2-5：同一份草稿（revision 相同、原文相同）的解析结果直接复用，不再解析一次
+        cached = ws.get("draft_parse") if (
+            int(ws.get("draft_parse_revision") or 0) == int(ws["draft_revision"])
+            and str(ws.get("draft_text") or "") == str(text or "")
+            and isinstance(ws.get("draft_parse"), dict)
+            and isinstance(ws["draft_parse"].get("model"), dict)
+        ) else None
+        card = await self._draft_card(
+            ws, text=text, fields=fields, scene=scene,
+            model_seed=(cached.get("model") if cached is not None else None),
+        )
+        seed = card.pop("model", {}) if isinstance(card, dict) else {}
         if not confirm:
+            ws = merge_workspace(
+                ws, draft_text=str(text or ""), draft_parse={**card, "model": seed},
+                draft_parse_revision=int(ws["draft_revision"]),
+            )
             return self._bundle(ws, view=view, stage="draft", plugin=plugin, draft=card)
+        # 确认提交：草稿这一版到此为止（下一份草稿从新 revision 起算，缓存随之失效）
+        ws = merge_workspace(
+            ws, draft_text=str(text or ""), draft_revision=int(ws["draft_revision"]) + 1,
+            draft_parse={}, draft_parse_revision=0,
+        )
         if not card["ready"]:
             return self._bundle(ws, view=view, stage="draft_gaps", plugin=plugin, draft=card,
                                 blocked="确认卡还有缺口：先补上再声明（不猜）")
@@ -308,6 +399,8 @@ class TrpgClient:
             changes = {key: value for key, value in card["fields"].items() if key != "actor" and value}
             if card["risks"]:
                 changes["visible_risks"] = list(card["risks"])
+            if rule_context:
+                changes["context"] = dict(rule_context)
             confirmed = self.campaign.confirm(
                 ws["instance_id"], ws["timeline_id"], ws["campaign_id"], target_action,
                 action_revision=int(row.get("action_revision") or 1), changes=changes or None,
@@ -316,30 +409,30 @@ class TrpgClient:
             return await self._resolve_and_maybe_submit(
                 ws, view=view, plugin=plugin, action_id=target_action, card=card,
                 revision=int(confirmed.get("action_revision") or 1),
-                idempotency_key=idempotency_key,
+                idempotency_key=idempotency_key, context=rule_context, scope_ref=scope,
             )
         declared = self.campaign.declare(
             ws["instance_id"], ws["timeline_id"], ws["campaign_id"],
             actor_id=actor, raw_text=str(text or ""), intent=str(card["fields"]["intent"]),
             target_refs=[str(card["fields"]["target"])] if card["fields"]["target"] else [],
             method=str(card["fields"]["method"]), expected_result=str(card["fields"]["expected_result"]),
+            context=rule_context or None,
             visible_risks=list(card["risks"]), requires_confirmation=False, auto_confirm=False,
+            # C-3：确认卡已经批准 → 声明与确认一次完成（只产生一个 action_id / 一个确认版本）
+            confirmed_by="user",
         )
         new_id = str(declared.get("action_id") or "")
-        confirmed = self.campaign.confirm(
-            ws["instance_id"], ws["timeline_id"], ws["campaign_id"], new_id,
-            action_revision=int(declared.get("action_revision") or 1),
-        )
         ws = merge_workspace(ws, selected_action_id=new_id)
         return await self._resolve_and_maybe_submit(
             ws, view=view, plugin=plugin, action_id=new_id, card=card,
-            revision=int(confirmed.get("action_revision") or declared.get("action_revision") or 1),
-            idempotency_key=idempotency_key,
+            revision=int(declared.get("action_revision") or 1),
+            idempotency_key=idempotency_key, context=rule_context, scope_ref=scope,
         )
 
     async def _resolve_and_maybe_submit(
         self, ws: dict[str, Any], *, view: dict[str, Any], plugin: dict[str, Any], action_id: str,
         card: dict[str, Any], revision: int, idempotency_key: str = "", explicit_retry: bool = False,
+        context: dict[str, Any] | None = None, scope_ref: str = "",
     ) -> dict[str, Any]:
         """裁定 + 玩家模式自动提交（§3.1 / §20.2）：GM 模式停在 reviewing 等主持操作。"""
         from ..runtime import campaign as campaign_mod
@@ -347,6 +440,8 @@ class TrpgClient:
         try:
             resolved = await self.campaign.resolve(
                 ws["instance_id"], ws["timeline_id"], ws["campaign_id"], action_id, plugin_manifest="",
+                context=context if isinstance(context, dict) and context else None,
+                scope_ref=str(scope_ref or ""),
             )
         except campaign_mod.CampaignError as exc:
             # 插件崩溃 / 超时 / 输出非法：行动已经被推成可展示的失败态，客户端如实表达，不猜结果（§C2）
@@ -429,12 +524,16 @@ class TrpgClient:
         )
 
     async def _draft_card(self, ws: dict[str, Any], *, text: str, fields: dict[str, Any] | None,
-                          scene: dict[str, Any]) -> dict[str, Any]:
-        """确认卡（§6.1）：显式字段优先；模型只补空缺；不确定就报缺口。"""
+                          scene: dict[str, Any], model_seed: dict[str, Any] | None = None) -> dict[str, Any]:
+        """确认卡（§6.1）：显式字段优先；模型只补空缺；不确定就报缺口。
+
+        `model_seed` 给了就是**复用上次那份模型解析**（P2-5）：确定性合并照跑（显式字段仍然优先），
+        但不再调模型——所以确认卡提交不会为同一份草稿再付一次解析。
+        """
         explicit = fields if isinstance(fields, dict) else {}
         needed = [key for key in draft_mod.KEY_FIELDS if not str(explicit.get(key) or "").strip()]
-        model: dict[str, Any] = {}
-        if needed and self.llm is not None and str(text or "").strip():
+        model: dict[str, Any] = dict(model_seed) if isinstance(model_seed, dict) else {}
+        if model_seed is None and needed and self.llm is not None and str(text or "").strip():
             known = [str(item.get("target") or item.get("target_ref") or "") for item in
                      (scene.get("public_facts") or []) if isinstance(item, dict)]
             prompt = draft_mod.draft_request(
@@ -448,19 +547,33 @@ class TrpgClient:
                 log.info("draft parse failed instance=%s campaign=%s", ws["instance_id"], ws["campaign_id"])
                 raw = ""
             model = draft_mod.parse_draft(raw)
-        return draft_mod.decide(text=text, explicit=explicit, model=model,
-                               actor=str(ws["active_character_id"]), scene=scene)
+        card = draft_mod.decide(text=text, explicit=explicit, model=model,
+                                actor=str(ws["active_character_id"]), scene=scene)
+        # 解析种子随卡片一起存进工作区（`draft_parse`）：确认时按 revision 复用，不再解析
+        card["model"] = model
+        return card
 
     # ------------------------------------------------------------------ C2：待选择 / 重试
 
     def choose(self, *, workspace: Any, choice_id: str, option_id: str,
-               idempotency_key: str = "") -> dict[str, Any]:
-        """处理当前 open choice（§16.2）：不自动声明下一行动。"""
+               idempotency_key: str = "", scene_revision: int | None = None) -> dict[str, Any]:
+        """处理当前 open choice（§16.2 / §10.2）：不自动声明下一行动。
+
+        选择提交带**当前场景 revision** 与幂等键（P2-6）：revision 不一致由运行时返回 `conflict`，
+        客户端重读场景后再选；同一个幂等键重放返回原结果。
+        """
         ws = merge_workspace(workspace, selected_choice_id=choice_id)
+        revision = int(scene_revision if scene_revision is not None else ws.get("scene_revision") or 0)
         result = self.campaign.select_choice(
             ws["instance_id"], ws["timeline_id"], ws["campaign_id"], choice_id,
             selection=option_id, idempotency_key=idempotency_key or f"trpg-client:{choice_id}:{option_id}",
+            scene_revision=revision or None,
         )
+        if str(result.get("status") or "") == "conflict":
+            # 场景已经变了：不套用旧选项，让调用方重读场景后重新选择（§11.3）
+            return self._bundle(ws, stage="choice_conflict", choice_conflict=result,
+                                chosen=option_id, duplicate=False,
+                                blocked="场景 revision 已变化：先刷新局面再重新选择（不套用旧选项）")
         ws = merge_workspace(ws, selected_choice_id="")
         return self._bundle(ws, stage="choice", chosen=option_id,
                             duplicate=bool(result.get("duplicate")))

@@ -52,6 +52,10 @@ class _Conn:
     #: 限速窗口（固定窗口计数；§3.2）
     window_start: float = 0.0
     window_count: int = 0
+    #: 流式增量的累计预算记账：message_id → 已发出的正文字节（附录 ⑤）
+    delta_bytes: dict[str, int] = field(default_factory=dict)
+    #: 因超预算被停发的增量帧数（观测用；不是错误）
+    delta_dropped: int = 0
 
 
 def negotiate(client_caps: dict[str, Any], cfg: Config) -> dict[str, Any]:
@@ -146,6 +150,28 @@ class CoreServer:
             except (ConnectionClosed, RuntimeError):
                 return False
 
+    def _delta_within_budget(self, conn: _Conn, envelope: dict[str, Any]) -> bool:
+        """单条消息的流式增量累计字节预算（CHANNEL_PROTOCOL_APPENDIX ⑤）。
+
+        超预算即**停发增量、只等固化帧**：不报错、不发 `error`，退回非流式等待；
+        固化 `reply` 本身仍走文本上限与协商限额，与增量预算分开计。
+        """
+        payload = envelope.get("payload") or {}
+        message_id = str(payload.get("message_id") or "")
+        text = str(payload.get("text") or "")
+        spent = int(conn.delta_bytes.get(message_id, 0))
+        cost = len(text.encode("utf-8"))
+        if spent + cost > ump.DELTA_BUDGET_BYTES:
+            # 超预算（含第一条就超）：停发并继续记账，后续增量同样不发
+            conn.delta_dropped += 1
+            conn.delta_bytes[message_id] = spent + cost
+            return False
+        conn.delta_bytes[message_id] = spent + cost
+        if len(conn.delta_bytes) > 256:  # 兜底：正常一轮以 reply / error 收尾并清理
+            for stale in sorted(conn.delta_bytes)[: len(conn.delta_bytes) - 256]:
+                conn.delta_bytes.pop(stale, None)
+        return True
+
     async def deliver(self, channel_id: str, thread_id: str, envelope: dict[str, Any]) -> bool:
         """会话核心的投递出口。目标离线时返回 False，消息保留未投递状态。"""
         conn = self._conns.get(channel_id)
@@ -153,8 +179,15 @@ class CoreServer:
             return False
         if envelope.get("type") == "status" and not conn.capabilities.get("status"):
             return True  # 未协商该能力的通道不接收操作状态
-        if envelope.get("type") in ump.DELTA_TYPES and not conn.capabilities.get("streaming"):
-            return True  # 未协商流式的通道不接收增量预览（最终 `reply` 照常发）
+        if envelope.get("type") in ump.DELTA_TYPES:
+            if not conn.capabilities.get("streaming"):
+                return True  # 未协商流式的通道不接收增量预览（最终 `reply` 照常发）
+            if not self._delta_within_budget(conn, envelope):
+                return True  # 超累计预算：停发增量、只等固化帧（不是错误）
+        elif envelope.get("type") in ("reply", "system_notice", "error"):
+            # 一轮收尾（固化帧 / 错误）：清掉这条消息的增量记账，长连接不积账
+            payload = envelope.get("payload") or {}
+            conn.delta_bytes.pop(str(payload.get("message_id") or ""), None)
         return await self._send_conn(conn, envelope)
 
     # ---------- 连接处理 ----------
@@ -741,11 +774,15 @@ def _public_message(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _parse_mgmt(raw: str | bytes) -> dict[str, Any] | None:
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+def _parse_mgmt(raw: str | bytes | dict[str, Any]) -> dict[str, Any] | None:
+    """管理帧解析：进程内传输会直接递 dict（不做编解码往返），所以两条路都收。"""
+    if isinstance(raw, dict):
+        data: Any = raw
+    else:
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            return None
     if isinstance(data, dict) and data.get("mgmt") == "1":
         return data
     return None

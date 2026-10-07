@@ -184,8 +184,11 @@ CREATE TABLE IF NOT EXISTS commit_snapshot(
   instance_id TEXT NOT NULL,
   payload TEXT NOT NULL,
   size INTEGER NOT NULL DEFAULT 0,
-  created_at REAL NOT NULL
+  created_at REAL NOT NULL,
+  -- 依赖关系显式落列（§8）：删除线时按等值查依赖，不再 LIKE 扫全部快照大 JSON
+  base_commit_id TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS ix_commit_snapshot_base ON commit_snapshot(base_commit_id);
 
 CREATE TABLE IF NOT EXISTS commit_log(
   id TEXT PRIMARY KEY,
@@ -338,6 +341,12 @@ CREATE TABLE IF NOT EXISTS memory(
   decay_world INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(instance_id, timeline_id, id)
 );
+-- 召回的候选集合与衰减扫描必须走索引（MEMORY_SPEC §5.1 / §六）：
+-- 主键以 instance_id 打头，按 id / 按时间线的查找用不上它，缺失时退化成全表扫描。
+CREATE INDEX IF NOT EXISTS ix_memory_character
+  ON memory(instance_id, timeline_id, character_id, learned_world);
+CREATE INDEX IF NOT EXISTS ix_memory_timeline_decay ON memory(timeline_id, decay_world);
+CREATE INDEX IF NOT EXISTS ix_memory_id ON memory(id);
 
 CREATE TABLE IF NOT EXISTS memory_task(
   id TEXT NOT NULL,
@@ -436,6 +445,8 @@ CREATE TABLE IF NOT EXISTS claim(
   PRIMARY KEY(instance_id, timeline_id, id)
 );
 CREATE INDEX IF NOT EXISTS ix_claim_event ON claim(instance_id, timeline_id, event_id);
+-- 补算按世界时间窗口取说法（§2.6）：没有这条索引，每批都要扫全部历史说法
+CREATE INDEX IF NOT EXISTS ix_claim_window ON claim(instance_id, timeline_id, earliest_world);
 
 -- 插件登记（CHANNEL_PLUGIN_SPEC §3.1/§3.2）：只记清单与启停状态；运行进程不跨核心重启存活
 CREATE TABLE IF NOT EXISTS plugin(
@@ -648,6 +659,20 @@ CREATE TABLE IF NOT EXISTS experience(
 );
 CREATE INDEX IF NOT EXISTS ix_experience_window ON experience(instance_id, timeline_id, character_id, world_seconds);
 
+-- 角色运行状态（WORLD_RUNTIME_SPEC §六）：归档是**版本化状态**，不靠「最近 N 条事件窗」反推。
+-- 有界事件窗在事件数超过窗口后会把早期死亡挤出视野，从而让已归档角色「复生」；状态位不会。
+CREATE TABLE IF NOT EXISTS character_state(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  character_id TEXT NOT NULL,
+  archived INTEGER NOT NULL DEFAULT 0,
+  archived_world INTEGER NOT NULL DEFAULT 0,
+  basis TEXT NOT NULL DEFAULT '',        -- 依据引用（死亡事件标识等）
+  source TEXT NOT NULL DEFAULT '',       -- 判定来源：death_event | migration | import
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, character_id)
+);
+
 -- TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）：核心托管的编排状态与规则私有状态附件。
 -- 全部键在 (instance_id, timeline_id) 上：随该线的提交 / 回滚 / 分叉 / 导入导出走同一条装载路径。
 CREATE TABLE IF NOT EXISTS trpg_campaign(
@@ -726,9 +751,11 @@ CREATE TABLE IF NOT EXISTS trpg_action(
   target_refs TEXT NOT NULL DEFAULT '[]',
   method TEXT NOT NULL DEFAULT '',
   expected_result TEXT NOT NULL DEFAULT '',
-  preconditions TEXT NOT NULL DEFAULT '[]',
+  preconditions TEXT NOT NULL DEFAULT '[]',      -- 前置条件：字符串列表语义（不承载规则输入，§3.3）
+  context TEXT NOT NULL DEFAULT '{}',            -- 规则输入（对象）：核心不解释，原样下发给插件（§3.3）
   visible_risks TEXT NOT NULL DEFAULT '[]',
   confirmation TEXT NOT NULL DEFAULT 'pending',  -- pending/confirmed/modified/abandoned
+  confirmed_by TEXT NOT NULL DEFAULT '',         -- user = 声明时已获用户确认；host_mode = 自动主持确认（C-3）
   action_revision INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'received',       -- 见 campaign.ACTION_STATES
   resolution TEXT NOT NULL DEFAULT '{}',         -- 公共模块规范化后的结果（resolution / changes / effects / claims / patch / 场景转换）
@@ -741,6 +768,9 @@ CREATE TABLE IF NOT EXISTS trpg_action(
   updated_real REAL NOT NULL DEFAULT 0,
   PRIMARY KEY(instance_id, timeline_id, campaign_id, action_id)
 );
+-- 局面投影按「本战役 + 状态」取，缺索引就是每次刷新全表取再切尾（TRPG_CLIENT_SPEC §137）
+CREATE INDEX IF NOT EXISTS ix_trpg_action_campaign
+  ON trpg_action(instance_id, timeline_id, campaign_id, status);
 
 CREATE TABLE IF NOT EXISTS trpg_choice(
   instance_id TEXT NOT NULL,
@@ -762,19 +792,22 @@ CREATE TABLE IF NOT EXISTS trpg_choice(
   PRIMARY KEY(instance_id, timeline_id, campaign_id, choice_id)
 );
 
--- 规则状态附件：字段由插件定义，核心只做版本边界（不解析 opaque_state）
+-- 规则状态附件：字段由插件定义，核心只做版本边界（不解析 opaque_state）。
+-- 按 scope_ref 分片（TRPG_CAMPAIGN_RUNTIME_SPEC §3.4）：一次检定只读写本次 scope_ref 那一片，
+-- '' 是全局分片（规则书级常量、战役级时钟等）；不同角色 / 场景各写各的，正常路径下不发生同片并发。
 CREATE TABLE IF NOT EXISTS trpg_rule_state(
   instance_id TEXT NOT NULL,
   timeline_id TEXT NOT NULL,
   campaign_id TEXT NOT NULL,
   ruleset_id TEXT NOT NULL,
+  scope_ref TEXT NOT NULL DEFAULT '',            -- 状态分片键（"" = 全局）
   ruleset_version TEXT NOT NULL DEFAULT '',   -- 写这份状态时插件声明的规则版本（§十六 兼容性检查的比对基准）
   state_revision INTEGER NOT NULL DEFAULT 1,
   opaque_state TEXT NOT NULL DEFAULT '{}',
   created_world INTEGER NOT NULL DEFAULT 0,
   updated_world INTEGER NOT NULL DEFAULT 0,
   updated_real REAL NOT NULL DEFAULT 0,
-  PRIMARY KEY(instance_id, timeline_id, campaign_id, ruleset_id)
+  PRIMARY KEY(instance_id, timeline_id, campaign_id, ruleset_id, scope_ref)
 );
 
 -- 联合提交记录：规则状态 patch + 世界后果 + 场景转换同批落地的凭据（幂等键在此）
@@ -922,9 +955,9 @@ TRPG_COLUMNS: dict[str, tuple[str, ...]] = {
     "action": (
         "instance_id", "timeline_id", "campaign_id", "scene_id", "action_id", "actor_id",
         "raw_text", "intent", "target_refs", "method", "expected_result", "preconditions",
-        "visible_risks", "confirmation", "action_revision", "status", "resolution",
-        "joint_commit_id", "failure_code", "audience", "created_world", "updated_world",
-        "created_real", "updated_real",
+        "context", "visible_risks", "confirmation", "confirmed_by", "action_revision", "status",
+        "resolution", "joint_commit_id", "failure_code", "audience", "created_world",
+        "updated_world", "created_real", "updated_real",
     ),
     "choice": (
         "instance_id", "timeline_id", "campaign_id", "scene_id", "choice_id", "action_id",
@@ -932,7 +965,7 @@ TRPG_COLUMNS: dict[str, tuple[str, ...]] = {
         "selection", "created_real", "updated_real", "created_world",
     ),
     "rule_state": (
-        "instance_id", "timeline_id", "campaign_id", "ruleset_id", "ruleset_version",
+        "instance_id", "timeline_id", "campaign_id", "ruleset_id", "scope_ref", "ruleset_version",
         "state_revision", "opaque_state", "created_world", "updated_world", "updated_real",
     ),
     "commit": (
@@ -947,7 +980,7 @@ TRPG_KEYS: dict[str, tuple[str, ...]] = {
     "scene": ("instance_id", "timeline_id", "campaign_id", "scene_id"),
     "action": ("instance_id", "timeline_id", "campaign_id", "action_id"),
     "choice": ("instance_id", "timeline_id", "campaign_id", "choice_id"),
-    "rule_state": ("instance_id", "timeline_id", "campaign_id", "ruleset_id"),
+    "rule_state": ("instance_id", "timeline_id", "campaign_id", "ruleset_id", "scope_ref"),
     "commit": ("joint_commit_id",),
 }
 #: 提交账本只增不改：同一幂等键重放返回原记录，不覆盖
@@ -1150,13 +1183,57 @@ class Store:
         return [_row_to_dict(item) for item in rows]
 
     def death_exists(self, instance_id: str, timeline_id: str, character_id: str) -> bool:
-        """该角色是否已有身故记录（归档判定；不另立字段）。"""
+        """该角色是否已归档（§六）：先看**版本化状态位**，老库未回填时才回落事件表。"""
+        row = self._conn.execute(
+            """SELECT archived FROM character_state
+               WHERE instance_id=? AND timeline_id=? AND character_id=?""",
+            (instance_id, timeline_id, str(character_id)),
+        ).fetchone()
+        if row is not None:
+            return bool(int(row["archived"] or 0))
+        return self.death_event_exists(instance_id, timeline_id, character_id)
+
+    def death_event_exists(self, instance_id: str, timeline_id: str, character_id: str) -> bool:
+        """死亡事件是否存在（一致性断言用；不作为运行判据——有界窗口会漏）。"""
         row = self._conn.execute(
             """SELECT 1 FROM event WHERE instance_id=? AND timeline_id=? AND template=?
                AND world_seconds>0 LIMIT 1""",
             (instance_id, timeline_id, f"death:{character_id}"),
         ).fetchone()
         return row is not None
+
+    def character_state_get(
+        self, instance_id: str, timeline_id: str, character_id: str
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT * FROM character_state
+               WHERE instance_id=? AND timeline_id=? AND character_id=?""",
+            (instance_id, timeline_id, str(character_id)),
+        ).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def character_state_list(
+        self, instance_id: str, timeline_id: str, *, until: int | None = None
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM character_state WHERE instance_id=? AND timeline_id=?"
+        args: list[Any] = [instance_id, timeline_id]
+        if until is not None:
+            sql += " AND updated_world<=?"
+            args.append(int(until))
+        rows = self._conn.execute(sql + " ORDER BY character_id", args).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def character_archived_ids(
+        self, instance_id: str, timeline_id: str, *, until: int | None = None
+    ) -> set[str]:
+        """已归档角色集合（§六）：一次查询，替代「每个角色扫一遍事件窗」的判法。"""
+        sql = "SELECT character_id FROM character_state WHERE instance_id=? AND timeline_id=? AND archived=1"
+        args: list[Any] = [instance_id, timeline_id]
+        if until is not None:
+            sql += " AND archived_world<=?"
+            args.append(int(until))
+        rows = self._conn.execute(sql, args).fetchall()
+        return {str(r["character_id"]) for r in rows}
 
     def session_notice_get(self, session_id: str, kind: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -1711,6 +1788,7 @@ class Store:
             self._migrate_memory_tables()
             self._migrate_disclosure_pk()
             self._migrate_runtime_tables()
+            self._migrate_character_state()
             row = self._conn.execute("SELECT value FROM meta WHERE key='data_format'").fetchone()
             if row is None:
                 self._conn.execute(
@@ -1720,6 +1798,34 @@ class Store:
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema', ?)", (str(SCHEMA_VERSION),)
             )
             self._conn.commit()
+
+    def _migrate_character_state(self) -> None:
+        """旧库回填归档态（§六）：从既有死亡事件把状态位补出来。
+
+        不回填的话，老库在运行判据切到状态位后会「查无此人」而重新触发寿终事件——
+        一次性回填把历史事实搬进状态位，之后运行期只读状态位、事件窗只作一致性断言。
+        """
+        missing = self._conn.execute(
+            """SELECT COUNT(*) AS n FROM event e
+               WHERE e.template LIKE 'death:%' AND e.world_seconds>0
+                 AND NOT EXISTS (
+                   SELECT 1 FROM character_state s
+                    WHERE s.instance_id=e.instance_id AND s.timeline_id=e.timeline_id
+                      AND s.character_id=substr(e.template, 7)
+                 )"""
+        ).fetchone()
+        if not missing or not int(missing["n"] or 0):
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO character_state(
+                       instance_id, timeline_id, character_id, archived, archived_world, basis, source, updated_world)
+                   SELECT instance_id, timeline_id, substr(template, 7), 1, world_seconds, id,
+                          'migration', world_seconds
+                     FROM event
+                    WHERE template LIKE 'death:%' AND world_seconds>0"""
+            )
+        log.info("character_state 回填归档态 rows=%s", int(missing["n"] or 0))
 
     def _migrate_disclosure_pk(self) -> None:
         """旧库迁移：披露授权表从 id 单主键改成 (实例, 线, id) 复合主键。
@@ -1806,12 +1912,43 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE trpg_rule_state ADD COLUMN ruleset_version TEXT NOT NULL DEFAULT ''"
             )
+        # 规则状态分片（TRPG_CAMPAIGN_RUNTIME_SPEC §3.4，2026-10-08）：主键加 scope_ref。
+        # SQLite 改不了主键，只能重建表再搬数据（老行一律落进全局分片 ''）——参照 memory 表的重建写法。
+        if columns and "scope_ref" not in columns:
+            log.warning("重建 trpg_rule_state（主键升级：加 scope_ref 分片键，老行落全局分片 ''）")
+            self._conn.execute(
+                """CREATE TABLE trpg_rule_state_new(
+                     instance_id TEXT NOT NULL, timeline_id TEXT NOT NULL, campaign_id TEXT NOT NULL,
+                     ruleset_id TEXT NOT NULL, scope_ref TEXT NOT NULL DEFAULT '',
+                     ruleset_version TEXT NOT NULL DEFAULT '', state_revision INTEGER NOT NULL DEFAULT 1,
+                     opaque_state TEXT NOT NULL DEFAULT '{}', created_world INTEGER NOT NULL DEFAULT 0,
+                     updated_world INTEGER NOT NULL DEFAULT 0, updated_real REAL NOT NULL DEFAULT 0,
+                     PRIMARY KEY(instance_id, timeline_id, campaign_id, ruleset_id, scope_ref))"""
+            )
+            self._conn.execute(
+                """INSERT OR IGNORE INTO trpg_rule_state_new
+                     (instance_id, timeline_id, campaign_id, ruleset_id, scope_ref, ruleset_version,
+                      state_revision, opaque_state, created_world, updated_world, updated_real)
+                   SELECT instance_id, timeline_id, campaign_id, ruleset_id, '', ruleset_version,
+                          state_revision, opaque_state, created_world, updated_world, updated_real
+                   FROM trpg_rule_state"""
+            )
+            self._conn.execute("DROP TABLE trpg_rule_state")
+            self._conn.execute("ALTER TABLE trpg_rule_state_new RENAME TO trpg_rule_state")
         # 行动材料的受众列（§十五）
         action_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(trpg_action)")}
         if action_columns and "audience" not in action_columns:
             self._conn.execute(
                 "ALTER TABLE trpg_action ADD COLUMN audience TEXT NOT NULL DEFAULT 'public_party'"
             )
+        # 规则输入 context（§3.3，2026-10-08）：声明时就落库，裁定原样下发给插件
+        if action_columns and "context" not in action_columns:
+            log.info("trpg_action 增列 context（规则输入，§3.3）")
+            self._conn.execute("ALTER TABLE trpg_action ADD COLUMN context TEXT NOT NULL DEFAULT '{}'")
+        # 确认来源（C-3，2026-10-08）：user = 用户确认；host_mode = 自动主持确认（客户端只读呈现）
+        if action_columns and "confirmed_by" not in action_columns:
+            log.info("trpg_action 增列 confirmed_by（确认来源，C-3）")
+            self._conn.execute("ALTER TABLE trpg_action ADD COLUMN confirmed_by TEXT NOT NULL DEFAULT ''")
         # 主持责任模式（TRPG_RULES_LAYER_SPEC §八）与场景推进节拍（§4.1 / §九）
         campaign_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(trpg_campaign)")}
         if campaign_columns and "host_mode" not in campaign_columns:
@@ -2243,6 +2380,21 @@ class Store:
         ).fetchone()
         return _row_to_dict(row) if row else None
 
+    def outbound_by_message_ids(self, message_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """按一批 message_id 取已固化出站行（§9.5-1）：故事图谱一次批量取回正文，不逐节点查。"""
+        wanted = [str(item) for item in message_ids if str(item)]
+        if not wanted:
+            return {}
+        marks = ",".join("?" for _ in wanted)
+        rows = self._conn.execute(
+            f"SELECT * FROM message WHERE message_id IN ({marks}) AND role != 'user'", wanted
+        ).fetchall()
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            item = _row_to_dict(row)
+            out[str(item.get("message_id") or "")] = item
+        return out
+
     # ---------- 投递 ----------
 
     def delivery_rows(self, msg_seq: int) -> list[dict[str, Any]]:
@@ -2660,27 +2812,28 @@ class Store:
 
     def commit_add(self, row: dict[str, Any], *, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
         """记一条提交；给快照就一并落盘（一致快照，§5.1）。"""
-        payload = self._snapshot_payload_for(row, snapshot) if snapshot is not None else None
+        payload, base_id = self._snapshot_payload_for(row, snapshot) if snapshot is not None else (None, "")
         with self._lock, self._conn:
             self._conn.execute(
                 """INSERT INTO commit_log(id, instance_id, timeline_id, kind, moment, note, created_at)
-                   VALUES(:id, :instance_id, :timeline_id, :kind, :moment, :note, :created_at)""",
+                   VALUES(:id,:instance_id,:timeline_id,:kind,:moment,:note,:created_at)""",
                 row,
             )
             if payload is not None:
                 self._conn.execute(
-                    """INSERT INTO commit_snapshot(commit_id, instance_id, payload, size, created_at)
-                       VALUES(?,?,?,?,?)""",
-                    (row["id"], row["instance_id"], payload, len(payload), time.time()),
+                    """INSERT INTO commit_snapshot(commit_id, instance_id, payload, size, created_at, base_commit_id)
+                       VALUES(?,?,?,?,?,?)""",
+                    (row["id"], row["instance_id"], payload, len(payload), time.time(), base_id),
                 )
         if payload is not None:
             self.commit_snapshot_compress(str(row["id"]))  # §8：链太长就把这条物化成全量
         return row
 
-    def _snapshot_payload_for(self, row: dict[str, Any], snapshot: dict[str, Any]) -> str:
+    def _snapshot_payload_for(self, row: dict[str, Any], snapshot: dict[str, Any]) -> tuple[str, str]:
         """这条提交的存储形态（§6）：接得上上一条就存 diff，接不上（或没有上一条）就存全量。
 
         全量与 diff 是等价的存储方式，读的时候统一物化，调用方看不到差别。
+        返回 `(payload, base_commit_id)`：依赖关系同时落列，删线时按等值查依赖（§8）。
         """
         from .runtime import versioning as versioning_mod
 
@@ -2689,13 +2842,35 @@ class Store:
                ORDER BY created_at DESC, id DESC LIMIT 1""",
             (row["instance_id"], row["timeline_id"]),
         ).fetchone()
-        base = self.commit_snapshot_get(str(previous["id"])) if previous is not None else None
+        base_id = str(previous["id"]) if previous is not None else ""
+        base = self.commit_snapshot_get(base_id) if base_id else None
         if base is None:
-            return versioning_mod.dump_snapshot(snapshot)
+            return versioning_mod.dump_snapshot(snapshot), ""
         delta = versioning_mod.encode_delta(base, snapshot)
-        return versioning_mod.dump_snapshot(
-            delta, kind=versioning_mod.SNAPSHOT_DELTA, base=str(previous["id"])
-        )
+        return versioning_mod.dump_snapshot(delta, kind=versioning_mod.SNAPSHOT_DELTA, base=base_id), base_id
+
+    def commit_snapshot_stored(self, commit_id: str) -> str | None:
+        """导出用：原样取回**存储形态**（kind/base/body），不物化成全量（§7.1 提交闭包）。
+
+        物化会让「导出 → 导入」把紧凑的 delta 链变成 C 份全量快照，容器与库都会膨胀。
+        """
+        row = self._conn.execute(
+            "SELECT payload FROM commit_snapshot WHERE commit_id=?", (commit_id,)
+        ).fetchone()
+        return str(row["payload"]) if row is not None else None
+
+    def commit_snapshot_put_stored(
+        self, commit_id: str, instance_id: str, payload: str, *, base_commit_id: str = ""
+    ) -> None:
+        """导入用：把容器里的存储形态原样写回，依赖进列；不做物化、不重新编码。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO commit_snapshot(commit_id, instance_id, payload, size, created_at, base_commit_id)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(commit_id) DO UPDATE SET
+                     payload=excluded.payload, size=excluded.size, base_commit_id=excluded.base_commit_id""",
+                (commit_id, instance_id, payload, len(payload), time.time(), str(base_commit_id or "")),
+            )
 
     def commit_snapshot_depth(self, commit_id: str, *, limit: int = 64) -> int:
         """从这条沿 base 往回数到全量的距离；链断了返回 -1。"""
@@ -2738,7 +2913,7 @@ class Store:
         dumped = versioning_mod.dump_snapshot(payload)
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE commit_snapshot SET payload=?, size=? WHERE commit_id=?",
+                "UPDATE commit_snapshot SET payload=?, size=?, base_commit_id='' WHERE commit_id=?",
                 (dumped, len(dumped), commit_id),
             )
         return {"compressed": True, "depth": depth, "kind": versioning_mod.SNAPSHOT_FULL}
@@ -2749,21 +2924,20 @@ class Store:
 
         moved = 0
         for cid in [str(item) for item in commit_ids if str(item)]:
+            # 依赖关系走 base_commit_id 等值查询（§8）：不再对全部快照大 JSON 做 LIKE 子串扫描
             rows = self._conn.execute(
-                "SELECT commit_id, payload FROM commit_snapshot WHERE payload LIKE ?",
-                (f'%"base": "{cid}"%',),
+                "SELECT commit_id, payload FROM commit_snapshot WHERE base_commit_id=?",
+                (cid,),
             ).fetchall()
             for row in rows:
-                kind, base = versioning_mod.snapshot_kind(row["payload"])
-                if kind != versioning_mod.SNAPSHOT_DELTA or base != cid:
-                    continue
+                # 列是依赖的权威来源；正文里的 base 只在老库未回填时补充校验
                 payload = self.commit_snapshot_get(str(row["commit_id"]))
                 if payload is None:
                     continue
                 dumped = versioning_mod.dump_snapshot(payload)
                 with self._lock, self._conn:
                     self._conn.execute(
-                        "UPDATE commit_snapshot SET payload=?, size=? WHERE commit_id=?",
+                        "UPDATE commit_snapshot SET payload=?, size=?, base_commit_id='' WHERE commit_id=?",
                         (dumped, len(dumped), str(row["commit_id"])),
                     )
                 moved += 1
@@ -2959,6 +3133,7 @@ class Store:
             "pending_event",    # 回滚撤销待执行状态及其后果（§八 末条）
             "disclosure",       # 回滚同时撤销授权与依赖它的派生（§7.2）
             "reaction",         # 短期反应随线版本化：回滚撤销派生状态（§11.1 / 附录B#17）
+            "character_state",  # 归档态随线版本化（§六 / P1-3）：回滚后由快照回写恢复当时的值
             "narrative_unit",   # 叙事单元 / 暂缓标记 / 审计结果同样是派生状态（NARRATIVE_LAYER §7.2）
             # 战役运行时：场景 / 行动 / 选择是派生编排状态，随回滚撤销；战役与规则状态由
             # 快照回写给出「提交那一刻」的值（TRPG_CAMPAIGN_RUNTIME_SPEC §十七）
@@ -3091,6 +3266,7 @@ class Store:
         customs: Iterable[dict[str, Any]] = (),
         clear_effects: Iterable[Any] = (),
         reactions: Iterable[dict[str, Any]] = (),
+        character_states: Iterable[dict[str, Any]] = (),
         trpg: dict[str, Any] | None = None,
         clock_shift_seconds: int = 0,
     ) -> bool:
@@ -3240,6 +3416,23 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
                     row,
                 )
+            for row in character_states:
+                # 归档态是版本化角色状态（§六）：与死亡事件同一批、同一事务落盘
+                payload = {
+                    "basis": "", "source": "death_event",
+                    "archived_world": int(row.get("updated_world") or 0),
+                    **row,
+                }
+                self._conn.execute(
+                    """INSERT INTO character_state(instance_id, timeline_id, character_id, archived,
+                                                   archived_world, basis, source, updated_world)
+                       VALUES(:instance_id, :timeline_id, :character_id, :archived,
+                              :archived_world, :basis, :source, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, character_id) DO UPDATE SET
+                         archived=:archived, archived_world=:archived_world, basis=:basis,
+                         source=:source, updated_world=:updated_world""",
+                    payload,
+                )
             for row in intents:
                 self._conn.execute(
                     """INSERT INTO intent(instance_id, timeline_id, character_id, id, object, basis, strength,
@@ -3356,6 +3549,104 @@ class Store:
             cur = self._conn.execute(f"DELETE FROM trpg_{kind} WHERE {where}", params)
             return int(cur.rowcount or 0)
 
+    # ---------- 规则状态分片（TRPG_CAMPAIGN_RUNTIME_SPEC §3.4） ----------
+
+    def trpg_rule_state_get(
+        self, instance_id: str, timeline_id: str, campaign_id: str, ruleset_id: str,
+        *, scope_ref: str = "",
+    ) -> dict[str, Any] | None:
+        """读**一个分片**的规则状态（含 opaque_state）。一次检定只进出一个分片。"""
+        return self.trpg_get(
+            "rule_state", instance_id=instance_id, timeline_id=timeline_id, campaign_id=campaign_id,
+            ruleset_id=ruleset_id, scope_ref=str(scope_ref or ""),
+        )
+
+    def trpg_rule_state_list(
+        self, instance_id: str, timeline_id: str, campaign_id: str, ruleset_id: str
+    ) -> list[dict[str, Any]]:
+        """该战役规则系统的全部分片（含正文）：迁移 / 人工接受版本这类要逐片改写的路径用。"""
+        return self.trpg_list(
+            "rule_state", instance_id=instance_id, timeline_id=timeline_id,
+            campaign_id=campaign_id, ruleset_id=ruleset_id,
+        )
+
+    def trpg_rule_state_view(
+        self, instance_id: str, timeline_id: str, campaign_id: str, ruleset_id: str
+    ) -> list[dict[str, Any]]:
+        """分片头：只要 scope_ref / revision / 写入版本，**不传 opaque_state**（P2-7 revision-only）。
+
+        版本闸、状态条与投影都只需要这些读数；正文属 gm_only，另有显式读取入口。
+        """
+        rows = self._conn.execute(
+            """SELECT scope_ref, ruleset_version, state_revision, created_world, updated_world, updated_real
+                 FROM trpg_rule_state
+                WHERE instance_id=? AND timeline_id=? AND campaign_id=? AND ruleset_id=?
+                ORDER BY scope_ref""",
+            (instance_id, timeline_id, campaign_id, ruleset_id),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    # ---------- 有界查询（TRPG_CLIENT_SPEC §4.2 / §5.2：数据库侧 LIMIT + 索引） ----------
+
+    def trpg_action_window(
+        self, instance_id: str, timeline_id: str, campaign_id: str, *,
+        statuses: tuple[str, ...] | list[str] | None = None, limit: int = 0,
+        audiences: tuple[str, ...] | list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """局面投影用的行动窗口：`campaign_id` 限定 + 数据库侧 `LIMIT`（走 `ix_trpg_action_campaign`）。
+
+        `statuses` 非空时按状态闭集过滤；`audiences` 是观察者的受众集合（GM 不传 = 全见）。
+        返回按提交顺序（老 → 新），调用方不用再切尾。
+        """
+        where = ["instance_id=?", "timeline_id=?", "campaign_id=?"]
+        params: list[Any] = [instance_id, timeline_id, campaign_id]
+        if statuses:
+            items = [str(item) for item in statuses]
+            where.append(f"status IN ({', '.join('?' for _ in items)})")
+            params.extend(items)
+        if audiences:
+            viewers = [str(item) for item in audiences]
+            if "gm_only" not in viewers:
+                # 受众下推：公开材料 + 观察者自己那几条（与 campaign.audience_visible 同一口径）
+                where.append("(audience='public_party' OR audience='' OR audience IN (%s))"
+                             % ", ".join("?" for _ in viewers))
+                params.extend(viewers)
+        sql = (
+            f"SELECT * FROM trpg_action WHERE {' AND '.join(where)} "
+            "ORDER BY rowid DESC" + (f" LIMIT {int(limit)}" if int(limit) > 0 else "")
+        )
+        rows = [_row_to_dict(row) for row in self._conn.execute(sql, tuple(params)).fetchall()]
+        rows.reverse()
+        return rows
+
+    def trpg_commit_ledger(
+        self, instance_id: str, timeline_id: str, campaign_id: str, *,
+        statuses: tuple[str, ...] | list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """该战役的提交台账（一次性取回，恢复路径不逐个行动重列）。"""
+        where = ["instance_id=?", "timeline_id=?", "campaign_id=?"]
+        params: list[Any] = [instance_id, timeline_id, campaign_id]
+        if statuses:
+            items = [str(item) for item in statuses]
+            where.append(f"status IN ({', '.join('?' for _ in items)})")
+            params.extend(items)
+        rows = self._conn.execute(
+            f"SELECT * FROM trpg_commit WHERE {' AND '.join(where)} ORDER BY rowid", tuple(params)
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def trpg_choice_open_count(
+        self, instance_id: str, timeline_id: str, campaign_id: str, *, exclude_choice_id: str = ""
+    ) -> int:
+        """剩余 open 待选择的**聚合计数**（不逐条列举全表，§11.3）。"""
+        row = self._conn.execute(
+            """SELECT COUNT(*) FROM trpg_choice
+                WHERE instance_id=? AND timeline_id=? AND campaign_id=? AND status='open'
+                  AND choice_id<>?""",
+            (instance_id, timeline_id, campaign_id, str(exclude_choice_id or "")),
+        ).fetchone()
+        return int(row[0] or 0)
+
     def runtime_dump(self, instance_id: str, timeline_id: str, *, watermark: int) -> dict[str, Any]:
         def rows(sql: str, *args: Any) -> list[dict[str, Any]]:
             return [_row_to_dict(r) for r in self._conn.execute(sql, args).fetchall()]
@@ -3446,6 +3737,14 @@ class Store:
             "effects": rows(
                 """SELECT * FROM effect_state WHERE instance_id=? AND timeline_id=? AND from_world<=?
                    ORDER BY from_world, seq, id""",
+                instance_id,
+                timeline_id,
+                watermark,
+            ),
+            # 归档态随件（§六）：回滚 / 分叉 / 导入导出与角色状态同一水位截断
+            "character_states": rows(
+                """SELECT * FROM character_state WHERE instance_id=? AND timeline_id=? AND updated_world<=?
+                   ORDER BY character_id""",
                 instance_id,
                 timeline_id,
                 watermark,
@@ -3607,6 +3906,24 @@ class Store:
                        VALUES(:instance_id, :timeline_id, :character_id, :id, :world_seconds,
                               :kind, :target, :source, :stance, :text)
                        ON CONFLICT(instance_id, timeline_id, character_id, id) DO NOTHING""",
+                    row,
+                )
+            for raw in payload.get("character_states") or []:
+                row = {
+                    "archived": 1, "archived_world": 0, "basis": "", "source": "import", "updated_world": 0,
+                    **{k: v for k, v in raw.items() if k in (
+                        "instance_id", "timeline_id", "character_id", "archived", "archived_world",
+                        "basis", "source", "updated_world",
+                    )},
+                }
+                self._conn.execute(
+                    """INSERT INTO character_state(instance_id, timeline_id, character_id, archived,
+                                                   archived_world, basis, source, updated_world)
+                       VALUES(:instance_id, :timeline_id, :character_id, :archived,
+                              :archived_world, :basis, :source, :updated_world)
+                       ON CONFLICT(instance_id, timeline_id, character_id) DO UPDATE SET
+                         archived=:archived, archived_world=:archived_world, basis=:basis,
+                         source=:source, updated_world=:updated_world""",
                     row,
                 )
             for row in payload.get("reactions") or []:
@@ -4056,14 +4373,58 @@ class Store:
     # ---------- 角色记忆（MEMORY_SPEC） ----------
 
     def memory_scope(
-        self, instance_id: str, timeline_id: str, character_id: str, *, until: int | None = None
+        self,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str,
+        *,
+        until: int | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """可召回集合（§5.1 第一步）：实例 + 线 + 角色 + 查询水位；来源状态与归档不豁免隔离。"""
+        """可召回集合（§5.1 第一步）：实例 + 线 + 角色 + 查询水位；来源状态与归档不豁免隔离。
+
+        给了 `limit` 就先按水位取**最近** N 条再翻回正序（§5.1 候选规模上界）：
+        召回是每轮对话的固定开销，不能随角色记忆总量线性增长。
+        """
+        bound = int(until) if until is not None else 10**15
+        if limit and int(limit) > 0:
+            rows = self._conn.execute(
+                """SELECT * FROM (
+                       SELECT * FROM memory WHERE instance_id=? AND timeline_id=? AND character_id=?
+                        AND learned_world<=? ORDER BY learned_world DESC, id DESC LIMIT ?
+                   ) ORDER BY learned_world, id""",
+                (instance_id, timeline_id, character_id, bound, int(limit)),
+            ).fetchall()
+            return [_row_to_dict(r) for r in rows]
         sql = """SELECT * FROM memory WHERE instance_id=? AND timeline_id=? AND character_id=?
                  AND learned_world<=? ORDER BY learned_world, id"""
-        rows = self._conn.execute(
-            sql, (instance_id, timeline_id, character_id, int(until) if until is not None else 10**15)
-        ).fetchall()
+        rows = self._conn.execute(sql, (instance_id, timeline_id, character_id, bound)).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    #: 去重与冲突比对的兄弟条目扫描上界（§4.2）：同角色同类型里足够大的可见窗口；
+    #: 0 或负数 = 不限（只用于对照测量）。比对上界是为了让写入代价不随记忆总量无界增长。
+    MEMORY_DEDUP_SCAN_MAX = 5000
+
+    def memory_siblings(
+        self, instance_id: str, timeline_id: str, character_id: str, *, kind: str = ""
+    ) -> list[dict[str, Any]]:
+        """去重 / 冲突比对的候选（§4.2）：只取比对真正要用的列，按最近优先截断。
+
+        旧的实现先取该角色**全部**记忆的完整行（19 列）再在 Python 里逐条两两比对，
+        写入代价随记忆总量线性增长；这里收窄列、加同上界，语义（同角色同线可达视图内）
+        不变，只是不再把无关字段和超长历史全拖进来。
+        """
+        sql = """SELECT id, text, kind, learned_world, happened_world, semantic_watermark, recorded_world
+                 FROM memory WHERE instance_id=? AND timeline_id=? AND character_id=?"""
+        args: list[Any] = [instance_id, timeline_id, character_id]
+        if kind:
+            sql += " AND kind=?"
+            args.append(str(kind))
+        sql += " ORDER BY learned_world DESC, id DESC"
+        if self.MEMORY_DEDUP_SCAN_MAX > 0:
+            sql += " LIMIT ?"
+            args.append(int(self.MEMORY_DEDUP_SCAN_MAX))
+        rows = self._conn.execute(sql, args).fetchall()
         return [_row_to_dict(r) for r in rows]
 
     def memory_add(self, row: dict[str, Any]) -> dict[str, Any] | None:
@@ -4079,11 +4440,10 @@ class Store:
             ).fetchone()
             if dup is not None:
                 return None  # 同源重复提取：不重复写、不重复强化
-        siblings = [
-            item
-            for item in self.memory_scope(str(row["instance_id"]), str(row["timeline_id"]), character_id)
-            if str(item["kind"]) == str(row["kind"])
-        ]
+        siblings = self.memory_siblings(
+            str(row["instance_id"]), str(row["timeline_id"]), character_id,
+            kind=str(row.get("kind") or ""),
+        )
         # 矛盾链的新旧只看**获知时刻**：记录水位会被迟到提取带成「最新」，把已固化的纠正顶掉（验收 14）
         def knowledge_world(item: dict[str, Any]) -> int:
             return int(
@@ -4288,18 +4648,25 @@ class Store:
         *,
         query_vector: list[float] | None = None,
         model: str = "",
+        limit: int | None = None,
     ) -> dict[str, float]:
-        """向量召回分数（§5.2）：没有查询向量 / 模型不符 / 维度不符时返回空——调用方退化全文召回。"""
+        """向量召回分数（§5.2）：没有查询向量 / 模型不符 / 维度不符时返回空——调用方退化全文召回。
+
+        `limit` 是候选规模上界：先按 id 取前 N 条（与全文腿同一量级），不把整库向量解包进 Python。
+        """
         if not query_vector:
             return {}
         import math
 
-        rows = self._conn.execute(
-            """SELECT e.memory_id, e.vector, e.dim FROM memory_embedding e
+        sql = """SELECT e.memory_id, e.vector, e.dim FROM memory_embedding e
                JOIN memory m ON m.id = e.memory_id
-               WHERE m.instance_id=? AND m.timeline_id=? AND m.character_id=? AND e.dim=? AND e.model=?""",
-            (instance_id, timeline_id, character_id, len(query_vector), str(model or "")),
-        ).fetchall()
+               WHERE m.instance_id=? AND m.timeline_id=? AND m.character_id=? AND e.dim=? AND e.model=?
+               ORDER BY e.memory_id"""
+        args: list[Any] = [instance_id, timeline_id, character_id, len(query_vector), str(model or "")]
+        if limit and int(limit) > 0:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        rows = self._conn.execute(sql, args).fetchall()
         scores: dict[str, float] = {}
         norm = math.sqrt(sum(value * value for value in query_vector)) or 1.0
         for row in rows:
@@ -4318,8 +4685,10 @@ class Store:
         from .runtime import memory as memory_mod
 
         rows = self._conn.execute(
-            "SELECT id, strength, decay_world, state FROM memory WHERE timeline_id=? AND state<>'archived'",
-            (timeline_id,),
+            """SELECT id, strength, decay_world, state FROM memory
+               WHERE timeline_id=? AND state<>'archived' AND decay_world<?
+               ORDER BY decay_world""",
+            (timeline_id, int(to_world)),
         ).fetchall()
         changed = 0
         with self._lock, self._conn:
@@ -4657,13 +5026,45 @@ class Store:
     # ---------- 事件 / 说法 / 获知 / 效果 ----------
 
     def event_window(
-        self, instance_id: str, timeline_id: str, *, until: int, limit: int = 50
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        until: int,
+        limit: int = 50,
+        since: int | None = None,
+        kind: str | None = None,
+        source: str | None = None,
+        subject: str | None = None,
+        before: tuple[int, int] | None = None,
     ) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
-            """SELECT * FROM event WHERE instance_id=? AND timeline_id=? AND world_seconds<=?
-               ORDER BY world_seconds DESC, seq DESC LIMIT ?""",
-            (instance_id, timeline_id, until, limit),
-        ).fetchall()
+        """世界事件窗口（§4.5 / §2.6）：**过滤、`since` 与游标与 `limit` 并列下推**。
+
+        - `until` 含上界、`since` 含下界；选择性强的过滤不再「先取固定条数再在 Python 里滤」；
+        - `kind` / `source` 等值、`subject` 对 `effects` 子串；
+        - `before=(world_seconds, seq)` 是**严格游标**：同秒内按 `seq` 继续往回翻，页与页不重叠。
+        """
+        sql = "SELECT * FROM event WHERE instance_id=? AND timeline_id=? AND world_seconds<=?"
+        args: list[Any] = [instance_id, timeline_id, int(until)]
+        if since is not None:
+            sql += " AND world_seconds>=?"
+            args.append(int(since))
+        if kind:
+            sql += " AND kind=?"
+            args.append(str(kind))
+        if source:
+            sql += " AND source=?"
+            args.append(str(source))
+        if subject:
+            sql += " AND effects LIKE ?"
+            args.append(f"%{subject}%")
+        if before is not None:
+            world, seq = int(before[0]), int(before[1])
+            sql += " AND (world_seconds<? OR (world_seconds=? AND seq<?))"
+            args.extend([world, world, seq])
+        sql += " ORDER BY world_seconds DESC, seq DESC LIMIT ?"
+        args.append(int(limit))
+        rows = self._conn.execute(sql, args).fetchall()
         return [_row_to_dict(r) for r in reversed(rows)]
 
     def event_ids(self, instance_id: str, timeline_id: str) -> set[str]:
@@ -4672,20 +5073,56 @@ class Store:
         ).fetchall()
         return {str(r["id"]) for r in rows}
 
+    def event_exists(self, instance_id: str, timeline_id: str, event_id: str) -> bool:
+        """单条事件存在性（§2.6）：走主键索引，补算按候选查，不把全部历史 id 拉进内存。"""
+        row = self._conn.execute(
+            "SELECT 1 FROM event WHERE instance_id=? AND timeline_id=? AND id=? LIMIT 1",
+            (instance_id, timeline_id, str(event_id)),
+        ).fetchone()
+        return row is not None
+
+    def effect_active_exists(self, instance_id: str, timeline_id: str, effect_id: str) -> bool:
+        """单条后果是否仍有效（§六）：同样走主键索引。"""
+        row = self._conn.execute(
+            "SELECT 1 FROM effect_state WHERE instance_id=? AND timeline_id=? AND id=? AND active=1 LIMIT 1",
+            (instance_id, timeline_id, str(effect_id)),
+        ).fetchone()
+        return row is not None
+
     def claim_list(
-        self, instance_id: str, timeline_id: str, *, event_id: str | None = None
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        event_id: str | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        at_least: int | None = None,
+        audience: str | None = None,
     ) -> list[dict[str, Any]]:
-        if event_id is None:
-            rows = self._conn.execute(
-                "SELECT * FROM claim WHERE instance_id=? AND timeline_id=? ORDER BY earliest_world, id",
-                (instance_id, timeline_id),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                """SELECT * FROM claim WHERE instance_id=? AND timeline_id=? AND event_id=?
-                   ORDER BY earliest_world, id""",
-                (instance_id, timeline_id, event_id),
-            ).fetchall()
+        """说法集合。给了 `since`/`until` 就按（`since`, `until`] 取 `earliest_world` 落在窗口内的部分：
+        补算每个世界日只该看**这一段新增**的说法，不必每批重扫全部历史（§2.6）。
+
+        `at_least` 是含下界（历史分页用 `[at_least, until]`）；`audience` 过滤同样下推。
+        """
+        sql = "SELECT * FROM claim WHERE instance_id=? AND timeline_id=?"
+        args: list[Any] = [instance_id, timeline_id]
+        if event_id is not None:
+            sql += " AND event_id=?"
+            args.append(event_id)
+        if since is not None:
+            sql += " AND earliest_world>?"
+            args.append(int(since))
+        if at_least is not None:
+            sql += " AND earliest_world>=?"
+            args.append(int(at_least))
+        if until is not None:
+            sql += " AND earliest_world<=?"
+            args.append(int(until))
+        if audience:
+            sql += " AND audience=?"
+            args.append(str(audience))
+        rows = self._conn.execute(sql + " ORDER BY earliest_world, id", args).fetchall()
         return [_row_to_dict(r) for r in rows]
 
     def knowledge_window(

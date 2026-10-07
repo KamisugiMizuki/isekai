@@ -58,6 +58,10 @@ THREAD_REQUIRED = frozenset(
 TOKEN_REQUIRED = frozenset({"user_message", "retry", "delivery"})
 #: 只有协商了 `streaming` 能力的通道才收得到（增量预览，最终以 `reply` 为准）
 DELTA_TYPES = frozenset({"reply_delta"})
+#: 单条消息的 `reply_delta` 累计正文字节预算（CHANNEL_PROTOCOL_APPENDIX ⑤，默认 64 KiB）。
+#: 超预算即**停发增量、只等固化帧**：不是错误、不产生 `error` 帧，退回非流式等待。
+#: 该预算与 `max_text_len` 分开计——增量只是预览，但不因此省掉配额。
+DELTA_BUDGET_BYTES = 64 * 1024
 ALL_TYPES = CLIENT_TYPES | SERVER_TYPES
 
 DELIVERY_STATES = frozenset({"accepted", "failed", "unknown"})

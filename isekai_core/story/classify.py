@@ -6,8 +6,11 @@
 - **分类结果不改变权限**：它只决定这一轮走哪条路。改世界仍必须由用户显式走
   `preview → commit`（§3.5 / §八），分类永远不给出写入许可；
 - **无法确定时按「联络分享」处理**，原文照旧作为她听到的内容（§3.4）——分不清就当她听见了；
-- 关键词只做两件事：① 对**结构性请求**（改世界 / 版本操作 / TRPG 行动）省一次调用，
-  ② 模型不可用时降级兜底。闲聊、询问、追问这类语义判断交给模型，不靠词表。
+- **确定性判定优先**（SESSION_CORE_SPEC §4.2 / NARRATIVE_LAYER_SPEC §6.2 同一口径）：
+  结构性请求、绑定 / 版本类显式命令、以及词表能定论的探询与追问，一律**在本地定论、不调模型**；
+  只有词表给不出结论的模糊输入才调一次模型（`decide_instant` 返回 None 即「无法结论」）。
+  词表因此从「省一次调用的小聪明」升级为**第一判据**——但它仍然不是唯一判据：
+  词表定不了就交给模型，模型也不可用才退回「分不清就当她听见了」。
 """
 
 from __future__ import annotations
@@ -72,7 +75,9 @@ SYSTEM = (
     "分不清时输出 contact_share。"
 )
 
-#: 结构性请求的预筛：命中即**跳过模型调用**——这三类要转独立流程，宁可交给流程也不在普通轮次里静默执行
+#: 确定性词表：**命中即定论、跳过模型调用**（SESSION_CORE_SPEC §4.2「确定性判定优先」）。
+#: 三类结构性请求命中的是「转独立流程」的类目，宁可交给流程也不在普通轮次里静默执行；
+#: 追问 / 询问两类是显式问法，词表能定论就不必每轮再花一次判断调用。
 _RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "version_op",
@@ -105,7 +110,8 @@ _RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 def prefilter(text: str) -> str | None:
-    """关键词预筛：命中返回类别，否则 None。**不是判据**——只用来省调用与兜底。"""
+    """确定性词表：命中返回类别，否则 None。**是第一判据，但仍不是唯一判据**——
+    它给不出结论的模糊输入由调用方交给模型判定（`decide_instant`）。"""
     body = str(text or "")
     if not body.strip():
         return None
@@ -151,22 +157,22 @@ def parse_classify(raw: str) -> tuple[str, str] | None:
     return category, str(payload.get("why") or "")
 
 
-def decide(text: str, *, model: tuple[str, str] | None = None) -> dict[str, Any]:
-    """合并预筛与模型判断，得到这一轮的唯一主类别。
+def decide(text: str, *, model: tuple[str, str] | None = None, model_failed: bool = False) -> dict[str, Any]:
+    """合并确定性判定与模型判断，得到这一轮的唯一主类别。
 
-    合并口径（§3.4）：
-    1. 预筛命中**结构性请求**（改世界 / 版本操作 / TRPG 行动）→ 直接用，不再花调用；
-    2. 否则以模型判断为准；
-    3. 模型不可用 / 判不出来 → 退到预筛（含追问 / 询问）；再没有就按联络分享。
+    合并口径（§3.4 / SESSION_CORE_SPEC §4.2「确定性判定优先」）：
+    1. 词表命中（结构 / 绑定 / 显式命令 / 追问 / 询问）→ 直接用，**不再调模型**；
+    2. 词表给不出结论时，以模型判断为准（模型是兜底，不是每轮固定动作）；
+    3. 模型不可用 / 判不出来 → 退到词表（若命中则标 `rule_fallback`）；再没有就按联络分享。
     """
     rule = prefilter(text)
-    if rule and rule in HANDOFF_TARGETS:
+    if rule is not None:
         return {
             "category": rule,
             "label": LABELS[rule],
-            "source": "rule",
-            "why": "命中结构性请求预筛",
-            "handoff": HANDOFF_TARGETS[rule],
+            "source": "rule_fallback" if model_failed else "rule",
+            "why": "判断点不可用，按确定性词表降级" if model_failed else "命中确定性词表（结构 / 绑定 / 显式命令）",
+            "handoff": HANDOFF_TARGETS.get(rule, ""),
         }
     if model is not None:
         category, why = model
@@ -177,14 +183,6 @@ def decide(text: str, *, model: tuple[str, str] | None = None) -> dict[str, Any]
             "why": why,
             "handoff": HANDOFF_TARGETS.get(category, ""),
         }
-    if rule:
-        return {
-            "category": rule,
-            "label": LABELS[rule],
-            "source": "rule_fallback",
-            "why": "判断点不可用，按预筛降级",
-            "handoff": HANDOFF_TARGETS.get(rule, ""),
-        }
     return {
         "category": DEFAULT_CATEGORY,
         "label": LABELS[DEFAULT_CATEGORY],
@@ -192,3 +190,14 @@ def decide(text: str, *, model: tuple[str, str] | None = None) -> dict[str, Any]
         "why": "分不清就当她听见了",
         "handoff": "",
     }
+
+
+def decide_instant(text: str) -> dict[str, Any] | None:
+    """确定性判定：词表能定论就给结论（**不调模型**），给不出结论回 None。
+
+    调用方据此决定「就此定论」还是「起一次模型判定」；`None` 表示确定性规则无法结论，
+    不是「判成联络分享」——兜底仍由 `decide` 在模型不可用时给出。
+    """
+    if prefilter(str(text or "")) is None:
+        return None
+    return decide(text)

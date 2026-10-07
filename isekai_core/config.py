@@ -116,7 +116,14 @@ class RuntimeConfig:
 
     rate_max: int = 2592000             # 世界秒 / 现实秒
     max_active_timelines: int = 4       # 同时激活的时间线数量上限
-    catch_up_batches: int = 8           # 单次推进批数上限（每批一个世界日）
+    #: 单次推进的**墙钟时间盒**（§2.6）：跑满预算或追平目标为止。
+    #: 排水果位 = 时间盒 / 单批成本；周期 tick 默认 1 s / 5 s 拍 = 20% 占空（不追赶时）。
+    catch_up_budget_seconds: float = 1.0
+    #: 滞后已超 `catch_up_lag_seconds`（追赶受限）时放宽到的时间盒：把一拍的大部分让给补算，
+    #: 追平后自动退回上面的常规预算。它不是新语义，只是「受限时允许用更多 CPU 去自愈」。
+    catch_up_max_budget_seconds: float = 4.0
+    catch_up_tick_batches: int = 4096   # 周期 tick 单次推进的批数硬闸（防病态输入把一拍拖死）
+    catch_up_batches: int = 8           # 直接调用 advance 时的批数上限（保持既有语义）
     catch_up_lag_seconds: int = 172800  # 滞后超过 2 世界日即记为「追赶受限」
     render_calls_per_day: int = 20      # 事件表述 / 展开的现实日调用上限（§2.8 单任务预算）
     instance_tokens_per_day: int = 400_000   # 实例总预算（所有激活线共享）
@@ -124,9 +131,12 @@ class RuntimeConfig:
     task_tokens_per_day: int = 60_000        # 单任务预算（防重试或坏输入耗尽整条线）
     priority_reserve_ratio: float = 0.25     # 给更高优先级任务留出的额度比例
     #: 角色记忆（MEMORY_SPEC §十：配额由运行层统一决定）
-    memory_extract_per_day: int = 40     # 每日提取的现实日调用上限
+    memory_extract_per_day: int = 40     # 每日提取的现实日调用上限（安全上限，不是额度定义）
+    memory_extract_per_world_day: int = 2  # 每角色每世界日的提取额度（MEMORY_SPEC §5.2 第 0 条）
     memory_recall_limit: int = 6         # 单轮简报条数上限
     memory_brief_tokens: int = 900       # 简报预算（字符量级）
+    #: 召回候选规模上界（MEMORY_SPEC §5.1）：先按水位取最近 N 条再排序，0 = 不限（不推荐）
+    memory_candidate_limit: int = 2000
     memory_decay_per_day: float = 0.02   # 每世界日强度衰减率
     #: 归档条目「强相关可唤起」的向量相似度门槛（§六）；逐字命中不受此限
     memory_archived_recall_min: float = 0.82

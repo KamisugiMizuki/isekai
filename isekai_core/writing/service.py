@@ -58,6 +58,9 @@ class WritingService:
         self.store = store
         self.cfg = cfg
         self.runtime = runtime
+        #: 观察结果按 (实例, 线, 观察者, 大纲, 受众) 缓存，键值带上观察水位（§6.1）：
+        #: 同一 revision 的重复「给我建议」不再重跑整轮世界观察（快照 + 认知投影 + 包 + 卡）。
+        self._observe_cache: dict[tuple[str, str, str, str, str], tuple[int, dict[str, Any]]] = {}
 
     # ---------------------------------------------------------------- 背景读数
 
@@ -304,13 +307,24 @@ class WritingService:
         observer_id: str,
         outline_id: str = "",
         audience: str = "author",
+        expected_revision: int | None = None,
     ) -> dict[str, Any]:
-        """三层输出（§5.2）：玩家观察层 / 主持依据层（默认只给 GM 与作者）/ 下一步编排层。"""
+        """三层输出（§5.2）：玩家观察层 / 主持依据层（默认只给 GM 与作者）/ 下一步编排层。
+
+        `expected_revision` 是调用方已读到的水位（客户端 `observed_revision`）：与当前水位一致且
+        缓存里有同一 revision 的结果时直接复用；不一致就走完整观察并把实际水位随结果返回。
+        """
         mode = str(audience or "author")
         if mode not in AUDIENCES:
             raise UmpError(Err.INVALID, f"未知受众：{mode}（只接受 {'/'.join(AUDIENCES)}）", retryable=False)
         runtime = self._runtime()
         self._line(instance_id, timeline_id)
+        cache_key = (instance_id, timeline_id, str(observer_id), str(outline_id), mode)
+        current = int(runtime.clock_row(timeline_id)["processed_world"])
+        if expected_revision is None or int(expected_revision) == current:
+            cached = self._observe_cache.get(cache_key)
+            if cached is not None and cached[0] == current:
+                return cached[1]
         snapshot = runtime.read_snapshot(
             instance_id, timeline_id,
             request={"characters": [str(observer_id)], "include": list(OBSERVE_INCLUDES)},
@@ -400,6 +414,7 @@ class WritingService:
                 "evidence": report["evidence"],
                 "snapshot_id": str(snapshot.get("snapshot_id") or ""),
             }
+        self._observe_cache[cache_key] = (current, payload)
         return payload
 
     # ---------------------------------------------------------------- §4.3 候选生命周期
@@ -780,10 +795,12 @@ class WritingService:
         limit: int = 3,
         llm: Any = None,
         prefix: str = "cand",
+        observed_revision: int | None = None,
     ) -> dict[str, Any]:
         """让系统提出多条情节推进 / 冲突后果（§六）：提议是**候选**，不写世界、不自动达成条目。
 
         一次便宜调用（`wa_suggest` 档），失败返回空提议并说明——不编造候选。
+        `observed_revision` 是客户端刚读到的观察水位：一致时复用观察结果，不重跑整轮世界观察（§6.1）。
         """
         row = self._state_row(instance_id, timeline_id, outline_id)
         definition = self._definition(self.store.wa_outline_get(str(row["outline_id"])) or {}) if row else {"items": []}
@@ -794,7 +811,8 @@ class WritingService:
         material = ""
         if observer_id:
             observed = self.observe(instance_id, timeline_id, observer_id=str(observer_id),
-                                    outline_id=outline_id, audience="author")
+                                    outline_id=outline_id, audience="author",
+                                    expected_revision=observed_revision)
             view = observed.get("player_view") or {}
             lines = [f"- （她的经历）{item.get('summary') or item}" for item in view.get("experiences") or []]
             lines += [f"- （她听说的）{item.get('text') or item}" for item in view.get("claims") or []]

@@ -48,7 +48,9 @@ ACTION_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "interpreted": ("awaiting_confirmation", "confirmed", "abandoned"),
     "awaiting_confirmation": ("confirmed", "modified", "abandoned"),
     "modified": ("interpreted", "awaiting_confirmation", "abandoned"),
-    "confirmed": ("snapshotting", "abandoned"),
+    # 在途态只有一个（§11.2，2026-10-08）：取得世界 / 规则状态快照是 `resolving` 的内部阶段，
+    # 不再单独持久化 `snapshotting`。下面那一行只留给**老库里的在途行**读出来时归位用。
+    "confirmed": ("resolving", "abandoned"),
     "snapshotting": ("resolving", "plugin_failed", "interrupted"),
     "resolving": ("reviewing", "plugin_failed", "interrupted"),
     "reviewing": ("awaiting_choice", "awaiting_gm_review", "committing", "rejected"),
@@ -101,7 +103,8 @@ def scene_beat(value: Any) -> str:
 
 
 #: 会改变规则状态或世界状态、因而必须走确认与联合提交的行动状态
-LIVE_ACTION_STATES = ("confirmed", "snapshotting", "resolving", "reviewing", "awaiting_choice",
+#: （在途只有一个 `resolving`；`snapshotting` 只是老库在途行读出来时的兼容值）
+LIVE_ACTION_STATES = ("confirmed", "resolving", "reviewing", "awaiting_choice",
                       "awaiting_gm_review", "committing")
 
 
@@ -131,6 +134,12 @@ def transition(table: str, current: str, target: str, *, what: str = "") -> str:
 
 # ---------------------------------------------------------------- 规则状态 patch
 
+#: patch 的 `op` 闭集（TRPG_CAMPAIGN_RUNTIME_SPEC §5.2 / C-4）：
+#: `add` / `replace` / `remove` 是**绝对量**（新增键 / 覆盖为给定值 / 删除键）；
+#: `increase` / `decrease` 是**并发安全的相对量**——写入的是差值，可与同一 `base..current`
+#: 区间内的其他相对量合并，不因 revision 落后就整批重裁。
+#: 它与世界后果的 `operation` 是两套词表：`add↔create`、`replace↔set`、`remove↔remove`、
+#: `increase`/`decrease↔change`；`reveal`/`advance` 只属于世界后果。
 PATCH_OPS = ("add", "replace", "remove", "increase", "decrease")
 
 
@@ -152,6 +161,10 @@ def validate_patch(patch: Any) -> list[str]:
         return ["rule_state_patch 必须是对象"]
     if not isinstance(patch.get("ruleset_id"), str) or not patch.get("ruleset_id"):
         errors.append("rule_state_patch.ruleset_id 缺失")
+    # 分片键（§5.2 / §3.4）：缺省与请求的 rule_state.scope_ref 相同；给了就必须是字符串。
+    # 核心不解释它的含义，只保证一次 patch 只写一片（跨片写入要逐片声明）。
+    if "scope_ref" in patch and not isinstance(patch.get("scope_ref"), str):
+        errors.append("rule_state_patch.scope_ref 必须是字符串（'' 表示全局分片）")
     base = patch.get("base_state_revision")
     if not isinstance(base, int) or isinstance(base, bool) or base < 0:
         errors.append("rule_state_patch.base_state_revision 必须是非负整数")
@@ -316,7 +329,7 @@ def scene_view(scene: dict[str, Any], *, audience: Any = PUBLIC_PARTY) -> dict[s
 
 
 def action_view(row: dict[str, Any], *, audience: Any = "public_party") -> dict[str, Any]:
-    """行动投影：GM 私有材料（原始 resolution）只有 gm_only 受众拿得到。"""
+    """行动投影：GM 私有材料（原始 resolution / 规则输入 context）只有 gm_only 受众拿得到。"""
     out: dict[str, Any] = {
         "action_id": str(row.get("action_id") or ""),
         "scene_id": str(row.get("scene_id") or ""),
@@ -325,6 +338,9 @@ def action_view(row: dict[str, Any], *, audience: Any = "public_party") -> dict[
         "target_refs": row.get("target_refs") or "[]",
         "method": str(row.get("method") or ""),
         "confirmation": str(row.get("confirmation") or ""),
+        # 确认来源（§3.3 / C-3）：user = 声明时已获用户确认；host_mode = 自动主持确认。
+        # 客户端据此把「已由主持模式确认」与用户确认分开呈现，不把前者说成玩家点的。
+        "confirmed_by": str(row.get("confirmed_by") or ""),
         "action_revision": int(row.get("action_revision") or 1),
         "status": str(row.get("status") or ""),
         "failure_code": str(row.get("failure_code") or ""),
@@ -333,4 +349,7 @@ def action_view(row: dict[str, Any], *, audience: Any = "public_party") -> dict[
     }
     if GM_ONLY in audience_set(audience):
         out["resolution"] = row.get("resolution") or "{}"
+        # 规则输入（属性 / 技能 / DC / 在册目标）是主持依据：只进 GM 面（§十二）
+        out["context"] = row.get("context") or "{}"
+        out["preconditions"] = row.get("preconditions") or "[]"
     return out

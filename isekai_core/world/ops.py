@@ -34,7 +34,14 @@ from .instances import (
     save_card,
     public_setting,
 )
-from .package import MAX_PACKAGE_BYTES, PackageError, load_package, save_package, template_package
+from .package import (
+    MAX_PACKAGE_BYTES,
+    PackageError,
+    atomic_write_text,
+    load_package,
+    save_package,
+    template_package,
+)
 from .portable import import_instance, read_container, write_export
 from .validate import validate_package
 from .. import onboarding as onboarding_mod
@@ -299,12 +306,117 @@ def _draft_path(cfg: Config, name: str) -> Path:
     return cfg.paths.packages / f"{safe}.draft.json"
 
 
+#: 包列表的校验结果缓存（P1-15）：规范把「列表」与显式的「[校验]」分成两个动作，
+#: 列表只做轻量列举 + 按 `mtime:size` 复用上一次结论；硬校验留在
+#: `world.package.validate` / `world.package.import`（与 `backup_pack.list_packs` 同一写法）。
+#: 放在数据目录而不是创作目录：创作目录是用户资产，不塞本机记账文件。
+VERIFY_CACHE_NAME = "package-verify-cache.json"
+
+
+def _verify_cache_path(cfg: Config) -> Path:
+    return cfg.paths.data / VERIFY_CACHE_NAME
+
+
+def _load_verify_cache(cfg: Config) -> dict[str, Any]:
+    try:
+        data = json.loads(_verify_cache_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_verify_cache(cfg: Config, data: dict[str, Any]) -> None:
+    try:
+        atomic_write_text(_verify_cache_path(cfg), json.dumps(data, ensure_ascii=False))
+    except OSError as exc:  # 缓存写不了不影响功能，只是下次要重算
+        log.warning("package verify cache write failed: %s", exc)
+
+
+def _stamp_of(path: Path) -> str:
+    """缓存键的时戳口径：`mtime:size`（与 `backup_pack.list_packs` 同一写法）。"""
+    stat = path.stat()
+    return f"{int(stat.st_mtime)}:{stat.st_size}"
+
+
+def _cached_package_entry(path: Path, known: dict[str, Any]) -> dict[str, Any]:
+    """按缓存结论组装一条列表项（本次**未**校验）。"""
+    return {
+        "file": path.name,
+        "name": known.get("name"),
+        "density": known.get("density"),
+        "valid": bool(known.get("valid")),
+        "errors": list(known.get("errors") or []),
+        "verify": "cached",  # 已缓存：本次列表没有重新校验
+        "checked_at": float(known.get("checked_at") or 0.0),
+    }
+
+
+def _package_entry(path: Path, cache: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+    """一条世界包列表项：`mtime:size` 命中就用上次结论，否则本次校验并回写缓存。
+
+    返回 `(列表项, 缓存是否变化)`；`None` = 这个文件其实是角色卡，不属于包列表。
+    列表项标注 `verify` = `cached`（已缓存，本次未校验）/ `fresh`（本次校验）。
+    """
+    try:
+        stamp = _stamp_of(path)
+    except OSError as exc:  # 列表中途被删 / 不可读：如实报，不炸整个列表
+        return {
+            "file": path.name, "name": None, "valid": False,
+            "errors": [str(exc)], "verify": "fresh",
+        }, False
+    known = cache.get(path.name) if isinstance(cache.get(path.name), dict) else None
+    if known is not None and known.get("stamp") == stamp:
+        return (None if known.get("kind") == "card" else _cached_package_entry(path, known)), False
+    checked_at = time.time()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        entry: dict[str, Any] | None = {
+            "file": path.name, "name": None, "valid": False,
+            "errors": ["不是合法 JSON"], "verify": "fresh", "checked_at": checked_at,
+        }
+        kind = "broken"
+    else:
+        if isinstance(payload, dict) and isinstance(payload.get("identity"), dict) and "calendar" not in payload:
+            cache[path.name] = {"stamp": stamp, "kind": "card", "checked_at": checked_at}
+            return None, True  # 角色卡：包列表不列它，但记下「这是卡」，下次不必重读
+        errors = validate_package(payload)
+        meta = payload.get("meta") if isinstance(payload, dict) and isinstance(payload.get("meta"), dict) else {}
+        entry = {
+            "file": path.name,
+            "name": meta.get("original_name"),
+            "density": meta.get("density"),
+            "valid": not errors,
+            "errors": errors,
+            "verify": "fresh",  # 本次列表现算的
+            "checked_at": checked_at,
+        }
+        kind = "package"
+    cache[path.name] = {
+        "stamp": stamp,
+        "kind": kind,
+        "name": (entry or {}).get("name"),
+        "density": (entry or {}).get("density"),
+        "valid": bool((entry or {}).get("valid")),
+        # 结论逐字复用（不截断）：命中缓存与本次现算给出的清单必须一模一样
+        "errors": list((entry or {}).get("errors") or []),
+        "checked_at": checked_at,
+    }
+    return entry, True
+
+
 def _list_files(cfg: Config, kind: str) -> list[dict[str, Any]]:
-    """创作目录列表：给管理面下拉用（只返回摘要与校验状态，不返回全文）。"""
+    """创作目录列表：给管理面下拉用（只返回摘要与校验状态，不返回全文）。
+
+    世界包列举走校验结果缓存（P1-15）：规范把「列表」与显式的「[校验]」分成两个动作，
+    列表按 `mtime:size` 复用上次结论，硬校验留在 `world.package.validate` / `import`。
+    """
     folder = cfg.paths.packages
     if not folder.exists():
         return []
     items: list[dict[str, Any]] = []
+    cache = _load_verify_cache(cfg) if kind == "package" else {}
+    cache_changed = False
     if kind == "container":
         # 实例导出件：导入下拉的候选（不算世界包创作内容）
         for path in sorted(folder.glob("*.isekai.json")):
@@ -329,25 +441,18 @@ def _list_files(cfg: Config, kind: str) -> list[dict[str, Any]]:
     for path in sorted(folder.glob("*.json")):
         if path.name.endswith((".candidate.json", ".draft.json", ".isekai.json")):
             continue  # 未通过校验的候选、草稿与实例导出件都不算创作内容
+        if kind == "package":
+            entry, changed = _package_entry(path, cache)
+            cache_changed = cache_changed or changed
+            if entry is not None:
+                items.append(entry)
+            continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            if kind == "package":
-                items.append({"file": path.name, "name": None, "valid": False, "errors": ["不是合法 JSON"]})
             continue
         is_card = isinstance(payload.get("identity"), dict) and "calendar" not in payload
-        if kind == "package" and not is_card:
-            errors = validate_package(payload)
-            items.append(
-                {
-                    "file": path.name,
-                    "name": (payload.get("meta") or {}).get("original_name"),
-                    "density": (payload.get("meta") or {}).get("density"),
-                    "valid": not errors,
-                    "errors": errors,
-                }
-            )
-        elif kind == "card" and is_card:
+        if kind == "card" and is_card:
             items.append(
                 {
                     "file": path.name,
@@ -356,6 +461,8 @@ def _list_files(cfg: Config, kind: str) -> list[dict[str, Any]]:
                     "race_id": (payload.get("identity") or {}).get("race_id"),
                 }
             )
+    if cache_changed:
+        _save_verify_cache(cfg, cache)
     return items
 
 
@@ -726,10 +833,14 @@ def dispatch(
             }
         if op == "world.generate.snapshot":
             # P3「进度可见」+ §3.4「看这次给模型的提示词」：核心单进程，生成在 await 模型时事件循环仍空闲，
-            # 这里读的是即时快照；提示词是最近一次实际发出去的原文（没发起过就是空串）。
+            # 这里读的是即时快照。**提示词默认不带**（P1-16 / P2-15：每秒轮询不该回传 6.7 KB 的原文），
+            # 只有界面真展开「这次给模型的提示词」时才用 `want_prompt=True` 单独取一次。
             from .generator import last_prompt, progress_snapshot
 
-            return {"progress": progress_snapshot(), "prompt": last_prompt()}
+            snapshot: dict[str, Any] = {"progress": progress_snapshot()}
+            if bool(args.get("want_prompt")):
+                snapshot["prompt"] = last_prompt()
+            return snapshot
         if op == "world.draft.list":
             return {"drafts": _list_files(cfg, "draft")}
         if op == "world.draft.save":
@@ -745,8 +856,9 @@ def dispatch(
                 "updated_at": time.time(),
             }
             target = _draft_path(cfg, name)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            # 草稿与包 / 卡片同一条原子规则（§2.4，P2-12）：同目录临时文件 → fsync → os.replace；
+            # 中途失败不截断、不覆盖已有草稿
+            atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
             return {"file": target.name}
         if op == "world.draft.load":
             target = _draft_path(cfg, str(args.get("name") or ""))
@@ -1398,6 +1510,9 @@ def _trpg_action_declare(cfg: Config, store: Store, runtime: Any, args: dict[str
         requires_confirmation=bool(args.get("require_confirmation")),
         auto_confirm=bool(args.get("auto_confirm")),
         action_id=str(args.get("action_id") or "") or None,
+        # 规则输入（P1-10）与确认来源（C-3）：显式传给战役运行时，不再拿 preconditions 当 context
+        context=_json_arg(args, "context", {}) if isinstance(_json_arg(args, "context", {}), dict) else {},
+        confirmed_by=str(args.get("confirmed_by") or ""),
     )
 
 
@@ -1445,7 +1560,11 @@ def _trpg_choice_select(cfg: Config, store: Store, runtime: Any, args: dict[str,
 
 def _trpg_rule_state(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
     instance_id, timeline_id, campaign_id = _campaign_ref(args)
-    return _campaign_call(_campaign_service(runtime).rule_state, instance_id, timeline_id, campaign_id)
+    # scope_ref 是规则状态分片键（P1-9）：缺省 '' = 全局分片，与旧口径一致
+    return _campaign_call(
+        _campaign_service(runtime).rule_state, instance_id, timeline_id, campaign_id,
+        scope_ref=str(args.get("scope_ref") or ""),
+    )
 
 
 def _trpg_commit(cfg: Config, store: Store, runtime: Any, args: dict[str, Any]) -> dict[str, Any]:
@@ -1530,6 +1649,7 @@ def _iface_op(cfg: Config, store: Store, runtime: Any, op: str, args: dict[str, 
                 snapshot_id=str(args.get("snapshot_id") or ""),
                 runtime_generation=int(generation) if generation is not None else None,
                 source_refs=_json_arg(args, "source_refs", []),
+                require_current=bool(args.get("require_current") or False),
             )
         if op == "runtime.task.invalidate":
             return _iface_call(
@@ -1816,6 +1936,10 @@ async def _wa_suggest(cfg: Config, llm: Any, store: Store | None, runtime: Any,
         limit=int(args.get("limit") or 3),
         llm=llm,
         prefix=str(args.get("prefix") or "cand"),
+        # 客户端刚读到的观察水位（P1-16）：一致时复用观察结果，不重跑整轮世界观察
+        observed_revision=(
+            int(args["observed_revision"]) if args.get("observed_revision") is not None else None
+        ),
     )
 
 
@@ -1860,7 +1984,11 @@ def _trpg_recover(cfg: Config, store: Store, runtime: Any, args: dict[str, Any])
     timeline_id = str(args.get("timeline_id") or "")
     if not instance_id or not timeline_id:
         raise UmpError(Err.INVALID, "恢复需要 instance_id 与 timeline_id", retryable=False)
-    return _campaign_call(_campaign_service(runtime).recover, instance_id, timeline_id)
+    return _campaign_call(
+        _campaign_service(runtime).recover, instance_id, timeline_id,
+        # 给 campaign_id 才走「按战役一次取在途集合」的有界恢复（P1-12）；不给则保持按线扫的兼容路径
+        campaign_id=str(args.get("campaign_id") or ""),
+    )
 
 
 async def _resolve_trpg_action(
@@ -1894,6 +2022,9 @@ async def _resolve_trpg_action(
                 plugin_manifest=plugin,
                 world_snapshot=args.get("world_snapshot") if isinstance(args.get("world_snapshot"), dict) else None,
                 timeout=float(args.get("timeout") or 60.0),
+                # 规则输入与分片键（P1-10 / P1-9）：显式下推，缺省与旧调用方一致
+                context=args.get("context") if isinstance(args.get("context"), dict) else None,
+                scope_ref=str(args.get("scope_ref") or ""),
             )
         except campaign_mod.CampaignError as exc:
             raise UmpError(Err.INVALID, str(exc), retryable=False) from exc
@@ -2257,10 +2388,13 @@ def _trpg_client_op(cfg: Config, store: Store, runtime: Any, op: str, args: dict
     if op == "trpg.client.refresh":
         return _client_call(client.refresh, workspace=ws, mode=str(args.get("mode") or ""))
     if op == "trpg.client.choice":
+        revision = args.get("scene_revision")
         return _client_call(
             client.choose, workspace=ws, choice_id=str(args.get("choice_id") or ""),
             option_id=str(args.get("selection") or args.get("option_id") or ""),
             idempotency_key=str(args.get("idempotency_key") or ""),
+            # 场景版本随选择一起下推（P2-6）：不符即 conflict，不套用旧选项
+            scene_revision=int(revision) if revision is not None else None,
         )
     if op == "trpg.client.gm_change":
         form = args.get("form") if isinstance(args.get("form"), dict) else {}

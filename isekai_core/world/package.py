@@ -86,6 +86,9 @@ def template_package(
             "axioms": [{"id": "ax-1", "text": ""}],
             "geography": "",
             "society": "",
+            # 区域登记（WORLD_SETTING_SPEC §2.2 / 附录 A，P2-11）：区域只作叙事范围标签，
+            # 无几何 / 路网；角色卡的 region 与事件效果的 target 都引用这里的稳定标识。
+            "regions": [],
             "lexicon": {"note": "", "terms": [{"term": "", "meaning": ""}]},
             "institutions": [
                 {
@@ -172,22 +175,36 @@ def load_package(path: str | os.PathLike[str]) -> dict[str, Any]:
     return raw
 
 
+def atomic_write_text(path: str | os.PathLike[str], text: str) -> None:
+    """原子替换一份文本文件（§2.4）：同目录临时文件 → `flush` + `fsync` → `os.replace`。
+
+    世界包、角色卡与草稿写入共用这一条（P2-12）：中途失败既不覆盖 / 截断已确认版本，
+    也不把临时文件留在创作目录里。
+    """
+    file = Path(path)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=str(file.parent), delete=False, suffix=".tmp"
+    )
+    name = handle.name
+    try:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        os.replace(name, file)
+    except BaseException:
+        handle.close()  # 重复 close 是无操作
+        Path(name).unlink(missing_ok=True)  # 失败不留半截产物
+        raise
+
+
 def save_package(path: str | os.PathLike[str], package: dict[str, Any]) -> None:
     """原子替换最新版：先写临时文件再替换，失败不覆盖原文件（§2.4）。"""
     file = Path(path)
     file.parent.mkdir(parents=True, exist_ok=True)
     ensure_original_name(package)
-    text = json.dumps(package, ensure_ascii=False, indent=2)
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=str(file.parent), delete=False, suffix=".tmp"
-    )
-    try:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    finally:
-        handle.close()
-    os.replace(handle.name, file)
+    atomic_write_text(file, json.dumps(package, ensure_ascii=False, indent=2))
 
 
 def clone_package(package: dict[str, Any]) -> dict[str, Any]:

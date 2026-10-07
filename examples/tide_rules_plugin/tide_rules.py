@@ -246,7 +246,17 @@ def main() -> None:
         if not line.strip():
             continue
         try:
-            print(json.dumps(resolve(json.loads(line)), ensure_ascii=False), flush=True)
+            request = json.loads(line)
+        except json.JSONDecodeError as exc:
+            print(json.dumps({"error": {"code": "rejected", "message": str(exc)}}, ensure_ascii=False),
+                  flush=True)
+            return 1
+        if str(request.get("type") or "") == "ping":
+            # 常驻协议：心跳必须回 pong（P1-8：战役裁定器缺省常驻，复用前会先探活）
+            print(json.dumps({"type": "pong"}), flush=True)
+            continue
+        try:
+            print(json.dumps(resolve(request), ensure_ascii=False), flush=True)
         except (ValueError, json.JSONDecodeError) as exc:
             print(json.dumps({"error": {"code": "rejected", "message": str(exc)}}, ensure_ascii=False),
                   flush=True)

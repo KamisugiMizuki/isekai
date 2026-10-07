@@ -55,6 +55,31 @@ class RuntimeStateError(ValueError):
     """运行层拒绝该操作：状态不允许或参数非法。"""
 
 
+class _LazyIdSet:
+    """按需查库的 id 集合（§2.6）：`in` 走主键索引，不把全部历史 id 取进内存。
+
+    批内新产生的事实用 `add()` 记在本地集合里（先查本地、再查库），不写库也不预载历史。
+    只支持成员判定与本地追加；需要**枚举**全部 id 的调用方必须显式用 `store.event_ids()`——
+    那本身就意味着「每批全量重扫历史」，属于规范违规的信号。
+    """
+
+    __slots__ = ("_probe", "_local")
+
+    def __init__(self, probe: Any) -> None:
+        self._probe = probe
+        self._local: set[str] = set()
+
+    def add(self, item: object) -> None:
+        self._local.add(str(item))
+
+    def __contains__(self, item: object) -> bool:
+        key = str(item)
+        return key in self._local or bool(self._probe(key))
+
+    def __iter__(self):  # pragma: no cover - 显式拒绝枚举，避免悄悄退化成全量读取
+        raise TypeError("_LazyIdSet 不支持枚举：补算期一律按候选查主键（§2.6）")
+
+
 def from_config(cfg: Any, store: Store) -> "RuntimeService":
     """运行层的**唯一构造入口**：按 RuntimeConfig 字段名对齐传参，不再各处手抄一份。
 
@@ -119,6 +144,9 @@ class RuntimeService:
         rate_max: int | None = None,
         max_active_timelines: int = 4,
         catch_up_batches: int = 8,
+        catch_up_budget_seconds: float = 1.0,
+        catch_up_max_budget_seconds: float = 4.0,
+        catch_up_tick_batches: int = 4096,
         catch_up_lag_seconds: int = 0,
         render_calls_per_day: int = 20,
         instance_tokens_per_day: int = 400_000,
@@ -126,8 +154,10 @@ class RuntimeService:
         task_tokens_per_day: int = 60_000,
         priority_reserve_ratio: float = 0.25,
         memory_extract_per_day: int = 40,
+        memory_extract_per_world_day: int = 2,
         memory_recall_limit: int = 6,
         memory_brief_tokens: int = 900,
+        memory_candidate_limit: int = 2000,
         memory_decay_per_day: float = 0.02,
         memory_archived_recall_min: float = 0.82,
         memory_embedding_model: str = "",
@@ -142,8 +172,14 @@ class RuntimeService:
         self.rate_max = int(rate_max or DEFAULT_RATE_MAX)
         #: 同时激活的时间线上限（§4）
         self.max_active_timelines = max(1, int(max_active_timelines))
-        #: 单次推进的批数上限（§2.6 预算）
+        #: 直接调用 advance 时的批数上限（§2.6）：保持既有单次语义，不由 tick 复用
         self.catch_up_batches = max(1, int(catch_up_batches))
+        #: 单次推进的墙钟时间盒（§2.6）：跑满预算或追平为止；0 = 只用批数上限
+        self.catch_up_budget_seconds = max(0.0, float(catch_up_budget_seconds))
+        #: 追赶受限时放宽到的时间盒（§2.6）：放宽只为自愈，追平后立刻退回常规预算
+        self.catch_up_max_budget_seconds = max(self.catch_up_budget_seconds, float(catch_up_max_budget_seconds))
+        #: 周期 tick 的批数硬闸（§2.6）：时间盒是主闸，这个数只防病态输入
+        self.catch_up_tick_batches = max(1, int(catch_up_tick_batches))
         #: 滞后超过该世界秒数即进入「追赶受限」（§2.6）；0 = 与目标同步才退出受限
         self.catch_up_lag_seconds = max(0, int(catch_up_lag_seconds))
         #: 表述 / 展开 / 自主提案的现实日调用上限（§2.8 单任务预算）
@@ -157,8 +193,12 @@ class RuntimeService:
         self.priority_reserve_ratio = max(0.0, min(1.0, float(priority_reserve_ratio)))
         #: 角色记忆参数（MEMORY_SPEC §十）
         self.memory_extract_per_day = max(0, int(memory_extract_per_day))
+        #: 提取额度按世界时间给（MEMORY_SPEC §5.2 第 0 条）：现实日预算是安全上限，不是额度定义
+        self.memory_extract_per_world_day = max(1, int(memory_extract_per_world_day))
         self.memory_recall_limit = max(1, int(memory_recall_limit))
         self.memory_brief_tokens = max(0, int(memory_brief_tokens))
+        #: 召回候选规模上界（§5.1）：先按水位取最近 N 条再排序；0 = 不限（仅供对照测量）
+        self.memory_candidate_limit = max(0, int(memory_candidate_limit))
         self.memory_decay_per_day = max(0.0, min(1.0, float(memory_decay_per_day)))
         self.memory_archived_recall_min = max(0.0, min(1.0, float(memory_archived_recall_min)))
         #: 远程 embedding（MEMORY_SPEC §5.2）：缺配置即退化全文召回
@@ -167,6 +207,9 @@ class RuntimeService:
         self.embedding_api_key = str(memory_embedding_api_key or "")
         #: 已确认的向量维度（0 = 本次进程还没成功调用过）；同名换维度要靠它比对
         self.embedding_dim = 0
+        #: 实例设定 / 历法解析缓存（§3.1）：键 = 实例 id，值 = (原文指纹, 结果)
+        self._setting_cache: dict[str, tuple[int, dict[str, Any]]] = {}
+        self._calendar_cache: dict[str, tuple[int, Calendar]] = {}
         #: 自动提交（§5.1）：默认现实 1 小时或新增事件 50 条，可配置可关；手动提交不受开关限制
         self.autocommit_enabled = bool(autocommit_enabled)
         self.autocommit_minutes = max(1, int(autocommit_minutes))
@@ -298,6 +341,10 @@ class RuntimeService:
                 targets.add(str(item["id"]))
         # 制度与职位也是已登记目标：用户可借合法事件改变某职位的持有者（§八 第 3 条）
         world = package.get("world") if isinstance(package.get("world"), dict) else {}
+        # 区域登记（P2-11 / WORLD_PACKAGE_APPENDIX ④）：区域与实体同在册，效果可以指向它
+        for region in world.get("regions") or []:
+            if isinstance(region, dict) and region.get("id"):
+                targets.add(str(region["id"]))
         for item in world.get("institutions") or []:
             if not isinstance(item, dict):
                 continue
@@ -1013,6 +1060,38 @@ class RuntimeService:
             "world": int(row.get("source_world") or 0),
         }
 
+    def _lazy_event_ids(self, instance_id: str, timeline_id: str) -> _LazyIdSet:
+        """补算期的「已知事件」集合（§2.6）：成员判定按候选查主键，不预载全部历史 id。"""
+        return _LazyIdSet(lambda ident: self.store.event_exists(instance_id, timeline_id, ident))
+
+    def _archived_ids(self, instance_id: str, timeline_id: str, *, until: int | None = None) -> set[str]:
+        """已归档角色集合（§六）：读**版本化状态位**，不靠有界事件窗反推。
+
+        事件窗判法在事件数超过窗口后会把早期死亡挤出视野，让已归档角色「复生」；
+        使用状态位后，窗口查询只作一致性断言（`events.is_dead` 仍保留给断言路径用）。
+        """
+        return self.store.character_archived_ids(instance_id, timeline_id, until=until)
+
+    def extraction_allowance(
+        self, instance_id: str, timeline_id: str, *, floor: int = 6, ceiling: int = 24
+    ) -> int:
+        """这一次提取的材料额度（MEMORY_SPEC §5.2 第 0 条）：**按世界时间**给，溢出顺延。
+
+        额度 = `每角色每世界日 N 条 × 待处理积压跨越的世界日数`，下限沿用既有单次批量（默认 6，
+        不让追平态的行为变差），上限防一次吃掉整天的现实预算。现实日预算
+        （`memory_extract_per_day`）仍是安全上限，由 `reserve_call` 在真正发起调用时把关。
+        """
+        row = self.clock_row(timeline_id)
+        watermark = int(row["processed_world"])
+        pending = self.store.memory_tasks(instance_id, timeline_id)
+        if not pending:
+            return max(1, int(floor))
+        oldest = min(int(item.get("source_world") or watermark) for item in pending)
+        day_seconds = max(1, self.calendar(self.store.instance_get(instance_id)).day_seconds)
+        span_days = max(0, watermark - oldest) // day_seconds
+        wanted = max(1, int(self.memory_extract_per_world_day)) * max(1, span_days)
+        return max(max(1, int(floor)), min(max(1, int(ceiling)), wanted))
+
     async def extract_memories(
         self,
         instance_id: str,
@@ -1563,7 +1642,10 @@ class RuntimeService:
         """混合召回（§5）：先限定可访问集合，再排序，再按预算打包简报；向量不可用即退化全文。"""
         if world_seconds is None:
             world_seconds = int(self.clock_row(timeline_id)["processed_world"])
-        entries = self.store.memory_scope(instance_id, timeline_id, character_id, until=int(world_seconds))
+        entries = self.store.memory_scope(
+            instance_id, timeline_id, character_id, until=int(world_seconds),
+            limit=self.memory_candidate_limit or None,
+        )
         # 已授权的转述：作为**视图**参与召回，不复制来源角色的其他内容（§7.1）
         for item in self.disclosed_fragments(instance_id, timeline_id, character_id, until=int(world_seconds)):
             entry = disclosure.transcribe_entry(item)
@@ -1583,6 +1665,7 @@ class RuntimeService:
         vector_scores = self.store.memory_vector_scores(
             instance_id, timeline_id, character_id, topic,
             query_vector=query_vector, model=self.embedding_model,
+            limit=self.memory_candidate_limit or None,
         )
         ranked = memory_mod.rank(
             query=topic,
@@ -1732,10 +1815,34 @@ class RuntimeService:
         return instance, timeline
 
     def setting(self, instance: dict[str, Any]) -> dict[str, Any]:
-        return json.loads(instance["setting"])
+        """实例设定（§3.1：创建时锁定、不可编辑）。
+
+        解析结果按 `(实例, 原文指纹)` 缓存：设定在实例生命周期内不变，只有转换 / 导入会改写，
+        指纹一变自然失效。补算一批要读 5–6 次、一轮对话要读 4 次以上，不能每次都 json.loads。
+        调用方一律只读（本仓库各处都只取 `world_package` / `cards`）。
+        """
+        raw = instance.get("setting")
+        if isinstance(raw, dict):  # 调用方已经把设定解析好了
+            return raw
+        key = str(instance.get("id") or "")
+        stamp = hash(raw or "")
+        cached = self._setting_cache.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        parsed = json.loads(raw or "{}")
+        self._setting_cache[key] = (stamp, parsed)
+        return parsed
 
     def calendar(self, instance: dict[str, Any]) -> Calendar:
-        return calendar_from_package(self.setting(instance)["world_package"])
+        """历法（§2.1）：由锁定设定派生，按同样的指纹缓存。"""
+        key = str(instance.get("id") or "")
+        stamp = hash(instance.get("setting") or "")
+        cached = self._calendar_cache.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        calendar = calendar_from_package(self.setting(instance)["world_package"])
+        self._calendar_cache[key] = (stamp, calendar)
+        return calendar
 
     def cards(
         self, instance: dict[str, Any], *, timeline_id: str | None = None, world_seconds: int | None = None
@@ -1909,6 +2016,13 @@ class RuntimeService:
             })
         includes = [str(item) for item in (request.get("include") or [])] or list(self.SNAPSHOT_INCLUDES)
         unknown = [item for item in includes if item not in self.SNAPSHOT_INCLUDES]
+        unsupported = [key for key in ("topics", "entities") if request.get(key)]
+        if unsupported:
+            # §4.2 选择器口径：不支持就显式拒绝，不静默返回「最新 N 条」冒充结果
+            return self.envelope(instance_id, timeline_id, status="rejected", extra={
+                "reason": f"snapshot.read 本版本不支持 {unsupported}；按主题 / 实体取用请走 cognition.project",
+                "snapshot_id": "", "payload": {},
+            })
         if unknown:
             return self.envelope(instance_id, timeline_id, status="rejected", extra={
                 "reason": f"未知的 include：{unknown}", "snapshot_id": "", "payload": {},
@@ -1958,9 +2072,19 @@ class RuntimeService:
             })
         row = self.clock_row(timeline_id)
         until = int(at_revision if at_revision is not None else row["processed_world"])
+        # §4.3 选择器真实生效（不允许「接后静默返回最新 50 条」）：
+        # `time_range` 收窄世界秒窗口；`entity_refs` 按指涉过滤；`topics` 只改排序（稳定，不丢条目）。
+        window = query.get("time_range") or []
+        since = int(window[0]) if len(window) == 2 else None
+        up_to = int(window[1]) if len(window) == 2 else None
+        if up_to is not None:
+            until = min(until, up_to)
+        entity_refs = {str(item) for item in (query.get("entity_refs") or []) if str(item)}
+        topics = [str(item).strip().lower() for item in (query.get("topics") or []) if str(item).strip()]
         observations = [
             {"text": str(item.get("summary") or ""), "kind": str(item.get("kind") or ""),
              "world_seconds": int(item["world_seconds"]), "ref": str(item["id"]),
+             "source_ref": str(item.get("source_ref") or ""),
              "when": self.describe_world(instance_id, int(item["world_seconds"]))}
             for item in self.store.experience_window(instance_id, timeline_id, observer, until=until, limit=50)
         ]
@@ -1971,6 +2095,25 @@ class RuntimeService:
              "ref": str(item["id"])}
             for item in self.store.knowledge_window(instance_id, timeline_id, observer, until=until, limit=50)
         ]
+        if since is not None:
+            observations = [item for item in observations if int(item["world_seconds"]) >= since]
+            claims = [item for item in claims if int(item["world_seconds"]) >= since]
+        if entity_refs:
+            observations = [
+                item for item in observations
+                if str(item["ref"]) in entity_refs or str(item.get("source_ref") or "") in entity_refs
+            ]
+            claims = [
+                item for item in claims
+                if str(item.get("target") or "") in entity_refs or str(item.get("source") or "") in entity_refs
+            ]
+        if topics:
+            def _hit(item: dict[str, Any]) -> int:
+                text = str(item.get("text") or "").lower()
+                return 0 if any(topic in text for topic in topics) else 1
+
+            observations = sorted(observations, key=_hit)
+            claims = sorted(claims, key=_hit)
         known_unknowns = [
             {"ref": str(item["id"]), "text": str(item.get("intent") or ""), "stage": str(item.get("stage") or "")}
             for item in self.store.intent_list(instance_id, timeline_id, observer)
@@ -2044,41 +2187,47 @@ class RuntimeService:
     ) -> dict[str, Any]:
         """§4.5：已固化的世界事件与说法的只读历史。
 
-        游标是 `世界秒:序号`（事件表主序），往回翻用 `until=游标世界秒`。事件层是**已发生事实**
-        的公开层，按观察者是否合法获知要看 `cognition.project`；这里 `audience` 过滤只作用在
-        说法（claim 自带受众列）上，不假装事件层有受众。
+        游标是 `世界秒:序号`（事件表主序），严格往回翻：同秒内按 `seq` 续翻，页与页不重叠。
+        事件层是**已发生事实**的公开层，按观察者是否合法获知要看 `cognition.project`；
+        这里 `audience` 过滤只作用在说法（claim 自带受众列）上，不假装事件层有受众。
+        过滤、`since` 与游标全部与 `limit` 并列下推（§4.5）：选择性强的过滤不会被
+        「先取固定条数再在 Python 里滤」吞掉，也不会返回不足页。
         """
         filters = filters if isinstance(filters, dict) else {}
         row = self.clock_row(timeline_id)
         until = int(row["processed_world"])
+        before: tuple[int, int] | None = None
         if cursor:
+            parts = str(cursor).split(":")
             try:
-                until = min(until, int(str(cursor).split(":")[0]))
+                before = (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
             except ValueError:
                 return self.envelope(instance_id, timeline_id, status="rejected", extra={"reason": f"游标不可解析：{cursor}"})
+            until = min(until, before[0])
         count = max(1, min(int(limit), 200))
         wanted_kind = str(filters.get("event_kind") or "")
         wanted_source = str(filters.get("source") or "")
         wanted_subject = str(filters.get("subject") or "")
         wanted_audience = str(filters.get("audience") or "")
         time_range = filters.get("time_range") or []
-        since = int(time_range[0]) if len(time_range) == 2 else 0
-        to = int(time_range[1]) if len(time_range) == 2 else until
-        events = [
-            item for item in self.store.event_window(instance_id, timeline_id, until=until, limit=count * 3)
-            if (not wanted_kind or str(item.get("kind")) == wanted_kind)
-            and (not wanted_source or str(item.get("source")) == wanted_source)
-            and (not wanted_subject or wanted_subject in str(item.get("effects") or ""))
-            and since <= int(item["world_seconds"]) <= to
-        ][-count:]
+        windowed = len(time_range) == 2
+        since = int(time_range[0]) if windowed else None
+        to = int(time_range[1]) if windowed else until
+        upper = min(until, to)
+        events = self.store.event_window(
+            instance_id, timeline_id,
+            until=upper, limit=count,
+            since=since, kind=wanted_kind or None, source=wanted_source or None,
+            subject=wanted_subject or None, before=before,
+        )
         claims = [
             {"ref": str(item["id"]), "event_id": str(item["event_id"]), "text": str(item["text"]),
              "source": str(item["source_id"]), "audience": str(item["audience"]),
              "world_seconds": int(item["earliest_world"]), "kind": "claim"}
-            for item in self.store.claim_list(instance_id, timeline_id)
-            if int(item["earliest_world"]) <= until
-            and (not wanted_audience or str(item.get("audience")) == wanted_audience)
-            and since <= int(item["earliest_world"]) <= to
+            for item in self.store.claim_list(
+                instance_id, timeline_id,
+                at_least=since, until=upper, audience=wanted_audience or None,
+            )
         ]
         items = [
             {"ref": str(item["id"]), "kind": "event", "event_kind": str(item.get("kind")),
@@ -2108,8 +2257,14 @@ class RuntimeService:
         snapshot_id: str = "",
         runtime_generation: int | None = None,
         source_refs: list[str] | None = None,
+        require_current: bool = False,
     ) -> dict[str, Any]:
-        """§6.3：异步模块固化结果前的检查。`stale` 只能存本地，不能写回世界。"""
+        """§6.3：异步模块固化结果前的检查。`stale` 只能存本地，不能写回世界。
+
+        水位口径：请求快照比当前水位**新**是 `conflict`；比当前水位**旧**时默认仍返回 `valid`
+        并把落后量放进 `watermark_lag`（上层按当前水位重新预览，见 WRITING_ASSISTANT §八），
+        调用方要严格拦旧结果就传 `require_current=True`，此时落后即 `stale`。
+        """
         row = self.clock_row(timeline_id)
         try:
             self.store.write_probe()
@@ -2129,13 +2284,24 @@ class RuntimeService:
         if runtime_generation is not None and int(runtime_generation) != current:
             return self.envelope(instance_id, timeline_id, status="stale",
                                  extra={"reason": f"世代不一致：请求 {runtime_generation}，当前 {current}"})
+        watermark_lag = 0
         if snapshot_id:
             want = str(snapshot_id)
             processed = int(row["processed_world"])
-            if want.startswith("snap-") and want[5:].isdigit() and int(want[5:]) > processed:
-                return self.envelope(instance_id, timeline_id, status="conflict",
-                                     extra={"reason": f"快照 {want} 比当前水位 {processed} 新"})
-        return self.envelope(instance_id, timeline_id, status="valid")
+            if want.startswith("snap-") and want[5:].isdigit():
+                seen = int(want[5:])
+                if seen > processed:
+                    return self.envelope(instance_id, timeline_id, status="conflict",
+                                         extra={"reason": f"快照 {want} 比当前水位 {processed} 新"})
+                watermark_lag = max(0, processed - seen)
+                if watermark_lag > 0 and require_current:
+                    return self.envelope(instance_id, timeline_id, status="stale", extra={
+                        "reason": f"快照 {want} 落后当前水位 {processed}（差 {watermark_lag} 世界秒）",
+                        "watermark_lag": watermark_lag,
+                    })
+        return self.envelope(instance_id, timeline_id, status="valid", extra={
+            "watermark_lag": watermark_lag,
+        })
 
     def invalidate_tasks(
         self, instance_id: str, timeline_id: str, *, generation: int | None = None, reason: str = ""
@@ -2568,9 +2734,19 @@ class RuntimeService:
         self._require_compatible(instance_id)
 
     def advance(
-        self, instance_id: str, timeline_id: str, *, now_real: float, max_batches: int | None = None
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        now_real: float,
+        max_batches: int | None = None,
+        budget_seconds: float | None = None,
     ) -> dict[str, Any]:
-        """把水位从已处理时刻推进到目标时刻，按世界日分批、每批原子（§2.6）。"""
+        """把水位从已处理时刻推进到目标时刻，按世界日分批、每批原子（§2.6）。
+
+        主闸是**墙钟时间盒**（§2.6）：跑满预算或追平目标为止。批数只是病态输入的硬上限——
+        固定批数会让排水果位被写死（4 批 / 5 s 拍 = 0.8 世界日/现实秒），高倍率下永远追不上。
+        """
         self._require_compatible(instance_id)
         instance, timeline = self._rows(instance_id, timeline_id)
         if timeline["state"] != "active":
@@ -2594,16 +2770,30 @@ class RuntimeService:
         calendar = self.calendar(instance)
         cards = self.cards(instance, timeline_id=timeline_id, world_seconds=processed)
         generation = int(row["generation"])
-        # 追赶受限（§2.6）：滞后超过预算即进入，停止扩大目标、只按已完成水位回答，不跳过事实效果
+        # 追赶受限（§2.6）：滞后超过阈值即记为受限——它是**只读的滞后状态**，不改目标、不跳效果；
+        # 追平即自动清除，长期受限说明 rate_max 与排水能力不自洽（配置问题，不是可接受的常态）
         limited = (target - processed) > self.catch_up_lag_seconds
         budget = self.catch_up_batches if max_batches is None else max(1, int(max_batches))
+        #: 墙钟时间盒：None = 用服务配置；0 = 只用批数上限（测试与对照用）
+        span = self.catch_up_budget_seconds if budget_seconds is None else max(0.0, float(budget_seconds))
+        deadline = time.monotonic() + span if span > 0 else None
         produced = 0
         batches = 0
+        # 本批共用一份「仍有效的后果」（§六）：三个子步骤原先各查一次、还按角色再查一次，
+        # 而批内没有任何写入落库，读到的一定是同一份——一次查询往下传，语义不变、代价 O(1) 次。
+        # 跨批也只在第一次查库：追加与解除都来自我们自己写的批次（P0-2 的「候选集每批取一次」）。
+        active_effects = self.store.effect_window(instance_id, timeline_id, until=processed)
         while processed < target and batches < budget:
             day = calendar.day_index(processed)
             stop = min(target, (day + 1) * calendar.day_seconds)
             plans, units, experiences = self._collect_batch(
-                instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
+                instance_id,
+                timeline_id,
+                cards,
+                calendar,
+                from_world=processed,
+                to_world=stop,
+                active_effects=active_effects,
             )
             world_rows = self._world_event_rows(
                 instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
@@ -2612,7 +2802,14 @@ class RuntimeService:
                 instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
             )
             prelim_intents = self._revise_intents(
-                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
+                instance,
+                instance_id,
+                timeline_id,
+                cards,
+                calendar,
+                from_world=processed,
+                to_world=stop,
+                active_effects=active_effects,
             )
             institution_rows = self._institution_rows(
                 instance,
@@ -2634,7 +2831,14 @@ class RuntimeService:
             )
             intent_rows = prelim_intents
             spread = self._propagate_and_clear(
-                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
+                instance,
+                instance_id,
+                timeline_id,
+                cards,
+                calendar,
+                from_world=processed,
+                to_world=stop,
+                active_effects=active_effects,
             )
             committed = self.store.apply_runtime_batch(
                 timeline_id=timeline_id,
@@ -2661,6 +2865,8 @@ class RuntimeService:
                     effects=world_rows['effects'] + intent_rows['effects'],
                     experiences=experiences + intent_rows['experiences'],
                 ),
+                # 归档态与死亡事件同一批落盘（§六 / P1-3）
+                character_states=death_rows.get("character_states") or [],
             )
             if not committed:
                 # 世代已变（冻结 / 重启后迟到）或水位已被别的批次推过：本批整批不落盘
@@ -2673,9 +2879,20 @@ class RuntimeService:
             processed = stop
             batches += 1
             produced += len(experiences)
+            # 本批的后果出入账并进内存集合（下一批直接用）：效果只由本流程写入 / 解除，
+            # 所以「查一次 + 增量维护」与「每批重查」等价（§2.6 候选集每批取一次向下传递）
+            cleared_ids = {str(item[0]) for item in (spread.get("clear_effects") or [])}
+            added_effects = (world_rows["effects"] or []) + (intent_rows["effects"] or [])
+            active_effects = [
+                item for item in active_effects
+                if str(item.get("id")) not in cleared_ids
+            ] + [{**item} for item in added_effects if str(item.get("id")) not in cleared_ids]
             # 记忆按世界时长衰减（§六）：冻结期间不推进即不衰减，幂等
             self.decay_memories(timeline_id, to_world=stop)
             self.apply_due_pending_events(instance_id, timeline_id, to_world=stop)
+            # 时间盒：本批已经完整落盘，到这里才允许因预算退出（不会留半批）
+            if deadline is not None and time.monotonic() >= deadline:
+                break
         return {
             "state": "current" if processed >= target else "catching_up",
             "processed_world": processed,
@@ -2753,22 +2970,21 @@ class RuntimeService:
         *,
         from_world: int,
         to_world: int,
+        active_effects: list[dict[str, Any]] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """收集一批事实转移（不落盘）：事件与后果、次日计划、单元衰减、已完成窗口的经历。"""
         plans: list[dict[str, Any]] = []
         units: list[dict[str, Any]] = []
         experiences: list[dict[str, Any]] = []
         day_seconds = calendar.day_seconds
-        dead = {
-            str((card.get("meta") or {}).get("card_id"))
-            for card in cards
-            if events.is_dead(
-                instance_id,
-                timeline_id,
-                str((card.get("meta") or {}).get("card_id") or ""),
-                self.store.event_window(instance_id, timeline_id, until=to_world, limit=400),
-            )
-        }
+        # 事件窗曾用来按「最近 400 条」反推生死；归档态改读状态位后（§六 / P1-3），
+        # 这里不再需要窗口：少一次 400 行的取回与 dict 转换（§2.6 有界读取）
+        shared_effects = (
+            active_effects
+            if active_effects is not None
+            else self.store.effect_window(instance_id, timeline_id, until=to_world)
+        )
+        dead = self._archived_ids(instance_id, timeline_id, until=to_world)
         for card in cards:
             character_id = str((card.get("meta") or {}).get("card_id") or "")
             if not character_id or character_id in dead:
@@ -2795,12 +3011,12 @@ class RuntimeService:
                 )
             # 收割昨日与今日的计划：跨日窗口属于昨日，其尾部落在今日（§11 附录 B #7）
             day_here = calendar.day_index(from_world)
-            constraints = self.store.effect_window(
-                instance_id,
-                timeline_id,
-                until=to_world,
-                targets=[character_id, str(card.get("role_id") or ""), region_of(card)],
-            )
+            constraints = [
+                item
+                for item in shared_effects
+                if str(item.get("target"))
+                in {character_id, str(card.get("role_id") or ""), region_of(card)}
+            ]
             note = life.effect_note(
                 constraints,
                 character_id,
@@ -3035,18 +3251,15 @@ class RuntimeService:
         world = int(clock["processed_world"])
         calendar = self.calendar(instance)
         day = calendar.day_index(world)
+        # 归档判定读状态位（§六 / P1-3），不需要 400 行事件窗
+        archived = self._archived_ids(instance_id, timeline_id, until=world)
         spoken: list[dict[str, Any]] = []
         skipped: dict[str, str] = {}
         for card in self.cards(instance, timeline_id=timeline_id, world_seconds=world):
             character_id = str((card.get("meta") or {}).get("card_id") or "")
             if not character_id:
                 continue
-            if events.is_dead(
-                instance_id,
-                timeline_id,
-                character_id,
-                self.store.event_window(instance_id, timeline_id, until=world, limit=400),
-            ):
+            if character_id in archived:
                 skipped[character_id] = "已归档"
                 continue
             session = self.store.session_ensure(instance_id, timeline_id, character_id)
@@ -3221,8 +3434,9 @@ class RuntimeService:
         """后验一致性检查（NARRATIVE_LAYER §6.2）：结构检查先行，语义交给一次便宜判断。
 
         - 数字越界 / 空文本是确定性检查；
-        - 来源、时间、范围、关系、处境要看语义：正文里没有可核对数字时再花一次调用问，
-          问不出来（超时 / 解析失败）按通过，不误杀合法叙述（关键词从来不是唯一判据）。
+        - 来源、时间、范围、关系、处境要看语义：本轮注入了候选块时才花这一次调用问，
+          问不出来（超时 / 解析失败）按通过，不误杀合法叙述（关键词从来不是唯一判据）；
+          含数字不再免检——数字先核对，核完照常问语义。
 
         这笔调用走调用预算（§2.8）：它是每条可见回复的固定税，不能没有账。
         预算拒绝时按通过（与超时 / 解析失败一个口径），并留一条日志——注意管理面的预算视图
@@ -3232,7 +3446,8 @@ class RuntimeService:
         findings = narrative.audit(text, unit, activity=activity)
         if findings:
             return False, str(findings[0].get("detail") or findings[0].get("kind") or "")
-        if llm is None or narrative.has_checkable_numbers(text):
+        # 确定性判定能收尾（空文本 / 没有候选块可越界）就不花这次调用；含数字不再免检。
+        if llm is None or not narrative.needs_semantic_audit(unit, text):
             return True, ""
         prompt = narrative.audit_request(unit, text, activity=activity)
         prompt_text = "\n".join(str(item.get("content") or "") for item in prompt)
@@ -3407,10 +3622,15 @@ class RuntimeService:
         只给管理元数据与**用户已经看过**的正文；实情层、未获知内容与他人私聊一律不进（DESIGN §2.2-9）。
         """
         rows = self.store.narrative_unit_list(instance_id, timeline_id, character_id=character_id)
+        # 正文一次批量取回（§9.5-1 / P2-2）：不按节点逐条查消息表
+        wanted = [str(row.get("message_id") or "") for row in rows if str(row.get("message_id") or "")]
+        texts = {
+            message_id: self.store.message_text(row)
+            for message_id, row in self.store.outbound_by_message_ids(wanted).items()
+        }
 
         def text_of(message_id: str) -> str:
-            row = self.store.outbound_by_message_id(str(message_id)) if message_id else None
-            return self.store.message_text(row) if row is not None else ""
+            return texts.get(str(message_id or ""), "")
 
         return narrative.map_payload(rows, text_of=text_of)
 
@@ -3580,21 +3800,23 @@ class RuntimeService:
         *,
         from_world: int,
         to_world: int,
+        active_effects: list[dict[str, Any]] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """打算重议与受支持行动（§11.3）：条件不足就等，窗口过了先延期后放弃，条件满足才提交事件。"""
         rows: dict[str, list[dict[str, Any]]] = {"intents": [], "events": [], "effects": [], "experiences": []}
-        known_events = self.store.event_ids(instance_id, timeline_id)
-        active_effects = self.store.effect_window(instance_id, timeline_id, until=to_world)
+        known_events = self._lazy_event_ids(instance_id, timeline_id)
+        active_effects = (
+            active_effects
+            if active_effects is not None
+            else self.store.effect_window(instance_id, timeline_id, until=to_world)
+        )
+        # 归档判定只读状态位（§六 / P1-3）：不再为每个角色取 400 行事件窗
+        archived = self._archived_ids(instance_id, timeline_id, until=to_world)
         for card in cards:
             character_id = str((card.get("meta") or {}).get("card_id") or "")
             if not character_id:
                 continue
-            dead = events.is_dead(
-                instance_id,
-                timeline_id,
-                character_id,
-                self.store.event_window(instance_id, timeline_id, until=to_world, limit=400),
-            )
+            dead = character_id in archived
             for row in self.store.intent_list(instance_id, timeline_id, character_id):
                 if str(row["stage"]) in ("done", "abandoned"):
                     continue
@@ -3700,8 +3922,10 @@ class RuntimeService:
         package = self.setting(instance)["world_package"]
         seed, rules = self.seed_of(instance), self.rules_of(instance)
         day_index = calendar.day_index(from_world)
-        known_events = self.store.event_ids(instance_id, timeline_id)
-        known_effects = self.store.effect_active_ids(instance_id, timeline_id)
+        known_events = self._lazy_event_ids(instance_id, timeline_id)
+        known_effects = _LazyIdSet(
+            lambda ident: self.store.effect_active_exists(instance_id, timeline_id, ident)
+        )
         for candidate in events.plan_day(
             package,
             seed=seed,
@@ -3802,13 +4026,21 @@ class RuntimeService:
         from_world: int,
         to_world: int,
     ) -> dict[str, list[dict[str, Any]]]:
-        """寿终事件（§四）：由寿命模型与世界时刻推出，单独记账、可产生死讯说法。"""
-        out: dict[str, list[dict[str, Any]]] = {"events": [], "claims": [], "knowledge": []}
+        """寿终事件（§四）：由寿命模型与世界时刻推出，单独记账、可产生死讯说法。
+
+        归档态与死亡事件**同一批**置位（§六）：状态位让「已归档」不再依赖有界事件窗，
+        窗口判法保留为一致性断言（历史库未回填时仍能识别）。
+        """
+        out: dict[str, list[dict[str, Any]]] = {
+            "events": [], "claims": [], "knowledge": [], "character_states": []
+        }
         package = self.setting(instance)["world_package"]
-        known = self.store.event_window(instance_id, timeline_id, until=to_world, limit=400)
+        archived = self._archived_ids(instance_id, timeline_id, until=to_world)
         for card in cards:
             character_id = str((card.get("meta") or {}).get("card_id") or "")
-            if not character_id or events.is_dead(instance_id, timeline_id, character_id, known):
+            if not character_id:
+                continue
+            if character_id in archived:
                 continue
             moment = events.death_moment(card, package, calendar)
             if moment is None or not (from_world < moment <= to_world):
@@ -3823,6 +4055,16 @@ class RuntimeService:
             )
             row.pop("_seed", None)
             out["events"].append(row)
+            out["character_states"].append({
+                "instance_id": instance_id,
+                "timeline_id": timeline_id,
+                "character_id": character_id,
+                "archived": 1,
+                "archived_world": int(moment),
+                "basis": str(row["id"]),
+                "source": "death_event",
+                "updated_world": int(to_world),
+            })
             claims = events.dump_rows(
                 events.claim_rows(
                     {"summary": row["summary"], "effects": []},
@@ -3849,7 +4091,7 @@ class RuntimeService:
             died = entity.get("died")
             if not entity_id or not isinstance(died, int) or isinstance(died, bool):
                 continue
-            if events.is_dead(instance_id, timeline_id, entity_id, known):
+            if entity_id in archived:
                 continue
             if not (from_world < int(died) <= to_world):
                 continue
@@ -3859,6 +4101,17 @@ class RuntimeService:
             if row is None:
                 continue
             out["events"].append(row)
+            # 卡外要点人物同样进归档状态位：窗口判法会随事件累积失效（§六 / P1-3）
+            out["character_states"].append({
+                "instance_id": instance_id,
+                "timeline_id": timeline_id,
+                "character_id": entity_id,
+                "archived": 1,
+                "archived_world": int(died),
+                "basis": str(row["id"]),
+                "source": "death_event",
+                "updated_world": int(to_world),
+            })
             claims = events.dump_rows(
                 events.claim_rows(
                     {"summary": row["summary"], "effects": []},
@@ -3887,13 +4140,13 @@ class RuntimeService:
         *,
         from_world: int,
         to_world: int,
+        active_effects: list[dict[str, Any]] | None = None,
     ) -> dict[str, list[Any]]:
         """传播到达的获知（§五）与后果的解除（§六）。"""
         rows: dict[str, list[Any]] = {"knowledge": [], "clear_effects": []}
-        for claim in self.store.claim_list(instance_id, timeline_id):
+        # 只取本批窗口内新增的说法（§2.6）：原先每批都扫全部历史说法再在 Python 里过滤
+        for claim in self.store.claim_list(instance_id, timeline_id, since=from_world, until=to_world):
             earliest = int(claim.get("earliest_world") or 0)
-            if not (from_world < earliest <= to_world):
-                continue
             for card in cards:
                 grant = events.claim_grant(claim, card, world_seconds=earliest)
                 if grant is not None:
@@ -3905,7 +4158,11 @@ class RuntimeService:
             family = str(item.get("family") or "")
             if family:
                 family_moments.setdefault(family, []).append(int(item["world_seconds"]))
-        for effect in self.store.effect_window(instance_id, timeline_id, until=to_world):
+        for effect in (
+            active_effects
+            if active_effects is not None
+            else self.store.effect_window(instance_id, timeline_id, until=to_world)
+        ):
             expiry = str(effect.get("expiry"))
             started = int(effect["from_world"])
             # 解除时刻 = 条件首次成立的世界时刻，不取批边界：换一种分批方式不改变留档
@@ -3932,25 +4189,35 @@ class RuntimeService:
         from_world: int,
         to_world: int,
     ) -> list[dict[str, Any]]:
-        """把本批内已结束的活动窗记为经历（幂等：同一窗口的 id 固定）。"""
-        out: list[dict[str, Any]] = []
-        for window in windows:
-            if not (from_world < int(window["end"]) <= to_world):
-                continue
-            out.append(
-                {
-                    "id": f"xp-{character_id}-{int(window['start'])}",
-                    "instance_id": instance_id,
-                    "timeline_id": timeline_id,
-                    "character_id": character_id,
-                    "world_seconds": int(window["end"]),
-                    "kind": "life",
-                    "summary": f"{window.get('activity') or 'activity'}（{calendar.describe(int(window['start']))}）",
-                    "source_ref": None,
-                    "confidence": "experienced",
-                }
-            )
-        return out
+        """把本批内已结束的活动窗记为经历（幂等：同一世界日的 id 固定）。
+
+        §11 / P1-2：存储层按「每角色每世界日**一段**」收口——一天里那些日程窗口切片
+        （睡眠、值守、补网…）合成一条经历，不再逐窗落行；真实行动 / 观察 / 获知仍各自成条。
+        """
+        ended = [window for window in windows if from_world < int(window["end"]) <= to_world]
+        if not ended:
+            return []
+        day_index = calendar.day_index(max(int(window["end"]) for window in ended))
+        activities: list[str] = []
+        for window in sorted(ended, key=lambda item: int(item["start"])):
+            activity = str(window.get("activity") or "").strip()
+            if activity and activity not in activities:
+                activities.append(activity)
+        label = calendar.describe(min(int(window["start"]) for window in ended))
+        detail = "；".join(activities) if activities else "日常"
+        return [
+            {
+                "id": f"xp-{character_id}-d{day_index}",
+                "instance_id": instance_id,
+                "timeline_id": timeline_id,
+                "character_id": character_id,
+                "world_seconds": max(int(window["end"]) for window in ended),
+                "kind": "life",
+                "summary": f"{label}：{detail}",
+                "source_ref": None,
+                "confidence": "experienced",
+            }
+        ]
 
     # ---------- 角色状态 ----------
 
@@ -4218,17 +4485,47 @@ class RuntimeService:
                     pairs.append((instance["id"], timeline["id"]))
         return pairs
 
-    def catch_up_all(self, *, now_real: float, max_batches: int = 8) -> dict[str, Any]:
-        """推进所有激活线（核心启动与周期 tick 用；冻结线自动跳过）。"""
+    def catch_up_all(
+        self, *, now_real: float, max_batches: int | None = None, budget_seconds: float | None = None
+    ) -> dict[str, Any]:
+        """推进所有激活线（核心启动与周期 tick 用；冻结线自动跳过）。
+
+        时间盒按**批**共享：多条激活线平分一次调用的预算，避免一条高倍率线吃掉整拍。
+        """
+        active = self.active_timelines()
+        span = self.catch_up_budget_seconds if budget_seconds is None else max(0.0, float(budget_seconds))
+        if span > 0 and active and self._any_line_behind(active, now_real):
+            # 有一条线滞后已超「追赶受限」阈值：这一拍整体放宽到自愈预算（§2.6），
+            # 但仍按线平分——不能让一条高倍率线吃掉整拍。追平后自动退回常规预算。
+            span = max(span, self.catch_up_max_budget_seconds)
+        share = None
+        if span is not None and active:
+            share = max(0.0, span) / len(active)
         advanced: dict[str, Any] = {}
-        for instance_id, timeline_id in self.active_timelines():
+        for instance_id, timeline_id in active:
             try:
                 advanced[timeline_id] = self.advance(
-                    instance_id, timeline_id, now_real=now_real, max_batches=max_batches
+                    instance_id,
+                    timeline_id,
+                    now_real=now_real,
+                    max_batches=max_batches,
+                    budget_seconds=share if share is not None else None,
                 )
             except Exception:  # 单线推进失败不影响其他线
                 log.exception("advance failed timeline=%s", timeline_id)
         return advanced
+
+    def _any_line_behind(self, active: list[tuple[str, str]], now_real: float) -> bool:
+        """是否有线滞后超过受限阈值（只读判定，用来决定这一拍用常规还是自愈预算）。"""
+        for _instance_id, timeline_id in active:
+            try:
+                row = self.clock_row(timeline_id)
+                target = target_world(self.state_of(row), now_real)
+                if int(row["processed_world"]) + self.catch_up_lag_seconds < target:
+                    return True
+            except Exception:  # 读不到就按「不落后」处理，推进本身会各自报错
+                continue
+        return False
 
     # ---------- 性格驱动入口 ----------
 
@@ -4317,7 +4614,8 @@ class RuntimeService:
         watermark = int(row["processed_world"])
         calendar = self.calendar(instance)
         package = self.setting(instance)["world_package"]
-        known_events = self.store.event_window(instance_id, timeline_id, until=watermark, limit=400)
+        # 归档判定读状态位（§六 / P1-3）：不再取 400 行事件窗
+        archived = self._archived_ids(instance_id, timeline_id, until=watermark)
         budget_bucket = int(now_real // 86400)
         remaining = int(self.render_calls_per_day)
         proposed: list[dict[str, Any]] = []
@@ -4325,7 +4623,7 @@ class RuntimeService:
         blocked: list[str] = []
         for card in self.cards(instance, timeline_id=timeline_id, world_seconds=watermark):
             character_id = str((card.get("meta") or {}).get("card_id") or "")
-            if not character_id or events.is_dead(instance_id, timeline_id, character_id, known_events):
+            if not character_id or character_id in archived:
                 continue
             live = [
                 item

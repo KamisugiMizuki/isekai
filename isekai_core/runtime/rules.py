@@ -61,6 +61,28 @@ def load_manifest(manifest_path: str | Path) -> dict[str, Any]:
     return manifest
 
 
+#: 需要常驻的形态（TRPG_RULE_PLUGIN_SPEC「定位」）：战役裁定器缺省常驻
+CAMPAIGN_MODE = "campaign_resolver"
+STATELESS_MODE = "stateless_resolver"
+
+
+def resident_default(manifest: dict[str, Any]) -> bool:
+    """清单的**有效**常驻语义（P1-8，2026-10-08 规范收紧）。
+
+    战役裁定器缺省常驻：一次检定 / 对抗不该支付解释器启动、导入与 stdio 握手的成本。
+    只有清单显式 `resident: false` 才退化成「一次请求一个进程」；声明了 `stateless_resolver`
+    而不声明 `campaign_resolver` 的插件缺省冷启（它本来就一次一进程）。常驻只影响进程
+    生命周期，不改变「状态只能经规则状态快照进出」。
+    """
+    declared = manifest.get("resident")
+    if isinstance(declared, bool):
+        return declared
+    modes = [str(item) for item in manifest.get("modes") or [] if str(item)]
+    if modes and CAMPAIGN_MODE not in modes:
+        return False
+    return True
+
+
 def converters_of(manifest_path: str | Path) -> list[dict[str, Any]]:
     """清单里声明的状态转换器（§十六）：坏清单 / 没声明 → 空表，调用方自己决定怎么办。"""
     try:
@@ -143,10 +165,51 @@ class RulePluginSession:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
 
+    async def _ready_for_request(self) -> None:
+        """复用会话前先探活（P1-8 的可靠性前提）。
+
+        进程可能已经退出，而退出事件未必已经被事件循环收下（一次性插件尤其明显：读完一行就走）。
+        往一个没有读者的管道写，然后只读到 EOF，会被误判成「半路失败」——按规范那是**不重发**的
+        情形，会把好好的裁定判成 plugin_failed。所以复用前先裸问一句 `ping`：答不上来就按
+        「还没发请求」重开一个，再发真请求。真正常驻的插件只多一次心跳往返；只支持一次一进程的
+        插件会在这里被发现并按原语义重开（不改变它的裁定语义）。
+        """
+        if self._proc is None and self._reader is None:
+            await self._spawn()  # 还没起过：先起一个（首次请求懒启动）
+            return
+        if self.last_used_real <= 0:
+            return  # 还没用过：进程刚起，直接用
+        if await self._probe_alive():
+            return
+        await self.close()
+        await self._spawn()
+
+    async def _probe_alive(self, *, timeout: float = 3.0) -> bool:
+        """裸探活：只走 `_send`，不走 `request` 的复用检查（否则会递归）。"""
+        if not self.alive():
+            return False
+        line = (json.dumps({"type": "ping", "protocol": "isekai.trpg.rules/1"}) + "\n").encode("utf-8")
+        try:
+            raw = await self._send(line, wait=timeout)
+        except (OSError, asyncio.TimeoutError):
+            return False
+        if not raw:
+            return False
+        try:
+            answer = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        return isinstance(answer, dict) and str(answer.get("type") or "") == "pong"
+
     def alive(self) -> bool:
         if self._reader is not None:
             return not self._reader.at_eof()
-        return self._proc is not None and self._proc.returncode is None
+        if self._proc is None or self._proc.returncode is not None:
+            return False
+        # 一次性插件（读一行就退出）在常驻语义下也要能被认成「已死」：stdout 已 EOF 就是没了。
+        # 不然下一次请求会往一个没有读者的管道写（EPIPE），把可恢复的「还没发请求」当成半路失败。
+        out = self._proc.stdout
+        return not (out is not None and out.at_eof())
 
     async def _attach(self) -> bool:
         """照共享文件连上活着的桥；能 ping 通才算接上（§二十一 残余第 3 条）。"""
@@ -239,23 +302,24 @@ class RulePluginSession:
 
         崩溃恢复的边界就在这里：进程在「我们还没写请求」时就已经死了 → 重开一个再发；
         请求发出去之后进程死了 → 报错，由调用方按 plugin_failed 处理（§12.2 不猜结果）。
+
+        判据是**字节有没有进管道**：写管道本身就是失败（EPIPE / 连接被重置）说明没有读者，
+        这条请求没有被送达，按「还没发请求」重开一次；`drain()` 之后再失败就算半路，不重发。
         """
         wait = float(timeout or self.timeout)
-        if not self.alive():
-            await self.close()
-            await self._spawn()
+        await self._ready_for_request()
         line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         try:
-            if self._reader is not None and self._writer is not None:
-                self._writer.write(line)
-                await self._writer.drain()
-                raw = await asyncio.wait_for(self._reader.readline(), timeout=wait)
-            else:
-                proc = self._proc
-                assert proc is not None and proc.stdin is not None and proc.stdout is not None
-                proc.stdin.write(line)
-                await proc.stdin.drain()
-                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=wait)
+            raw = await self._send(line, wait=wait)
+        except (BrokenPipeError, ConnectionResetError):
+            # 还没发出去（管道无读者）：重开一个进程再发一次，不算重跑裁定
+            await self.close()
+            await self._spawn()
+            try:
+                raw = await self._send(line, wait=wait)
+            except (OSError, asyncio.TimeoutError) as exc:
+                await self.close()
+                raise RulePluginError(f"常驻规则插件调用失败：{type(exc).__name__}") from exc
         except (OSError, asyncio.TimeoutError) as exc:
             await self.close()
             raise RulePluginError(f"常驻规则插件调用失败：{type(exc).__name__}") from exc
@@ -271,6 +335,18 @@ class RulePluginSession:
         if not isinstance(result, dict):
             raise RulePluginError("常驻规则插件返回的不是 JSON 对象")
         return result
+
+    async def _send(self, line: bytes, *, wait: float) -> bytes:
+        """把一行请求写出去并取回一行响应（共享承载与直连 stdio 两条路同一处）。"""
+        if self._reader is not None and self._writer is not None:
+            self._writer.write(line)
+            await self._writer.drain()
+            return await asyncio.wait_for(self._reader.readline(), timeout=wait)
+        proc = self._proc
+        assert proc is not None and proc.stdin is not None and proc.stdout is not None
+        proc.stdin.write(line)
+        await proc.stdin.drain()
+        return await asyncio.wait_for(proc.stdout.readline(), timeout=wait)
 
     async def ping(self, *, timeout: float = 5.0) -> bool:
         """心跳：活着且答得上 pong（顺序协议下这就是唯一安全的探活方式）。"""
@@ -371,7 +447,11 @@ async def resolve(
     timeout: float = 30.0,
     session: "RulePluginSession | None" = None,
 ) -> dict[str, Any]:
-    """一次裁定：给了常驻会话就走会话，否则一次调用一个进程。"""
+    """一次裁定：给了常驻会话就走会话，否则一次调用一个进程。
+
+    会话由调用方按 `resident_default(manifest)` 决定建不建（战役裁定器缺省常驻，P1-8）；
+    这里只认「给不给会话」，两条路都过同一套边界检查。
+    """
     if session is not None:
         result = await session.request(request, timeout=timeout)
         return _check_resolution(result)

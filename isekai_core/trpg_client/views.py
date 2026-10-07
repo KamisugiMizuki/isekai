@@ -36,6 +36,29 @@ EFFECT_LABELS: dict[str, str] = {
 }
 
 
+#: §八 主持责任模式的缺省值（核心口径）：客户端恒以辅助裁定工作（C-3）
+DEFAULT_HOST_MODE = "assisted"
+
+
+def confirmation_source(action: dict[str, Any], *, host_mode: str = DEFAULT_HOST_MODE) -> str:
+    """这条行动的确认是谁做的（C-3）：`user` = 用户确认；`host_mode` = 核心自动主持确认。
+
+    客户端不给 `host_mode` 设置入口、也不实现自动确认门控；非 `assisted` 战役由受信调用方
+    （CLI / 管理面）配置，客户端只把它当**只读事实**呈现——核心自动确认的行动显示为
+    「已由主持模式确认」，不假装那是玩家点的。
+    """
+    action = action if isinstance(action, dict) else {}
+    recorded = str(action.get("confirmed_by") or "")
+    if recorded == "user":
+        return "user"
+    if recorded == "host_mode":
+        return "host_mode"
+    if str(action.get("confirmation") or "") == "confirmed" and str(host_mode or "") != DEFAULT_HOST_MODE:
+        # 老数据没有这一列：非 assisted 战役里已确认的行动按主持模式确认解释（不冒充用户确认）
+        return "host_mode"
+    return ""
+
+
 def audience_valid(value: str) -> bool:
     """受众闭集校验（§十二）：两份固定项 + 三类带标识的。自由字符串不当作公开。"""
     text = str(value or "").strip().lower()
@@ -102,7 +125,9 @@ def campaign_item(
         "campaign_id": str(campaign.get("campaign_id") or ""),
         "ruleset": str(campaign.get("ruleset_id") or plugin.get("id") or ""),
         "ruleset_version": str(campaign.get("ruleset_version") or plugin.get("version") or ""),
-        "host_mode": str(campaign.get("host_mode") or ""),
+        # 主持模式是**运行时事实**（§八）：客户端不提供设置入口、也不做自动确认门控（C-3），
+        # 这里如实回显，供界面把「已由主持模式确认」与用户确认分开呈现。
+        "host_mode": str(campaign.get("host_mode") or DEFAULT_HOST_MODE),
         "status": status,
         "status_line": campaign_line(status),
         "instance": str((instance or {}).get("display_name") or campaign.get("instance_id") or ""),
@@ -131,6 +156,7 @@ def scene_face(
     actions = [item for item in (view.get("actions") or []) if isinstance(item, dict)]
     recent = [item for item in (view.get("recent") or []) if isinstance(item, dict)]
     cognition = cognition if isinstance(cognition, dict) else {}
+    host_mode = str(campaign.get("host_mode") or DEFAULT_HOST_MODE)
     unknowns = [
         {"kind": "known_unknown", "text": str(item.get("text") or ""), "stage": str(item.get("stage") or "")}
         for item in (cognition.get("known_unknowns") or [])
@@ -164,6 +190,9 @@ def scene_face(
         "unfinished_actions": [{"action_id": str(item.get("action_id") or ""),
                                 "action_revision": int(item.get("action_revision") or 1),
                                 "status": str(item.get("status") or ""),
+                                # C-3：核心自动确认（非 assisted 战役）的行动显示为「已由主持模式确认」，
+                                # 不显示成用户确认；客户端自己不提供 host_mode 设置入口，也不做自动确认。
+                                "confirmed_by": confirmation_source(item, host_mode=host_mode),
                                 "state": user_state(str(item.get("status") or ""))} for item in actions],
         "next_choice": choices[0] if choices else None,
         "choice_count": len(choices),
@@ -246,8 +275,11 @@ def gm_face(
         },
         "rule_state": {"ruleset": str(campaign.get("ruleset_id") or campaign.get("ruleset") or ""),
                        "ruleset_version": str(campaign.get("ruleset_version") or ""),
-                       "base_revision": int(rule.get("base_revision") or 0),
-                       "state_revision": int(rule.get("revision") or 0)},
+                       # §4.2 / P2-7：规则视图**只取 revision**（正文属 gm_only，另有显式读取入口）；
+                       # 投影里给的字段名是 state_revision，这里别去读不存在的 revision
+                       "scope_ref": str(rule.get("scope_ref") or ""),
+                       "state_revision": int(rule.get("state_revision") or rule.get("revision") or 0),
+                       "shards": list(rule.get("shards") or [])},
         "plugin": {"id": str((plugin or {}).get("id") or ""), "version": str((plugin or {}).get("version") or ""),
                    "modes": list((plugin or {}).get("modes") or [])},
         "unfinished_actions": [{"action_id": str(item.get("action_id") or ""),
@@ -268,16 +300,24 @@ def gm_face(
 
 
 def version_block(campaign: dict[str, Any], plugin: dict[str, Any] | None = None,
-                  state_version: str = "") -> dict[str, Any]:
+                  state_version: str = "", state_versions: list[str] | None = None) -> dict[str, Any]:
     """§14.4 规则版本阻断：可用 / 不可用操作分明，人工接受是主持人承担的决定。
 
     现有证据判定：规则状态行记录的版本（写这份状态时插件声明的版本，人工接受会改写它）
-    与插件当前声明的版本不一致 = 阻断。
+    与插件当前声明的版本不一致 = 阻断。分片状态下**任一分片**读不动就阻断（§3.4 / §十六），
+    所以接口收一串写入版本（`state_versions`），只给一个是旧口径。
     """
     campaign = campaign if isinstance(campaign, dict) else {}
     plugin = plugin if isinstance(plugin, dict) else {}
     declared = str(plugin.get("version") or "")
-    recorded = str(state_version or campaign.get("ruleset_version") or "")
+    recorded_versions = [str(item) for item in (state_versions or []) if str(item or "")]
+    if not recorded_versions:
+        recorded_versions = [str(state_version or campaign.get("ruleset_version") or "")]
+    recorded = recorded_versions[0]
+    if declared:
+        drifted = [item for item in recorded_versions if item and item != declared]
+        if drifted:
+            recorded = drifted[0]
     flag = campaign.get("version_block") if isinstance(campaign.get("version_block"), dict) else {}
     blocked = bool(flag.get("blocked")) or bool(plugin) and bool(declared) and bool(recorded) and declared != recorded
     if not blocked:

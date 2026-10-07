@@ -8,7 +8,14 @@ from __future__ import annotations
 from typing import Any
 
 #: §7.1 用户可见状态表：核心状态 → 用户文案 / 可操作内容 / 禁止的客户端行为。
-#: `received` 与 `interpreted` 合并显示、`snapshotting` 与 `resolving` 各自一行（规范原文如此）。
+#: `received` 与 `interpreted` 合并显示；**在途只有一个状态 `resolving`**（§七 / P2-4，2026-10-08）：
+#: 取得世界 / 规则状态快照是它的第一阶段，客户端不再有独立的 `snapshotting`
+#: （老库在途行的兼容映射见下面的 `EXTRA_STATES`）。
+_RESOLVING_COPY: dict[str, Any] = {
+    "label": "正在裁定（取得世界与规则状态 → 调用插件）",
+    "actions": ["等待", "查看阶段说明"],
+    "forbidden": ["重新发起随机裁定", "猜测骰点或结果"],
+}
 VISIBLE_STATES: dict[str, dict[str, Any]] = {
     "received": {"label": "正在理解行动", "actions": ["补充", "取消"], "forbidden": ["显示为已裁定"]},
     "interpreted": {"label": "正在理解行动", "actions": ["补充", "取消"], "forbidden": ["显示为已裁定"]},
@@ -16,10 +23,7 @@ VISIBLE_STATES: dict[str, dict[str, Any]] = {
                               "forbidden": ["调插件或提交世界"]},
     "confirmed": {"label": "已确认，等待裁定", "actions": ["查看", "取消（若状态仍允许）"],
                   "forbidden": ["修改成另一个 action_id"]},
-    "snapshotting": {"label": "正在取得当前世界与规则状态", "actions": ["等待"],
-                     "forbidden": ["重新发起随机裁定"]},
-    "resolving": {"label": "规则裁定中", "actions": ["等待", "查看阶段说明"],
-                  "forbidden": ["猜测骰点或结果"]},
+    "resolving": dict(_RESOLVING_COPY),
     "reviewing": {"label": "裁定完成；玩家模式自动尝试提交，GM 模式等待主持操作",
                   "actions": ["查看摘要", "GM 可提交、拒绝或转待审"],
                   "forbidden": ["在提交成功前说成世界已经改变"]},
@@ -44,11 +48,13 @@ VISIBLE_STATES: dict[str, dict[str, Any]] = {
                     "forbidden": ["自动重跑不完整裁定"]},
 }
 
-#: 规范表没单列、但核心状态集合里有的两态：合并进相邻文案（不新造状态）
+#: 规范表没单列、但核心状态集合里有的几态：合并进相邻文案（不新造状态）
 EXTRA_STATES: dict[str, dict[str, Any]] = {
     "modified": {"label": "等待确认（已修改，行动版本 +1）", "actions": ["确认", "继续修改", "放弃"],
                  "forbidden": ["用旧确认卡提交"]},
     "abandoned": {"label": "已放弃", "actions": ["重新声明行动"], "forbidden": ["把放弃当成失败骰点"]},
+    # 老库在途行（2026-10-08 起在途合并为 `resolving`，不再新写）：同一份文案，读得出来、不猜
+    "snapshotting": dict(_RESOLVING_COPY),
 }
 
 #: 空态与阻断文案（§5.1 / §5.2 / C0：waiting、blocked、paused、archived、空战役）

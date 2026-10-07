@@ -122,6 +122,9 @@ def normalize(
         resolution = {}
     patch = result.get("rule_state_patch")
     if patch is not None:
+        # `op` 是闭集 `add` / `replace` / `remove` / `increase` / `decrease`（TRPG_CAMPAIGN_RUNTIME_SPEC
+        # §5.2 / C-4）：前三个是绝对量，`increase` / `decrease` 是并发安全的相对量（写的是差值，
+        # 可与同一 base..current 区间的其他相对量合并）。校验器与 patch 应用共用同一套词表。
         errors.extend(campaign_mod.validate_patch(patch))
     if not campaign and patch:
         errors.append("B0 兼容路径不接受 rule_state_patch：持续规则状态要走战役路径（§3.7）")

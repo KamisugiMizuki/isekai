@@ -130,9 +130,11 @@ def validate_package(package: dict[str, Any]) -> list[str]:
     _validate_races_entities(package, errors)
     _validate_institution_refs(package, errors)
     _validate_historiography(package, known, errors)
-    _validate_events(package, known, errors)
+    # 在册标识集合（含 region）只重建一次往下传（P1-14：同一函数内不重复重建）
+    registered = _all_ids(package)
+    _validate_events(package, known, errors, registered=registered)
     _validate_event_calendar(package, errors)
-    _validate_environment_observers(package, errors)
+    _validate_environment_observers(package, errors, registered=registered)
     _validate_life_roles(package, errors)
     _validate_initial_state(package, known, errors)
     return errors
@@ -270,6 +272,33 @@ def _validate_world(world: Any, errors: list[str]) -> None:
                     if not _text(item.get(field)):
                         errors.append(f"{where}.{field}: 已声明惯例必须写明{hint}")
                 _validate_custom_forms(item, where, errors)
+    _validate_regions(world.get("regions"), errors)
+
+
+def _validate_regions(regions: Any, errors: list[str]) -> None:
+    """区域登记（§2.2 / 附录 A，P2-11）：稳定标识 + 名称（可选描述），同集合内唯一。
+
+    未声明 `regions` 或声明为空列表 = 本包不使用区域标签，不是错误；一旦声明，
+    每一项都要有标识与名称，且标识在集合内唯一。
+    """
+    if regions is None:
+        return
+    if not isinstance(regions, list):
+        errors.append("world.regions: 必须是列表")
+        return
+    _check_unique(regions, "world.regions", errors)
+    for index, region in enumerate(regions):
+        if not isinstance(region, dict):
+            errors.append(f"world.regions[{index}]: 条目必须是对象")
+            continue
+        if not _text(region.get("name")):
+            errors.append(f"world.regions[{index}].name: 缺少区域名称")
+
+
+def region_ids(package: dict[str, Any]) -> set[str]:
+    """已登记区域标识（`world.regions[].id`）：卡片 `region` 只引用这些（P2-11）。"""
+    world = package.get("world") if isinstance(package.get("world"), dict) else {}
+    return set(_ids(world.get("regions")))
 
 
 def _validate_offices(institution: dict[str, Any], where: str, errors: list[str]) -> None:
@@ -599,7 +628,11 @@ def _validate_institution_refs(package: dict[str, Any], errors: list[str]) -> No
 
 
 def _all_ids(package: dict[str, Any]) -> set[str]:
-    """包内全部稳定标识：效果目标等结构引用只允许指向这些（附录 C #10）。"""
+    """包内全部稳定标识：效果目标等结构引用只允许指向这些（附录 C #10）。
+
+    已登记区域（`world.regions[]`）也是在册对象的一种（§2.2 / 附录 A，P2-11）：
+    效果 `target` 引用区域标识时在这里闭合。
+    """
     found: set[str] = set()
     for key in ("sources", "canon", "narratives", "entities", "races", "life", "roles", "historiography"):
         items = package.get(key)
@@ -607,7 +640,7 @@ def _all_ids(package: dict[str, Any]) -> set[str]:
             found |= set(_ids(items))
     world = package.get("world")
     if isinstance(world, dict):
-        for key in ("axioms", "institutions", "customs"):
+        for key in ("axioms", "institutions", "customs", "regions"):
             items = world.get(key)
             if isinstance(items, list):
                 found |= set(_ids(items))
@@ -662,11 +695,13 @@ def _environment_type(package: dict[str, Any], type_id: str) -> dict[str, Any] |
     return None
 
 
-def _validate_environment_observers(package: dict[str, Any], errors: list[str]) -> None:
+def _validate_environment_observers(
+    package: dict[str, Any], errors: list[str], *, registered: set[str] | None = None
+) -> None:
     """环境类型：观察者名单（可选，缺省即无人可见）——与既有的取值域 / 单位 / 期限校验互补。"""
     environment = package.get("environment") if isinstance(package.get("environment"), dict) else {}
     types = environment.get("types") if isinstance(environment.get("types"), list) else []
-    known = _all_ids(package)
+    known = _all_ids(package) if registered is None else registered
     for index, item in enumerate(types):
         if not isinstance(item, dict):
             continue
@@ -689,8 +724,10 @@ def _validate_environment_observers(package: dict[str, Any], errors: list[str]) 
                 errors.append(f"{where}.observers: 引用不存在的标识 {value!r}")
 
 
-def _validate_events(package: dict[str, Any], known: set[str], errors: list[str]) -> None:
-    targets = _all_ids(package)
+def _validate_events(
+    package: dict[str, Any], known: set[str], errors: list[str], *, registered: set[str] | None = None
+) -> None:
+    targets = _all_ids(package) if registered is None else registered
     events = package.get("events")
     families = events.get("families") if isinstance(events, dict) else None
     if not isinstance(families, list) or not families:
