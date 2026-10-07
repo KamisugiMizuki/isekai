@@ -18,7 +18,7 @@ class FakeMemoryLLM:
         self.replies = list(replies)
         self.calls: list[list[dict]] = []
 
-    async def chat(self, messages, *, max_tokens=None, timeout=None, temperature=None) -> str:
+    async def chat(self, messages, *, max_tokens=None, timeout=None, temperature=None, thinking=None) -> str:
         self.calls.append(messages)
         if not self.replies:
             raise RuntimeError("模型不可用")

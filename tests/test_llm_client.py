@@ -79,7 +79,7 @@ async def test_empty_completion_retry_uses_doubled_budget() -> None:
         bodies.append(json.loads(request.content))
         if len(bodies) == 1:
             return httpx.Response(
-                200, json={"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+                200, json={"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
             )
         return httpx.Response(
             200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
@@ -90,6 +90,45 @@ async def test_empty_completion_retry_uses_doubled_budget() -> None:
 
     assert reply == "ok"
     assert [item["max_tokens"] for item in bodies] == [64, 128], "空内容重试要带上翻倍后的预算"
+    assert bodies[1].get("thinking") == {"type": "disabled"}, "烧空的重试要降为直接输出（thinking disabled）"
+
+
+async def test_thinking_switch_when_asked_and_absent_by_default() -> None:
+    """判断点显式传 thinking="disabled" 时请求体带开关；不传就不带（对话保持服务端默认）。"""
+    client = LLMClient(_cfg())
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        )
+
+    _wire(client, handler)
+    await client.chat([{"role": "user", "content": "hi"}], thinking="disabled")
+    await client.chat([{"role": "user", "content": "hi"}])
+
+    assert bodies[0]["thinking"] == {"type": "disabled"}
+    assert "thinking" not in bodies[1]
+
+
+async def test_empty_completion_gives_up_after_disabled_retry() -> None:
+    """降档重试只做一次：仍然空就如实失败，不无限重试。"""
+    client = LLMClient(_cfg())
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+        )
+
+    _wire(client, handler)
+    with pytest.raises(LLMError) as info:
+        await client.chat([{"role": "user", "content": "hi"}])
+
+    assert info.value.code == "empty_completion"
+    assert len(bodies) == 2 and bodies[1].get("thinking") == {"type": "disabled"}
 
 
 async def test_max_tokens_is_sent_as_integer() -> None:

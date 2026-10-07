@@ -443,7 +443,7 @@ class TrpgClient:
             )
             try:
                 # 不传小 max_tokens：推理型模型会把预算烧在推理上返回空文本（仓库既有坑）
-                raw = await self.llm.chat(prompt, temperature=0.0, timeout=DRAFT_TIMEOUT_S)
+                raw = await self.llm.chat(prompt, temperature=0.0, timeout=DRAFT_TIMEOUT_S, thinking="disabled")
             except Exception:  # noqa: BLE001 —— 模型不可用不该让玩家声明不了行动
                 log.info("draft parse failed instance=%s campaign=%s", ws["instance_id"], ws["campaign_id"])
                 raw = ""

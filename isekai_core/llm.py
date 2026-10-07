@@ -58,7 +58,15 @@ class LLMClient:
         max_tokens: int | None = None,
         timeout: float | None = None,
         temperature: float | None = None,
+        thinking: str | None = None,
     ) -> str:
+        """非流式补全。
+
+        `thinking`：思考模式开关（DeepSeek 默认 enabled + high 强度）。结构化判断点
+        （要求只输出 JSON 的小任务）传 "disabled"：实测同一提示词带思考会整段烧在
+        reasoning 里返回空正文（5~6 秒白等、还要计费），关掉后 1 秒出字。
+        对话与正文生成不传（保留服务端默认的思考强度）。
+        """
         if not self.cfg.api_key:
             raise LLMError("llm_not_configured", "未配置 LLM API Key", retryable=False)
 
@@ -75,6 +83,8 @@ class LLMClient:
             "temperature": heat,
             "stream": False,
         }
+        if thinking in ("disabled", "enabled"):
+            payload["thinking"] = {"type": thinking}
         last: LLMError | None = None
         for attempt in (0, 1):
             try:
@@ -125,9 +135,13 @@ class LLMClient:
             log.debug("llm done len=%s finish=%s budget=%s", len(content), finish, budget)
             if not content.strip():
                 last = LLMError("empty_completion", "模型返回空文本", retryable=True)
+                # 推理型模型会把预算整段烧在 reasoning 里（finish=length、content 空）：
+                # 这时加倍预算救不回来（实测 4096 也烧光），降为「直接输出」重试才有用。
+                log.warning("llm empty completion finish=%s budget=%s", finish, budget)
                 if attempt == 0:
                     budget = min(budget * 2, MAX_COMPLETION_BUDGET)
                     payload["max_tokens"] = int(budget)
+                    payload["thinking"] = {"type": "disabled"}
                     continue
                 raise last
             if finish == "length":
@@ -149,11 +163,13 @@ class LLMClient:
         max_tokens: int | None = None,
         timeout: float | None = None,
         temperature: float | None = None,
+        thinking: str | None = None,
     ) -> AsyncIterator[str]:
         """流式补全：逐段产出正文（OpenAI 兼容 SSE）。
 
         只在**还没产出任何字**时重试：一旦吐过增量，重放会把同一段话说两遍——那由调用方按
-        「最终帧没来就不算数」处理（§七 流式项）。
+        「最终帧没来就不算数」处理（§七 流式项）。一个字都没出的整段空流（推理把预算
+        烧空）降为「直接输出」重试一次。
         """
         if not self.cfg.api_key:
             raise LLMError("llm_not_configured", "未配置 LLM API Key", retryable=False)
@@ -164,6 +180,8 @@ class LLMClient:
             "temperature": self.cfg.temperature if temperature is None else temperature,
             "stream": True,
         }
+        if thinking in ("disabled", "enabled"):
+            payload["thinking"] = {"type": thinking}
         request_timeout = timeout or self.cfg.timeout_s
         emitted = 0
         for attempt in (0, 1):
@@ -193,6 +211,11 @@ class LLMClient:
                             emitted += len(piece)
                             yield piece
                 log.debug("llm stream done len=%s", emitted)
+                if emitted == 0 and attempt == 0:
+                    # 整段空流（推理把预算烧空）：降为直接输出重试一次
+                    payload["thinking"] = {"type": "disabled"}
+                    log.warning("llm stream empty, retry with thinking disabled")
+                    continue
                 return
             except httpx.HTTPError as exc:
                 log.warning("llm stream transport error attempt=%s: %s", attempt, type(exc).__name__)
@@ -238,6 +261,7 @@ class FakeLLM:
         max_tokens: int | None = None,
         timeout: float | None = None,
         temperature: float | None = None,
+        thinking: str | None = None,
     ) -> str:
         head = str((messages[0] if messages else {}).get("content") or "")
         if head.startswith(JUDGEMENT_MARK):

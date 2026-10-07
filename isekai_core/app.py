@@ -328,73 +328,94 @@ def _backup_if_due(cfg: Any, store: Any, *, note: str) -> None:
     log.info("backup due-check %s: parts=%s bytes=%s", note, result.get("parts"), result.get("bytes"))
 
 
+async def _derived_pass(runtime: Runtime, active: list[tuple[str, str]]) -> None:
+    """LLM 派生任务：自主提案 / 记忆提取与积压汇总 / 主动发言。
+
+    与时钟推进分开跑（`_clock_tick` 里单开一个任务）：这些段的耗时由模型决定
+    （空返回重试能到分钟级），串在推进节拍里会把 5 秒一拍的补算拖成分钟级，
+    让「追赶中」成为常态。失败只记日志，不影响世界推进。
+    """
+    # 角色自主提案：只在激活线上、按现实日预算（§11.3 / §2.8）
+    try:
+        for instance_id, timeline_id in active:
+            await runtime.world.propose_intents(
+                instance_id, timeline_id, llm=runtime.llm, now_real=time.time()
+            )
+    except Exception:
+        log.exception("intent proposal pass failed")
+    # 证据充分后提取记忆：有界、按现实日预算、失败留待处理（§4.1）
+    try:
+        for instance_id, timeline_id in active:
+            runtime.world.queue_world_sources(instance_id, timeline_id)
+            await runtime.world.extract_memories(
+                instance_id, timeline_id, llm=runtime.llm, now_real=time.time(), limit=6
+            )
+            # 积压汇总：世界时间跑得比现实预算快，没有这一步积压只会越长越大（§4.1）
+            await runtime.world.compact_backlog(
+                instance_id, timeline_id, llm=runtime.llm, now_real=time.time(), batch=40, limit=1
+            )
+            await runtime.world.embed_memories(instance_id, timeline_id, now_real=time.time(), limit=8)
+    except Exception:
+        log.exception("memory extraction pass failed")
+    # 世界源主动发言（§5.2 / §5.3）：按节律与配额从她已获知的素材里挑一条固化，并当场投给唯一目标
+    try:
+        for instance_id, timeline_id in active:
+            spoken = await runtime.world.proactive_tick(
+                instance_id,
+                timeline_id,
+                llm=runtime.llm,
+                max_text_len=int(runtime.cfg.max_text_len),
+                max_parts=int(runtime.cfg.max_parts),
+            )
+            for item in spoken.get("messages") or []:
+                row = runtime.store.outbound_by_message_id(str(item.get("message_id") or ""))
+                if row is not None:
+                    await runtime.service.flush_proactive(str(row["session_id"]))
+    except Exception:
+        log.exception("proactive pass failed")
+
+
 async def _clock_tick(runtime: Runtime, stop: asyncio.Event, *, interval: float = 5.0) -> None:
-    """世界时钟自己走：周期性推进激活线（冻结线跳过，单线失败不影响其他线）。"""
-    while not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=interval)
-            return
-        except asyncio.TimeoutError:
-            pass
-        if backup_pack.PAUSE.is_set():
-            # 打包 / 恢复切换期间世界先别动：素材与库要来自同一时点（§9.1）
-            continue
-        if runtime.world is None:
-            continue
-        # 兼容性阻断的实例不进这一轮的推进与派生任务（§7.6：blocked 只读，等用户确认转换）
-        active = [
-            pair for pair in runtime.world.active_timelines() if runtime.world.compatible(pair[0])
-        ]
-        try:
-            runtime.world.catch_up_all(now_real=time.time(), max_batches=4)
-        except Exception:  # 推进失败不该让核心退出
-            log.exception("clock tick failed")
-        # 角色自主提案：只在激活线上、按现实日预算（§11.3 / §2.8）
-        try:
-            for instance_id, timeline_id in active:
-                await runtime.world.propose_intents(
-                    instance_id, timeline_id, llm=runtime.llm, now_real=time.time()
-                )
-        except Exception:
-            log.exception("intent proposal pass failed")
-        # 自动提交（§5.1）：现实间隔或新增事件数到阈值，可配置可关
-        try:
-            for instance_id, timeline_id in active:
-                runtime.world.maybe_auto_commit(instance_id, timeline_id, now_real=time.time())
-        except Exception:
-            log.exception("auto commit pass failed")
-        # 证据充分后提取记忆：有界、按现实日预算、失败留待处理（§4.1）
-        try:
-            for instance_id, timeline_id in active:
-                runtime.world.queue_world_sources(instance_id, timeline_id)
-                await runtime.world.extract_memories(
-                    instance_id, timeline_id, llm=runtime.llm, now_real=time.time(), limit=6
-                )
-                # 积压汇总：世界时间跑得比现实预算快，没有这一步积压只会越长越大（§4.1）
-                await runtime.world.compact_backlog(
-                    instance_id, timeline_id, llm=runtime.llm, now_real=time.time(), batch=40, limit=1
-                )
-                await runtime.world.embed_memories(instance_id, timeline_id, now_real=time.time(), limit=8)
-        except Exception:
-            log.exception("memory extraction pass failed")
-        # 备份到期检查（§五）：运行期间定时检查，失败只记日志，不挡推进
-        try:
-            _backup_if_due(runtime.cfg, runtime.store, note="运行期到期检查")
-        except Exception:
-            log.exception("backup due-check failed")
-        # 世界源主动发言（§5.2 / §5.3）：按节律与配额从她已获知的素材里挑一条固化，并当场投给唯一目标
-        try:
-            for instance_id, timeline_id in active:
-                spoken = await runtime.world.proactive_tick(
-                    instance_id,
-                    timeline_id,
-                    llm=runtime.llm,
-                    max_text_len=int(runtime.cfg.max_text_len),
-                    max_parts=int(runtime.cfg.max_parts),
-                )
-                for item in spoken.get("messages") or []:
-                    row = runtime.store.outbound_by_message_id(str(item.get("message_id") or ""))
-                    if row is not None:
-                        await runtime.service.flush_proactive(str(row["session_id"]))
-        except Exception:
-            log.exception("proactive pass failed")
+    """世界时钟自己走：周期性推进激活线（冻结线跳过，单线失败不影响其他线）。
+
+    推进与自动提交留在节拍里（快、同步）；LLM 派生段（`_derived_pass`）单独跑，
+    一次只跑一个：跑完才接下一轮，不参与节拍计时。
+    """
+    derived: asyncio.Task[None] | None = None
+    try:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if backup_pack.PAUSE.is_set():
+                # 打包 / 恢复切换期间世界先别动：素材与库要来自同一时点（§9.1）
+                continue
+            if runtime.world is None:
+                continue
+            # 兼容性阻断的实例不进这一轮的推进与派生任务（§7.6：blocked 只读，等用户确认转换）
+            active = [
+                pair for pair in runtime.world.active_timelines() if runtime.world.compatible(pair[0])
+            ]
+            try:
+                runtime.world.catch_up_all(now_real=time.time(), max_batches=4)
+            except Exception:  # 推进失败不该让核心退出
+                log.exception("clock tick failed")
+            # 自动提交（§5.1）：现实间隔或新增事件数到阈值，可配置可关
+            try:
+                for instance_id, timeline_id in active:
+                    runtime.world.maybe_auto_commit(instance_id, timeline_id, now_real=time.time())
+            except Exception:
+                log.exception("auto commit pass failed")
+            # LLM 派生任务：上一轮没跑完就不叠新的（一次只跑一个）
+            if derived is None or derived.done():
+                derived = asyncio.create_task(_derived_pass(runtime, active))
+            # 备份到期检查（§五）：运行期间定时检查，失败只记日志，不挡推进
+            try:
+                _backup_if_due(runtime.cfg, runtime.store, note="运行期到期检查")
+            except Exception:
+                log.exception("backup due-check failed")
+    finally:
+        if derived is not None and not derived.done():
+            derived.cancel()

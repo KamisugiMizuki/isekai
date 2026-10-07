@@ -368,7 +368,7 @@ class StoryService:
             raw = ""
             try:
                 # 不传小的 max_tokens：推理型模型会把预算烧在推理上返回空文本（本仓库既有坑）
-                raw = await llm.chat(prompt, temperature=0.0, timeout=CLASSIFY_TIMEOUT_S)
+                raw = await llm.chat(prompt, temperature=0.0, timeout=CLASSIFY_TIMEOUT_S, thinking="disabled")
             except Exception:
                 log.info("classify call failed instance=%s character=%s", instance_id, character_id)
                 self._settle_classify(reservation, prompt_text=prompt_text, reply="", outcome="error")

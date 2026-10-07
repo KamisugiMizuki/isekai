@@ -16,7 +16,7 @@ class FakePlanLLM:
         self.replies = list(replies)
         self.calls: list[list[dict]] = []
 
-    async def chat(self, messages, *, max_tokens=None, timeout=None, temperature=None) -> str:
+    async def chat(self, messages, *, max_tokens=None, timeout=None, temperature=None, thinking=None) -> str:
         self.calls.append(messages)
         if not self.replies:
             raise RuntimeError("模型不可用")
@@ -177,7 +177,7 @@ class AdvancingLLM(FakePlanLLM):
         self.timeline_id = timeline_id
         self.now_real = now_real
 
-    async def chat(self, messages, *, max_tokens=None, timeout=None, temperature=None) -> str:
+    async def chat(self, messages, *, max_tokens=None, timeout=None, temperature=None, thinking=None) -> str:
         text = await super().chat(messages, max_tokens=max_tokens, timeout=timeout, temperature=temperature)
         self.world_service.advance(self.info["id"], self.timeline_id, now_real=self.now_real)
         self.world_service.freeze(self.info["id"], self.timeline_id, now_real=self.now_real)

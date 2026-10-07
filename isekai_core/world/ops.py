@@ -1993,7 +1993,8 @@ async def _grounded_else_numeric(llm: Any, base: str, candidate: str) -> bool:
         return True
     try:
         text = await llm.chat(
-            render_mod.grounding_prompt(str(base), str(candidate)), temperature=0.0, timeout=20.0
+            render_mod.grounding_prompt(str(base), str(candidate)), temperature=0.0, timeout=20.0,
+            thinking="disabled",
         )
     except Exception:
         return True

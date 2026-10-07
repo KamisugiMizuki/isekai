@@ -23,7 +23,7 @@ class FakeRenderLLM:
         self.replies = list(replies)
         self.calls: list[list[dict]] = []
 
-    async def chat(self, messages, *, max_tokens=None, timeout=None, temperature=None) -> str:
+    async def chat(self, messages, *, max_tokens=None, timeout=None, temperature=None, thinking=None) -> str:
         self.calls.append(messages)
         index = min(len(self.calls) - 1, len(self.replies) - 1)
         return self.replies[index]

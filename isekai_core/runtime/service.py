@@ -410,7 +410,9 @@ class RuntimeService:
             )
             if reservation.get("ok"):
                 try:
-                    text = await llm.chat(prompt, temperature=0.3, timeout=60.0)
+                    text = await llm.chat(
+                        prompt, temperature=0.3, timeout=60.0, thinking="disabled"
+                    )
                     self.settle_call(reservation, prompt_text=prompt_text, reply=text)
                     proposed = drafts.parse_proposal(text, targets)
                     candidate = {**candidate, **{k: v for k, v in proposed.items() if v}}
@@ -1064,10 +1066,8 @@ class RuntimeService:
                 continue
             calls += 1
             try:
-                text = await llm.chat(prompt, temperature=0.3, timeout=90.0)
-                if not str(text or "").strip():
-                    # 推理型模型偶发把预算烧在 reasoning 里返回空正文：原样重试一次，仍空就当失败
-                    text = await llm.chat(prompt, temperature=0.3, timeout=90.0)
+                # 空正文由客户端重试（降为直接输出）；仍空就按失败留待处理
+                text = await llm.chat(prompt, temperature=0.3, timeout=90.0, thinking="disabled")
             except Exception:  # 提取失败不阻断对话与世界推进
                 log.exception("memory extraction failed character=%s", character_id)
                 self.settle_call(reservation, prompt_text=prompt_text, outcome="error")
@@ -1377,7 +1377,7 @@ class RuntimeService:
             calls += 1
             batches += 1
             try:
-                text = await llm.chat(prompt, temperature=0.3, timeout=90.0)
+                text = await llm.chat(prompt, temperature=0.3, timeout=90.0, thinking="disabled")
             except Exception:
                 log.exception("memory compaction failed character=%s", character_id)
                 self.settle_call(reservation, prompt_text=prompt_text, outcome="error")
@@ -1476,7 +1476,10 @@ class RuntimeService:
                 if llm is None:
                     break
                 try:
-                    text = await llm.chat(memory_mod.organize_prompt(row), temperature=0.3, timeout=30.0)
+                    text = await llm.chat(
+                        memory_mod.organize_prompt(row), temperature=0.3, timeout=30.0,
+                        thinking="disabled",
+                    )
                 except Exception:
                     continue
                 short = memory_mod.parse_organized(str(text), str(row.get("text") or ""))
@@ -1803,6 +1806,16 @@ class RuntimeService:
             high_water_real=float(row["high_water_real"]),
         )
 
+    def _catching(self, row: dict[str, Any]) -> bool:
+        """「世界追赶中」以推进器的记账为准（§2.6）。
+
+        `catching_up` / `limited` 由水位推进在每一批上写、追平的那批清 0：
+        它们表达「最近一次推进没有把目标追平」。
+        不能改回「此刻是否存在未处理区间（`processed < target`）」——持续运行的线
+        在两次推进之间总有未处理区间（一个 tick 间隔 × 倍率的量），那会把追赶报成常态。
+        """
+        return bool(int(row.get("catching_up") or 0) or int(row.get("limited") or 0))
+
     # ------------------------------------------------ 对外接口（WORLD_RUNTIME_INTERFACE_SPEC）
 
     def envelope(
@@ -1833,7 +1846,7 @@ class RuntimeService:
         target = target_world(state, now)
         processed = int(row["processed_world"])
         timeline_state = str(timeline["state"])
-        catching = processed < target or int(row.get("catching_up") or 0)
+        catching = self._catching(row)
         if timeline_state == "active" and catching:
             timeline_state = "catching_up"
         ruleset_version = ""
@@ -1890,7 +1903,7 @@ class RuntimeService:
             return self.envelope(instance_id, timeline_id, status="not_ready", extra={
                 "reason": f"时间线当前是 {timeline['state']}", "snapshot_id": "", "payload": {},
             })
-        if processed < target:
+        if self._catching(row):
             return self.envelope(instance_id, timeline_id, status="not_ready", extra={
                 "reason": f"还在追赶：水位 {processed} < 目标 {target}", "snapshot_id": "", "payload": {},
             })
@@ -2544,7 +2557,7 @@ class RuntimeService:
             "label": calendar.describe(world),
             "rate": state.rate,
             "processed_world": int(row["processed_world"]),
-            "catching_up": int(row["processed_world"]) < world,
+            "catching_up": self._catching(row),
             "clock": describe(state, now_real),
         }
 
@@ -3236,7 +3249,7 @@ class RuntimeService:
                 )
                 return True, ""
         try:
-            raw = await llm.chat(prompt, temperature=0.0, timeout=12.0)
+            raw = await llm.chat(prompt, temperature=0.0, timeout=12.0, thinking="disabled")
         except Exception:
             if reservation is not None:
                 self.settle_call(reservation, prompt_text=prompt_text, outcome="error")
@@ -4372,7 +4385,7 @@ class RuntimeService:
                 blocked = list(reservation.get("blocked") or [])
                 continue
             try:
-                text = await llm.chat(messages, temperature=0.7, timeout=60.0)
+                text = await llm.chat(messages, temperature=0.7, timeout=60.0, thinking="disabled")
             except Exception:  # 模型不可用不该影响世界推进
                 log.exception("intent proposal failed character=%s", character_id)
                 self.settle_call(reservation, prompt_text=prompt_text, outcome="error")

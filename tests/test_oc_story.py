@@ -334,7 +334,11 @@ async def test_trpg_action_never_rolls_dice_in_oc_session(tmp_path) -> None:
 
 
 async def test_offline_return_reports_catching_up_with_completed_time(tmp_path) -> None:
-    """§十二 第七行：追赶中只把已完成水位当已发生，目标时刻不冒充事实。"""
+    """§十二 第七行：追赶中只把已完成水位当已发生，目标时刻不冒充事实。
+
+    追赶的构造 = 推进器记下的「没追平」（世界时间跳了两天、推进只做了一批），
+    不是「此刻存在未处理区间」——持续运行的线两次推进之间总有区间、那不叫追赶。
+    """
     _fast(tmp_path)
     async with running_core(tmp_path, replies=["刚巡堤回来。"]) as h:
         h.fake.judgements["输入分类"] = CONTACT
@@ -342,7 +346,10 @@ async def test_offline_return_reports_catching_up_with_completed_time(tmp_path) 
         client, bound, instance_id, timeline_id, cards = await _room(h, mgmt, activate=False)
         try:
             h.runtime.world.activate(instance_id, timeline_id, now_real=time.time(), rate=3600)
-            await asyncio.sleep(1.05)  # 1 秒 ≈ 1 世界小时：目标水位跑在已完成水位前面
+            # 离线积累：世界时间往前跳两天（停机期间目标水位前进），推进只做一批 → 落在追上之前
+            h.runtime.world.consume_time(
+                instance_id, timeline_id, seconds=2 * DAY, cause="离线回访模拟", max_batches=1
+            )
             scene = await mgmt.call("story.scene", instance_id=instance_id, timeline_id=timeline_id,
                                     character_id=cards[0])
             assert scene["product_state"] == "catching_up" and scene["label"] == "世界追赶中"
@@ -365,6 +372,12 @@ async def test_offline_return_reports_catching_up_with_completed_time(tmp_path) 
             still = await mgmt.call("story.scene", instance_id=instance_id, timeline_id=timeline_id,
                                     character_id=cards[0])
             assert still["product_state"] == "catching_up", "场景级仍是世界追赶中"
+
+            # 推进追上：记账清 0 回到可用；不因新的小滞后（推进间隙）复现
+            h.runtime.world.advance(instance_id, timeline_id, now_real=time.time(), max_batches=8)
+            done = await mgmt.call("story.scene", instance_id=instance_id, timeline_id=timeline_id,
+                                   character_id=cards[0])
+            assert done["product_state"] == "available", "追平后不再报追赶"
         finally:
             await client.close()
             await mgmt.close()
