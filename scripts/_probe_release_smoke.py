@@ -96,12 +96,13 @@ async def main() -> None:
             problems.append("壳把数据写进了程序目录")
 
         # 首屏 + 从样例世界开一份（真链路）
-        # 界面按方案 B 改过（启动选择器 + 顶栏 [⋯] 菜单，左侧导航已删）：
-        # 到「世界与素材」的真实路径 = 启动器选一个应用 → [⋯] → 世界管理
+        # 新顺序（2026-10-07 可用性评审 P0-2）：第一次打开直接进「首次设置」，
+        # 不再先弹三选一；「选择应用」推迟到首次设置之后。所以这里不再点启动器卡片。
         steps: list[str] = []
-        launched = await click_text(cdp, ".u-launcher-card", "isekai Chat")
-        steps.append(f"启动选择器选 Chat：{launched}")
-        await asyncio.sleep(1.5)
+        route0 = str(await cdp.js("JSON.stringify(window.__uiApp.probeState.route)"))
+        steps.append(f"首启 route：{route0}")
+        if "onboarding" not in route0:
+            problems.append(f"第一次打开没有直接进「首次设置」（route={route0}）")
         opened = await click_text(cdp, "#u-more-btn", "⋯")
         steps.append(f"打开 [⋯] 菜单：{opened}")
         await asyncio.sleep(0.6)

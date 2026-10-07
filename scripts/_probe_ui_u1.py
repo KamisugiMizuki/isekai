@@ -113,31 +113,57 @@ async def main() -> None:
         state = await cdp.js("JSON.stringify(window.__uiApp.probeState)")
         print("[连接]", state)
 
+        # ---------------- 0) 首启顺序（可用性评审 P0-2）----------------
+        # 第一次打开必须直接进「首次设置」，不再先弹三个英文应用名让人猜
+        first = await visible_text(cdp, "#u-main")
+        print("[首启]", json.dumps({"片段": first[:80]}, ensure_ascii=False))
+        if "首次设置" not in first or "本机环境" not in first:
+            problems.append(f"第一次打开没有直接进「首次设置 → 本机检查」：{first[:120]}")
+        if await cdp.js("!!document.querySelector('.u-launcher-overlay')"):
+            problems.append("首启仍然弹了「选择应用」浮层（新顺序里它应该推迟到首次设置之后）")
+
         # ---------------- 1) 首页 ----------------
+        await cdp.js("window.__uiApp.navigate({pane:'home'})")
+        await wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('从这里开始')")
         home = await visible_text(cdp, "#u-main")
         cards = await cdp.js("document.querySelectorAll('#u-main .u-card').length")
         print("[首页]", json.dumps({"卡片": cards, "片段": home[:80]}, ensure_ascii=False))
         if cards != 3:
             problems.append(f"首页任务入口数={cards}（应 3）")
-        if "第一步:连接 AI" not in home:
-            problems.append("未配置 AI 时首页没有给出「第一步:连接 AI」")
+        if "第一步：连接 AI" not in home:
+            problems.append("未配置 AI 时首页没有给出「第一步：连接 AI」")
         if "推荐下一步" not in home:
             problems.append("无数据时首页没有给出推荐下一步")
+        # 首页入口要在「不是首页」时可见（在首页时本来就不该有这颗按钮）
+        await cdp.js("window.__uiApp.navigate({pane:'worlds'})")
+        await wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('我的世界')")
+        if not await wait_true(cdp, "!!document.getElementById('u-home-btn')"):
+            problems.append("顶栏没有可见的「首页」入口（只藏在 ⋯ 里）")
+        if not await click_text(cdp, "#u-home-btn", "首页"):
+            problems.append("顶栏的「首页」按钮点不动")
+        await wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('从这里开始')")
 
         # ---------------- 2) 首次设置向导 ----------------
+        # 「从样例世界开始」现在直达「准备材料」（未配 AI 不再被押回连接 AI，评审 P0-2）
         if not await click_text(cdp, "#u-main button", "从样例世界开始"):
             problems.append("点不到「从样例世界开始」")
-        await wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('首次设置')")
+        landed_material = await wait_true(
+            cdp, "(document.querySelector('#u-main')?.innerText||'').includes('准备材料')"
+        )
+        if not landed_material:
+            problems.append(f"「从样例世界开始」没有直达准备材料：{(await visible_text(cdp, '#u-main'))[:120]}")
+        await cdp.js("window.__uiApp.navigate({pane:'onboarding', sub:'check'})")
+        await wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('本机环境')")
         check_note = await visible_text(cdp, "#u-main")
         if "本机环境" not in check_note:
             problems.append(f"向导第一步不是本机检查：{check_note[:60]}")
         if "继续：连接 AI" not in check_note:
             problems.append(f"本机检查没有通过：{check_note[:160]}")
         await click_text(cdp, "#u-main button", "继续：连接 AI")
-        await wait_true(cdp, "!!document.getElementById('onb-key')")
-        await set_value(cdp, "#onb-key", "sk-probe-1234567890")
-        await set_value(cdp, "#onb-base-url", "https://api.example.com/v1")
-        await set_value(cdp, "#onb-model", "probe-model")
+        await wait_true(cdp, "!!document.getElementById('ai-key')")
+        await set_value(cdp, "#ai-key", "sk-probe-1234567890")
+        await set_value(cdp, "#ai-base-url", "https://api.example.com/v1")
+        await set_value(cdp, "#ai-model", "probe-model")
         await click_text(cdp, "#u-main button", "测试并保存")
         reached_task = await wait_true(
             cdp, "(document.querySelector('#u-main')?.innerText||'').includes('选择第一件事')", timeout=60.0
@@ -215,6 +241,14 @@ async def main() -> None:
         await cdp.js("window.__uiApp.navigate({pane:'help'})")
         await wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('帮助与诊断')")
         # ---------------- 6) 帮助与诊断 + 高级调试往返 ----------------
+        # 2026-10-08 视觉体系审查：帮助页改成「问答在前、本机详情收进折叠」，
+        # 所以先展开那个折叠块，确认信息仍然一条不少（而不是把它删了）。
+        await cdp.js(
+            "(()=>{const d=[...document.querySelectorAll('#u-main details')]"
+            ".find(n=>(n.querySelector('summary')?.textContent||'').includes('本机详情'));"
+            "if(d)d.open=true;return !!d;})()"
+        )
+        await asyncio.sleep(0.3)
         help_text = await visible_text(cdp, "#u-main")
         for want in ("本机检查明细", "后台服务", "高级调试", "常见问题"):
             if want not in help_text:

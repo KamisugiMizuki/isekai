@@ -34,6 +34,7 @@ FAKE_REPLY = (SAMPLE / "huichao.json").read_text(encoding="utf-8")
 WORLD_NAME = "运河世界"
 BRIEF = "一个靠运河吃饭的城邦，外面是越来越深的潮"
 EDITED = "运河是命脉（我改过这条）"
+EDITED_NEW = "新加的一条：潮水每年退一尺（我加的这条）"
 LOG = REPO / "scripts" / "_u2probe_create.log"
 
 
@@ -156,6 +157,66 @@ async def row_button_in(cdp: desk.Cdp, container: str, needle: str, label: str) 
         + ");if(!hit){return 'no-button';}hit.click();return 'ok';})()"
     )
     return str(await cdp.js(expr))
+
+
+async def open_section(cdp: desk.Cdp, label: str) -> str:
+    """让「当前分区」确实是 label：点目录行上的「打开」，再等条目区标题对上。
+
+    2026-10-08：创建向导重排成「一级 panel 包六个阶段」之后，探针原来只点一下「打开」就假定
+    当前分区已经切过去；实际没切过去时，后面的「编辑」「添加一条」会落到别的分区上
+    （实测把一条空的时段行加到时段里，第 5 条 [0,0) 直接卡住创建）。这里把这件事变成显式断言。
+    """
+    clicked = await row_button_in(cdp, ".u-create-catalog", label, "打开")
+    if clicked != "ok":
+        # 该分区已经是当前分区时，目录行上只有「在编辑」
+        clicked = await row_button_in(cdp, ".u-create-catalog", label, "在编辑")
+    ok = await wait_true(
+        cdp,
+        "(()=>{const s=document.querySelector('.u-create-entries .u-section-title');"
+        "return !!s&&(s.textContent||'').includes(" + json.dumps(label) + ");})()",
+        timeout=15,
+    )
+    if not ok:
+        title = await cdp.js(
+            "(()=>{const s=document.querySelector('.u-create-entries .u-section-title');"
+            "return s?(s.textContent||''):'(没有条目区)';})()"
+        )
+        return f"clicked={clicked}｜当前分区={title}"
+    return "ok"
+
+
+async def catalog_labels(cdp: desk.Cdp) -> list[str]:
+    """目录里现在有哪些分区（按屏幕顺序）。"""
+    value = await cdp.js(
+        "(()=>{const box=document.querySelector('.u-create-catalog');if(!box)return '[]';"
+        "return JSON.stringify([...box.querySelectorAll('.u-row-line')]"
+        ".map(r=>{const s=r.querySelector('.u-grow');return (s?(s.textContent||''):(r.textContent||'')).trim();}));})()"
+    )
+    try:
+        return list(json.loads(value or "[]"))
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def open_editable_section(cdp: desk.Cdp) -> str:
+    """挑一个「有内容字段可改」的分区并切过去，返回它的名字。
+
+    为什么不能写死「世界公理」：起草结果按核心的分区批次走，同一次运行里未必每个分区都有条目
+    （2026-10-08 实测：某次草稿只有时段，目录里根本没有「世界公理」行）。
+    探针要验的是「改一条 + 锁定 + 加一条 → 进新世界」这套动作，不依赖具体是哪个分区。
+    """
+    labels = await catalog_labels(cdp)
+    for label in labels:
+        if await open_section(cdp, label) != "ok":
+            continue
+        await asyncio.sleep(0.4)
+        has = await cdp.js(
+            "(()=>{const box=document.querySelector('.u-create-form');if(!box)return false;"
+            "return [...box.querySelectorAll('.u-field-label')].some(s=>(s.textContent||'').trim()==='内容');})()"
+        )
+        if has:
+            return label
+    return f"（没有可编辑的分区；目录={labels}）"
 
 
 async def entry_button(cdp: desk.Cdp, index: int, label: str) -> str:
@@ -303,11 +364,10 @@ async def main() -> None:
         say("起草", after_draft[:200])
 
         # ---------------- 3) 条目表单：改一条并锁定 ----------------
-        opened = await row_button_in(cdp, ".u-create-catalog", "世界公理", "打开")
-        if opened != "ok":
-            opened = await row_button_in(cdp, ".u-create-catalog", "世界公理", "在编辑")
-        if opened != "ok":
-            problems.append(f"分区目录里打不开「世界公理」：{opened}")
+        opened = await open_editable_section(cdp)
+        if opened.startswith("（"):
+            problems.append(f"没有切到可编辑的分区：{opened}")
+        say("编辑分区", {"分区": opened})
         await asyncio.sleep(0.4)
         picked_entry = await entry_button(cdp, 0, "编辑")
         if picked_entry != "ok":
@@ -325,14 +385,15 @@ async def main() -> None:
         say("编辑条目", {"改字段": typed, "锁定": locked})
 
         # ---------------- 4) 加一条 + 确认设定 ----------------
-        before = await section_count(cdp, "世界公理")
+        # 用第 3 步实际切过去的那个分区（不写死分区名：草稿未必每个分区都有条目）
+        before = await section_count(cdp, opened if not opened.startswith("（") else "")
         await click_text(cdp, ".u-create-entries button", "添加一条")
         await asyncio.sleep(0.5)
-        after = await section_count(cdp, "世界公理")
+        after = await section_count(cdp, opened if not opened.startswith("（") else "")
         if before < 0 or after != before + 1:
-            problems.append(f"「添加一条」没有落到分区上：{before} → {after}")
+            problems.append(f"「添加一条」没有落到分区上（{opened}）：{before} → {after}")
         # 新加的那条会立刻被选中：填上内容（空条目本来就该被校验拦下）
-        filled_new = await set_field(cdp, ".u-create-form", "内容", "新加的一条公理：潮水每年退一尺")
+        filled_new = await set_field(cdp, ".u-create-form", "内容", EDITED_NEW)
         if not filled_new:
             problems.append("新加的条目没有打开可填的表单")
         await click_text(cdp, "#u-main button", "确认世界设定，去选角色")
@@ -364,6 +425,10 @@ async def main() -> None:
         for need in ("创建摘要", "设定来源", "校验"):
             if need not in review:
                 problems.append(f"检查页缺：{need}")
+        # 样例那份设定必须能过校验：过不了就不该硬点「创建世界」，否则后面的失败全是连带伤
+        # （2026-10-08：探针此前把一条空行加到时段上，第 5 条 [0,0) 卡住创建，却报成「创建没生效」）
+        if "项需要处理" in review:
+            problems.append(f"样例设定没过校验：{review[-200:]}")
         say("检查", review[:200])
 
         # ---------------- 6) 创建世界（先暂停） ----------------
@@ -371,7 +436,7 @@ async def main() -> None:
             problems.append("检查页没有「创建世界」这个动作")
         if not await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('只创建，暂不运行')", timeout=20):
             diag = await cdp.js(
-                "JSON.stringify({crumbs:[...document.querySelectorAll('.u-crumbs button')].map(b=>[b.textContent,b.disabled]),"
+                "JSON.stringify({crumbs:[...document.querySelectorAll('.u-tools button')].map(b=>[b.textContent,b.disabled]),"
                 "buttons:[...document.querySelectorAll('#u-main button')].map(b=>b.textContent.slice(0,18))})"
             )
             problems.append(f"没有进到创建这一步：{diag}")
@@ -387,11 +452,13 @@ async def main() -> None:
             problems.append(f"「只创建」的时间线要先暂停：{final['states']}")
         say("创建", final)
 
-        # 用户改过的那条内容确实进了新世界（读落盘的世界设定）
+        # 用户改过的那条和新加的那条都要确实进了新世界（读落盘的世界设定）
         saved = sorted(Path(root / "packages").glob(f"*{WORLD_NAME}*.json"))
         text = saved[0].read_text(encoding="utf-8") if saved else ""
         if EDITED not in text:
             problems.append("用户改过的内容没有进到保存的设定里")
+        if EDITED_NEW not in text:
+            problems.append("用户新加的那条没有进到保存的设定里")
         if text and "#" in text:
             problems.append("保存的设定看着不像真 JSON")
     finally:

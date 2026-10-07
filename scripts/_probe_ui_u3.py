@@ -259,7 +259,7 @@ async def main() -> None:
         await nav.launch_app(cdp, "isekai Writer")
         await asyncio.sleep(1.6)
         text = await visible_text(cdp)
-        for need in ("辅助写作", "世界", "时间线", "观察角色", "大纲", "新建大纲", "绑定到大纲"):
+        for need in ("辅助写作", "世界", "世界线", "观察角色", "大纲", "新建大纲", "绑定 / 更新绑定"):
             if need not in text:
                 problems.append(f"工作区缺：{need}")
         for tab in ("大纲", "当前素材", "推进建议", "文字草稿"):
@@ -277,7 +277,7 @@ async def main() -> None:
         await click_dialog(cdp, "保存大纲")
         if not await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('" + OUTLINE_NAME + "')"):
             problems.append("新建的大纲没有出现在选择里")
-        await click_text(cdp, "#u-main button", "绑定到大纲", last=True)
+        await click_text(cdp, "#u-main button", "绑定 / 更新绑定", last=True)
         if not await wait_true(cdp, "!!document.querySelector('#u-wa-chapter')"):
             problems.append("绑定对话框没打开")
         await set_value(cdp, "#u-wa-chapter", "第一章")
@@ -287,7 +287,8 @@ async def main() -> None:
         if not bound or not state["bound_outline"]:
             problems.append(f"绑定没有生效：界面={bound} 库={state['bound_outline']}")
         outline_text = await visible_text(cdp)
-        for need in ("主题约束", "必达节点", "禁止事项", "角色弧线", "节奏目标", "可变素材"):
+        # 六类条目：界面说法在 2026-10-08 的术语收口里改过人话（必达节点→必须做到、角色弧线→角色变化）
+        for need in ("主题约束", "必须做到", "禁止事项", "角色变化", "节奏目标", "可变素材"):
             if need not in outline_text:
                 problems.append(f"大纲分区缺：{need}")
         say("绑定", {"界面已绑定": bound, "库里": state["bound_outline"], "条目状态": state["item_status"]})
@@ -320,18 +321,18 @@ async def main() -> None:
         say("检查", (await visible_text(cdp))[-140:])
 
         # ---------------- 5) 当前素材 ----------------
-        await click_text(cdp, "#u-main nav.u-crumbs button", "当前素材")
+        await click_text(cdp, "#u-main nav.u-tools button", "当前素材")
         await asyncio.sleep(0.6)
         await click_text(cdp, "#u-main button", "读取当前素材")
-        await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('她知道的')", timeout=60)
+        await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('这个角色知道的')", timeout=60)
         material = await visible_text(cdp)
-        for need in ("她知道的", "作者依据"):
+        for need in ("这个角色知道的", "作者依据"):
             if need not in material:
                 problems.append(f"当前素材缺：{need}")
         say("当前素材", material[:120])
 
         # ---------------- 6) 推进建议 ----------------
-        await click_text(cdp, "#u-main nav.u-crumbs button", "推进建议")
+        await click_text(cdp, "#u-main nav.u-tools button", "推进建议")
         await asyncio.sleep(0.5)
         await set_value(cdp, "#u-wa-goal", "这一章要让读者第一次怀疑账本")
         await click_text(cdp, "#u-main button", "给我推进建议")
@@ -358,10 +359,16 @@ async def main() -> None:
                 if need not in preview:
                     problems.append(f"预览缺：{need}")
             await click_dialog(cdp, "确认应用")
-            applied = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('已生效')", timeout=90)
+            # 「已生效」在 2026-10-08 的术语收口里改成写清后果的说法：「已提交：世界里已经按它变化」
+            applied = await wait_true(
+                cdp,
+                "(()=>{const t=document.querySelector('#u-main').innerText||'';"
+                "return t.includes('已提交')||t.includes('已生效');})()",
+                timeout=90,
+            )
             after = inspect(root)
             if not applied:
-                problems.append("确认应用之后界面没有「已生效」")
+                problems.append("确认应用之后界面没有「已提交 / 已生效」")
             if after["events"] <= before:
                 problems.append(f"世界没有真的变化（事件 {before} → {after['events']}）")
             committed = [row for row in after["candidates"] if row["joint"]]
@@ -385,7 +392,12 @@ async def main() -> None:
         await set_value(cdp, "#u-wa-draft-title", "第一章·退潮")
         await set_value(cdp, "#u-wa-draft-body", DRAFT_TEXT)
         await click_text(cdp, "#u-main button", "保存文字草稿")
-        saved = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('文字草稿已保存')", timeout=60)
+        saved = await wait_true(
+            cdp,
+            "(()=>{const t=document.querySelector('#u-main').innerText||'';"
+            "return t.includes('已保存「')||t.includes('文字草稿已保存');})()",
+            timeout=60,
+        )
         if not saved:
             problems.append(f"保存文字草稿没有回执：{(await visible_text(cdp))[-140:]}")
         await click_text(cdp, "#u-main button", "锁定正文")

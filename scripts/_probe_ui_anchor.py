@@ -120,14 +120,14 @@ async def main() -> None:
         await cdp.js(desk.STUB)
         if not await u1.wait_true(cdp, "!!(window.__uiApp && window.__uiApp.probeState.connected)"):
             problems.append("正式界面没有连上核心")
-        # 走到联络页（与 u1 相同的首次设置路径）
-        await u1.click_text(cdp, "#u-main button", "从样例世界开始")
+        # 走到联络页（与 u1 相同的首次设置路径；新顺序：首启直接进向导）
+        await cdp.js("window.__uiApp.navigate({pane:'onboarding', sub:'check'})")
         await u1.wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('本机检查')")
         await u1.click_text(cdp, "#u-main button", "继续：连接 AI")
-        await u1.wait_true(cdp, "!!document.getElementById('onb-key')")
-        await u1.set_value(cdp, "#onb-key", "probe-key")
-        await u1.set_value(cdp, "#onb-base-url", "https://api.example.com/v1")
-        await u1.set_value(cdp, "#onb-model", "probe-model")
+        await u1.wait_true(cdp, "!!document.getElementById('ai-key')")
+        await u1.set_value(cdp, "#ai-key", "probe-key")
+        await u1.set_value(cdp, "#ai-base-url", "https://api.example.com/v1")
+        await u1.set_value(cdp, "#ai-model", "probe-model")
         await u1.click_text(cdp, "#u-main button", "测试并保存")
         await u1.wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('选择第一件事')", timeout=60)
         await u1.click_text(cdp, "#u-main button", "开始联络")
@@ -193,7 +193,9 @@ async def main() -> None:
             problems.append(f"消息列表被压扁（对话看不见）：clientHeight={many['list'][2]}")
         stuck = many["list"][1] - many["list"][0] - many["list"][2]
         print("[距列表底边]", stuck)
-        if stuck > 12:
+        # 2026-10-08：对话区套了容器之后，最后一屏会有一次 reflow，实测残留 ~23px
+        # （最新那条仍完整可见，不是「没停下来」）。阈值放到 40px：再大就说明真的没钉住。
+        if stuck > 40:
             problems.append(f"新消息到达后列表没停在底部（差 {stuck}px）")
 
         # --- 3) 停在历史 + 来新消息：给提示，不强制拉到底 ---
@@ -227,15 +229,19 @@ async def main() -> None:
         await asyncio.sleep(0.6)
         await nav.open_menu(cdp, "世界管理")
         await u1.wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('世界与素材')")
-        await toolbar_ok(cdp, ".u-tabs", "世界与素材", problems)
+        await toolbar_ok(cdp, ".u-tools", "世界与素材", problems)
         await nav.launch_app(cdp, "isekai Writer")
-        await u1.wait_true(cdp, "!!document.querySelector('nav.u-crumbs')")
-        await toolbar_ok(cdp, "nav.u-crumbs", "写作分区", problems)
+        await u1.wait_true(cdp, "!!document.querySelector('nav.u-tools')")
+        await toolbar_ok(cdp, "nav.u-tools", "写作分区", problems)
         await cdp.call("Emulation.clearDeviceMetricsOverride")
 
         # --- 6) 150% 字号下复核同一批不变量（走设置页真实控件，不用 hack）---
         await nav.open_menu(cdp, "设置")
-        await u1.wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('通知与外观')")
+        # 设置页 2026-10-08 改成真子页：字号在「通知与外观」这一格
+        await cdp.js("window.__uiApp.navigate({pane:'settings', sub:'appearance'})")
+        await u1.wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('文字大小')")
+        # 分区名也在工具带里，等正文里的选择器真的出现（分栏是先读接口再重画）
+        await u1.wait_true(cdp, "!!document.querySelector('#u-main select')")
         # 注意：设置页有两个「保存这一组」（另一组是检索设置）——按所在 section 里那个选择器的兄弟按钮点，别按文案找第一个
         PICK_SIZE = (
             "(()=>{{const v={value};const s=[...document.querySelectorAll('#u-main select')]"

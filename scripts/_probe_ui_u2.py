@@ -236,7 +236,7 @@ async def main() -> None:
         lines = after_draft
         if got_draft:
             await set_value(cdp, "#u-change-name", LINE_NAME)
-            await click_text(cdp, "#u-main button", "确认并新建时间线")
+            await click_text(cdp, "#u-main button", "确认并新建世界线")
             arrived = await wait_true(
                 cdp,
                 "(()=>{const t=document.querySelector('#u-main').innerText;return t.includes('已归档')||t.includes('已暂停');})()",
@@ -273,7 +273,7 @@ async def main() -> None:
             await set_dialog_input(cdp, LINE_NAME)
             matched = await dialog_action(cdp, "删除这条线")
             gone = await wait_true(
-                cdp, "document.querySelector('#u-main').innerText.includes('已删除时间线')", timeout=30
+                cdp, "document.querySelector('#u-main').innerText.includes('已删除世界线')", timeout=30
             )
             if not gone:
                 problems.append(f"名称对上没有删除（{again}/{matched}）：{(await visible_text(cdp))[-200:]}")

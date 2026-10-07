@@ -1,7 +1,7 @@
 """修复轮验收探针：真壳 + 假 LLM + 临时数据根，全流程走一遍（2026-10-07 修复轮锁）。
 
 锁定的回归（每条都在真壳里实测过）：
-  - W1/W9：转交通知卡的按钮排（[查看X][继续联络][仅作为联络发送]）。
+  - W1/W9：转交通知卡的按钮排（[查看X][继续联络][只把这句话告诉她]）。
     曾因 handoffTargets 用「尝试世界变化」等文案去匹配核心正文（实际是「创作请求」等）而整排不渲染——
     这里的「按钮出现→点→原文回输入框→重发有回复→不产生新通知」链专门守住它。改任一侧文案都要跑本探针。
   - W4 最近使用 / W3 加入角色向导 / W5 跑团样例入口 / W7 触控目标 44px / W8 焦点环主题色。
@@ -121,39 +121,56 @@ async def main() -> None:
         async def S(name: str, focus: str = "") -> None:
             shots.append(await shot(cdp, name, focus))
 
-        # ---- 01 启动器 ----
-        if await nav.wait_true(cdp, "!!document.querySelector('.u-launcher')", timeout=20):
+        # ---- 01 启动器（首启新顺序之后可能不弹：直接从「首次设置」开始）----
+        if await nav.wait_true(cdp, "!!document.querySelector('.u-launcher')", timeout=12):
             await S("01_launcher")
             await nav.click_text(cdp, ".u-launcher-card", "isekai Chat")
             await nav.wait_true(cdp, "!document.querySelector('.u-launcher-overlay')", timeout=20)
         await asyncio.sleep(0.8)
 
-        # ---- 02 向导走到联络页（假 LLM 用 JSON 回复过结构化测试，走全绿路径）----
-        if await nav.click_text(cdp, "#u-main button", "从样例世界开始"):
-            await nav.wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('本机环境')")
-            await nav.click_text(cdp, "#u-main button", "继续：连接 AI")
-            ok = await nav.wait_true(cdp, "!!document.getElementById('onb-key')", timeout=30)
-            if ok:
-                await set_value(cdp, "#onb-key", "probe-key")
-                await set_value(cdp, "#onb-base-url", "https://api.example.com/v1")
-                await set_value(cdp, "#onb-model", "probe-model")
-                await nav.click_text(cdp, "#u-main button", "测试并保存")
-                reached = await nav.wait_true(
-                    cdp, "(document.querySelector('#u-main')?.innerText||'').includes('选择第一件事')", timeout=60
-                )
-                if not reached:
-                    # 兜底：测试部分通过时先保存未验证配置，再尝试点步骤条
-                    if await nav.click_text(cdp, "#u-main button", "保存未验证配置"):
-                        await asyncio.sleep(0.8)
-                        await cdp.js(
-                            "(()=>{const n=[...document.querySelectorAll('.u-steps *')]"
-                            ".find(x=>(x.innerText||'').trim()==='选择任务');if(n){n.click();return true;}return false;})()"
-                        )
-                        reached = await nav.wait_true(
-                            cdp, "(document.querySelector('#u-main')?.innerText||'').includes('选择第一件事')",
-                            timeout=30,
-                        )
-                check("连接 AI 测试并进入选择任务（假 LLM 全绿路径）", reached)
+        # ---- 02 首次设置：本机检查 → 连接 AI → 选择第一件事 ----
+        # 新顺序（可用性评审 P0-2）：第一次打开直接进向导，不再先弹三选一。
+        # 老状态（启动器/首页）也兜得住：先回首页，再从「从样例世界开始」进。
+        await S("02_first_screen")
+        for _ in range(3):
+            if await cdp.js("!!document.getElementById('ai-key')"):
+                break
+            if await nav.click_text(cdp, "#u-main button", "继续：连接 AI"):
+                await nav.wait_true(cdp, "!!document.getElementById('ai-key')", timeout=30)
+                continue
+            if await nav.click_text(cdp, "#u-main button", "从样例世界开始"):
+                await asyncio.sleep(1.5)
+                continue
+            if await cdp.js("!!document.getElementById('u-home-btn')"):
+                await cdp.js("document.getElementById('u-home-btn').click()")
+                await asyncio.sleep(1.2)
+                continue
+            break
+        ok = bool(await cdp.js("!!document.getElementById('ai-key')"))
+        if ok:
+            await S("03_ai_step")
+            await set_value(cdp, "#ai-key", "probe-key")
+            await set_value(cdp, "#ai-base-url", "https://api.example.com/v1")
+            await set_value(cdp, "#ai-model", "probe-model")
+            await nav.click_text(cdp, "#u-main button", "测试并保存")
+            reached = await nav.wait_true(
+                cdp, "(document.querySelector('#u-main')?.innerText||'').includes('选择第一件事')", timeout=60
+            )
+            if not reached:
+                # 兜底：测试部分通过时先保存未验证配置，再尝试点步骤条（进度轨的圆点）
+                if await nav.click_text(cdp, "#u-main button", "保存未验证配置"):
+                    await asyncio.sleep(0.8)
+                    await cdp.js(
+                        "(()=>{const n=[...document.querySelectorAll('.u-rail-step, .u-steps *')]"
+                        ".find(x=>(x.innerText||'').includes('选择任务'));if(n){n.click();return true;}return false;})()"
+                    )
+                    reached = await nav.wait_true(
+                        cdp, "(document.querySelector('#u-main')?.innerText||'').includes('选择第一件事')",
+                        timeout=30,
+                    )
+            check("连接 AI 测试并进入选择任务（假 LLM 全绿路径）", reached)
+        else:
+            check("走到首次设置的「连接 AI」这一步", False, "没有找到 ai-key；见 02_first_screen 截图")
         await nav.click_text(cdp, "#u-main button", "开始联络")
         ok = await nav.wait_true(cdp, "!!document.getElementById('onb-sample')", timeout=30)
         if ok:
@@ -180,9 +197,9 @@ async def main() -> None:
         await asyncio.sleep(0.6)
         await S("02_notice_card")
 
-        # ---- 04 仅作为联络发送（W9；按钮排曾因 matcher 错文案整排不渲染）----
+        # ---- 04 只把这句话告诉她（W9；按钮排曾因 matcher 错文案整排不渲染）----
         restored = False
-        if await nav.click_text(cdp, "#u-main button", "仅作为联络发送"):
+        if await nav.click_text(cdp, "#u-main button", "只把这句话告诉她"):
             restored = await nav.wait_true(
                 cdp,
                 "(document.getElementById('u-contact-input')?.value||'').includes('加一个内陆城邦')",
@@ -190,7 +207,7 @@ async def main() -> None:
             )
             await asyncio.sleep(0.5)
             await S("03_as_contact_composer")
-        check("「仅作为联络发送」把原文放回输入框（W9）", restored)
+        check("「只把这句话告诉她」把原文放回输入框（W9）", restored)
         hint = await js_text(cdp, "#u-contact-handoff")
         check("输入框附近有「不执行其中操作」提示（W9）", "不执行" in hint or "只把这句话" in hint, hint[:80])
 
@@ -225,7 +242,7 @@ async def main() -> None:
                 check("加入角色向导第①步（W3）", entered)
                 await asyncio.sleep(0.4)
                 await S("06_join_step1")
-                await nav.click_text(cdp, "#u-main button", "下一步：审定卡片")
+                await nav.click_text(cdp, "#u-main button", "下一步：确认角色卡")
                 ok2 = await nav.wait_true(
                     cdp,
                     "(()=>{const t=document.querySelector('#u-main')?.innerText||'';"

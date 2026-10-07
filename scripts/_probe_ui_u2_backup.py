@@ -182,9 +182,21 @@ async def main() -> None:
         # ---------------- 1) 打一份备份 ----------------
         if not await nav.open_menu(cdp, "设置"):
             problems.append("侧栏没有「设置」入口")
-        await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('数据与备份')")
+        # 设置页 2026-10-08 改成真子页：备份在「数据与备份」这一格（不带 sub 会落到上次停留的分区）。
+        # 分区名同时出现在工具带上，所以不能只等文字——要等这一格的动作真的出现（分区是先读接口再画内容）。
+        await cdp.js("window.__uiApp.navigate({pane:'settings', sub:'data'})")
+        if not await wait_true(
+            cdp,
+            "[...document.querySelectorAll('#u-main button')]"
+            ".some(b=>(b.textContent||'').includes('立即备份全部数据'))",
+            timeout=30,
+        ):
+            problems.append("没有进到「数据与备份」这一格")
         await click_text(cdp, "#u-main button", "立即备份全部数据")
         made = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('备份完成')")
+        # 列表是打包完成后重新读的，等那一行状态出现再读整页文字
+        if made:
+            await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('完整')", timeout=15)
         settings_text = await visible_text(cdp)
         if not made:
             problems.append(f"没有打出备份：{settings_text[-220:]}")

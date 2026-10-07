@@ -38,6 +38,9 @@ _fix_*.py
 # 探针日志（真壳验收的读数，跑一次就重写）
 scripts/_*.log
 
+# 可用性 / 视觉 / 无障碍走查的工作区（截图、真机数据根、临时脚本，几百 MB）
+.tmp-usability/
+
 # 行于泰拉专属规则实现（仅本地使用，不提交）
 examples/terra_v12_rules_plugin/
 tests/test_terra_v12_plugin.py

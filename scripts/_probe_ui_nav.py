@@ -11,7 +11,7 @@
   N3 「世界设定 / 角色卡」分栏高亮跟着内容走（不再停在「我的世界」）；
   N4 子页面顶栏返回写明去处，点它回到应用根；应用根点它是「选择应用」；
   N5 刚选过应用（<5 秒）再点返回，选择器照样弹出（用户的明确点击不被守卫吞掉）；
-  N6 联络页「时间线与版本」落到世界详情；设置页 `sub:"extensions"` 滚到扩展那一节。
+  N6 联络页「世界线与版本记录」落到世界详情；设置页 `sub:"extensions"` 滚到扩展那一节。
 """
 
 from __future__ import annotations
@@ -80,13 +80,21 @@ async def route_pane(cdp: desk.Cdp) -> str:
 
 
 async def tab_states(cdp: desk.Cdp, selector: str) -> list[list[str]]:
+    # 2026-10-08 视觉体系审查之后，分区条统一成 .u-tools：选中态 = 下划线（box-shadow）+ 加粗 + 前景色，
+    # 不再是「换底色」。所以这里量 color / fontWeight / boxShadow 三样，任两样不同即视为可区分。
     value = await cdp.js(
         "(()=>{const bs=[...document.querySelectorAll(" + json.dumps(selector) + ")];"
         "return JSON.stringify(bs.map(b=>[(b.textContent||'').trim(),"
-        "getComputedStyle(b).backgroundColor,getComputedStyle(b).fontWeight,"
-        "b.getAttribute('aria-current')||'']));})()"
+        "getComputedStyle(b).color,getComputedStyle(b).fontWeight,"
+        "b.getAttribute('aria-current')||'',getComputedStyle(b).boxShadow]));})()"
     )
     return json.loads(value) if value else []
+
+
+def distinct_enough(active: list[str], other: list[str]) -> bool:
+    """选中项与未选中项至少两处计算样式不同（颜色/字重/下划线）。"""
+    same = sum(1 for i in (1, 2, 4) if active[i] == other[i])
+    return same <= 1
 
 
 async def main() -> None:
@@ -108,7 +116,10 @@ async def main() -> None:
         await cdp.js("document.querySelector('.u-launcher-overlay')?.remove()")
 
         # ---------------- N1 入口跳步 ----------------
+        # navigate() 是排队执行的（navChain），不等首页真的画出来就点会点空：
+        # 首次打开现在直接进「首次设置」，首页是后来才挂上的（2026-10-08 首启顺序调整）。
         await cdp.js("window.__uiApp.navigate({pane:'home'})")
+        await wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('从这里开始')", timeout=30)
         await wait_true(cdp, "!!document.querySelector('#u-main button')")
         await click_text(cdp, "#u-main button", "从样例世界开始")
         landed_sample = await wait_true(cdp, "!!document.getElementById('onb-sample')", timeout=30)
@@ -130,25 +141,25 @@ async def main() -> None:
         in_contact = await wait_true(cdp, "!!document.querySelector('#u-contact-input')", timeout=60)
         check("N1b 向导一路走到联络页", in_contact, f"created={created}")
 
-        # ---------------- N6a 联络页 → 时间线与版本 ----------------
+        # ---------------- N6a 联络页 → 世界线与版本记录 ----------------
         if in_contact:
-            await click_text(cdp, "#u-main button", "时间线与版本")
+            await click_text(cdp, "#u-main button", "世界线与版本记录")
             in_detail = await wait_true(
                 cdp, "(document.querySelector('#u-main')?.innerText||'').includes('返回世界列表')", timeout=30
             )
-            check("N6a「时间线与版本」落到世界详情", in_detail, f"路由={await route_pane(cdp)}")
+            check("N6a「世界线与版本记录」落到世界详情", in_detail, f"路由={await route_pane(cdp)}")
         else:
-            check("N6a「时间线与版本」落到世界详情", False, "没进联络页，跳过")
+            check("N6a「世界线与版本记录」落到世界详情", False, "没进联络页，跳过")
 
         # ---------------- N2 写作分区高亮 ----------------
         await cdp.js("window.__uiApp.navigate({pane:'writing'})")
-        await wait_true(cdp, "document.querySelectorAll('.u-crumbs button').length>=4", timeout=30)
-        await click_text(cdp, ".u-crumbs button", "推进建议")
-        await wait_true(cdp, "[...document.querySelectorAll('.u-crumbs button')].some(b=>b.getAttribute('aria-current')==='page')")
-        states = await tab_states(cdp, ".u-crumbs button")
+        await wait_true(cdp, "document.querySelectorAll('.u-tools button').length>=4", timeout=30)
+        await click_text(cdp, ".u-tools button", "推进建议")
+        await wait_true(cdp, "[...document.querySelectorAll('.u-tools button')].some(b=>b.getAttribute('aria-current')==='page')")
+        states = await tab_states(cdp, ".u-tools button")
         active = [row for row in states if row[3] == "page"]
         others = [row for row in states if row[3] != "page"]
-        distinct = bool(active and others and active[0][1] != others[0][1] and active[0][2] != others[0][2])
+        distinct = bool(active and others and distinct_enough(active[0], others[0]))
         check(
             "N2 写作分区的当前格高亮",
             len(active) == 1 and distinct,
@@ -157,10 +168,27 @@ async def main() -> None:
 
         # ---------------- N3 世界与素材分栏 ----------------
         await cdp.js("window.__uiApp.navigate({pane:'worlds'})")
-        await wait_true(cdp, "!!document.querySelector('.u-tabs button')", timeout=30)
-        await click_text(cdp, ".u-tabs button", "世界设定 / 角色卡")
-        await wait_true(cdp, "(document.querySelector('#u-main')?.innerText||'').includes('世界设定与角色卡')", timeout=30)
-        states = await tab_states(cdp, ".u-tabs button")
+        # 要等的是「世界与素材」这一行的工具带：刚离开写作页时 DOM 里还留着写作的分区条，
+        # 只等 .u-tools button 会立刻为真，随后点到的是上一页的按钮（实测点空）。
+        await wait_true(
+            cdp,
+            "[...document.querySelectorAll('#u-main .u-tools button')]"
+            ".some(b=>(b.textContent||'').includes('世界设定 / 角色卡'))",
+            timeout=30,
+        )
+        clicked_tab = await click_text(cdp, ".u-tools button", "世界设定 / 角色卡")
+        if not clicked_tab:
+            check("N3 点「世界设定 / 角色卡」后高亮跟着走", False, "没点到这个分区按钮")
+            return
+        # 注意：不能等「世界设定与角色卡」这段文字——它既是分区名也是内容面板标题，
+        # 旧的分区条里本来就有，会立刻为真（分栏是先读接口再重画的）。等选中态真的挪过去。
+        await wait_true(
+            cdp,
+            "[...document.querySelectorAll('.u-tools button')]"
+            ".some(b=>(b.textContent||'').includes('世界设定 / 角色卡')&&b.getAttribute('aria-current')==='page')",
+            timeout=30,
+        )
+        states = await tab_states(cdp, ".u-tools button")
         assets = [row for row in states if row[0] == "世界设定 / 角色卡"]
         worlds = [row for row in states if row[0] == "我的世界"]
         check(
@@ -180,8 +208,10 @@ async def main() -> None:
             view_h = await cdp.js("window.innerHeight")
             scrolled = await cdp.js("document.querySelector('.u-main').scrollTop")
             check(
+                # 设置页 2026-10-08 改成真子页：「扩展」是进入后的第一块内容，已在视口顶部附近。
+                # 原来断言的 scrolled > 100 是「同一页里滚到那一节」时代的写法，真子页天然拿不到。
                 "N6b 设置页 extensions 定位到扩展节",
-                isinstance(top, (int, float)) and top >= 0 and top < view_h - 120 and scrolled > 100,
+                isinstance(top, (int, float)) and top >= 0 and top < view_h - 120,
                 f"该节顶部 y={top}（视口 {view_h}）｜滚动位置={scrolled}",
             )
             back_label = str(await cdp.js("document.getElementById('u-back')?.textContent||''"))

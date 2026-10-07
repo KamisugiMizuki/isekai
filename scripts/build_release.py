@@ -11,6 +11,10 @@
       runtime/python/Lib/site-packages/  ← 运行依赖（websockets / httpx / PyYAML …）
       README.md  LICENSE  发行说明.md
 
+`README.md` 与 `发行说明.md` 都由本脚本**生成**（不是拷仓库根 README）：包里没有 `docs/`、
+`tests/`、`scripts/`，拷过去只会留下一片死链。两者共用同一份正文片段（`RELEASE_*` 常量），
+改一处两边同步。
+
 数据不放进程序目录：发行件把数据根落在 `%LOCALAPPDATA%\\isekai`（`isekai_core.config.user_data_root`）。
 跑法：.venv/Scripts/python.exe scripts/build_release.py [--skip-shell] [--out release]
 """
@@ -119,27 +123,95 @@ def copy_runtime(python_home: Path, runtime: Path) -> dict[str, int]:
     return counts
 
 
-RELEASE_NOTE = """# 发行说明（{version}）
+#: 发行件里给用户看的正文片段——`README.md` 与 `发行说明.md` 共用同一份，不各写一遍
+RELEASE_INTRO = """# isekai
 
-## 怎么用
+一个持续运行的异世界。你通过与世界内角色的对话（经由角色专属的双向联络方式），
+碎片化地发现这个世界的历史、人文与重要事件；世界不依赖你在线而存在。
+"""
+
+RELEASE_STEPS = """## 怎么用（五步）
 
 1. 解压这个目录到任意位置（不要解压到需要管理员权限的地方）。
-2. 双击 `isekai.exe`：程序自己带运行环境，不需要另外装 Python。界面依赖 WebView2 运行时——Win11 与多数已更新的 Win10 已预装；若双击没有反应，请先安装 Microsoft Edge WebView2 Runtime。
-3. 第一次打开会进「首次设置」：先做本机检查，再填 AI 服务的地址、模型名与密钥（地址与模型名是必填项），然后从样例世界开始。
-4. 选项都在程序里：设置 → AI 服务（密钥可随时改）、设置 → 数据与备份（立即备份、恢复、搬迁）。
-5. 卸载 = 删除这个目录；你的数据在 `%LOCALAPPDATA%\\isekai`，要一起清掉再删除那个目录。
+2. 双击 `isekai.exe`：程序自己带运行环境，不需要另外装 Python。
+   - 界面依赖 WebView2 运行时——Win11 与多数已更新的 Win10 已预装。若双击**没有反应**，
+     装一次微软的 WebView2 Runtime 再双击：<https://developer.microsoft.com/microsoft-edge/webview2/>
+     （选「Evergreen Standalone Installer → x64」）。
+   - 本程序未购买数字签名。从网上下载的压缩包可能被 Windows 标记，双击时弹「Windows 已保护你的电脑」——点「更多信息 → 仍要运行」即可。
+3. 第一次打开直接进「首次设置」：本机检查 → 连接 AI → 选择第一件事 → 准备材料 → 开始使用。
+   - **用 AI 需要自己有一个 AI 服务的账号**（要注册，多数要充值或领免费额度）。界面里推荐 DeepSeek：
+     地址和模型名已经填好，你只要点「打开密钥申请页」，按页面上写的步骤创建密钥，把那一整串粘贴回来。
+   - 不想现在弄：点「稍后配置，先整理素材」，照样能把世界和角色建起来，之后再回来补。
+4. 准备材料：在「世界与素材」里从**样例世界**开始（推荐），或者自己新建世界设定、起草角色卡。
+5. 开始用：想认识角色去「角色联络」，想整理故事走向去「辅助写作」，想跑一局去「跑团」。
+   - **关掉窗口 ≠ 退出程序**：点右上角 × 只是收进任务栏托盘，世界还在后台走。
+     要真正退出：右键任务栏里的 isekai 图标 → 「退出」。
+   - 卸载 = 先在托盘里退出，再删除这个目录；你的数据在 `%LOCALAPPDATA%\\isekai`，要一起清掉再删那个目录。
+"""
 
-## 数据与隐私
+RELEASE_SLOW_REPLY = """## 第一次与角色说话可能慢一拍
+
+角色若正处于睡眠时段，她的回复会先攒一拍再答（把这期间的多句话并成一批处理），
+所以**第一句可能要等 30–120 秒才出现回复**——这是设计，不是卡死。
+联络页会写着「最长约 2 分钟」并显示你已经等了多久；等不下去可以直接关掉窗口，
+回复生成后仍然会保存下来，下次打开就能看到。
+"""
+
+RELEASE_PRIVACY = """## 数据与隐私
 
 - 数据根：`%LOCALAPPDATA%\\isekai`（数据库、素材、日志都在这里，程序目录只放程序）。
-- 密钥写在数据根的 `config/config.yaml` 里，只在本机使用；备份文件里不含密钥。
+- API 密钥只存在这台机器上：在界面「设置 → AI 服务」里填、在那里改；不进入日志、插件环境或导出件，备份文件里也不含密钥。
 - 规则插件是本机扩展程序：登记时会显示来源、规则与版本、入口，进程隔离不是完整安全沙箱。
-
-## 这一版里还没有的
-
-- 安装程序（当前是 zip + 手动解压；卸载靠删除目录）。
-- 面向普通用户的三条完整路径的真实试用记录（需要真人试跑，尚未做）。
 """
+
+RELEASE_SCOPE = """## 这一版里还没有的
+
+- 安装程序（当前是 zip + 手动解压；卸载靠「托盘退出 + 删除目录」）。
+- 面向普通用户的三条完整路径的真实试用记录（需要真人试跑，尚未做）。
+
+出问题时：界面「帮助与诊断」里有常见问题（密钥去哪申请、填哪个模型名、回复慢、怎么退出、怎么备份），
+以及「复制诊断信息」——把那段连同问题描述发给提供这个程序的人。
+"""
+
+#: 包里没有 docs/，所以 README 只留「包里真实存在」的指路
+RELEASE_DOCS_SECTION = """## 文档
+
+包里只有程序本身，没有仓库的 `docs/`。你需要的都在这两份里：
+
+- [`发行说明.md`](发行说明.md)：怎么装、怎么开始、第一次为什么可能慢、数据放在哪、这一版还没有什么。
+- 界面内「帮助与诊断」：本机检查、日志位置与高级调试。
+
+想了解设计与协议、或用源码开发，去仓库（本包不含）：
+
+- 设计文档地图：`docs/README.md`
+- 十分钟跑通一个世界：`docs/QUICKSTART.md`
+- 开发指南：`docs/DEVELOPING.md`
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。
+"""
+
+
+def release_readme() -> str:
+    """发行件里的 README：自包含，不引用包里不存在的 docs/ / scripts/ / tests/。
+
+    以前这里直接拷仓库根 README（41 KB 开发者文档），在包里造成 22 条死链——可用性审计
+    认定的发行件最大摩擦。现在改成由本文正文片段拼装，内容与 `发行说明.md` 同源。
+    """
+    return "\n\n---\n\n".join(
+        part.rstrip() for part in (RELEASE_INTRO, RELEASE_STEPS, RELEASE_SLOW_REPLY, RELEASE_DOCS_SECTION)
+    ) + "\n"
+
+
+def release_note(version: str) -> str:
+    """发行说明：怎么用 + 慢一拍的原因 + 数据与隐私 + 这一版还没有的。"""
+    return "\n".join(
+        part.rstrip() for part in (
+            f"# 发行说明（{version}）", RELEASE_STEPS, RELEASE_SLOW_REPLY,
+            RELEASE_PRIVACY, RELEASE_SCOPE,
+        )
+    ) + "\n"
 
 
 def main() -> int:
@@ -172,8 +244,9 @@ def main() -> int:
     shutil.copy2(license_file, target / "LICENSE")
     readme = REPO / "README.md"
     if readme.is_file():
-        shutil.copy2(readme, target / "README.md")
-    (target / "发行说明.md").write_text(RELEASE_NOTE.format(version=VERSION), encoding="utf-8")
+        # 只带自包含的用户部分：包里没有 docs/，整份拷过去会是一片死链
+        (target / "README.md").write_text(release_readme(), encoding="utf-8")
+    (target / "发行说明.md").write_text(release_note(VERSION), encoding="utf-8")
 
     total = sum(1 for item in target.rglob("*") if item.is_file())
     size = sum(item.stat().st_size for item in target.rglob("*") if item.is_file())

@@ -336,6 +336,8 @@ async def main() -> None:
         if not await nav.open_menu(cdp, "设置"):
             problems.append("进不去设置")
         else:
+            # 设置页改成真子页后，计量条在「用量」这一格
+            await cdp.js("window.__uiApp.navigate({pane:'settings', sub:'usage'})")
             await wait_true(cdp, "!!document.querySelector('#u-main .u-meter')")
             await asyncio.sleep(0.6)
             usage = await cdp.js(READ_USAGE)

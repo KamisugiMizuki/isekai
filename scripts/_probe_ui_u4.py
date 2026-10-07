@@ -213,7 +213,7 @@ async def main() -> None:
         await set_value(cdp, "#u-trpg-scene-brief", "潮声比白天更近，堤顶能听见水下的石头在动")
         await set_value(cdp, "#u-trpg-scene-location", "rl-1")
         wizard = await visible_text(cdp)
-        for need in ("战役名称", "时间线", "规则与版本", "开场场景", "创建摘要"):
+        for need in ("战役名称", "世界线", "规则与版本", "开场场景", "创建摘要"):
             if need not in wizard:
                 problems.append(f"新建向导缺：{need}")
         summary = await cdp.js("(()=>{const n=document.querySelector('#u-tprg-summary')||document.querySelector('#u-trpg-summary');return n?(n.innerText||''):'';})()")
@@ -307,7 +307,7 @@ async def main() -> None:
             "(()=>{const s=document.querySelector('#u-trpg-actor');if(!s||!s.options.length){return false;}"
             "s.value=s.options[0].value;s.dispatchEvent(new Event('change',{bubbles:true}));return s.value;})()"
         )
-        await click_text(cdp, "#u-main button", "确认并裁定")
+        await click_text(cdp, "#u-main button", "确认并算结果")
         resolved = await wait_true(
             cdp,
             "(()=>{const t=document.querySelector('#u-main .u-note')?.innerText||document.querySelector('#u-main').innerText;"
