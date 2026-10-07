@@ -10,7 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { AppContext, Pane } from "./app";
 import { openDir } from "./app";
 import type { InstanceEntry, Json } from "./api";
-import { uiError } from "./api";
+import { newRequestId, uiError } from "./api";
 import {
   bulletList,
   button,
@@ -86,9 +86,22 @@ const EXPIRY_TEXT: Record<string, string> = {
   until_cleared: "保留到被明确解除",
 };
 
+/**
+ * 「加入角色」向导（§5.4）：目标线 → 卡片审定 → 加入时间与说明 → 确认。
+ * 四步都留在世界详情页内，不新开窗口；每一步只问一件事，确认前把要发生的事列全。
+ */
+type JoinStep = "timeline" | "card" | "when" | "review";
+
+const JOIN_STEPS: Array<{ id: JoinStep; label: string }> = [
+  { id: "timeline", label: "① 目标线" },
+  { id: "card", label: "② 卡片审定" },
+  { id: "when", label: "③ 加入时间与说明" },
+  { id: "review", label: "④ 确认" },
+];
+
 export class WorldsPane implements Pane {
   readonly id = "worlds" as const;
-  private view: "list" | "detail" | "change" = "list";
+  private view: "list" | "detail" | "change" | "join" = "list";
   /** 并列分栏的当前格（「我的世界」/「世界设定与角色卡」）：只由各自的渲染函数设置，切换时看得见 */
   private tab: "worlds" | "assets" = "worlds";
   private current: InstanceEntry | null = null;
@@ -96,6 +109,12 @@ export class WorldsPane implements Pane {
   /** 动作结果：rerender 会重建反馈槽，先把话记下来，渲染完再写回 */
   private pendingNote: { text: string; kind: "ok" | "bad" | "pending" | "muted" } | null = null;
   private showArchived = false;
+  /** 加入角色向导的状态：选中的目标线 / 卡片文件 / 说明，以及本次向导固定的请求标识 */
+  private joinStep: JoinStep = "timeline";
+  private joinTimelineId = "";
+  private joinCardFile = "";
+  private joinNote = "";
+  private joinRequestId = "";
 
   constructor(private readonly ctx: AppContext) {}
 
@@ -126,6 +145,7 @@ export class WorldsPane implements Pane {
     }
     if (this.view === "detail" && this.current) await this.renderDetail(body);
     else if (this.view === "change" && this.current) await this.renderChange(body);
+    else if (this.view === "join" && this.current) await this.renderJoin(body);
     else await this.renderList(body);
   }
 
@@ -370,7 +390,7 @@ export class WorldsPane implements Pane {
         el(
           "div",
           { class: "u-row" },
-          button("加入角色…", () => setNote(this.note, "加入角色属于「角色卡导入并向这条线补入」：在第 5.4 节流程落地前，请用核心命令行完成", "pending")),
+          button("加入角色…", () => this.openJoin()),
         ),
       ),
     );
@@ -698,6 +718,349 @@ export class WorldsPane implements Pane {
         result,
       ),
     );
+  }
+
+  /* ------------------------------------------------------------ 加入角色（§5.4） */
+
+  /** 进向导：固定本次请求标识，选默认目标线（第一条未归档的线） */
+  private openJoin(): void {
+    this.view = "join";
+    this.joinStep = "timeline";
+    this.joinCardFile = "";
+    this.joinNote = "";
+    this.joinTimelineId = "";
+    this.joinRequestId = newRequestId("card-add");
+    void this.rerender();
+  }
+
+  /** 同一次向导里的重试共用同一个请求标识：重复提交由核心复用原结果（§5.4） */
+  private ensureJoinRequestId(): string {
+    if (!this.joinRequestId) this.joinRequestId = newRequestId("card-add");
+    return this.joinRequestId;
+  }
+
+  private async renderJoin(host: HTMLElement): Promise<void> {
+    const instance = this.current;
+    if (!instance) {
+      this.view = "list";
+      await this.renderList(host);
+      return;
+    }
+    const info = await this.ctx.api.instanceInfo(instance.id);
+    const timelines = (info.timelines as Json[]) ?? [];
+    // 详情页正在看的就是第一条线：向导默认落在它上面；换了目标线要重新审卡（审定结论跟着线走）
+    const known = timelines.find((item) => String(item.id) === this.joinTimelineId);
+    const fallback = timelines.find((item) => String(item.state) !== "archived") ?? timelines[0];
+    this.joinTimelineId = String(known?.id ?? fallback?.id ?? "");
+    const timeline = timelines.find((item) => String(item.id) === this.joinTimelineId) ?? timelines[0] ?? null;
+    const timelineName = String(timeline?.name ?? "—");
+    const timelineState = String(timeline?.state ?? "");
+    const joined = new Set(((info.characters as Json[]) ?? []).map((item) => String(item.card_id ?? "")));
+    const cardNote = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
+    let cards: Json[] = [];
+    let cardsError: unknown = null;
+    try {
+      cards = ((await this.ctx.api.cards()).cards as Json[]) ?? [];
+    } catch (error) {
+      cardsError = error;
+    }
+    // 卡片文件不带稳定标识：逐张读出来核对「这张卡的角色是否已经有定义」（世界卡片列表只给文件名与审定状态）
+    const cardIds = new Map<string, string>();
+    if (!cardsError) {
+      for (const item of cards.filter((entry) => Boolean(entry.confirmed))) {
+        const file = String(item.file ?? "");
+        if (!file) continue;
+        try {
+          const loaded = (await this.ctx.api.cardLoad(file)).card as Json;
+          cardIds.set(file, String((loaded?.meta as Json | undefined)?.card_id ?? ""));
+        } catch {
+          cardIds.set(file, ""); // 读不出来的卡交给核心在校验时给实际原因
+        }
+      }
+    }
+    // 加入时间固定成「当前最后完成时刻」：能拿到世界钟就把那一刻写出来，拿不到只留说明
+    let joinedWorld: number | null = null;
+    let worldLabel = "";
+    let worldError = false;
+    if (timeline) {
+      try {
+        const clock = (await this.ctx.api.clock(instance.id, String(timeline.id))).clock as Json;
+        joinedWorld = Number(clock?.processed_world ?? 0);
+        worldLabel = String(clock?.label ?? "");
+      } catch {
+        worldError = true;
+      }
+    }
+    const worldText = worldError
+      ? "以这条线当前最后完成的时刻为准（此刻没读到世界钟，数值确认后由核心定）"
+      : joinedWorld === null
+        ? "以这条线当前最后完成的时刻为准"
+        : `世界进度 ${joinedWorld}${worldLabel && worldLabel !== "已冻结" ? `（${worldLabel}）` : ""} —— 这条线已经走完的那一刻`;
+    const stepBody = el("div", { class: "u-step-body" });
+    const nav = this.joinStepper();
+    const back = button("返回世界详情", () => {
+      this.view = "detail";
+      void this.rerender();
+    });
+    const draw = (): void => {
+      fill(stepBody);
+      if (!timelines.length) {
+        stepBody.appendChild(paragraph("这个实例还没有时间线：先在详情页建一条线，再加入角色。", "u-hint"));
+        return;
+      }
+      if (this.joinStep === "timeline") this.renderJoinTimeline(stepBody, timelines);
+      else if (this.joinStep === "card") this.renderJoinCard(stepBody, cards, cardsError, cardIds, joined, cardNote);
+      else if (this.joinStep === "when") this.renderJoinWhen(stepBody, timelineName, worldText, timelineState === "active");
+      else this.renderJoinReview(stepBody, instance.name, timelineName, worldText, joinedWorld, cardNote);
+    };
+    fill(host, section(`给「${instance.name}」加入角色`, paragraph("加入角色走独立向导：先选目标线，再挑一张已审定的卡，最后确认加入时间与说明。"), nav, stepBody, el("div", { class: "u-row" }, back)));
+    draw();
+  }
+
+  private joinStepper(): HTMLElement {
+    const list = el("ol", { class: "u-steps", "aria-label": "加入角色步骤" });
+    const index = JOIN_STEPS.findIndex((item) => item.id === this.joinStep);
+    JOIN_STEPS.forEach((item, position) => {
+      const status = position === index ? "current" : position < index ? "done" : "todo";
+      list.appendChild(el("li", { class: `u-step u-step-${status}`, text: item.label }));
+    });
+    return list;
+  }
+
+  /** 第 1 步：目标线（只对选中的那条线生效） */
+  private renderJoinTimeline(host: HTMLElement, timelines: Json[]): void {
+    const grid = el("div", { class: "u-cards" });
+    for (const item of timelines) {
+      const id = String(item.id);
+      const state = String(item.state ?? "");
+      const box = el("div", { class: "u-card" });
+      const pick = el("input", { type: "radio", name: "u-join-timeline", value: id }) as HTMLInputElement;
+      pick.checked = id === this.joinTimelineId;
+      pick.addEventListener("change", () => {
+        if (!pick.checked) return;
+        // 换了线就重新审卡：上一步的结论属于上一条线
+        this.joinTimelineId = id;
+        this.joinCardFile = "";
+        this.joinStep = "card";
+        void this.rerender();
+      });
+      box.appendChild(el("label", { class: "u-field" }, el("span", { class: "u-field-label", text: String(item.name ?? id) }), pick));
+      box.appendChild(chip(STATE_TEXT[state] ?? state, state === "active" ? "ok" : "pending"));
+      box.appendChild(el("p", { class: "u-hint", text: id }));
+      grid.appendChild(box);
+    }
+    host.appendChild(section("① 目标线", paragraph("只对选中的这条线生效：其它时间线不因这次加入而改变。"), grid));
+    host.appendChild(
+      el(
+        "div",
+        { class: "u-row" },
+        primary("下一步：审定卡片", () => {
+          if (!this.joinTimelineId) return;
+          this.joinStep = "card";
+          void this.rerender();
+        }),
+      ),
+    );
+  }
+
+  /** 第 2 步：卡片审定（只列已审定卡；已在本实例的置灰并注明） */
+  private renderJoinCard(
+    host: HTMLElement,
+    cards: Json[],
+    cardsError: unknown,
+    cardIds: Map<string, string>,
+    joined: Set<string>,
+    note: HTMLElement,
+  ): void {
+    if (cardsError) {
+      host.appendChild(errorCard(uiError(cardsError, { module: "世界管理", action: "读取角色卡" })));
+      host.appendChild(el("div", { class: "u-row" }, primary("重新读取角色卡", () => void this.rerender())));
+      return;
+    }
+    const confirmed = cards.filter((item) => Boolean(item.confirmed));
+    const unconfirmed = cards.length - confirmed.length;
+    const rows = el("div", { class: "u-rows" });
+    let selectable = 0;
+    for (const item of confirmed) {
+      const file = String(item.file ?? "");
+      const row = el("div", { class: "u-row-line" });
+      const characterId = cardIds.get(file) ?? "";
+      // 已有不可变定义的卡不能再补：置灰而不是装成能点（核心也会拒绝同一标识的第二份定义）
+      if (characterId && joined.has(characterId)) {
+        row.appendChild(el("span", { class: "u-grow", text: `${String(item.name ?? file)}（${file}）` }));
+        row.appendChild(chip("已有定义", "muted"));
+        row.appendChild(el("span", { class: "u-hint", text: `角色 ${characterId} 在本实例里已有不可变定义：补卡只增加角色，不能借同一标识改写已有角色卡` }));
+        rows.appendChild(row);
+        continue;
+      }
+      selectable += 1;
+      row.appendChild(el("span", { class: "u-grow", text: `${String(item.name ?? file)}（${file}）` }));
+      if (item.race_id) row.appendChild(chip(String(item.race_id), "muted"));
+      row.appendChild(button("选这张", () => {
+        this.joinCardFile = file;
+        this.joinStep = "when";
+        void this.rerender();
+      }));
+      rows.appendChild(row);
+    }
+    if (!confirmed.length) {
+      rows.appendChild(
+        el("p", {
+          class: "u-hint",
+          text: cards.length ? "还没有已审定的角色卡：先在「世界设定 / 角色卡」里确认一张。" : "创作目录里还没有角色卡。",
+        }),
+      );
+    }
+    host.appendChild(
+      section(
+        "② 卡片审定",
+        paragraph("只能补入已审定的角色卡：未审定的卡要先在「世界设定 / 角色卡」里确认。"),
+        rows,
+        paragraph(unconfirmed ? `另有 ${unconfirmed} 张卡尚未审定，未列出。` : "所选卡在加入时会按实例锁定设定重新校验。", "u-hint"),
+      ),
+    );
+    host.appendChild(
+      el(
+        "div",
+        { class: "u-row" },
+        button("上一步", () => {
+          this.joinStep = "timeline";
+          void this.rerender();
+        }),
+        selectable
+          ? null
+          : button("去角色卡列表确认", () => void this.renderAssetsInline()),
+        note,
+      ),
+    );
+  }
+
+  /** 第 3 步：加入时间与说明（时间固定为当前最后完成时刻；两个口径分开讲） */
+  private renderJoinWhen(host: HTMLElement, timelineName: string, worldText: string, active: boolean): void {
+    const textarea = el("textarea", {
+      class: "u-textarea",
+      id: "u-join-note",
+      rows: "3",
+      placeholder: "写清这次加入的来由（可留空）",
+    }) as HTMLTextAreaElement;
+    textarea.value = this.joinNote;
+    textarea.addEventListener("input", () => {
+      this.joinNote = textarea.value;
+    });
+    host.appendChild(
+      section(
+        "③ 加入时间与说明",
+        facts([
+          ["目标线", timelineName],
+          ["加入时间", worldText],
+          ["说明", this.joinNote.trim() || "（未填写）"],
+        ]),
+        field("说明（可留空）", textarea, "会写进这条线的加入记录，不自动编造她与其他人的关系。"),
+        paragraph("「曾经存在」：她本来就活在这个世界里，个人史与既成历史照旧，不会因为这次加入被改写。"),
+        paragraph(
+          "「现在进入可联络集合」：从加入这一刻起，她出现在这条线的角色集合里，可以被选中联络；加入不会启动这条线。",
+        ),
+        active ? null : paragraph("这条线当前不是运行中：加入锚定它已完成的水位，加入后它仍保持原状态。", "u-hint"),
+      ),
+    );
+    host.appendChild(
+      el(
+        "div",
+        { class: "u-row" },
+        button("上一步", () => {
+          this.joinStep = "card";
+          void this.rerender();
+        }),
+        primary("下一步：确认", () => {
+          if (!this.joinCardFile) {
+            this.joinStep = "card";
+            void this.rerender();
+            return;
+          }
+          this.joinStep = "review";
+          void this.rerender();
+        }),
+      ),
+    );
+  }
+
+  /** 第 4 步：确认页（目标 / 角色 / 加入说明列全，确认后才写入） */
+  private renderJoinReview(
+    host: HTMLElement,
+    worldName: string,
+    timelineName: string,
+    worldText: string,
+    joinedWorld: number | null,
+    note: HTMLElement,
+  ): void {
+    const file = this.joinCardFile;
+    const result = el("div", { class: "u-step-body" });
+    const submit = primary("确认加入", () => {
+      void (async () => {
+        if (!file) return;
+        submit.disabled = true;
+        setNote(note, "正在加入…", "pending");
+        try {
+          const outcome = await this.ctx.api.call(
+            "runtime.card.add",
+            {
+              instance_id: this.current?.id ?? "",
+              timeline_id: this.joinTimelineId,
+              card_path: file,
+              note: this.joinNote.trim(),
+              // 同一次向导重试共用一个 request_id：核心复用原结果，不重复登记
+              request_id: this.ensureJoinRequestId(),
+              // 本轮固定锚定「当前最后完成时刻」；世界钟读不到就不传，由核心按同一口径取
+              ...(joinedWorld === null ? {} : { joined_world: joinedWorld }),
+            },
+            60000,
+          );
+          const join = (outcome.join as Json) ?? {};
+          const name = String(join.name ?? "");
+          const label = String(join.joined_label ?? "");
+          this.view = "detail";
+          this.joinStep = "timeline";
+          this.joinCardFile = "";
+          this.joinNote = "";
+          this.joinRequestId = "";
+          this.flash(`已加入角色${name ? `「${name}」` : ""}${label ? `（${label} 起）` : ""}：只对「${timelineName}」生效`);
+          await this.rerender();
+        } catch (error) {
+          setNote(note, uiError(error, { module: "世界管理", action: "加入角色" }).message, "bad");
+          fill(result);
+          result.appendChild(
+            errorCard(uiError(error, { module: "世界管理", action: "加入角色", done: "角色定义未登记", unknown: "这条线是否已新增成员" }), [
+              { label: "重新提交（复用同一请求）", run: () => submit.click() },
+            ]),
+          );
+        } finally {
+          submit.disabled = false;
+        }
+      })();
+    });
+    fill(
+      result,
+      facts([
+        ["目标世界", worldName],
+        ["目标线", timelineName],
+        ["角色卡", file],
+        ["加入时间", worldText],
+        ["加入说明", this.joinNote.trim() || "（未填写）"],
+      ]),
+      paragraph("确认后只发生三处留痕：实例快照里的角色定义、这条线的成员资格、这条线的加入提交；其它时间线不受影响。"),
+      paragraph("加入不启动这条线，也不编造她与其他角色的关系。"),
+      el(
+        "div",
+        { class: "u-row" },
+        submit,
+        button("上一步", () => {
+          this.joinStep = "when";
+          void this.rerender();
+        }),
+      ),
+      note,
+    );
+    host.appendChild(section("④ 确认", result));
   }
 
   private async renameTimeline(timelineId: string, current: string): Promise<void> {
