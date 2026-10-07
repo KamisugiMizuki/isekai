@@ -28,6 +28,17 @@ import { flowRail, type FlowStep } from "./graphics";
 
 type View = "list" | "create" | "play";
 
+/**
+ * 跑团工作区自己的上下文（§3.3）：世界 / 时间线 / 战役分别记住，形状照抄 `sel.contact`。
+ * `campaign_id` 为空表示只记了「世界 + 时间线」（从世界详情点「在此跑团」进入的情形）。
+ */
+interface TrpgSelection {
+  instance_id: string;
+  timeline_id: string;
+  campaign_id: string;
+  campaign_name: string;
+}
+
 /** 一次行动在界面上走到哪一步（§8.2/§8.3）；写死的是流程，不是核心状态名 */
 const ACTION_STEPS: FlowStep[] = [
   { label: "写下行动", hint: "行动、行动者与目标齐了才能打开确认卡" },
@@ -106,6 +117,8 @@ export class TrpgPane implements Pane {
   private actorOptions: string[] = [];
   private mode: "player" | "gm" = "player";
   private workspace: Json | null = null;
+  /** 上次选择读了但对象已不存在时，如实说明回落原因（不静默继承别的域） */
+  private selectionHint = "";
   private bundle: Json | null = null;
   private actionText = "";
   private actionId = "";
@@ -136,6 +149,7 @@ export class TrpgPane implements Pane {
     this.host = host;
     this.note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
     fill(host, this.note);
+    await this.adoptStoredSelection();
     await this.render();
   }
 
@@ -144,7 +158,7 @@ export class TrpgPane implements Pane {
   private async render(): Promise<void> {
     const host = this.host;
     if (!host || !this.note) return;
-    fill(host, this.note);
+    fill(host, this.note, this.selectionHint ? paragraph(this.selectionHint, "u-hint") : null);
     this.sampleErrorCard = null;
     try {
       if (this.view === "list") await this.renderList(host);
@@ -152,6 +166,46 @@ export class TrpgPane implements Pane {
       else this.renderPlay(host);
     } catch (error) {
       host.appendChild(errorCard(uiError(error, { module: "跑团", action: "打开工作区" })));
+    }
+  }
+
+  /**
+   * 挂载时读自己的 `sel.trpg`（§3.3）：本域选择为空才读；世界 / 时间线 / 战役都还在才采用。
+   * 只记了世界与时间线（`campaign_id` 为空）时，把它当作新建战役的默认落点，不强行进主持界面；
+   * 战役已不在时回落到战役列表并说明，不静默换到别的世界。
+   */
+  private async adoptStoredSelection(): Promise<void> {
+    if (this.instanceId) return;
+    const stored = (this.ctx.prefs["sel.trpg"] as Partial<TrpgSelection> | undefined) ?? undefined;
+    const storedInstance = String(stored?.instance_id ?? "");
+    if (!storedInstance) return;
+    const instance = this.ctx.instances().find((item) => item.id === storedInstance);
+    if (!instance) {
+      this.selectionHint = "上次跑团的世界已经不在本机：已回到战役列表，请重新选择。";
+      return;
+    }
+    const timelineId = String(stored?.timeline_id ?? "");
+    const campaignId = String(stored?.campaign_id ?? "");
+    if (!campaignId) {
+      this.draft.instanceId = instance.id;
+      this.draft.timelineId = timelineId;
+      this.selectionHint = `已带入上次的世界「${instance.name}」：新建战役默认用它；要进原有战役仍从列表选。`;
+      return;
+    }
+    try {
+      const result = await this.ctx.api.trpgCampaigns(instance.id);
+      const hit = ((result.campaigns as Json[]) ?? []).find((item) => String(item.campaign_id) === campaignId);
+      if (!hit) {
+        this.draft.instanceId = instance.id;
+        this.draft.timelineId = timelineId;
+        this.selectionHint = "上次的战役已经不在这个世界：已回到战役列表，请重新选择。";
+        return;
+      }
+      await this.open(instance.id, String(hit.timeline_id ?? timelineId), campaignId, String(hit.name ?? ""));
+    } catch {
+      this.draft.instanceId = instance.id;
+      this.draft.timelineId = timelineId;
+      this.selectionHint = "没能确认上次的战役是否还在：已回到战役列表（世界与时间线已带入新建战役）。";
     }
   }
 
@@ -194,7 +248,11 @@ export class TrpgPane implements Pane {
         }),
       );
       head.appendChild(chip(STATUS_TEXT[String(item.status)] ?? String(item.status), "muted"));
-      head.appendChild(button("继续", () => void this.open(String(item.instance_id), String(item.timeline_id), String(item.campaign_id))));
+      head.appendChild(
+        button("继续", () =>
+          void this.open(String(item.instance_id), String(item.timeline_id), String(item.campaign_id), String(item.name ?? "")),
+        ),
+      );
       rows.appendChild(head);
       rows.appendChild(
         paragraph(
@@ -712,7 +770,7 @@ export class TrpgPane implements Pane {
           : `已保存为准备中：${String(created.name ?? this.draft.name)}（核心只在规则版本、参与者、初始状态与场景都合法时才允许开始）`,
         "ok",
       );
-      await this.open(this.draft.instanceId, this.draft.timelineId, String(created.campaign_id));
+      await this.open(this.draft.instanceId, this.draft.timelineId, String(created.campaign_id), String(created.name ?? this.draft.name));
     } catch (error) {
       setNote(
         this.note,
@@ -728,12 +786,14 @@ export class TrpgPane implements Pane {
 
   /* ------------------------------------------------------------ §8.2–8.3 场景与行动 */
 
-  private async open(instanceId: string, timelineId: string, campaignId: string): Promise<void> {
+  private async open(instanceId: string, timelineId: string, campaignId: string, campaignName = ""): Promise<void> {
     this.instanceId = instanceId;
     this.timelineId = timelineId;
     this.campaignId = campaignId;
     this.view = "play";
     this.workspace = null;
+    // 进入某战役就记住它（§3.3）+ 记一条最近使用（§3.4）
+    this.rememberCampaign(campaignName);
     if (!this.characterId) {
       // 当前角色 = 这局的活动角色（缺了行动者，行动只能停在「补充行动」）
       try {
@@ -756,6 +816,26 @@ export class TrpgPane implements Pane {
       }
     }
     await this.refresh();
+  }
+
+  /** 进入某战役后写 `sel.trpg` 与一条「最近使用」（§3.3 / §3.4）；写失败静默，不挡读取局面 */
+  private rememberCampaign(name = ""): void {
+    if (!this.instanceId || !this.campaignId) return;
+    const instance = this.ctx.instances().find((item) => item.id === this.instanceId);
+    const campaign = this.campaigns.find((item) => String(item.campaign_id) === this.campaignId);
+    const campaignName = name || displayName(campaign?.name, this.campaignId, "未命名战役");
+    const selection: TrpgSelection = {
+      instance_id: this.instanceId,
+      timeline_id: this.timelineId,
+      campaign_id: this.campaignId,
+      campaign_name: campaignName,
+    };
+    void this.ctx.setPrefs({ "sel.trpg": selection });
+    this.ctx.rememberRecent({
+      pane: "trpg",
+      label: `跑团 · ${String(instance?.name ?? "")} / ${campaignName}`,
+      key: `trpg:${this.instanceId}:${this.timelineId}:${this.campaignId}`,
+    });
   }
 
   private async refresh(): Promise<void> {

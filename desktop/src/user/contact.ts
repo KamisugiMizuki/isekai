@@ -202,7 +202,19 @@ export class ContactPane implements Pane {
       character_name: String(character.name ?? ""),
     };
     await this.ctx.setPrefs({ "sel.contact": this.selection });
+    this.rememberContact();
     await this.connect();
+  }
+
+  /** §3.4 最近使用：选中角色确定后记一条（与写 sel.contact 同一处） */
+  private rememberContact(): void {
+    const selection = this.selection;
+    if (!selection) return;
+    this.ctx.rememberRecent({
+      pane: "contact",
+      label: `${this.worldName} · ${selection.character_name}`,
+      key: `contact:${selection.instance_id}:${selection.timeline_id}:${selection.character_id}`,
+    });
   }
 
   private async connect(): Promise<void> {
@@ -747,6 +759,7 @@ export class ContactPane implements Pane {
       character_name: String(character?.name ?? ""),
     };
     await this.ctx.setPrefs({ "sel.contact": this.selection });
+    this.rememberContact();
     this.messages = [];
     this.pending = [];
     fill(this.systemHost as HTMLElement);
@@ -799,6 +812,7 @@ export class ContactPane implements Pane {
               character_name: String(character?.name ?? ""),
             };
             await this.ctx.setPrefs({ "sel.contact": this.selection });
+            this.rememberContact();
             this.messages = [];
             await this.connect();
           })();

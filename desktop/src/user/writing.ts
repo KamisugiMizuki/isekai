@@ -35,6 +35,18 @@ import { stackBar, type Seg } from "./graphics";
 
 type Tab = "outline" | "material" | "advice" | "draft";
 
+/**
+ * 写作工作区自己的上下文（§3.3）：世界 / 时间线 / 大纲分别记住，形状照抄 `sel.contact`。
+ * 只读自己这一个键，不跨工作区继承别的域的写入目标。
+ */
+interface WritingSelection {
+  instance_id: string;
+  timeline_id: string;
+  timeline_name: string;
+  outline_id: string;
+  outline_name: string;
+}
+
 /** 六类条目：界面说法 + 一句示例（§7.2） */
 const LAYERS: Array<[string, string, string]> = [
   ["theme", "主题约束", "例：主题围绕记住与遗忘"],
@@ -76,6 +88,11 @@ function refs(value: string): string[] {
   return value.split(/[,，;；\s]+/).map((item) => item.trim()).filter(Boolean);
 }
 
+/** 追加一句回落说明（已有说明时接在后面，不互相覆盖） */
+function hint(current: string, next: string): string {
+  return current ? `${current} ${next}` : next;
+}
+
 export class WritingPane implements Pane {
   readonly id = "writing" as const;
   private host: HTMLElement | null = null;
@@ -98,6 +115,10 @@ export class WritingPane implements Pane {
   private draftKey = "";
   private autoTimer: number | null = null;
   private busy = false;
+  /** 上次选择读了但对象已不存在时，如实说明回落原因（不静默继承别的域） */
+  private selectionHint = "";
+  /** 上一次已写入「最近使用 / sel.writing」的 key：同一选择不重复写 */
+  private lastRecallKey = "";
 
   constructor(private readonly ctx: AppContext) {}
 
@@ -105,6 +126,7 @@ export class WritingPane implements Pane {
     this.host = host;
     this.note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
     fill(host, this.note);
+    await this.adoptStoredSelection();
     await this.render();
   }
 
@@ -136,10 +158,12 @@ export class WritingPane implements Pane {
       return;
     }
     if (!this.instanceId) this.instanceId = instances[0].id;
+    if (this.selectionHint) host.appendChild(paragraph(this.selectionHint, "u-hint"));
     try {
       const info = await this.ctx.api.instanceInfo(this.instanceId);
       const timelines = (info.timelines as Json[]) ?? [];
       const characters = (info.characters as Json[]) ?? [];
+      // 存储的选择已在 adoptStoredSelection 里校验过；这里的回落只服务「换世界 / 选中的线没了」这类界面内变化
       if (!timelines.some((item) => String(item.id) === this.timelineId)) {
         this.timelineId = String(timelines[0]?.id ?? "");
       }
@@ -152,6 +176,7 @@ export class WritingPane implements Pane {
       }
       await this.loadState();
       await this.refreshCandidates();
+      this.rememberWriting(instances, timelines, outlineList);
       // 分栏条排在页首（世界 / 时间线选择器之前）：内容再长它也贴在视口顶部，
       // 排在中间时它落在页尾附近，sticky 没有可吸附的行程，等于没锚定
       this.renderTabs(host);
@@ -171,6 +196,61 @@ export class WritingPane implements Pane {
     } catch (error) {
       host.appendChild(errorCard(uiError(error, { module: "辅助写作", action: "打开工作区" })));
     }
+  }
+
+  /**
+   * 挂载时读自己的 `sel.writing`（§3.3）：本域选择为空才读；世界 / 时间线 / 大纲都还在才采用，
+   * 少了任何一层都回落到既有默认并在页面上说明，不静默改用别的域的选择。
+   */
+  private async adoptStoredSelection(): Promise<void> {
+    if (this.instanceId) return;
+    const instances = this.ctx.instances();
+    if (!instances.length) return;
+    const stored = (this.ctx.prefs["sel.writing"] as Partial<WritingSelection> | undefined) ?? undefined;
+    const storedInstance = String(stored?.instance_id ?? "");
+    const instance = instances.find((item) => item.id === storedInstance) ?? instances[0];
+    if (storedInstance && instance.id !== storedInstance) {
+      this.selectionHint = "上次写作的世界已经不在本机：已回到第一个世界，请重新选择。";
+    }
+    this.instanceId = instance.id;
+    try {
+      const info = await this.ctx.api.instanceInfo(instance.id);
+      const timelines = (info.timelines as Json[]) ?? [];
+      const storedTimeline = String(stored?.timeline_id ?? "");
+      if (storedTimeline && timelines.some((item) => String(item.id) === storedTimeline)) this.timelineId = storedTimeline;
+      else if (storedTimeline) this.selectionHint = hint(this.selectionHint, "上次的时间线已经不在这个世界：已回落到现有的第一条。");
+      const outlines = ((await this.ctx.api.waOutlines()).outlines as Json[]) ?? [];
+      const storedOutline = String(stored?.outline_id ?? "");
+      if (storedOutline && outlines.some((item) => String(item.outline_id ?? item.id) === storedOutline)) this.outlineId = storedOutline;
+      else if (storedOutline) this.selectionHint = hint(this.selectionHint, "上次的大纲已经不在了：已回落到现有的第一份。");
+    } catch {
+      // 读不到就先按世界默认渲染：render() 会用错误卡说明这次没读到什么
+    }
+  }
+
+  /** 选中（世界 / 时间线 / 大纲）落定后写 `sel.writing` 与一条「最近使用」（§3.3 / §3.4） */
+  private rememberWriting(
+    instances: Array<{ id: string; name: string }>,
+    timelines: Json[],
+    outlines: Json[],
+  ): void {
+    if (!this.instanceId) return;
+    const key = `writing:${this.instanceId}:${this.timelineId}:${this.outlineId}`;
+    if (key === this.lastRecallKey) return;
+    this.lastRecallKey = key;
+    const timeline = timelines.find((item) => String(item.id) === this.timelineId);
+    const outline = outlines.find((item) => String(item.outline_id ?? item.id) === this.outlineId);
+    const selection: WritingSelection = {
+      instance_id: this.instanceId,
+      timeline_id: this.timelineId,
+      timeline_name: String(timeline?.name ?? ""),
+      outline_id: this.outlineId,
+      outline_name: String(outline?.name ?? ""),
+    };
+    void this.ctx.setPrefs({ "sel.writing": selection });
+    const world = instances.find((item) => item.id === this.instanceId)?.name ?? "";
+    const line = String(timeline?.name ?? "");
+    this.ctx.rememberRecent({ pane: "writing", label: `写作 · ${world}${line ? ` / ${line}` : ""}`, key });
   }
 
   private async loadState(): Promise<void> {

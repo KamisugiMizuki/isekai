@@ -25,6 +25,13 @@ const APPS: AppChoice[] = [
   { mode: "gm", icon: "🎲", title: "isekai GM", subtitle: "跑团主持和规则裁定" },
 ];
 
+/** 三个模式各自的落点（与 `app.ts` 的 appPane 一致；这里单独放一份避免 app ⇄ launcher 循环运行引用） */
+const MODE_PANE: Record<AppMode, "contact" | "writing" | "trpg"> = {
+  chat: "contact",
+  writer: "writing",
+  gm: "trpg",
+};
+
 export class Launcher {
   private overlay: HTMLElement | null = null;
 
@@ -68,7 +75,10 @@ export class Launcher {
 
   /** 启动选中的应用 */
   private async launch(mode: AppMode): Promise<void> {
+    const app = APPS.find((item) => item.mode === mode);
     await this.ctx.setPrefs({ app_mode: mode, app_launched_at: Date.now() });
+    // §3.4 最近使用：应用名当 label，key 只认模式（同一应用只留一条）
+    this.ctx.rememberRecent({ pane: MODE_PANE[mode], label: app?.title ?? mode, key: `launch:${mode}` });
     
     // 淡出动画
     if (this.overlay) {
@@ -78,13 +88,7 @@ export class Launcher {
     }
     
     // 根据模式路由到对应页面
-    if (mode === "chat") {
-      this.ctx.navigate({ pane: "contact" });
-    } else if (mode === "writer") {
-      this.ctx.navigate({ pane: "writing" });
-    } else if (mode === "gm") {
-      this.ctx.navigate({ pane: "trpg" });
-    }
+    this.ctx.navigate({ pane: MODE_PANE[mode] });
   }
 
   /** 判断是否 5 秒内重启(避免反复弹窗) */

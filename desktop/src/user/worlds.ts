@@ -124,6 +124,7 @@ export class WorldsPane implements Pane {
     if ((sub === "detail" || sub === "timeline") && this.ctx.instances().length) {
       this.view = "detail";
       this.current = this.ctx.instances()[0];
+      this.rememberWorld(this.current);
     }
     await this.render(host);
     if (sub === "import") await this.importFlow();
@@ -256,11 +257,7 @@ export class WorldsPane implements Pane {
           el(
             "div",
             { class: "u-row" },
-            link("打开", () => {
-              this.current = row.instance;
-              this.view = "detail";
-              void this.rerender();
-            }),
+            link("打开", () => this.openDetail(row.instance)),
             link("重命名", () => void this.rename(row.instance)),
             link("导出", () => void this.exportInstance(row.instance)),
             link("删除", () => void this.deleteInstance(row.instance)),
@@ -355,6 +352,10 @@ export class WorldsPane implements Pane {
     const timelines = (info.timelines as Json[]) ?? [];
     const characters = (info.characters as Json[]) ?? [];
     const commits = (info.commits as Json[]) ?? [];
+    // 进工作区时带的世界落点：第一条未归档的线；没有未归档的就退到第一条（§3.3）
+    const firstTimelineId = String(
+      timelines.find((item) => String(item.state) !== "archived")?.id ?? timelines[0]?.id ?? "",
+    );
     host.appendChild(
       section(
         instance.name,
@@ -365,9 +366,9 @@ export class WorldsPane implements Pane {
             this.view = "list";
             void this.rerender();
           }),
-          primary("联络角色", () => this.ctx.navigate({ pane: "contact" })),
-          button("在此写作", () => this.ctx.navigate({ pane: "writing" })),
-          button("在此跑团", () => this.ctx.navigate({ pane: "trpg" })),
+          primary("联络角色", () => this.openWorkspace("contact", instance, firstTimelineId)),
+          button("在此写作", () => this.openWorkspace("writing", instance, firstTimelineId)),
+          button("在此跑团", () => this.openWorkspace("trpg", instance, firstTimelineId)),
           button("尝试世界变化…", () => {
             this.view = "change";
             void this.rerender();
@@ -407,6 +408,52 @@ export class WorldsPane implements Pane {
         ),
       ),
     );
+  }
+
+  /** 打开世界详情：切到详情视图，并记一条「最近使用」（§3.4：只存名称、身份、访问时间） */
+  private openDetail(instance: InstanceEntry): void {
+    this.current = instance;
+    this.view = "detail";
+    this.rememberWorld(instance);
+    void this.rerender();
+  }
+
+  private rememberWorld(instance: InstanceEntry | null): void {
+    if (!instance) return;
+    this.ctx.rememberRecent({ pane: "worlds", label: `世界 · ${instance.name}`, key: `worlds:${instance.id}` });
+  }
+
+  /**
+   * 从世界详情进三个工作区：先把「这个世界 + 第一条未归档时间线」写进目标工作区自己的选择（§3.3），
+   * 目标页挂载时读到的就是这个世界；写入失败由 setPrefs 统一提示，不挡导航。
+   */
+  private openWorkspace(pane: "contact" | "writing" | "trpg", instance: InstanceEntry, timelineId: string): void {
+    if (pane === "contact") {
+      void this.ctx.setPrefs({
+        "sel.contact": {
+          instance_id: instance.id,
+          timeline_id: timelineId,
+          timeline_name: "",
+          character_id: "",
+          character_name: "",
+        },
+      });
+    } else if (pane === "writing") {
+      void this.ctx.setPrefs({
+        "sel.writing": {
+          instance_id: instance.id,
+          timeline_id: timelineId,
+          timeline_name: "",
+          outline_id: "",
+          outline_name: "",
+        },
+      });
+    } else {
+      void this.ctx.setPrefs({
+        "sel.trpg": { instance_id: instance.id, timeline_id: timelineId, campaign_id: "", campaign_name: "" },
+      });
+    }
+    this.ctx.navigate({ pane });
   }
 
   private timelineSection(timelines: Json[]): HTMLElement {

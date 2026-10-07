@@ -7,8 +7,8 @@
 
 import type { AppContext, Pane } from "./app";
 import { openDir } from "./app";
-import type { Json } from "./api";
-import { bulletList, button, el, facts, fill, paragraph, primary, section, stamp } from "./dom";
+import { uiError, type Json } from "./api";
+import { bulletList, button, el, errorCard, facts, fill, paragraph, primary, section, stamp } from "./dom";
 import { dotLine } from "./graphics";
 
 interface Recent {
@@ -102,12 +102,22 @@ export class HomePane implements Pane {
       );
     }
 
-    if (drafts.length) {
+    if (!drafts.ok) {
+      // 读取失败与真空态分开：失败给错误卡 + 重试，不显示「暂无」，也不假装没有未完成内容
+      page.appendChild(
+        section(
+          "未完成内容",
+          errorCard(uiError(drafts.error, { module: "首页", action: "读取未完成内容" }), [
+            { label: "重试读取", run: () => void this.mount(host) },
+          ]),
+        ),
+      );
+    } else if (drafts.drafts.length) {
       page.appendChild(
         section(
           "未完成内容",
           bulletList(
-            drafts.map((item) =>
+            drafts.drafts.map((item) =>
               button(
                 `${draftLabel(item)}（${stamp(Number(item.updated_at ?? 0))}）`,
                 () => this.ctx.navigate({ pane: draftPane(String(item.module ?? "")) }),
@@ -173,12 +183,19 @@ export class HomePane implements Pane {
     return { open: true, note: "先覆盖已验证的样例组合" };
   }
 
-  private async draftList(): Promise<Json[]> {
+  /**
+   * 未完成内容列表：把「真的没有」与「读取失败」分开（审计 Q2④#5）。
+   * 失败时把错误原样交给调用方渲染错误卡，不再吞成空数组。
+   */
+  private async draftList(): Promise<{ ok: true; drafts: Json[] } | { ok: false; error: unknown }> {
     try {
       const result = await this.ctx.api.draftList();
-      return ((result.drafts as Json[]) ?? []).filter((item) => String(item.text ?? "").length > 0);
-    } catch {
-      return [];
+      return {
+        ok: true,
+        drafts: ((result.drafts as Json[]) ?? []).filter((item) => String(item.text ?? "").length > 0),
+      };
+    } catch (error) {
+      return { ok: false, error };
     }
   }
 

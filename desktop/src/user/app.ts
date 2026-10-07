@@ -38,6 +38,8 @@ export interface AppContext {
   settings: Json;
   prefs: Record<string, unknown>;
   setPrefs(patch: Record<string, unknown>): Promise<void>;
+  /** 记一次「最近使用」（§3.4）：按 key 去重后置顶、最多 5 项；写入失败静默，不打断主流程 */
+  rememberRecent(entry: { pane: PaneId; label: string; key: string }): void;
   route: Route;
   navigate(target: Route): void;
   banner(text: string, kind?: "ok" | "bad" | "pending" | "muted"): void;
@@ -70,11 +72,31 @@ const PREF_KEYS = {
   contact: "sel.contact",
   writing: "sel.writing",
   trpg: "sel.trpg",
-  worlds: "sel.worlds",
   recent: "recent",
   textSize: "appearance.text_size",
   theme: "appearance.theme",
 } as const;
+
+/** 「最近使用」条目（§3.4）：只存名称、身份与访问时间，不生成故事摘要 */
+export interface RecentEntry {
+  pane: string;
+  label: string;
+  at: number;
+  key: string;
+}
+
+/** 最近使用的默认条数（§3.4：默认显示最近 5 项） */
+export const RECENT_LIMIT = 5;
+
+/**
+ * 把一条「最近使用」并进列表：按 key 去重（旧条目删掉）、新的置顶、最多 RECENT_LIMIT 条。
+ * 时间戳单位是秒（`home.ts` 用 `stamp(at)` 渲染，stamp 按秒换算）。
+ */
+export function pushRecent(list: unknown, entry: { pane: string; label: string; key: string }): RecentEntry[] {
+  const current = Array.isArray(list) ? (list as RecentEntry[]) : [];
+  const kept = current.filter((item) => item && typeof item === "object" && String(item.key ?? "") !== entry.key);
+  return [{ pane: entry.pane, label: entry.label, at: Date.now() / 1000, key: entry.key }, ...kept].slice(0, RECENT_LIMIT);
+}
 
 /** 界面草稿的保存纪律（§3.5）：停止输入 1 秒保存；连续输入时最多 5 秒一次；切页/退出立即保存 */
 export class DraftKeeper {
@@ -516,6 +538,7 @@ export class App {
       settings: this.settings,
       prefs: this.prefs,
       setPrefs: (patch) => this.setPrefs(patch),
+      rememberRecent: (entry) => this.rememberRecent(entry),
       route: this.route,
       navigate: (target) => this.navigate(target),
       banner: (text, kind) => this.banner(text, kind),
@@ -547,6 +570,12 @@ export class App {
         this.toast(`偏好保存失败：${String(error)}`, "bad");
       }
     }
+  }
+
+  /** 「最近使用」的唯一写入口（§3.4）：就地合并保证调用方立刻读到新列表；失败由 setPrefs 统一提示 */
+  private rememberRecent(entry: { pane: PaneId; label: string; key: string }): void {
+    const next = pushRecent(this.prefs[PREF_KEYS.recent], entry);
+    void this.setPrefs({ [PREF_KEYS.recent]: next });
   }
 
   private applyAppearance(): void {
