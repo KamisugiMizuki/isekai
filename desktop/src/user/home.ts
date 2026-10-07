@@ -120,7 +120,7 @@ export class HomePane implements Pane {
             drafts.drafts.map((item) =>
               button(
                 `${draftLabel(item)}（${stamp(Number(item.updated_at ?? 0))}）`,
-                () => this.ctx.navigate({ pane: draftPane(String(item.module ?? "")) }),
+                () => this.openDraftItem(item),
                 { class: "u-btn u-ghost" },
               ),
             ),
@@ -183,6 +183,16 @@ export class HomePane implements Pane {
     return { open: true, note: "先覆盖已验证的样例组合" };
   }
 
+  /** 未完成内容入口：create 草稿要带着 key 回创建向导读回；其余按模块进对应页 */
+  private openDraftItem(item: Json): void {
+    const module = String(item.module ?? "");
+    if (module === "create") {
+      this.ctx.navigate({ pane: "create", sub: `draft:${String(item.key ?? "")}` });
+      return;
+    }
+    this.ctx.navigate({ pane: draftPane(module) });
+  }
+
   /**
    * 未完成内容列表：把「真的没有」与「读取失败」分开（审计 Q2④#5）。
    * 失败时把错误原样交给调用方渲染错误卡，不再吞成空数组。
@@ -212,7 +222,7 @@ function draftLabel(item: Json): string {
   const target = String(item.target ?? "");
   const name = target.split(":")[0] || "草稿";
   const module = String(item.module ?? "");
-  const kind = module === "contact" ? "未发送的联络" : module === "world" ? "世界设定编辑" : module === "writing" ? "写作草稿" : "草稿";
+  const kind = module === "contact" ? "未发送的联络" : module === "world" ? "世界设定编辑" : module === "create" ? "新世界设定" : module === "writing" ? "写作草稿" : "草稿";
   return `${kind} · ${name.slice(0, 12)}`;
 }
 
