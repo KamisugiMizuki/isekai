@@ -8,7 +8,7 @@
       runtime/python/           ← 自带解释器（核心与规则插件都用它）
       runtime/isekai_core/      ← 核心源码
       runtime/examples/         ← 随发行样例（世界包 + 角色卡 + 潮汐规则）
-      runtime/site-packages/    ← 运行依赖（websockets / httpx / PyYAML …）
+      runtime/python/Lib/site-packages/  ← 运行依赖（websockets / httpx / PyYAML …）
       README.md  LICENSE  发行说明.md
 
 数据不放进程序目录：发行件把数据根落在 `%LOCALAPPDATA%\\isekai`（`isekai_core.config.user_data_root`）。
@@ -31,9 +31,9 @@ PYTHON_HOME = Path.home() / "AppData" / "Roaming" / "uv" / "python"
 PYTHON_LINK = PYTHON_HOME / "cpython-3.11-windows-x86_64-none"
 #: 运行依赖（与 pyproject 的 dependencies 同源）；开发依赖不进发行件
 RUNTIME_PACKAGES = (
-    "websockets", "httpx", "httpcore", "h11", "anyio", "idna", "certifi", "sniffio", "sniffio",
+    "websockets", "httpx", "httpcore", "h11", "anyio", "idna", "certifi",
     "yaml", "yaml-*.dist-info", "websockets-*.dist-info", "httpx-*.dist-info", "httpcore-*.dist-info",
-    "h11-*.dist-info", "anyio-*.dist-info", "idna-*.dist-info", "certifi-*.dist-info", "sniffio-*.dist-info",
+    "h11-*.dist-info", "anyio-*.dist-info", "idna-*.dist-info", "certifi-*.dist-info",
     "PyYAML-*.dist-info", "typing_extensions.py",
 )
 SKIP_DIRS = {"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
@@ -124,8 +124,8 @@ RELEASE_NOTE = """# 发行说明（{version}）
 ## 怎么用
 
 1. 解压这个目录到任意位置（不要解压到需要管理员权限的地方）。
-2. 双击 `isekai.exe`：程序自己带运行环境，不需要另外装 Python。
-3. 第一次打开会进「首次设置」：先做本机检查，再填 AI 服务的地址与密钥，然后从样例世界开始。
+2. 双击 `isekai.exe`：程序自己带运行环境，不需要另外装 Python。界面依赖 WebView2 运行时——Win11 与多数已更新的 Win10 已预装；若双击没有反应，请先安装 Microsoft Edge WebView2 Runtime。
+3. 第一次打开会进「首次设置」：先做本机检查，再填 AI 服务的地址、模型名与密钥（地址与模型名是必填项），然后从样例世界开始。
 4. 选项都在程序里：设置 → AI 服务（密钥可随时改）、设置 → 数据与备份（立即备份、恢复、搬迁）。
 5. 卸载 = 删除这个目录；你的数据在 `%LOCALAPPDATA%\\isekai`，要一起清掉再删除那个目录。
 
@@ -165,10 +165,14 @@ def main() -> int:
 
     python_home = resolve_python()
     counts = copy_runtime(python_home, target / "runtime")
-    for name in ("README.md", "LICENSE"):
-        source = REPO / name
-        if source.exists():
-            shutil.copy2(source, target / name)
+    # LICENSE 是发行件的必需件：缺了就停下，不静默产出一个没有许可声明的包
+    license_file = REPO / "LICENSE"
+    if not license_file.is_file():
+        raise SystemExit(f"发行件缺少必需文件：{license_file}（MIT 许可全文）。补齐后再组装。")
+    shutil.copy2(license_file, target / "LICENSE")
+    readme = REPO / "README.md"
+    if readme.is_file():
+        shutil.copy2(readme, target / "README.md")
     (target / "发行说明.md").write_text(RELEASE_NOTE.format(version=VERSION), encoding="utf-8")
 
     total = sum(1 for item in target.rglob("*") if item.is_file())

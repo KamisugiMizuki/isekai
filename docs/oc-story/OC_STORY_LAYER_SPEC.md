@@ -1,13 +1,13 @@
 # OC 故事层模块设计
 
-> 状态：已定稿 v1.0（产品设计）；实现状态：应用层语义与管理面已落地（对照见 §十三），OC 客户端表达层（窗口与交互）未实现。
+> 状态：已定稿 v1.0（产品设计）；实现状态：应用层语义与管理面已落地（对照见 §十三），OC 客户端表达层已实现（`desktop/src/user/contact.ts` 会话界面与转述、`onboarding.ts` 首次向导、设置与恢复；见 [用户界面定案](../user-interface/README.md) U1/U3 行）。
 > 产品所有者：普通 OC 用户体验与角色联络应用层。
 > 上游契约：[`../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md`](../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md)、[`../worldruntime/SESSION_CORE_SPEC.md`](../worldruntime/SESSION_CORE_SPEC.md)、[`../worldruntime/NARRATIVE_LAYER_SPEC.md`](../worldruntime/NARRATIVE_LAYER_SPEC.md)。
 > 评价依据：[`USER_PERSPECTIVE_EVALUATION_DRAFT.md`](USER_PERSPECTIVE_EVALUATION_DRAFT.md)。
 >
 > 本文是 OC 故事层的唯一产品规范。世界事实、认知投影、会话固化、叙事候选和版本操作的底层语义分别由上游 SPEC 持有；本文只规定普通 OC 用户如何进入、使用和理解这些能力。
 
-> 桌面承载已由 [用户界面设计 v1.0](../user-interface/README.md) 定稿，尚未实施；首次向导、名称化入口、草稿保护、转述确认与恢复操作按该交互规范执行。本文继续持有联络、分类、表达和可见边界；“本期不建壳”保留为内核阶段历史范围，不限制后续界面阶段。
+> 桌面承载已由 [用户界面设计 v1.0](../user-interface/README.md) 定稿并已实施（U1「启动与联络」）；首次向导、名称化入口、草稿保护、转述确认与恢复操作按该交互规范执行。本文继续持有联络、分类、表达和可见边界；“本期不建壳”保留为内核阶段历史范围，不限制后续界面阶段。
 
 ## 一、定位
 
@@ -272,9 +272,8 @@ OC 故事层向会话核心提供的是用户场景和联络意图，不直接�
 管理面 op：`story.enter` / `story.scene` / `story.home` / `story.turn` / `story.branch` / `story.restore`（同步）与
 `story.classify`（异步——它要调一次模型）；CLI 有同名命令组 `story`。
 
-**未实现（记账，不充数）**：OC 客户端表达层——窗口、会话界面、首次向导与恢复交互的界面部分。
-桌面壳是 Core Debugging 外壳，OC 客户端与 TRPG 客户端一样属独立实现范围；本层给出的产品状态、
-可见面投影与操作结果就是它的输入契约。**2026-09-22 范围拍板**：本期不建壳、只验功能——本层语义面
-按 `scripts/_audit2_ocstory.py`（23/23 PASS）与 `tests/test_oc_story.py`（14 项）的真链路读数固定，
-界面由后续实现方按同一批 `story.*` 渲染。
+**已实现（记账，不充数）**：OC 客户端表达层——窗口、会话界面（`desktop/src/user/contact.ts`）、首次向导与恢复交互
+（`onboarding.ts`、设置 → 数据与备份）已按本层 `story.*` 的产品状态与可见面投影落地，见 [用户界面定案](../user-interface/README.md) U1/U3 行。
+本层语义面按 `scripts/_audit2_ocstory.py`（23/23 PASS）与 `tests/test_oc_story.py`（14 项）的真链路读数固定。
+**仍待排期**：发行安装程序与三条完整路径的真人试用（U5 门槛）。
 

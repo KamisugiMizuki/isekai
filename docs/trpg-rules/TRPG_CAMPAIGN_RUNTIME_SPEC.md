@@ -1,6 +1,6 @@
 # TRPG 战役运行时模块设计
 
-> 状态：设计规范 v1.0，未实现声明。
+> 状态：设计规范 v1.0；实现状态：战役运行时已落地（`isekai_core/runtime/campaign.py` / `trpg.py` / `rules.py` / `plugin_bridge.py` 与 `isekai_core/rules_registry.py`；行为验收见 §二十一「实施状态」与 [用户界面定案](../user-interface/README.md) U4 行）。
 > 定位：位于 TRPG 规则层与 WorldRuntime 之间的战役编排层。
 > 相关文档：[`TRPG_RULE_PLUGIN_SPEC.md`](TRPG_RULE_PLUGIN_SPEC.md)、[`TRPG_RULE_COMMON_MODULE_SPEC.md`](TRPG_RULE_COMMON_MODULE_SPEC.md)、[`../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md`](../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md)。
 
@@ -622,7 +622,5 @@ created_at / updated_at
   这就是「显式重试」的合法路径，仍然不自动重跑不带用户意图的随机裁定；
 - B0 兼容：不带 `campaign_id` 的 `trpg.action.resolve` 语义不变。
 
-**尚未实现（记为设计义务，不充数）**：
-
-（本节原列四条残余已于 2026-09-22 全部落地：来源细分 / 受众显式并集 / 跨核心复用 / patch 分片合并。）
+**残余项（记账，不充数）**：无。本节原列四条残余已于 2026-09-22 全部落地（来源细分 / 受众显式并集 / 跨核心复用 / patch 分片合并），当前无已知未实现的设计义务项。
 

@@ -1,6 +1,6 @@
 # Writing Assistant 模块设计
 
-> 状态：已定稿 v1.0（产品设计）；实现状态：核心语义与管理面已落地（对照见 §十三），编剧层客户端表达层（大纲编辑器 / 候选对比界面）未实现。
+> 状态：已定稿 v1.0（产品设计）；实现状态：核心语义与管理面已落地（对照见 §十三），编剧层客户端表达层已实现（`desktop/src/user/writing.ts`：大纲编辑器、候选卡比较与三种动作、文字草稿编辑 / 锁定 / 导出；见 [用户界面定案](../user-interface/README.md) U3 行）。
 > 定位：面向小说创作的上层叙事约束编排模块；GM 辅助是其一种应用方式。
 > 上游契约：[`../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md`](../worldruntime/WORLD_RUNTIME_INTERFACE_SPEC.md)、[`../worldruntime/NARRATIVE_LAYER_SPEC.md`](../worldruntime/NARRATIVE_LAYER_SPEC.md)。
 > 相关模块：[`../trpg-rules/TRPG_RULES_LAYER_SPEC.md`](../trpg-rules/TRPG_RULES_LAYER_SPEC.md)、[`../trpg-client/TRPG_CLIENT_SPEC.md`](../trpg-client/TRPG_CLIENT_SPEC.md)。
@@ -8,7 +8,7 @@
 >
 > 本文是 Writing Assistant 的唯一产品规范。它拥有大纲、候选、草稿和偏离决定的产品语义；WorldRuntime 只拥有事实，叙事中介只拥有角色表达材料，TRPG 规则层只拥有规则裁定编排。
 
-> 桌面承载已由 [用户界面设计 v1.0](../user-interface/README.md) 定稿，尚未实施；大纲编辑、观察者选择、候选比较、文本保存与导出按其“辅助写作”工作区执行。本文继续持有产品语义。候选隔离、重复提案保护和提交状态等已复现缺口列于 [界面设计 §11](../user-interface/USER_INTERFACE_DESIGN.md)，需在所属模块修复后再验收界面，不能以本文历史通过数视为已闭合。
+> 桌面承载已由 [用户界面设计 v1.0](../user-interface/README.md) 定稿并已实施（U3「辅助写作」工作区）；大纲编辑、观察者选择、候选比较、文本保存与导出按其“辅助写作”工作区执行。本文继续持有产品语义。候选隔离、重复提案保护和提交状态等此前复现的缺口已按 [界面设计 §11](../user-interface/USER_INTERFACE_DESIGN.md) 在所属模块修复并接进界面（`tests/test_wa_boundaries.py` 8 项），不再是待验收界面的前置。
 
 ## 一、定位
 
@@ -284,8 +284,8 @@ GM 直接变化意图
 
 **记账不充数**：
 
-- 编剧层客户端表达层（大纲编辑器、候选对比与并排试演界面、章节工作区）未实现——与 OC 客户端、
-  TRPG 客户端同属独立实现范围，本层给出的候选生命周期、可见面投影与读数就是它的输入契约；
+- 编剧层客户端表达层**已实现**（`desktop/src/user/writing.ts`：六类大纲条目编辑器、候选卡比较与三种动作「以此起草 / 另开分支试演 / 预览世界变化后确认应用」、文字草稿编辑 / 锁定 / 导出；见 [用户界面定案](../user-interface/README.md) U3 行）。
+  **待排期**：候选的真正并排对比试演与章节级多稿编排。本层给出的候选生命周期、可见面投影与读数就是它的输入契约；
 - 大纲定义~~未进实例导出件~~（跨线复用的作者资产）：**2026-09-22 已落地**——导出件带**引用闭包**里的大纲定义 + 各线绑定状态与候选 / 决定（`world/portable.py::_writing_payload` / `_restore_writing`，随容器完整性摘要走）。定义 id **不重铸**（作者资产跨线复用不因导入断掉）；本机已有同名大纲且内容不同时**保留本机那份**并把 id 回报在 `instance.import` 的 `writing_kept_outlines` 里，不静默替换作者资产。行为验收 `tests/test_wa_export.py`。
 - 大纲条目与世界引用的自动匹配未做：`watch_refs` / `evidence_refs` 由调用方给出，模型不猜；
 - 多人协作与自动出版按规范明确不做（W3 范围之外）。
