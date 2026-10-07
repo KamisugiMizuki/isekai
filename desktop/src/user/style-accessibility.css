@@ -4,9 +4,12 @@
  */
 
 /* ============ 按钮尺寸（菲茨定律 + 触控目标） ============ */
-.u-btn-primary {
+/* 主按钮的真实类名是 .u-primary（dom.ts primary() 产出 "u-btn u-primary"），
+   原 .u-btn-primary 匹配不到任何元素，44px 触控目标从未生效 */
+.u-primary {
   min-height: 44px;
-  font-weight: 500;
+  /* user.css 的 .u-primary 已是 600；本文件后加载，若写 500 反而会把主按钮压轻 */
+  font-weight: 600;
 }
 
 .u-btn {
@@ -20,25 +23,23 @@
   font-size: 0.8em;
 }
 
-.u-chip[data-kind="ok"]::before {
+/* chip 的状态挂在类名上（dom.ts chip() 产出 "u-chip u-chip-<kind>"），没有 data-kind 属性；
+   符号颜色不写死：::before 继承 .u-chip-<kind> 的主题色 --u-ok/--u-bad/--u-warn */
+.u-chip-ok::before {
   content: "✓";
-  color: #2e7d32;
 }
 
-.u-chip[data-kind="bad"]::before {
+.u-chip-bad::before {
   content: "✗";
-  color: #d32f2f;
 }
 
-.u-chip[data-kind="pending"]::before {
+.u-chip-pending::before {
   content: "⏳";
 }
 
-/* ============ 对比度：次要文字提升到 5.74:1 ============ */
-.u-note,
-.u-muted {
-  color: #555;
-}
+/* 已删除 .u-note, .u-muted { color:#555 }：它在本文件后加载、与 .u-note-ok/-bad/-pending
+   同特异性，把状态色整片压掉；深色模式下 #555 只有 ≈2.5:1。
+   .u-note 现由 user.css 按主题变量 --u-muted 着色（.u-muted 只作标记，随 .u-note 继承） */
 
 /* ============ 焦点可见：2px 蓝描边 ============ */
 *:focus-visible {
@@ -48,29 +49,20 @@
 }
 
 /* ============ 进度指示器（测试 AI 时显示步骤） ============ */
+/* 仍在用：settings.ts:120 建 div.u-progress，其子节点是 p（settings.ts:125）→ 保留 */
 .u-progress p {
   margin: 0.25rem 0;
   font-size: 14px;
 }
 
-/* ============ 系统消息卡片（与对话消息区分） ============ */
-.u-system-card {
-  background: #f5f5f5;
-  border-left: 3px solid #757575;
-  padding: 12px;
-  margin: 8px 0;
-  border-radius: 4px;
-}
-
-/* 深色模式 */
-@media (prefers-color-scheme: dark) {
-  .u-system-card {
-    background: #2a2a2a;
-    border-left-color: #9e9e9e;
-  }
-}
+/* ============ 系统消息卡片 ============
+   已删除 .u-system-card（含深色分支）：实际类名是 .u-system（contact.ts systemHost），
+   该规则从未命中。系统块与对话的区分已由 user.css 的 .u-system + .u-handoff
+   （边框 + var(--u-sunken) 浅底 + 靠左 max-width）承担，无需另加硬编码配色 */
 
 /* ============ 屏幕阅读器专用（隐藏但可读） ============ */
+/* 仍在用：contact.ts:109 的 aria-live 播报节点 → 保留。
+   user.css 也有一份（用 clip-path），本条补 clip:rect() 与去边距，二者互补 */
 .u-sr-only {
   position: absolute;
   width: 1px;
