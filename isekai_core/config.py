@@ -100,7 +100,7 @@ def paths_for(root: Path) -> Paths:
 @dataclass
 class LLMConfig:
     base_url: str = "https://api.deepseek.com"
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek-flash"
     api_key: str = ""
     timeout_s: float = 60.0
     max_tokens: int = 1024

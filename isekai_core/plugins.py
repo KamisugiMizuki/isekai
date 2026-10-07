@@ -34,6 +34,24 @@ MANIFEST_FIELDS = ("id", "name", "version", "ump", "entry")
 MANIFEST_NAME = "manifest.json"
 #: 子进程只拿这些环境变量（§3.4）：降低误泄漏，不替代沙箱
 ENV_ALLOWLIST = ("PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP", "LANG", "PYTHONUTF8", "PYTHONIOENCODING")
+
+
+def child_env(**extra: str) -> dict[str, str]:
+    """受信子进程（插件 / 常驻规则插件 / 桥）的统一运行环境。
+
+    子进程的 stdin/stdout 是 JSON 帧通路，核心按 UTF-8 解码；但 Windows 上非 UTF-8
+    代码页（中文机器 cp936）里的 Python 子进程会按代码页写字节，核心解出代理字符，
+    再写日志就抛 `UnicodeEncodeError: surrogates not allowed`——插件启用会直接失败。
+    像 `cli.py` 起核心时那样显式钉住 UTF-8，不让结果取决于运行环境的代码页。
+    """
+    env = {name: os.environ[name] for name in ENV_ALLOWLIST if name in os.environ}
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    env.update(extra)
+    return env
+
+
 STDERR_KEEP_LINES = 200   # stderr 保留的最近行数（容量上限）
 STDERR_LINE_CHARS = 500   # 单行截断
 STDOUT_QUEUE_MAX = 200    # 出站帧排队上限：堵住输出不能拖死核心
@@ -291,10 +309,7 @@ class PluginHost:
 
     def _env_for(self, plugin_id: str) -> dict[str, str]:
         """最小环境（§3.4）：只给必要变量与该插件自己的配置，不继承核心凭据。"""
-        env = {name: os.environ[name] for name in ENV_ALLOWLIST if name in os.environ}
-        env["PYTHONUNBUFFERED"] = "1"
-        env["ISEKAI_PLUGIN_ID"] = str(plugin_id)
-        return env
+        return child_env(ISEKAI_PLUGIN_ID=str(plugin_id))
 
     # ---------- 生命周期 ----------
 

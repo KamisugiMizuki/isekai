@@ -770,6 +770,10 @@ class SessionService:
         character_id = str(session.get("character_id") or "")
         if not (instance_id and timeline_id and character_id):
             return
+        if instance_id.startswith("ph-"):
+            # 阶段 0 占位会话（没有世界、没有时钟、没有生活线）：记忆是与世界挂钩的派生数据，
+            # 这里没有可挂的东西。早退，别让每一轮对话都刷一条 ERROR + 完整堆栈。
+            return
         try:
             world_seconds = runtime.world_moment(instance_id, timeline_id)
             runtime.cite_memories(

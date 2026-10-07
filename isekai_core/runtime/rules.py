@@ -12,6 +12,7 @@ import sys as _sys
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,11 @@ from typing import Any
 
 class RulePluginError(ValueError):
     """The external rule plugin did not produce a usable result."""
+
+
+#: 子进程 stdio 是 UTF-8 JSON 帧通路：显式钉住编码，别让它取决于 Windows 代码页
+#: （中文机器 cp936 下子进程按代码页写字节 → 核心解出代理字符 → 写日志直接崩）。
+_CHILD_UTF8_ENV = {"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 
 
 def manifest_identity(manifest_path: str | Path) -> dict[str, Any]:
@@ -207,6 +213,7 @@ class RulePluginSession:
                 _sys.executable, "-m", "isekai_core.runtime.plugin_bridge",
                 str(self.share_file), token, "--", *self.entry,
                 cwd=str(self.manifest_path.parent),
+                env={**os.environ, **_CHILD_UTF8_ENV},
             )
             self.spawns += 1
             deadline = time.time() + 20.0
@@ -223,6 +230,7 @@ class RulePluginSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **_CHILD_UTF8_ENV},
         )
         self.spawns += 1
 
@@ -404,6 +412,7 @@ async def _invoke(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **_CHILD_UTF8_ENV},
         )
         assert proc.stdin is not None and proc.stdout is not None
         proc.stdin.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))

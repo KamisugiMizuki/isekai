@@ -24,8 +24,49 @@ from typing import Any, Sequence
 from . import ump
 from .client import MgmtClient, UmpClient
 from .config import Config, load_config
+from .llm import LLMError
 from .ump import Envelope, UmpError
 from .version import APP_VERSION
+
+#: 进程内幂等标记。故意**不用**环境变量：CLI 起子进程时会 `{**os.environ}` 全量继承，
+#: 子 Python 进程看见标记就会静默跳过重配（插件白名单虽不含它，但规则插件会继承 os.environ）。
+_UTF8_CONSOLE_READY = False
+
+
+def ensure_utf8_console() -> None:
+    """让 CLI 自己的 stdout/stderr 按 UTF-8 输出。
+
+    核心 / 插件是子进程，编码由父进程钉住；但 CLI **自己**也是被管道、重定向或
+    CI 捕获的一方。Windows 非 UTF-8 代码页（中文机器 cp936）下，向管道写中文或
+    `•`（`mask_api_key` 的打码符）会直接抛 `UnicodeEncodeError`，把一次正常的
+    「自检失败」变成崩溃。
+
+    交互终端用严格模式（乱码比崩掉更糟）；管道 / 重定向退回 `replace`，宁可有个别
+    替代字符也不中断读数。**必须在 `parse_args` 之前调用**：`-h` 在解析内部就打印。
+    """
+    global _UTF8_CONSOLE_READY
+    if _UTF8_CONSOLE_READY:
+        return
+    _UTF8_CONSOLE_READY = True
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # 已被测试替换成 StringIO 等：不动它
+            continue
+        errors = "strict" if _stream_is_tty(stream) else "replace"
+        try:
+            reconfigure(encoding="utf-8", errors=errors)
+        except (OSError, ValueError):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+def _stream_is_tty(stream: Any) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 def _attach_payload(paths: list[str] | None) -> list[dict[str, Any]]:
@@ -214,12 +255,13 @@ async def run_turn(
         if not quiet:
             final_text = "".join(texts)
             if streamed:
-                # 增量与最终不一致时要说清（最终为准）；一致就只补一个换行
+                # 增量与最终不一致时要说清（最终为准）；一致就只补一个换行。
+                # 正文已由增量预览打过，这里不重复打印一遍。
                 if "".join(streamed) != final_text:
                     print("\n（最终正文与增量预览不同，以最终为准）")
+                    print(f"角色> {final_text}")
                 else:
                     print()
-                print(f"角色> {final_text}")
             else:
                 for text_part in texts:
                     print(f"角色> {text_part}")
@@ -381,7 +423,36 @@ async def amain(args: argparse.Namespace, cfg: Config) -> int:
                 proc.kill()
 
 
+def _explain_error(exc: BaseException, cfg: Config) -> str:
+    """把底层错误码翻成「哪一项错了 + 去哪改」，不甩裸 traceback 给使用者。"""
+    config_hint = f"配置文件：{cfg.paths.config_file}"
+    code = str(getattr(exc, "code", "") or "")
+    message = str(getattr(exc, "message", "") or exc)
+    if code == "llm_not_configured":
+        return "\n".join([
+            f"失败：{message}",
+            f"  改这里：{config_hint} 的 `llm.api_key`（或设环境变量 ISEKAI_LLM_API_KEY）",
+            "  自检：.venv/Scripts/python.exe -m isekai_core.world_cli setup ai-test",
+            "  只想先跑通链路、不接真模型：设 ISEKAI_LLM_FAKE=1",
+        ])
+    if code == "llm_rejected":
+        return "\n".join([
+            f"失败：{message}（服务端拒绝了这次请求）",
+            f"  改这里：{config_hint} 的 `llm.api_key` / `llm.model` 是否与该服务商一致",
+            "  自检：.venv/Scripts/python.exe -m isekai_core.world_cli setup ai-test",
+        ])
+    if code in ("llm_unreachable", "llm_unavailable"):
+        return "\n".join([
+            f"失败：{message}（连不上 AI 服务）",
+            f"  改这里：{config_hint} 的 `llm.base_url` 是否是可达的 OpenAI 兼容地址",
+            "  自检：.venv/Scripts/python.exe -m isekai_core.world_cli setup ai-test",
+        ])
+    return f"失败：{message}"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    # 必须在解析参数之前：`-h` 在 parse_args 内部打印，之后再重配就来不及了
+    ensure_utf8_console()
     parser = argparse.ArgumentParser(prog="isekai_chat", description="isekai 开发用 UMP 聊天客户端")
     parser.add_argument("--root", default=None, help="数据根目录")
     parser.add_argument("--endpoint", default=None, help="连接已有核心（默认自行拉起）")
@@ -410,8 +481,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     cfg = load_config(args.root)
     started = time.time()
+    status = 0
     try:
-        return asyncio.run(amain(args, cfg))
+        try:
+            return asyncio.run(amain(args, cfg))
+        except (UmpError, LLMError) as exc:
+            status = 1
+            print(_explain_error(exc, cfg))
+            return status
+        except KeyboardInterrupt:
+            print()
+            status = 130
+            return status
+        except (ConnectionRefusedError, OSError) as exc:
+            status = 1
+            print(f"失败：连不上核心或 AI 服务（{exc}）")
+            return status
     finally:
         print(f"· 会话结束（{time.time() - started:.1f}s）")
 

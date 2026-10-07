@@ -23,9 +23,54 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .client import MgmtClient
-from .cli import spawn_core
+from .cli import ensure_utf8_console, spawn_core
 from .config import load_config
 from .world import ops
+
+
+class _HelpFormatter(argparse.HelpFormatter):
+    """help 排版：命令总览整段放在 usage 之后、选项表之前，不被 80 列折行截断。"""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("max_help_position", 34)
+        super().__init__(*args, **kwargs)
+        self._overview = ""
+
+    def _format_action(self, action: argparse.Action) -> str:
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001 - 只为排版
+            return ""
+        return super()._format_action(action)
+
+    def format_help(self) -> str:
+        if not self._overview:
+            return super().format_help()
+        base = super().format_help()
+        usage, sep, rest = base.partition("\n\n")
+        if not sep:
+            return f"{base}\n{self._overview}\n"
+        return f"{usage}\n{self._overview}\n\n{rest}"
+
+
+def _command_help() -> str:
+    """按组的命令总览（放在 --help 顶部，替代 255 行平铺）。"""
+    order = [
+        "package", "card", "instance", "runtime", "event", "story", "wa", "trpg", "client",
+        "plugin", "rules", "backup", "disclose", "proactive", "narrative", "setup",
+    ]
+    lines = ["命令总览（用法：isekai-world <组> <命令> [选项]）："]
+    for group in order:
+        commands = [cmd for (g, cmd) in OP_BY_COMMAND if g == group]
+        if commands:
+            lines.append(f"  {group:<10} {' / '.join(commands)}")
+    lines.append("")
+    lines.append("下面这张选项表是全部命令共用的（很长，按需搜）；每个命令只读它自己那几个。")
+    lines.append("")
+    lines.append("  例：isekai-world package validate --file packages/huichao.json")
+    lines.append("      isekai-world instance create --package packages/huichao.json --card a.json,b.json")
+    lines.append("      isekai-world runtime activate --id in-xxxx --timeline tl-xxxx")
+    lines.append("  新手先看：docs/QUICKSTART.md（源码）或 发行说明.md（发行件）。")
+    return "\n".join(lines)
+
 
 OP_BY_COMMAND = {
     ("package", "template"): "world.package.template",
@@ -230,13 +275,6 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
         if cmd == "list":
             return {}
         return {"ruleset_id": ns.ruleset or "", "ruleset_version": ns.ruleset_version or ""}
-    if group == "setup":
-        args = {}
-        if cmd in ("migrate-check", "migrate"):
-            args["path"] = ns.file or ns.package
-        if cmd == "migrate":
-            args["note"] = ns.note or "从旧开发目录迁移"
-        return args
     if group == "backup":
         args = {}
         if cmd == "create":
@@ -338,6 +376,11 @@ def build_args(ns: argparse.Namespace) -> dict[str, Any]:
             args.update({"choice_id": ns.choice or "", "selection": ns.selection or ""})
         return args
     if group == "setup":
+        if cmd in ("migrate-check", "migrate"):
+            args = {"path": ns.file or ns.package}
+            if cmd == "migrate":
+                args["note"] = ns.note or "从旧开发目录迁移"
+            return args
         if cmd == "sample-install":
             return {"sample": ns.name or ns.file or "", "request_id": ns.request or ""}
         if cmd == "ai-test":
@@ -681,9 +724,20 @@ async def run(ns: argparse.Namespace) -> int:
     mgmt = MgmtClient(endpoint, mgmt_token or "")
     await mgmt.connect()
     try:
+        # 运行层命令常要「实例 + 时间线」两个标识：只给了实例就自动取它第一条线，
+        # 省掉「先跑 instance info 再手抄 tl-…」这一步（照样例说明走的人会卡在这）。
+        if ns.timeline is None and ns.id and op.startswith("runtime."):
+            info = await mgmt.call("instance.info", id=ns.id)
+            timelines = info.get("timelines") or []
+            if not timelines:
+                print(f"操作失败：实例 {ns.id} 没有可用时间线")
+                return 1
+            ns.timeline = str(timelines[0]["id"])
+            print(f"· 未指定 --timeline，自动使用 {ns.timeline}")
+        args = build_args(ns)
         # ponytail: 生成类操作同步等待模型返回；真需要长任务队列时再改作业式接口
         timeout = 600.0 if op in ops.ASYNC_OPS else 30.0
-        result = await mgmt.call(op, timeout=timeout, **build_args(ns))
+        result = await mgmt.call(op, timeout=timeout, **args)
     except Exception as exc:  # noqa: BLE001 —— CLI 只负责把错误讲清楚
         print(f"操作失败：{exc}")
         return 1
@@ -698,11 +752,40 @@ async def run(ns: argparse.Namespace) -> int:
         if isinstance(workspace, dict):
             Path(ns.ws_file).write_text(json.dumps(workspace, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"工作区已写入 {ns.ws_file}")
-    return print_result(result, out=ns.out, hide_candidate=ns.group != "wa")
+    code = print_result(result, out=ns.out, hide_candidate=ns.group != "wa")
+    # 自检命令 setup ai-test（settings.test）把失败写在结果里而不是抛异常：
+    # 别让脚本拿到「假成功」。只针对这一个 op——别的操作里 ok:false 可能只是正常返回值。
+    if op == "settings.test" and isinstance(result, dict) and result.get("ok") is False:
+        return 1
+    return code
+
+
+def _parser() -> argparse.ArgumentParser:
+    """带命令总览与分组排版的主解析器（`--help` 不再是一坨 255 行平铺）。"""
+
+    class _OverviewHelpFormatter(_HelpFormatter):
+        """formatter_class 每次都会被重新实例化，所以在这里挂总览，别去改解析器内部缓存。"""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._overview = _command_help()
+
+    return argparse.ArgumentParser(
+        prog="isekai-world",
+        description="世界设定层 CLI（阶段 1）",
+        formatter_class=_OverviewHelpFormatter,
+        epilog=(
+            "常用动作：package validate → card confirm → instance create → "
+            "runtime activate（详见 docs/QUICKSTART.md）"
+        ),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="isekai-world", description="世界设定层 CLI（阶段 1）")
+    # 输出里有中文与打码符 `•`：在 cp936 控制台 / 管道下先钉住 UTF-8，别让读数变成崩溃。
+    # 放在最开头：`--help` 也要按 UTF-8 输出。
+    ensure_utf8_console()
+    parser = _parser()
     parser.add_argument("--root", default=None, help="数据根目录")
     parser.add_argument("--endpoint", default=None, help="连接已有核心（默认自行拉起）")
     parser.add_argument("--mgmt", default=None, help="已有核心的管理凭据")
@@ -850,9 +933,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--module", default=None, help="setup：草稿所属模块（contact / writing / world）")
     parser.add_argument("--target", default=None, help="setup：草稿目标对象")
     parser.add_argument("--payload", default=None, help="setup：草稿附带数据（内联 JSON）")
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        # 什么都不给时直接给命令总览，而不是让 argparse 报「缺少 group」再刷 250 行选项
+        parser.print_help()
+        return 2
+    if "--help" in argv or "-h" in argv:
+        # 帮助里先给命令总览，再看选项；`<组> <命令> --help` 与顶层同义（不再各给一坨）
+        parser.print_help()
+        return 0
     ns = parser.parse_args(argv)
     if (ns.group, ns.command) not in OP_BY_COMMAND:
-        parser.error(f"未知命令 {ns.group} {ns.command}")
+        parser.error(f"未知命令 {ns.group} {ns.command}（用 `--help` 看命令总览）")
     return asyncio.run(run(ns))
 
 

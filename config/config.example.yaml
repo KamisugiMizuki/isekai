@@ -1,11 +1,13 @@
 # isekai 核心进程本地配置
 #
 # 用法：复制为 config/config.yaml 后按需修改；config.yaml 不入库（.gitignore）。
-# 环境变量覆盖：ISEKAI_LLM_API_KEY（API Key）、ISEKAI_ROOT（数据根目录）。
+# 注意：改这一份不会影响已存在的 config/config.yaml；把这一份复制过去会覆盖你已填的密钥。
+# 环境变量：ISEKAI_LLM_API_KEY（key 的兜底值，配置文件里的 llm.api_key 优先）
+#           ISEKAI_ROOT（数据根目录覆盖，优先级最高）
 
 llm:
   base_url: https://api.deepseek.com
-  model: deepseek-v4-flash
+  model: deepseek-flash
   api_key: ""            # UI / 手编写入；不会进入日志、插件环境或导出件
   timeout_s: 60
   max_tokens: 1024       # 只限输出；推理型模型把预算烧在 reasoning 时会按空回复重试一次
@@ -34,6 +36,11 @@ runtime:
   catch_up_batches: 8        # 单次推进批数上限（每批推进一个世界日）
   catch_up_lag_seconds: 172800  # 滞后超过 2 世界日即记为「追赶受限」并如实上报
   render_calls_per_day: 20   # 事件表述 / 史料展开的现实日调用上限（超出即退回模板，不重复调用）
+  # 睡眠等待与合并批（SESSION_CORE_SPEC §4.5）：角色此刻在睡眠块里时，她的回复会先攒一拍
+  # 再答（把这期间的多句话并成一批处理）。所以第一句可能等 30–120 秒才出现回复——这是设计，
+  # 不是卡死。想快点看到回复就把这两个值调小（例如 1 / 2）。
+  sleep_wait_min_s: 30.0
+  sleep_wait_max_s: 120.0
   # 角色记忆（MEMORY_SPEC）：提取 / 简报 / 衰减配额
   memory_extract_per_day: 40      # 每日提取调用上限（单次最多 8 条材料）
   memory_recall_limit: 6          # 单轮简报条数上限

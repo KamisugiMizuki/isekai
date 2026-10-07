@@ -60,6 +60,8 @@ async def serve(share_file: Path, token: str, entry: list[str]) -> int:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=None,  # 真插件的 stderr 直通桥的 stderr（核心侧看不到，但用户终端能看到）
+        # 桥与真插件之间的 stdio 也是 UTF-8 JSON 帧：别让它取决于 Windows 代码页
+        env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
     )
     assert child.stdin is not None and child.stdout is not None
 
