@@ -46,6 +46,9 @@
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
 }
 
+/* 「最近用过」的标记色（不是焦点环）：这条蓝是启动器里唯一区分「最近」的线索，
+   与 focus 无关，因此不并入「焦点可见 = 2px var(--u-fg)」的统一规则
+   （焦点环由 style-accessibility.css 的 *:focus-visible 统一负责）。 */
 .u-launcher-card-recent {
   border-color: #1976d2 !important;
   border-width: 2px;

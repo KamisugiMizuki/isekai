@@ -168,17 +168,17 @@ export function errorCard(error: UiError, actions: Array<{ label: string; run: (
   for (const action of actions) row.appendChild(button(action.label, action.run));
   if (row.childElementCount) node.appendChild(row);
   const detail = el("details", { class: "u-error-detail" }, el("summary", { text: "查看技术详情" }));
-  detail.appendChild(
-    facts([
-      ["模块", error.module],
-      ["操作", error.action],
-      ["阶段", error.stage],
-      ["原因码", error.code],
-      ["可重试", error.retryable ? "是" : "否"],
-      ["关联编号", error.requestId || "—"],
-      ["发生时间", stamp(Date.now() / 1000)],
-    ]),
-  );
+  // 没有的阶段 / 关联编号整行不出：摆一行「阶段 —」既占位又像是真有一条读数
+  const rows: Array<[string, string]> = [
+    ["模块", error.module],
+    ["操作", error.action],
+  ];
+  if (error.stage) rows.push(["阶段", error.stage]);
+  rows.push(["原因码", error.code]);
+  rows.push(["可重试", error.retryable ? "是" : "否"]);
+  if (error.requestId) rows.push(["关联编号", error.requestId]);
+  rows.push(["发生时间", stamp(Date.now() / 1000)]);
+  detail.appendChild(facts(rows));
   node.appendChild(detail);
   return node;
 }

@@ -41,9 +41,11 @@
    同特异性，把状态色整片压掉；深色模式下 #555 只有 ≈2.5:1。
    .u-note 现由 user.css 按主题变量 --u-muted 着色（.u-muted 只作标记，随 .u-note 继承） */
 
-/* ============ 焦点可见：2px 蓝描边 ============ */
+/* ============ 焦点可见：2px 主题前景描边 ============ */
+/* 全站兜底：不写死蓝色，跟 user.css 的 .u-btn/.u-input/…:focus-visible 用同一个 --u-fg，
+   深浅主题都是「黑白语义」；下面 user.css 里已有的专类规则特异性更高，二者不打架 */
 *:focus-visible {
-  outline: 2px solid #1976d2;
+  outline: 2px solid var(--u-fg);
   outline-offset: 2px;
   border-radius: 2px;
 }

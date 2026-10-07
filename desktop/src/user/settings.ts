@@ -308,17 +308,6 @@ export class SettingsPane implements Pane {
     const restoreHost = el("div", { class: "u-restore" });
 
     let packs: Json[] = [];
-    try {
-      const result = await this.ctx.api.packList();
-      packs = (result.packs as Json[]) ?? [];
-      const record = (result.record as Json) ?? {};
-      if (String(record.state ?? "") === "rolled_back" || String(record.state ?? "") === "needs_attention") {
-        note.textContent= `上次恢复没有走完：${String(record.state) === "rolled_back" ? "已回退到恢复前的数据" : "需要人工确认数据状态"}`;
-        note.className = `u-note u-note-${String(record.state) === "rolled_back" ? "pending" : "bad"}`;
-      }
-    } catch (error) {
-      list.appendChild(errorCard(uiError(error, { module: "备份", action: "读取列表" })));
-    }
 
     const renderList = (): void => {
       fill(list);
@@ -369,7 +358,29 @@ export class SettingsPane implements Pane {
         }
       }
     };
-    renderList();
+    // 列表读取是只读的：失败时给出实话（没改数据 / 读取是否成功），重试就地重读
+    const loadPacks = async (): Promise<void> => {
+      fill(list, el("p", { class: "u-hint", text: "正在读取备份列表…" }));
+      try {
+        const result = await this.ctx.api.packList();
+        packs = (result.packs as Json[]) ?? [];
+        const record = (result.record as Json) ?? {};
+        if (String(record.state ?? "") === "rolled_back" || String(record.state ?? "") === "needs_attention") {
+          note.textContent = `上次恢复没有走完：${String(record.state) === "rolled_back" ? "已回退到恢复前的数据" : "需要人工确认数据状态"}`;
+          note.className = `u-note u-note-${String(record.state) === "rolled_back" ? "pending" : "bad"}`;
+        }
+        renderList();
+      } catch (error) {
+        fill(
+          list,
+          errorCard(
+            uiError(error, { module: "备份", action: "读取列表", done: "没有改动任何数据", unknown: "这次读取是否成功" }),
+            [{ label: "重试读取", run: () => void loadPacks() }],
+          ),
+        );
+      }
+    };
+    await loadPacks();
 
     return section(
       "数据与备份",

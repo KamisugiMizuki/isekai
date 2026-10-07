@@ -31,16 +31,21 @@ export function makeEnvelope(
 
 type Waiter = { predicate: (env: Envelope) => boolean; resolve: (env: Envelope) => void };
 
-/** 管理面错误：把「稳定原因码 + 安全短说明 + 是否可重试」带到界面层（ONBOARDING §5.1）。 */
+/** error 信封里 stage 的合法取值（与 isekai_core/ump.py 的 Stage 同源；不认的取值一律当缺省） */
+const ERROR_STAGES = new Set(["receive", "generate", "delivery", "protocol", "auth"]);
+
+/** 管理面错误：把「稳定原因码 + 安全短说明 + 是否可重试 + 发生阶段」带到界面层（ONBOARDING §5.1）。 */
 export class MgmtError extends Error {
   readonly code: string;
   readonly retryable: boolean;
+  readonly stage: string;
 
-  constructor(code: string, message: string, retryable = false) {
+  constructor(code: string, message: string, retryable = false, stage = "") {
     super(message);
     this.name = "MgmtError";
     this.code = code;
     this.retryable = retryable;
+    this.stage = ERROR_STAGES.has(stage) ? stage : "";
   }
 }
 
@@ -213,11 +218,12 @@ export class MgmtClient {
     this.counter += 1;
     const reply = await this.send({ mgmt: "1", op, id: `r-${this.counter}`, args }, timeoutMs);
     if (!reply.ok) {
-      const error = reply.error as { code?: string; message?: string; retryable?: boolean } | undefined;
+      const error = reply.error as { code?: string; message?: string; retryable?: boolean; stage?: string } | undefined;
       throw new MgmtError(
         error?.code ?? "mgmt_error",
         error?.message ?? "管理操作失败",
         Boolean(error?.retryable),
+        String(error?.stage ?? ""),
       );
     }
     return (reply.result ?? {}) as Record<string, unknown>;

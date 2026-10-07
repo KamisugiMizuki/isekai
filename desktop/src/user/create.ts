@@ -206,6 +206,9 @@ const KNOB_LIST: Array<[string, string]> = [
   ["homage", "可参考致敬"],
 ];
 
+/** 创建向导的固定草稿键：同一时间只留一份「填到一半」的世界设定 */
+const CREATE_DRAFT_KEY = "create:world";
+
 interface Section {
   path: string;
   label: string;
@@ -409,6 +412,8 @@ export class CreatePane implements Pane {
   private step: Step = "source";
   private root: HTMLElement | null = null;
   private note: HTMLElement | null = null;
+  /** 草稿状态行：DraftKeeper 往这里写「未保存 / 正在保存 / 已保存 / 保存失败」，不跟主 note 抢 */
+  private draftSlot: HTMLElement | null = null;
   private candidate: Json | null = null;
   private locks: Record<string, string[]> = {};
   private errors: string[] = [];
@@ -461,7 +466,8 @@ export class CreatePane implements Pane {
       nav.appendChild(step);
     }
     this.note = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
-    fill(host, section("创建世界", nav), this.note, this.root);
+    this.draftSlot = el("p", { class: "u-note", role: "status", "aria-live": "polite" });
+    fill(host, section("创建世界", nav), this.note, this.draftSlot, this.root);
     const sub = this.ctx.route.sub ?? "";
     if (sub.startsWith("edit:")) {
       void this.openExisting(sub.slice(5));
@@ -470,6 +476,11 @@ export class CreatePane implements Pane {
     } else {
       void this.render();
     }
+  }
+
+  /** 切页 / 退出：把在途草稿落盘（壳层导航前也会 flush 一次，这里补一道保险） */
+  unmount(): void {
+    void this.ctx.drafts.flush();
   }
 
   /** 从「世界与素材」进来的：编辑一份已有设定（改完另存/覆盖都由确认那一步统一处理） */
@@ -484,6 +495,7 @@ export class CreatePane implements Pane {
       this.absorbPackage((loaded.package as Json) ?? {});
       this.base = file;
       this.source = this.source || "manual";
+      this.queueDraft();
       setNote(this.note, `正在编辑「${this.name}」：这份设定用于以后创建的世界，已有的世界不会变`, "ok");
       this.step = "world";
       await this.render();
@@ -512,6 +524,7 @@ export class CreatePane implements Pane {
         this.knobs = (payload.knobs as Record<string, unknown>) ?? {};
         this.source = String(payload.source ?? "manual");
       }
+      this.queueDraft(); // absorbPackage 之后才补上 locks / errors / brief / knobs / source，这里重排一次
       setNote(this.note, "草稿已读回：接着改，确认后才成为正式设定", "ok");
       this.step = "world";
       await this.render();
@@ -530,6 +543,39 @@ export class CreatePane implements Pane {
     return Boolean(this.created);
   }
 
+  /** 向导手里这份设定的快照：与 openDraft() 读回时消费的 payload 同形状 */
+  private draftPayload(): Json {
+    const pkg = this.candidate ?? {};
+    if (this.candidate) {
+      // 向导里的名字/简介要到「确认」那一步才写进 meta：现在同步进去，草稿读回时才认得出
+      // （清空名字也会同步成空串，读回后不会被旧名字复活）
+      const meta = (pkg.meta as Json) ?? {};
+      meta.original_name = this.name;
+      meta.display_name = this.name;
+      meta.description = this.brief;
+      pkg.meta = meta;
+    }
+    return {
+      package: pkg,
+      locks: this.locks,
+      errors: this.errors,
+      brief: this.brief,
+      knobs: this.knobs,
+      source: this.source,
+    };
+  }
+
+  /**
+   * 把当前进度交给 DraftKeeper（它负责防抖与「未保存 / 正在保存 / 已保存 / 保存失败」状态）。
+   * 只在「有内容可恢复」时写：名字 / 简介 / 参数 / 设定对象全空就不产生空草稿
+   * （首页与素材页的列表按 text 非空过滤，空草稿读回来也没东西可接着改）。
+   */
+  private queueDraft(): void {
+    if (!this.candidate && !this.name.trim() && !this.brief.trim() && !Object.keys(this.knobs).length) return;
+    const text = this.name.trim() || "未命名世界";
+    this.ctx.drafts.watch(CREATE_DRAFT_KEY, this.draftSlot, "create", text, text, this.draftPayload());
+  }
+
   private async render(): Promise<void> {
     if (!this.root) return;
     fill(this.root);
@@ -544,7 +590,17 @@ export class CreatePane implements Pane {
       else if (this.step === "create") this.renderCreate();
       else this.renderStart();
     } catch (error) {
-      this.root.appendChild(errorCard(uiError(error, { module: "创建世界", action: "打开发这一步" })));
+      this.root.appendChild(
+        errorCard(
+          uiError(error, {
+            module: "创建世界",
+            action: "打开发这一步",
+            done: "没有改动任何数据",
+            unknown: "这一步是否已经读到需要的数据",
+          }),
+          [{ label: "重试打开这一步", run: () => void this.render() }],
+        ),
+      );
     }
   }
 
@@ -572,6 +628,7 @@ export class CreatePane implements Pane {
         make("让 AI 起草", "写一句想要的世界，AI 起草一份完整设定，你再逐条改。需要已配置 AI。", () => {
           this.source = "ai";
           this.candidate = null;
+          this.queueDraft();
           this.goto("world");
         }),
         make("自己填写", "从空白骨架开始，按分区一条条写。不调用 AI。", () => {
@@ -645,6 +702,7 @@ export class CreatePane implements Pane {
     const sections = sectionsOf(pkg);
     this.section = sections[0]?.path ?? "";
     this.entryId = "";
+    this.queueDraft();
   }
 
   private renderWorld(): void {
@@ -653,11 +711,13 @@ export class CreatePane implements Pane {
     const nameInput = el("input", { class: "u-input", value: this.name, id: "u-create-name" }) as HTMLInputElement;
     nameInput.addEventListener("input", () => {
       this.name = nameInput.value;
+      this.queueDraft();
     });
     const brief = el("textarea", { class: "u-textarea", rows: "3", id: "u-create-brief", placeholder: "一句话说清这个世界是什么样" }) as HTMLTextAreaElement;
     brief.value = this.brief;
     brief.addEventListener("input", () => {
       this.brief = brief.value;
+      this.queueDraft();
     });
 
     host.appendChild(
@@ -819,20 +879,19 @@ export class CreatePane implements Pane {
     if (kind === "text") {
       if (raw) this.knobs[key] = raw;
       else delete this.knobs[key];
-      return;
-    }
-    if (kind === "count") {
+    } else if (kind === "count") {
       if (raw === "") {
         delete this.knobs[key];
-        return;
+      } else {
+        const value = Number(raw);
+        if (Number.isInteger(value) && value >= 0) this.knobs[key] = value;
       }
-      const value = Number(raw);
-      if (Number.isInteger(value) && value >= 0) this.knobs[key] = value;
-      return;
+    } else {
+      const lines = raw.split("\n").map((item) => item.trim()).filter(Boolean);
+      if (lines.length) this.knobs[key] = lines;
+      else delete this.knobs[key];
     }
-    const lines = raw.split("\n").map((item) => item.trim()).filter(Boolean);
-    if (lines.length) this.knobs[key] = lines;
-    else delete this.knobs[key];
+    this.queueDraft();
   }
 
   private entryTitle(item: Json): string {
@@ -859,6 +918,7 @@ export class CreatePane implements Pane {
       const node = controlFor(key, value, refs, (next) => {
         if (locked) return;
         item[key] = next;
+        this.queueDraft();
       });
       card.appendChild(field(label(key), node));
     }
@@ -925,6 +985,7 @@ export class CreatePane implements Pane {
     if (on) list.add(ident);
     else list.delete(ident);
     this.locks[path] = [...list];
+    this.queueDraft();
     setNote(this.note, on ? "已锁定：AI 不会覆盖这一条" : "已解锁", "muted");
     void this.render();
   }
@@ -943,6 +1004,7 @@ export class CreatePane implements Pane {
     }
     sectionRef.items.push(blank);
     this.entryId = String(blank.id);
+    this.queueDraft();
     setNote(this.note, "已添加一条：填完记得重新检查", "pending");
     void this.render();
   }
@@ -957,6 +1019,7 @@ export class CreatePane implements Pane {
     if (typeof copy.name === "string") copy.name = `${copy.name}（副本）`;
     sectionRef.items.push(copy);
     this.entryId = String(copy.id);
+    this.queueDraft();
     setNote(this.note, "已复制一条（新身份）：其他条目对原条目的引用不会跟着变", "muted");
     void this.render();
   }
@@ -1000,6 +1063,7 @@ export class CreatePane implements Pane {
             const index = sectionRef.items.findIndex((row) => String(row.id) === ident);
             if (index >= 0) sectionRef.items.splice(index, 1);
             if (this.entryId === ident) this.entryId = "";
+            this.queueDraft();
             setNote(this.note, "已删除一条", "muted");
             void this.render();
           },
@@ -1037,6 +1101,7 @@ export class CreatePane implements Pane {
       const meta = (this.candidate?.meta as Json) ?? {};
       if (!this.name) this.name = String(meta.original_name ?? "");
       this.section = sectionsOf(this.candidate ?? {}).at(0)?.path ?? "";
+      this.queueDraft();
       setNote(
         this.note,
         this.errors.length ? `起草完成，但还有 ${this.errors.length} 项要处理（已保留这一版）` : "起草完成：逐条看看，改完再确认",
@@ -1066,6 +1131,7 @@ export class CreatePane implements Pane {
       if (result.candidate) this.candidate = result.candidate as Json;
       this.errors = ((result.errors as string[]) ?? []).slice();
       this.usage = (result.usage as Json) ?? this.usage;
+      this.queueDraft();
       setNote(this.note, "改完了：锁定的条目原样保留", "ok");
       void this.render();
     } catch (error) {
@@ -1088,6 +1154,7 @@ export class CreatePane implements Pane {
       if (result.candidate) this.candidate = result.candidate as Json;
       this.errors = ((result.errors as string[]) ?? []).slice();
       this.usage = (result.usage as Json) ?? this.usage;
+      this.queueDraft();
       setNote(this.note, "这一段重跑完了：锁定条目保留，其他分区没动", "ok");
       void this.render();
     } catch (error) {
@@ -1108,6 +1175,7 @@ export class CreatePane implements Pane {
     try {
       const result = await this.ctx.api.packageValidate({ package: this.candidate });
       this.errors = ((result.errors as string[]) ?? []).slice();
+      this.queueDraft();
       setNote(this.note, this.errors.length ? `还有 ${this.errors.length} 项要处理` : "检查通过", this.errors.length ? "pending" : "ok");
       void this.render();
     } catch (error) {
@@ -1121,19 +1189,9 @@ export class CreatePane implements Pane {
       setNote(this.note, "先给这份设定起个名字，草稿也要有名字", "bad");
       return;
     }
-    try {
-      await this.ctx.api.draftSave(this.name.trim(), "create", this.section, this.name.trim(), {
-        package: this.candidate,
-        locks: this.locks,
-        errors: this.errors,
-        brief: this.brief,
-        knobs: this.knobs,
-        source: this.source,
-      });
-      setNote(this.note, "草稿已保存：下次回来能接着改（草稿不是正式设定）", "ok");
-    } catch (error) {
-      setNote(this.note, uiError(error, { module: "世界设定", action: "保存草稿" }).message, "bad");
-    }
+    // 走同一条草稿链（固定键 + 同一个状态槽）：保存状态由 DraftKeeper 写在草稿行上
+    this.queueDraft();
+    await this.ctx.drafts.flush(CREATE_DRAFT_KEY);
   }
 
   /* ------------------------------------------------------------ 确认 → 角色 */
@@ -1148,6 +1206,7 @@ export class CreatePane implements Pane {
     }
     if (this.brief.trim()) meta.description = this.brief.trim();
     pkg.meta = meta;
+    this.queueDraft();
     setNote(this.note, "正在检查这份设定…", "pending");
     try {
       const checked = await this.ctx.api.packageValidate({ package: pkg });
@@ -1582,6 +1641,8 @@ export class CreatePane implements Pane {
         request_id: requestId,
       });
       this.created = (result.instance as Json) ?? {};
+      // 正式设定已经落地：把向导草稿丢掉，别让它在「未完成内容」里当第二份残留
+      await this.ctx.drafts.discard(CREATE_DRAFT_KEY);
       const instanceId = String(this.created.id ?? "");
       if (run && instanceId) {
         const info = await this.ctx.api.instanceInfo(instanceId);

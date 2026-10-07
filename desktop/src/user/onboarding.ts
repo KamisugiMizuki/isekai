@@ -377,7 +377,17 @@ export class OnboardingPane implements Pane {
       const listed = await this.ctx.api.samples();
       samples = (listed.samples as Json[]) ?? [];
     } catch (error) {
-      results.appendChild(errorCard(uiError(error, { module: "样例", action: "读取随程序样例" })));
+      results.appendChild(
+        errorCard(
+          uiError(error, {
+            module: "样例",
+            action: "读取随程序样例",
+            done: "没有改动任何数据",
+            unknown: "这次读取是否成功",
+          }),
+          [{ label: "重试读取样例", run: () => void this.render() }],
+        ),
+      );
     }
     if (!samples.length) {
       host.appendChild(

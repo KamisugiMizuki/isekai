@@ -196,7 +196,6 @@ export class App {
   private settings: Json = {};
   private instanceCache: InstanceEntry[] = [];
   private exitHandshake = false;
-  private navHost!: HTMLElement;
   private topHost!: HTMLElement;
   private mainHost!: HTMLElement;
   private bannerHost!: HTMLElement;
@@ -251,7 +250,6 @@ export class App {
     clear(this.root);
     this.root.className = "u-app";
     // ponytail: 方案 B 删除左侧导航栏和 brand,顶部添加返回启动器按钮
-    this.navHost = el("div", { hidden: true }); // 保留引用避免其他代码崩溃
 
     this.topHost = el("header", { class: "u-topbar u-topbar-focused" });
     this.bannerHost = el("div", { class: "u-banner hidden", role: "status", "aria-live": "polite" });
@@ -511,7 +509,6 @@ export class App {
     const container = el("section", { class: "u-pane" });
     this.mainHost.appendChild(container);
     this.current = pane;
-    this.renderNav();
     await pane.mount(container);
     if (token !== this.navToken) {
       pane.unmount?.();
@@ -521,14 +518,6 @@ export class App {
   }
 
   private navToken = 0;
-
-  private renderNav(): void {
-    for (const node of this.navHost.querySelectorAll("button")) {
-      const id = node.dataset.pane;
-      node.classList.toggle("u-nav-active", id === this.route.pane);
-      node.setAttribute("aria-current", id === this.route.pane ? "page" : "false");
-    }
-  }
 
   private context(): AppContext {
     return {

@@ -579,7 +579,17 @@ export class WorldsPane implements Pane {
     try {
       targets = await this.ctx.api.eventTargets(instance.id, timelineId);
     } catch (error) {
-      host.appendChild(errorCard(uiError(error, { module: "尝试世界变化", action: "读取可选对象" })));
+      host.appendChild(
+        errorCard(
+          uiError(error, {
+            module: "尝试世界变化",
+            action: "读取可选对象",
+            done: "没有改动任何数据",
+            unknown: "这次读取是否成功",
+          }),
+          [{ label: "重试读取", run: () => void this.rerender() }],
+        ),
+      );
       return;
     }
     const groups = (targets.groups as Record<string, Json[]>) ?? {};
@@ -920,8 +930,17 @@ export class WorldsPane implements Pane {
     note: HTMLElement,
   ): void {
     if (cardsError) {
-      host.appendChild(errorCard(uiError(cardsError, { module: "世界管理", action: "读取角色卡" })));
-      host.appendChild(el("div", { class: "u-row" }, primary("重新读取角色卡", () => void this.rerender())));
+      host.appendChild(
+        errorCard(
+          uiError(cardsError, {
+            module: "世界管理",
+            action: "读取角色卡",
+            done: "没有改动任何数据",
+            unknown: "这次读取是否成功",
+          }),
+          [{ label: "重新读取角色卡", run: () => void this.rerender() }],
+        ),
+      );
       return;
     }
     const confirmed = cards.filter((item) => Boolean(item.confirmed));
@@ -1247,21 +1266,38 @@ export class WorldsPane implements Pane {
     const instanceId = this.current?.id ?? "";
     const body = el("div", {});
     const note = el("p", { class: "u-note" });
-    try {
-      const preview = await this.ctx.api.storyRestore(instanceId, timelineId, String(commit.id ?? ""), false, false);
-      const coverage = (preview.coverage as Json) ?? {};
-      body.appendChild(
-        facts([
-          ["回到的世界时刻", String(coverage.to_world ?? "—")],
-          ["现在", String(coverage.now_world ?? "—")],
-          ["这条线已投递的回复总数", String(coverage.delivered_replies ?? 0)],
-        ]),
-      );
-      body.appendChild(paragraph(String(preview.warning ?? "")));
-      body.appendChild(paragraph(String(preview.reason ?? ""), "u-hint"));
-    } catch (error) {
-      body.appendChild(errorCard(uiError(error, { module: "版本", action: "恢复到此版本" })));
-    }
+    // 预读是只读的：读失败只影响这一块，重试就地重读，不必关掉整个对话框
+    const previewHost = el("div", {});
+    const loadPreview = async (): Promise<void> => {
+      fill(previewHost);
+      try {
+        const preview = await this.ctx.api.storyRestore(instanceId, timelineId, String(commit.id ?? ""), false, false);
+        const coverage = (preview.coverage as Json) ?? {};
+        previewHost.appendChild(
+          facts([
+            ["回到的世界时刻", String(coverage.to_world ?? "—")],
+            ["现在", String(coverage.now_world ?? "—")],
+            ["这条线已投递的回复总数", String(coverage.delivered_replies ?? 0)],
+          ]),
+        );
+        previewHost.appendChild(paragraph(String(preview.warning ?? "")));
+        previewHost.appendChild(paragraph(String(preview.reason ?? ""), "u-hint"));
+      } catch (error) {
+        previewHost.appendChild(
+          errorCard(
+            uiError(error, {
+              module: "版本",
+              action: "恢复到此版本",
+              done: "没有改动任何数据",
+              unknown: "这次读取是否成功",
+            }),
+            [{ label: "重试读取", run: () => void loadPreview() }],
+          ),
+        );
+      }
+    };
+    await loadPreview();
+    body.appendChild(previewHost);
     body.appendChild(
       paragraph("恢复是覆盖操作：先保存当前进展（保存为分支或导出），确认页才能体现「当前进展已保留」。", "u-hint"),
     );

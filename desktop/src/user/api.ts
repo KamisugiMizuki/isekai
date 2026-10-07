@@ -71,6 +71,7 @@ export function uiError(error: unknown, ctx: ErrorContext): UiError {
   if (error instanceof MgmtError) {
     base.code = error.code;
     base.retryable = error.retryable;
+    base.stage = error.stage;
     const known = CODE_TEXT[error.code] ?? "这一步没有完成";
     // 底层自由文本照实带上（不臆猜），只在前面加一句能看懂的定性
     base.message = error.message && !error.message.startsWith(error.code)
