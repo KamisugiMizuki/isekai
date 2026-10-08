@@ -188,7 +188,6 @@ CREATE TABLE IF NOT EXISTS commit_snapshot(
   -- 依赖关系显式落列（§8）：删除线时按等值查依赖，不再 LIKE 扫全部快照大 JSON
   base_commit_id TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS ix_commit_snapshot_base ON commit_snapshot(base_commit_id);
 
 CREATE TABLE IF NOT EXISTS commit_log(
   id TEXT PRIMARY KEY,
@@ -1789,6 +1788,7 @@ class Store:
             self._migrate_disclosure_pk()
             self._migrate_runtime_tables()
             self._migrate_character_state()
+            self._migrate_commit_snapshot_base()
             row = self._conn.execute("SELECT value FROM meta WHERE key='data_format'").fetchone()
             if row is None:
                 self._conn.execute(
@@ -1798,6 +1798,23 @@ class Store:
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema', ?)", (str(SCHEMA_VERSION),)
             )
             self._conn.commit()
+
+    def _migrate_commit_snapshot_base(self) -> None:
+        """旧库补 `base_commit_id` 列与索引（§8）。
+
+        列写在 `CREATE TABLE` 里只对新库生效：老库的表已存在，`CREATE TABLE IF NOT EXISTS`
+        是空操作，紧接着的 `CREATE INDEX ... (base_commit_id)` 会以「no such column」把整个
+        `executescript(SCHEMA)` 打断——**老数据根再也打不开**。所以列与索引都放到这里补，
+        `ensure_schema` 在跑完 SCHEMA 之后调用（对新库是幂等的空操作）。
+        """
+        columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(commit_snapshot)")}
+        if columns and "base_commit_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE commit_snapshot ADD COLUMN base_commit_id TEXT NOT NULL DEFAULT ''"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_commit_snapshot_base ON commit_snapshot(base_commit_id)"
+        )
 
     def _migrate_character_state(self) -> None:
         """旧库回填归档态（§六）：从既有死亡事件把状态位补出来。

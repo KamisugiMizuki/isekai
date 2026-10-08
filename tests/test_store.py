@@ -113,3 +113,34 @@ def test_history_page_walks_backwards(store):
     assert first["has_more"] is True
     older = store.history_page("se-1", limit=2, before_seq=first["next_before_seq"])
     assert [row["text"] for row in older["messages"]] == ["hello 1", "hello 2"]
+
+
+def test_legacy_db_without_base_commit_id_still_opens(tmp_path):
+    """老数据根必须能重新打开：`base_commit_id` 由迁移补，不能写在 SCHEMA 的建表里就当老库也有。
+
+    回归点（2026-10-08 真壳验收抓到）：列只写进 `CREATE TABLE` 时，老库的表已存在、
+    `CREATE TABLE IF NOT EXISTS` 是空操作，紧随其后的 `CREATE INDEX ... (base_commit_id)`
+    会以 `no such column` 中断整个 `executescript(SCHEMA)`——用户的数据根再也打不开。
+    """
+    path = tmp_path / "isekai.db"
+    store = Store(path)
+    store.ensure_schema()
+    with store._lock, store._conn:
+        store._conn.execute(
+            """INSERT INTO commit_snapshot(commit_id, instance_id, payload, size, created_at, base_commit_id)
+               VALUES('cid-legacy','in-1','{}',2,1.0,'')"""
+        )
+        # 退回旧形态：没有这一列、也没有它的索引
+        store._conn.execute("DROP INDEX IF EXISTS ix_commit_snapshot_base")
+        store._conn.execute("ALTER TABLE commit_snapshot DROP COLUMN base_commit_id")
+    store.close()
+
+    again = Store(path)
+    again.ensure_schema()  # 不许抛
+    columns = {str(row[1]) for row in again._conn.execute("PRAGMA table_info(commit_snapshot)")}
+    assert "base_commit_id" in columns, "迁移要把列补回来"
+    indexes = {str(row[1]) for row in again._conn.execute("PRAGMA index_list('commit_snapshot')")}
+    assert "ix_commit_snapshot_base" in indexes, "迁移要把索引补上"
+    assert again._conn.execute("SELECT count(*) FROM commit_snapshot").fetchone()[0] == 1, "老行不许丢"
+    again.ensure_schema()  # 幂等：再跑一次不报错
+    again.close()
