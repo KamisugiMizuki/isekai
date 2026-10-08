@@ -20,9 +20,16 @@ import { SettingsPane } from "./settings";
 import { WorldsPane } from "./worlds";
 import { TrpgPane } from "./trpg";
 import { WritingPane } from "./writing";
-import { Launcher } from "./launcher";
 
 export type PaneId = "home" | "contact" | "writing" | "trpg" | "worlds" | "settings" | "help" | "onboarding" | "create";
+
+/**
+ * 三个工作区的模式（原「选择应用」浮层的「应用模式」）。
+ *
+ * 浮层删除后（2026-10-08）这个值不再由用户选，而是**走进工作区时隐式记下**：
+ * 顶栏归属（工作区标题旁的图标）、子页面返回去处、首次设置「选择第一件事」的默认值都读它。
+ */
+export type AppMode = "chat" | "writer" | "gm";
 
 export interface Route {
   pane: PaneId;
@@ -276,10 +283,9 @@ export class App {
       // 已经有世界的老用户（升级上来的）：别再把人塞回向导，补一个标记就好
       void this.setPrefs({ [PREF_KEYS.onboard]: true });
     }
-    // 走完首次设置但还没选过应用：这时问「你想从哪个入口进」是有意义的
-    if (!this.prefs.app_mode) {
-      new Launcher(this.context()).show(true);
-    }
+    // 「选择应用」浮层已删除（2026-10-08）：走完首次设置就直接落在首页——
+    // 首页那三块入口与浮层原来问的三个是同一套；工作区从首页 / ⋯ 菜单 / 世界详情进，
+    // 进去时隐式记下「当前应用」（见 open()），不再为收集这一个偏好弹一屏挡住页面。
   }
 
   private build(): void {
@@ -297,9 +303,10 @@ export class App {
 
   /* ---------------------------------------------------------------- 顶栏 / 条幅 */
 
-  /** 上一级页面：应用三页（联络 / 写作 / 跑团）与首页之上是启动选择器，其余页面挂在当前应用下。 */
+  /** 上一级页面：首页是枢纽（没有上一级）；三个工作区的上一级是首页；其余页面挂在当前工作区下。 */
   private parentTarget(): Route | null {
-    if (APP_ROOT_PANES.has(this.route.pane)) return null;
+    if (this.route.pane === "home") return null;
+    if (APP_ROOT_PANES.has(this.route.pane)) return { pane: "home" };
     // 首次设置还没走完时，「上一级」不能是角色联络：用户根本还没见过那一页（那时它是空的），
     // 顶栏却写着「← 返回角色联络」（2026-10-08 视觉体系审查）。这时给首页这条真退路。
     if (this.route.pane === "onboarding" && !this.prefs[PREF_KEYS.onboard]) return { pane: "home" };
@@ -312,13 +319,13 @@ export class App {
     const atAppRoot = Boolean(this.current) && this.route.pane === appPane(mode);
     const parent = this.current ? this.parentTarget() : null;
 
-    // 返回按钮写清去处（原来只有一个应用图标，点下去回哪儿看不出来）
-    const backLabel = parent ? `← 返回${paneTitle(parent.pane)}` : "← 返回选择应用";
-    const backBtn = button(backLabel, () => {
-      if (parent) this.navigate(parent);
-      else new Launcher(this.context()).show();
-    }, { class: "u-btn u-btn-back", id: "u-back", title: backLabel });
-    backBtn.setAttribute("aria-label", backLabel);
+    // 返回按钮写清去处（原来只有一个应用图标，点下去回哪儿看不出来）；
+    // 首页本身就是枢纽，没有上一级——那里不出返回键，省得「返回首页」指向自己。
+    const backLabel = parent ? `← 返回${paneTitle(parent.pane)}` : "";
+    const backBtn = parent
+      ? button(backLabel, () => this.navigate(parent), { class: "u-btn u-btn-back", id: "u-back", title: backLabel })
+      : null;
+    backBtn?.setAttribute("aria-label", backLabel);
 
     const moreBtn = button("⋯", () => this.showMoreMenu(), { class: "u-btn u-ghost", id: "u-more-btn", title: "更多选项" });
     moreBtn.setAttribute("aria-label", "更多选项");
@@ -353,15 +360,20 @@ export class App {
   private showMoreMenu(): void {
     const menu = el("div", { class: "u-more-menu", role: "menu", "aria-label": "更多选项" });
     const backdrop = el("div", { class: "u-more-backdrop" });
-    // 页面入口与动作分开：以前五项平铺，用户分不出「返回选择应用」是个动作
+    // 页面入口与全局页分开（可读性审查 P1-4 的分组保留）：「选择应用」浮层删除后
+    // （2026-10-08），三个工作区在这里直接进——与首页三块入口是同一套去处，不再弹浮层中转。
     const groups: Array<Array<{ label: string; action: () => void }>> = [
       [
         { label: "首页", action: () => this.navigate({ pane: "home" }) },
-        { label: "设置", action: () => this.navigate({ pane: "settings" }) },
-        { label: "帮助与诊断", action: () => this.navigate({ pane: "help" }) },
+        { label: "角色联络", action: () => this.navigate({ pane: "contact" }) },
+        { label: "辅助写作", action: () => this.navigate({ pane: "writing" }) },
+        { label: "跑团", action: () => this.navigate({ pane: "trpg" }) },
         { label: "世界管理", action: () => this.navigate({ pane: "worlds" }) },
       ],
-      [{ label: "返回选择应用", action: () => new Launcher(this.context()).show() }],
+      [
+        { label: "设置", action: () => this.navigate({ pane: "settings" }) },
+        { label: "帮助与诊断", action: () => this.navigate({ pane: "help" }) },
+      ],
     ];
     const trigger = document.getElementById("u-more-btn") as HTMLElement | null;
     const close = (): void => {
@@ -571,6 +583,14 @@ export class App {
     this.current?.unmount?.();
     this.current = null;
     this.route = target;
+    // 「当前应用」改为走进工作区时**隐式记下**（2026-10-08 删除「选择应用」浮层）：
+    // 顶栏归属、子页面的返回去处、首次设置「选择第一件事」的默认值都读它。
+    // 只在真的切到工作区、且值确实变了才写，避免每次导航都产生一次偏好写入与「最近使用」。
+    const mode = appModeOf(target.pane);
+    if (mode && String(this.prefs.app_mode ?? "") !== mode) {
+      void this.setPrefs({ app_mode: mode });
+      this.rememberRecent({ pane: target.pane, label: paneTitle(target.pane), key: `launch:${mode}` });
+    }
     clear(this.mainHost);
     if (!this.apiRef) {
       this.renderStartup();
@@ -898,14 +918,22 @@ export class App {
   }
 }
 
-/** 应用根页（它们的上一级是启动选择器）；首页是通用落点，同样归在根这一层。 */
+/** 应用根页（首页 + 三个工作区）：首页是枢纽，工作区的上一级是首页。 */
 const APP_ROOT_PANES: ReadonlySet<PaneId> = new Set<PaneId>(["home", "contact", "writing", "trpg"]);
 
-/** 启动选择器的三个模式 → 对应的应用根页（与 launcher.launch 的路由一致） */
+/** 工作区模式 → 对应的工作区页（原「选择应用」的路由表，现在只用于落点与偏好） */
 export function appPane(mode: string): PaneId {
   if (mode === "writer") return "writing";
   if (mode === "gm") return "trpg";
   return "contact";
+}
+
+/** 反过来：这一页属于哪个应用模式（不是工作区就返回空串） */
+export function appModeOf(pane: PaneId): AppMode | "" {
+  if (pane === "writing") return "writer";
+  if (pane === "trpg") return "gm";
+  if (pane === "contact") return "chat";
+  return "";
 }
 
 export function appIcon(mode: string): string {

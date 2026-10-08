@@ -6,11 +6,10 @@
  * 未通过的能力测试不带绿色就绪，也不写进正式配置。
  */
 
-import type { AppContext, Pane } from "./app";
+import type { AppContext, AppMode, Pane } from "./app";
 import { appPane, paneTitle } from "./app";
 import type { Json } from "./api";
 import { uiError } from "./api";
-import type { AppMode } from "./launcher";
 import { migrateCard } from "./migrate";
 import { aiSetup } from "./ai-setup";
 import { button, el, errorCard, field, fill, pageHead, paragraph, primary, section, setNote, stamp } from "./dom";
