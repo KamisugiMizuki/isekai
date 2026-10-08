@@ -63,16 +63,20 @@ async def open_menu(cdp: Any, label: str) -> bool:
 
 
 async def launch_app(cdp: Any, card: str) -> bool:
-    """从启动器选一个应用（先点返回按钮弹出选择器；在子页面要多点一次回到应用根）。"""
+    """进一个工作区（联络 / 写作 / 跑团）。
+
+    「选择应用」浮层已删除（2026-10-08）：三个工作区与首页都在同一层，从 ⋯ 菜单或首页
+    直接进即可，不再有「先弹浮层再点卡片」这一跳。参数沿用旧卡名，调用方不用改。
+
+    **等壳搭好再导航**：`connected` 事件早于 `boot()` 自己那一次导航（它会把 home / onboarding
+    排进 `navChain`，晚到的写入会盖掉这里的目标——`open()` 里「更新的导航接管」那条判断）。
+    直接抢跑会让工作区根本没挂上，探针后面全线误报，所以这里等 ⋯ 按钮出现、并允许重试。
+    """
     pane = APP_PANES[card]
+    await wait_true(cdp, "!!document.getElementById('u-more-btn')", timeout=60)
     for _ in range(3):
-        if await cdp.js("!!document.querySelector('.u-launcher')"):
-            break
-        await cdp.js("document.getElementById('u-back')?.click()")
-        if await wait_true(cdp, "!!document.querySelector('.u-launcher')", timeout=6):
-            break
-    if not await cdp.js("!!document.querySelector('.u-launcher')"):
-        return False
-    if not await click_text(cdp, ".u-launcher-card", card):
-        return False
-    return await wait_true(cdp, f"window.__uiApp.probeState.route.pane==={json.dumps(pane)}")
+        await cdp.js(f"window.__uiApp && window.__uiApp.navigate({{pane:{json.dumps(pane)}}})")
+        if await wait_true(cdp, f"window.__uiApp.probeState.route.pane==={json.dumps(pane)}", timeout=20):
+            return True
+        await asyncio.sleep(0.5)
+    return False

@@ -121,11 +121,9 @@ async def main() -> None:
         async def S(name: str, focus: str = "") -> None:
             shots.append(await shot(cdp, name, focus))
 
-        # ---- 01 启动器（首启新顺序之后可能不弹：直接从「首次设置」开始）----
-        if await nav.wait_true(cdp, "!!document.querySelector('.u-launcher')", timeout=12):
-            await S("01_launcher")
-            await nav.click_text(cdp, ".u-launcher-card", "isekai Chat")
-            await nav.wait_true(cdp, "!document.querySelector('.u-launcher-overlay')", timeout=20)
+        # ---- 01 首屏：「选择应用」浮层已删除（2026-10-08），第一次打开直接进向导 ----
+        await S("01_first_screen")
+        check("没有「选择应用」浮层（已删除）", not await cdp.js("!!document.querySelector('.u-launcher')"))
         await asyncio.sleep(0.8)
 
         # ---- 02 首次设置：本机检查 → 连接 AI → 选择第一件事 ----

@@ -113,7 +113,6 @@ async def main() -> None:
         if not await wait_true(cdp, "!!(window.__uiApp && window.__uiApp.probeState.connected)"):
             check("N0 界面连上核心", False, "没有连上核心")
             return
-        await cdp.js("document.querySelector('.u-launcher-overlay')?.remove()")
 
         # ---------------- N1 入口跳步 ----------------
         # navigate() 是排队执行的（navChain），不等首页真的画出来就点会点空：
@@ -224,14 +223,29 @@ async def main() -> None:
                 f"标签={back_label!r}｜点前={on_settings}｜点后={await route_pane(cdp)}",
             )
             root_label = str(await cdp.js("document.getElementById('u-back')?.textContent||''"))
-            check("N4b 应用根的返回是选择应用", "选择应用" in root_label, f"标签={root_label!r}")
+            check("N4b 工作区的返回是首页", "返回首页" in root_label, f"标签={root_label!r}")
+            await click_text(cdp, "#u-back", "返回首页")
+            back_home = await wait_true(cdp, "window.__uiApp.probeState.route.pane==='home'", timeout=30)
+            check("N4c 工作区点返回回首页", back_home, f"点后={await route_pane(cdp)}")
 
-        # ---------------- N5 5 秒内返回照样弹选择器 ----------------
-        await click_text(cdp, ".u-launcher-card", "isekai Writer")
-        await wait_true(cdp, "window.__uiApp.probeState.route.pane==='writing'", timeout=20)
-        await click_text(cdp, "#u-back", "选择应用")          # 刚选过 < 5 秒
-        again = await wait_true(cdp, "!!document.querySelector('.u-launcher')", timeout=20)
-        check("N5 刚选过应用再点返回仍有选择器", bool(again), f"5 秒内={again}")
+        # ---------------- N5 首页没有返回键（首页就是枢纽），⋯ 菜单能直接进工作区 ----------------
+        on_home = await route_pane(cdp) == "home"
+        home_back = await cdp.js("!!document.getElementById('u-back')")
+        check(
+            "N5 首页不出返回键",
+            on_home and not home_back,
+            f"在首页={on_home}｜有返回键={home_back}",
+        )
+        await cdp.js("document.getElementById('u-more-btn')?.click()")
+        picked = False
+        if await wait_true(cdp, "!!document.querySelector('.u-more-menu')", timeout=10):
+            picked = await click_text(cdp, ".u-more-menu-item", "跑团")
+        await wait_true(cdp, "window.__uiApp.probeState.route.pane==='trpg'", timeout=30)
+        check(
+            "N5b ⋯ 菜单直接进工作区（不再经选择应用浮层）",
+            picked and await route_pane(cdp) == "trpg" and not await cdp.js("!!document.querySelector('.u-launcher')"),
+            f"点中={picked}｜落点={await route_pane(cdp)}",
+        )
 
         print("\n结果:", "PASS" if not PROBLEMS else f"FAIL {len(PROBLEMS)} 项", flush=True)
         for item in PROBLEMS:
