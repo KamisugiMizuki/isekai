@@ -179,6 +179,23 @@ async def main() -> None:
     problems: list[str] = []
     try:
         await cdp.js(desk.STUB)  # 原生 confirm/对话框 stub：删除这类破坏性路径要用
+        # 壳现在默认进正式界面，调试面板藏在「帮助与诊断 → 高级调试」后面：
+        # 不先切过去，`nav .nav[data-pane]` 根本不存在，探针会停在「列不出实例」
+        if await cdp.js("document.body.dataset.mode!=='debug'"):
+            entered = await cdp.js(
+                "(()=>{const b=[...document.querySelectorAll('#u-main button')]"
+                ".find(x=>(x.textContent||'').includes('进入高级调试'));"
+                "if(!b){return 'no-button';}b.click();return 'clicked';})()"
+            )
+            if entered == "no-button":
+                await cdp.js("window.__uiApp && window.__uiApp.navigate({pane:'help'})")
+                await asyncio.sleep(1.5)
+                await cdp.js(
+                    "(()=>{const b=[...document.querySelectorAll('#u-main button')]"
+                    ".find(x=>(x.textContent||'').includes('进入高级调试'));"
+                    "if(b){b.click();return true;}return false;})()"
+                )
+            await wait_js(cdp, "document.body.dataset.mode==='debug'")
         await cdp.pane("manage")
         listed = await wait_js(
             cdp,

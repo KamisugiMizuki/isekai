@@ -282,7 +282,10 @@ async def main() -> None:
             print(f"截图失败：{type(exc).__name__}: {exc}", flush=True)
         say("玩家面", play[:180])
 
-        # ---------------- 4) 行动：确认卡 → 确认并裁定 ----------------
+        # ---------------- 4) 行动：确认卡 → 确认并算结果 ----------------
+        # 术语收口（2026-10-08 审查第 8 节，早于本轮）：按钮是「查看这次行动 / 确认并算结果」，
+        # 打开确认卡后状态行说「这次行动可以确认了…」——旧文案（查看行动确认卡 / 确认并裁定 /
+        # 行动确认卡已就绪 / 视角：主持 / 主持准备）都已不在界面上。
         before = inspect(root)
         await set_value(cdp, "#u-trpg-intent", INTENT)
         await cdp.js(
@@ -291,11 +294,16 @@ async def main() -> None:
         )
         await set_value(cdp, "#u-trpg-target", "rl-1")
         await set_value(cdp, "#u-trpg-method", "沿堤顶走过去，看水深")
-        await click_text(cdp, "#u-main button", "查看行动确认卡")
-        carded = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('行动确认卡已就绪')", timeout=120)
+        await click_text(cdp, "#u-main button", "查看这次行动")
+        carded = await wait_true(
+            cdp,
+            "(()=>{const t=document.querySelector('#u-main').innerText;"
+            "return t.includes('可以确认了')||t.includes('已经可以确认');})()",
+            timeout=120,
+        )
         if not carded:
             card_text = await cdp.js(
-                "(()=>{const s=[...document.querySelectorAll('.u-section')].find(x=>(x.textContent||'').includes('行动确认卡'));"
+                "(()=>{const s=[...document.querySelectorAll('.u-section')].find(x=>(x.textContent||'').includes('这次行动'));"
                 "return s?(s.innerText||'').slice(0,240):'（没有确认卡分区）';})()"
             )
             problems.append(f"没有拿到行动确认卡：卡面={card_text}")
@@ -311,7 +319,7 @@ async def main() -> None:
         resolved = await wait_true(
             cdp,
             "(()=>{const t=document.querySelector('#u-main .u-note')?.innerText||document.querySelector('#u-main').innerText;"
-            "return t.includes('已固化');})()",
+            "return t.includes('已固化')||t.includes('写进世界');})()",
             timeout=180,
         )
         await asyncio.sleep(2.0)
@@ -328,23 +336,23 @@ async def main() -> None:
         say("行动", {"行动行": after["actions"], "事件": [before["events"], after["events"]]})
 
         # ---------------- 5) 主持面 ----------------
-        await click_text(cdp, "#u-main button", "主持准备")
-        gm = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('视角：主持')", timeout=90)
+        await click_text(cdp, "#u-main button", "主持视图")
+        gm = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('当前是主持视图')", timeout=90)
         if not gm:
             # 第一次切换撞上核心忙段时再点一次（用户也会这么干）
-            await click_text(cdp, "#u-main button", "主持准备")
-            gm = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('视角：主持')", timeout=90)
+            await click_text(cdp, "#u-main button", "主持视图")
+            gm = await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('当前是主持视图')", timeout=90)
         gm_text = await visible_text(cdp)
         for need in ("待处理行动", "直接变化", "场景准备", "暂停战役"):
             if need not in gm_text:
                 problems.append(f"主持面缺：{need}")
         say("主持面", gm_text[:170])
-        await click_text(cdp, "#u-main button", "主持准备")
+        await click_text(cdp, "#u-main button", "玩家视图")
         await asyncio.sleep(1.5)
         back = await visible_text(cdp)
         if "直接变化" in back or "待处理行动" in back:
             problems.append("切回玩家视图后主持内容还在（受众投影没有重取）")
-        if "视角：主持" in back:
+        if "当前是主持视图" in back:
             problems.append("切回玩家视图之后还标着主持")
         say("切回", back[:120])
 

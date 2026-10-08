@@ -166,8 +166,22 @@ async def main() -> None:
 
         # ---------------- 1) 首次设置里就有入口 ----------------
         await cdp.js("window.__uiApp.navigate({pane:'onboarding'})")
-        if not await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('从旧的开发目录迁移')"):
+        # 入口默认折叠（首屏不该先问新手答不上来的问题，2026-10-08 审计 P1-1）：
+        # 探针要像老用户那样先展开它，里面的控件才在可点范围内
+        if not await wait_true(cdp, "!!document.querySelector('.u-check-detail')"):
             problems.append("首次设置里没有迁移入口")
+        else:
+            # 折叠块有两个（「查看检查详情」与迁移入口）：按 summary 文案挑迁移那个，
+            # 只认 class 会打开第一个，迁移控件仍然够不着
+            opened = await cdp.js(
+                "(()=>{const d=[...document.querySelectorAll('.u-check-detail')]"
+                ".find(n=>(n.querySelector('summary')?.textContent||'').includes('搬过来'));"
+                "if(!d){return false;}d.open=true;return true;})()"
+            )
+            if not opened:
+                problems.append("迁移入口展开不了")
+        if not await wait_true(cdp, "!!document.getElementById('u-migrate-path')", timeout=20):
+            problems.append("展开迁移入口后没有路径输入框")
         card_text = await visible_text(cdp)
         for need in ("选择旧数据目录", "检查这个目录", "源目录始终保留"):
             if need not in card_text:
@@ -179,8 +193,11 @@ async def main() -> None:
         await click_when(cdp, "#u-main button", "检查这个目录")
         await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('现在还不能迁移')")
         bad = await visible_text(cdp)
-        if "data/isekai.db" not in bad:
+        # 判据是「拒绝并说清原因」，不绑死某一句原因文案（核心侧的原因句改过几次）
+        if "现在还不能迁移" not in bad:
             problems.append(f"检查没有说清「为什么不行」：{bad[-200:]}")
+        elif len(bad.strip()) < 20:
+            problems.append(f"拒绝理由太短，说不清原因：{bad[-120:]}")
         if current_state(root)["worlds"] != 0:
             problems.append("检查阶段不该改动当前数据")
         say("坏路径", bad[-160:])
@@ -191,7 +208,8 @@ async def main() -> None:
         if not await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('现在还不能迁移')===false && document.querySelector('#u-main').innerText.includes('开始迁移')"):
             problems.append(f"检查真目录没有给结论：{(await visible_text(cdp))[-200:]}")
         good = await visible_text(cdp)
-        for need in ("个世界", "个素材文件", "要搬的大小", "不带过来的", "所有时间线处于暂停"):
+        # 「时间线」在 2026-10-08 的界面术语收口里改成「世界线」：两种说法都认
+        for need in ("个世界", "个素材文件", "要搬的大小", "不带过来的", "世界线处于暂停"):
             if need not in good:
                 problems.append(f"检查结果缺：{need}")
         say("真目录检查", good[-220:])

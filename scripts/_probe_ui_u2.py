@@ -220,7 +220,10 @@ async def main() -> None:
         before = timeline_rows(root, seeded["instance_id"])
         await click_text(cdp, "#u-main button", "查看草案")
         got_draft = await wait_true(
-            cdp, "document.querySelector('#u-main').innerText.includes('草案编号')", timeout=60
+            cdp,
+            "(()=>{const t=document.querySelector('#u-main').innerText;"
+            "return t.includes('草案已生成')||t.includes('等你确认');})()",
+            timeout=60,
         )
         draft_view = await visible_text(cdp)
         after_draft = timeline_rows(root, seeded["instance_id"])
@@ -284,8 +287,22 @@ async def main() -> None:
         say("删除后", remaining)
 
         # ---------------- 5) 归档：从常用列表隐藏，开关能看回来 ----------------
-        await click_row(cdp, "初始时间线", "归档")
-        if not await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('显示已归档')"):
+        # 归档改成「先确认再生效」（可用性评审 P1：一键生效没有回头路）：点行内「归档…」
+        # 会开一个对话框，必须再点「归档这条线」才真的归档——探针要跟着点两下。
+        opened = await click_row(cdp, "初始时间线", "归档…")
+        if opened != "ok":
+            problems.append(f"归档按钮点不到：{opened}")
+        if not await wait_true(cdp, "!!document.querySelector('.u-dialog')"):
+            problems.append("归档没有先给确认对话框")
+        else:
+            confirmed = await cdp.js(
+                "(()=>{const box=document.querySelector('.u-dialog');"
+                "const hit=[...box.querySelectorAll('button')].find(b=>(b.textContent||'').includes('归档这条线'));"
+                "if(!hit){return false;}hit.click();return true;})()"
+            )
+            if not confirmed:
+                problems.append("归档确认对话框里点不到「归档这条线」")
+        if not await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('显示已归档')", timeout=30):
             problems.append("归档后没有出现「显示已归档」开关")
         hidden = await visible_text(cdp)
         if "运行中" in hidden or "已暂停" in hidden:
@@ -296,7 +313,7 @@ async def main() -> None:
         if not shown or "已归档" not in archived:
             problems.append(f"打开开关后看不到已归档的线：{archived[-200:]}")
         still_offered = await cdp.js(
-            "[...document.querySelectorAll('#u-main button')].filter(n=>n.textContent.trim()==='归档').length"
+            "[...document.querySelectorAll('#u-main button')].filter(n=>n.textContent.trim()==='归档…').length"
         )
         if still_offered:
             problems.append("已归档的线不该再给归档按钮")

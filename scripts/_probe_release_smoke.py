@@ -99,7 +99,14 @@ async def main() -> None:
         # 新顺序（2026-10-07 可用性评审 P0-2）：第一次打开直接进「首次设置」，
         # 不再先弹三选一；「选择应用」推迟到首次设置之后。所以这里不再点启动器卡片。
         steps: list[str] = []
-        route0 = str(await cdp.js("JSON.stringify(window.__uiApp.probeState.route)"))
+        # 落点可能慢一拍（壳先渲染应用根、再进向导）：等一会儿再看 route，别抢这一拍
+        # （2026-10-08 实测：同一份发行件第一次读成 home、再跑一次就是 onboarding）
+        route0 = ""
+        for _ in range(30):
+            route0 = str(await cdp.js("JSON.stringify(window.__uiApp.probeState.route)"))
+            if "onboarding" in route0:
+                break
+            await asyncio.sleep(0.5)
         steps.append(f"首启 route：{route0}")
         if "onboarding" not in route0:
             problems.append(f"第一次打开没有直接进「首次设置」（route={route0}）")

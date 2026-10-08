@@ -82,7 +82,12 @@ async def main() -> int:
         print("== knowledge/memory/intent/memory_task counts ==")
         for table, where in (("knowledge", "character_id='cc-程霜'"), ("memory", "1=1"), ("intent", "1=1"), ("memory_task", "character_id='cc-程霜'")):
             n = db_rows(f"SELECT COUNT(*) n FROM {table} WHERE instance_id=? AND timeline_id=? AND {where}", (INSTANCE, TIMELINE))
-            states = db_rows(f"SELECT state, COUNT(*) n FROM {table} WHERE instance_id=? AND timeline_id=? AND {where} GROUP BY state", (INSTANCE, TIMELINE))
+            # 不是每张表都有 state 列（knowledge 就没有）：先问列存不存在，再决定要不要分组
+            has_state = bool(db_rows(f"SELECT name FROM pragma_table_info('{table}') WHERE name='state'"))
+            states = (
+                db_rows(f"SELECT state, COUNT(*) n FROM {table} WHERE instance_id=? AND timeline_id=? AND {where} GROUP BY state", (INSTANCE, TIMELINE))
+                if has_state else "（该表没有 state 列）"
+            )
             print(f"  {table}: n={n[0]['n']} states={states}")
         return 0
     finally:

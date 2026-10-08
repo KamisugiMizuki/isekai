@@ -311,6 +311,11 @@ async def main() -> None:
             raise SystemExit("止损：界面没连上核心")
 
         # ---------------- 1) 来源 ----------------
+        # 首启现在直接进「首次设置」（可用性评审 P0-2）：⋯ 菜单只在应用壳里有，
+        # 所以先回到应用根再走菜单——不修这一步会在向导页空等，后面全线误报。
+        if "首次设置" in await visible_text(cdp):
+            await cdp.js("window.__uiApp.navigate({pane:'home'})")
+            await wait_true(cdp, "!!document.getElementById('u-more-btn')", timeout=30)
         await nav.open_menu(cdp, "世界管理")
         await wait_true(cdp, "document.querySelector('#u-main').innerText.includes('世界')")
         await asyncio.sleep(1.2)
