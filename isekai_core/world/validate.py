@@ -506,9 +506,20 @@ def _validate_canon_sources(package: dict[str, Any], errors: list[str]) -> set[s
         errors.append("sources: 缺少信息来源列表")
         sources = []
     _check_unique(sources, "sources", errors)
+    registered_regions = region_ids(package)
     for index, source in enumerate(sources):
-        if isinstance(source, dict) and not _text(source.get("reach")):
+        if not isinstance(source, dict):
+            continue
+        if not _text(source.get("reach")):
             errors.append(f"sources[{index}].reach: 缺少接触条件")
+        # B-4 v2（S1）：来源可声明所在区域。**可选**——未声明即「不参与拓扑传播计算」，
+        # 与声明 `regions` 之前的行为逐字节相同。声明了就必须是已登记区域（不静默降级成自由文本）。
+        region = source.get("region")
+        if region is not None and str(region) not in registered_regions:
+            errors.append(
+                f"sources[{index}].region: 未登记的区域 {region!r}"
+                "（必须是 world.regions[].id；未登记即失败，不静默降级）"
+            )
 
     canon = package.get("canon")
     if not isinstance(canon, list):
@@ -994,6 +1005,12 @@ def _validate_events(
     density = events.get("density") if isinstance(events, dict) else None
     if density not in DENSITY_TARGETS:
         errors.append(f"events.density: 必须是 {' / '.join(DENSITY_TARGETS)} 之一（体裁必填）")
+    # B-4 v2：每跳延迟（可选）。声明它才会启用「说法传播延迟 = 来源延迟 + 跳数 × 每跳延迟」。
+    hop_delay = events.get("hop_delay_seconds") if isinstance(events, dict) else None
+    if hop_delay is not None and (
+        isinstance(hop_delay, bool) or not isinstance(hop_delay, int) or hop_delay <= 0
+    ):
+        errors.append("events.hop_delay_seconds: 必须是正整数世界秒（不声明即不启用拓扑传播）")
     _check_unique(families, "events.families", errors)
     for index, family in enumerate(families):
         if not isinstance(family, dict):

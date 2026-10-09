@@ -349,21 +349,33 @@ def claim_rows(
     event_ident: str,
     world_seconds: int,
     calendar: Any,
+    regions: list[dict[str, Any]] | None = None,
+    hop_delay_seconds: int = 0,
 ) -> list[dict[str, Any]]:
     """说法集合：每条带来源渠道、受众条件、最早传播时刻与可信线索（§二、§五）。
 
     阶段 3 的说法由骨架直接派生（真实、片面的版本）；失真 / 立场改写属内容生成路径，
     需要时再经 LLM 在骨架约束内产出，不能反过来决定事件事实。
+
+    **B-4 v2（S2）**：`earliest_world = world_seconds + delay_seconds + 跳数 × hop_delay_seconds`。
+    「跳数」= 事件效果 target 里的**区域**到「该来源声明所在区域」的**最小可达代价**（`space.reachable`）。
+    缺省（`regions` 为空 / `hop_delay_seconds` 为 0 / 来源未声明 `region`）⇒ **与接入前逐字节相同**。
     """
     sources = [item for item in package.get("sources") or [] if isinstance(item, dict)]
     # B-6.1（**纯增量**）：事件模板可声明 `claims`（`source_id → 该来源的表述骨架`），
     # 让同一事件的不同来源说不同的话。未声明时**照旧**回退到事件摘要 ⇒ 既有世界包逐字节不变。
     # 原状是每个来源都拿 `event["summary"]`——1500 世界日实测 9147 条说法只有 8 句不同文本。
     variants = _claim_variants(package, str(event.get("template") or ""))
+    event_regions = _effect_target_regions(event, regions)
     out: list[dict[str, Any]] = []
     for index, source in enumerate(sources):
         source_id = str(source.get("id") or "")
         delay = int(source.get("delay_seconds") or 0)
+        # B-4 v2：只对**声明了 region 的来源**做拓扑折算；其余来源保持原延迟
+        source_region = str(source.get("region") or "")
+        hops = 0
+        if event_regions and source_region and int(hop_delay_seconds) > 0:
+            hops = _min_hops(regions, event_regions, source_region)
         out.append(
             {
                 "id": f"cl-{stable_key(event_ident, source.get('id'))[:12]}",
@@ -373,12 +385,74 @@ def claim_rows(
                 "source_id": source_id,
                 "text": variants.get(source_id) or str(event.get("summary") or ""),
                 "audience": str(source.get("audience") or "公开"),
-                "earliest_world": int(world_seconds) + max(0, delay),
+                "earliest_world": int(world_seconds) + max(0, delay) + int(hops) * int(hop_delay_seconds),
                 "credibility": "recorded",
                 "_order": index,
             }
         )
     return out
+
+
+def _declared_region_ids(regions: list[dict[str, Any]] | None) -> set[str]:
+    return {str(item.get("id") or "") for item in regions or [] if isinstance(item, dict)}
+
+
+def _region_in_scope(
+    card: dict[str, Any], targets: set[str], regions: list[dict[str, Any]] | None
+) -> bool:
+    """角色的区域是否落在「效果 target 区域」的可达范围内。
+
+    **只对确实是已登记区域的 target 做可达扩展**：`effects[].target` 混装区域 / 角色 / 职位 / 环境，
+    若把角色 id 当区域查，会静默得到空集合——那又是一次「静默丢数据」（A-9b 那一类）。
+    """
+    card_region = region_of(card)
+    if not card_region:
+        return False
+    known = _declared_region_ids(regions)
+    if not known or not card_region:
+        # 未声明 regions ⇒ 退回零跳判定（行为与接入前相同）
+        return card_region in targets
+    from . import space
+
+    reach = set(space.reachable(regions, card_region))
+    return any(target in reach for target in targets if target in known)
+
+
+def _event_effect_regions(event: dict[str, Any]) -> list[str]:
+    """事件效果 target 里**确实是已登记区域**的那些（其余 target 是角色 / 职位 / 环境，不参与拓扑）。"""
+    raw = event.get("effects")
+    if isinstance(raw, str):  # 落库后 effects 是 JSON 文本
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = []
+    return [str(item.get("target") or "") for item in raw or [] if isinstance(item, dict)]
+
+
+def _effect_target_regions(event: dict[str, Any], regions: list[dict[str, Any]] | None) -> list[str]:
+    known = _declared_region_ids(regions)
+    return [item for item in _event_effect_regions(event) if item and item in known]
+
+
+def _min_hops(
+    regions: list[dict[str, Any]] | None, origin_regions: list[str], target_region: str
+) -> int:
+    """`origin_regions` 到 `target_region` 的**最小可达代价**；不可达返回 0（不臆造延迟）。
+
+    这是拓扑的**唯一**空间语义：不涉及坐标、连续距离或路径（「能不能到、要几步」）。
+    """
+    from . import space  # 延迟导入：avoid 顶层循环
+
+    best: int | None = None
+    for origin in sorted(origin_regions):
+        if origin == target_region:
+            return 0
+        reach = space.reachable(regions, origin)
+        cost = reach.get(target_region)
+        if cost is None:
+            continue
+        best = cost if best is None else min(best, cost)
+    return int(best or 0)
 
 
 def grants(
@@ -388,10 +462,14 @@ def grants(
     *,
     world_seconds: int,
     calendar: Any,
+    regions: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """某角色的获知记录：亲历（参与者 / 受影响目标）或经卡片渠道接触说法（§五、§13）。
 
     只处理**已成立**的获知：渠道要有、传播时刻要已到；「可能听到」不算已经听到。
+
+    **B-4 v2（S3）**：亲历判定由「零跳」扩展为「角色的区域在**效果 target 区域的 `reachable` 集合内**」。
+    缺省（`regions` 为空）⇒ 退回原来的 `region_of(card) in targets`，行为逐字节相同。
     """
     character_id = str((card.get("meta") or {}).get("card_id") or "")
     channels = {str(item.get("source_id")) for item in card.get("channels") or []}
@@ -404,7 +482,7 @@ def grants(
     targets = {str(item.get("target") or "") for item in raw_effects or [] if isinstance(item, dict)}
     role = str(card.get("role_id") or "")
     out: list[dict[str, Any]] = []
-    involved = role in targets or region_of(card) in targets
+    involved = role in targets or _region_in_scope(card, targets, regions)
     if involved:
         out.append(
             {

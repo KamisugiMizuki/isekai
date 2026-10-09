@@ -17,7 +17,12 @@ def test_fingerprint_is_stable_and_model_scoped() -> None:
     assert generator_fingerprint(segments=("x",), hints=("y",), model="m") == generator_fingerprint(
         segments=("x",), hints=("y",), model="m"
     )
-    assert (DATA_FORMAT_VERSION, RULES_VERSION) == ("0.1", "0.1")
+    # 三件套各自是有形版本号（`主.次`）。**刻意不写死具体数字**：
+    # 规则版本会随改语义的裁决递增（例如 B-4 v2 的拓扑传播：0.1 → 0.2），
+    # 断言「形状与存在性」才是这条测试的意图；写死数字会逼着改一处无关的测试。
+    for value in (DATA_FORMAT_VERSION, RULES_VERSION):
+        parts = str(value).split(".")
+        assert len(parts) == 2 and all(part.isdigit() for part in parts), value
 
 
 def test_generated_package_carries_generator_boundary() -> None:

@@ -4119,6 +4119,19 @@ class RuntimeService:
         del until  # 生效窗口已由 `effect_constraints` 的 `from_world<=until` 决定
         return totals
 
+    def _spatial(self, package: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+        """B-4 v2：把「区域邻接」与「每跳延迟」取出来，传给说法与影响范围的消费方。
+
+        缺省（未声明 `world.regions` 或 `events.hop_delay_seconds`）⇒
+        `regions` 为空 / 每跳延迟为 0 ⇒ 两个消费者都退回接入前的行为（逐字节不变）。
+        """
+        world = package.get("world") if isinstance(package.get("world"), dict) else {}
+        regions = [item for item in (world.get("regions") or []) if isinstance(item, dict)]
+        events_block = package.get("events") if isinstance(package.get("events"), dict) else {}
+        raw = events_block.get("hop_delay_seconds")
+        hop_delay = int(raw) if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else 0
+        return regions, hop_delay
+
     def _world_event_rows(
         self,
         instance: dict[str, Any],
@@ -4137,6 +4150,7 @@ class RuntimeService:
         """
         out: dict[str, list[dict[str, Any]]] = {"events": [], "claims": [], "knowledge": [], "effects": []}
         package = self.setting(instance)["world_package"]
+        regions, hop_delay = self._spatial(package)
         seed, rules = self.seed_of(instance), self.rules_of(instance)
         day_index = calendar.day_index(from_world)
         known_events = self._lazy_event_ids(instance_id, timeline_id)
@@ -4198,11 +4212,15 @@ class RuntimeService:
                     event_ident=ident,
                     world_seconds=at,
                     calendar=calendar,
+                    regions=regions,
+                    hop_delay_seconds=hop_delay,
                 )
             )
             out["claims"].extend(claims)
             for card in cards:
-                out["knowledge"].extend(events.grants(row, claims, card, world_seconds=at, calendar=calendar))
+                out["knowledge"].extend(events.grants(
+                    row, claims, card, world_seconds=at, calendar=calendar, regions=regions
+                ))
         return out
 
     def _entity_death_row(
@@ -4258,6 +4276,7 @@ class RuntimeService:
             "events": [], "claims": [], "knowledge": [], "character_states": []
         }
         package = self.setting(instance)["world_package"]
+        regions, hop_delay = self._spatial(package)
         archived = self._archived_ids(instance_id, timeline_id, until=to_world)
         for card in cards:
             character_id = str((card.get("meta") or {}).get("card_id") or "")
@@ -4308,6 +4327,8 @@ class RuntimeService:
                     event_ident=str(row["id"]),
                     world_seconds=moment,
                     calendar=calendar,
+                    regions=regions,
+                    hop_delay_seconds=hop_delay,
                 )
             )
             out["claims"].extend(claims)
@@ -4315,7 +4336,7 @@ class RuntimeService:
                 if str((other.get("meta") or {}).get("card_id")) == character_id:
                     continue  # 死者不需要自己的死讯
                 out["knowledge"].extend(
-                    events.grants(row, claims, other, world_seconds=moment, calendar=calendar)
+                    events.grants(row, claims, other, world_seconds=moment, calendar=calendar, regions=regions)
                 )
         # 登记实体的寿终（§四）：卡外的人也不是背景板——要点人物的生死同样登记为事件 + 死讯说法
         for entity in package.get("entities") or []:
@@ -4355,12 +4376,14 @@ class RuntimeService:
                     event_ident=str(row["id"]),
                     world_seconds=int(died),
                     calendar=calendar,
+                    regions=regions,
+                    hop_delay_seconds=hop_delay,
                 )
             )
             out["claims"].extend(claims)
             for other in cards:
                 out["knowledge"].extend(
-                    events.grants(row, claims, other, world_seconds=int(died), calendar=calendar)
+                    events.grants(row, claims, other, world_seconds=int(died), calendar=calendar, regions=regions)
                 )
         return out
 
@@ -4638,6 +4661,7 @@ class RuntimeService:
         # 只登记事件与说法、不施加效果（沿用回填的边界）。
         calendar = self.calendar(instance)
         package = self.setting(instance)["world_package"]
+        regions, hop_delay = self._spatial(package)
         moment = int(instance["moment"] or 0)
         key_figures = set(
             events.backfill_key_figures(package, seed=self.seed_of(instance), rules_version=self.rules_of(instance))
@@ -4685,6 +4709,8 @@ class RuntimeService:
                         event_ident=str(row["id"]),
                         world_seconds=int(entity["died"]),
                         calendar=calendar,
+                        regions=regions,
+                        hop_delay_seconds=hop_delay,
                     )
                 )
             )

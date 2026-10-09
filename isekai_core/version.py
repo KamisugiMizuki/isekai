@@ -13,7 +13,11 @@ UMP_VERSION = "1.0"
 UMP_MAJOR = "1"
 
 DATA_FORMAT_VERSION = "0.1"
-RULES_VERSION = "0.1"
+#: B-4 v2（2026-10-10，人类裁决）：说法传播延迟引入**拓扑跳数** ⇒ 「同一设定 + 种子 + 前序状态」
+#: 下角色**何时获知**会不同 ⇒ 世界走上不同的路 ⇒ 必须递增（`WORLD_RUNTIME_SPEC` §十二 兼容性阻断）。
+#: 说明：未声明 `world.regions` 或 `events.hop_delay_seconds` 的世界包行为**逐字节不变**；
+#: 递增是为「拓扑传播一旦被声明就是另一条世界线」这件事留痕，不是为了改动既有实例。
+RULES_VERSION = "0.2"
 
 #: 导出容器格式版本（导入兼容性判定的主版本；主版本不同需要转换工具）
 CONTAINER_FORMAT = "isekai.instance"

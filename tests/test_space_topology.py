@@ -135,3 +135,140 @@ def test_the_coordinate_rejection_guard_itself_exists() -> None:
     assert 'coordinate_like' in src, "区域校验里的坐标拒绝词表不见了"
     assert '不允许坐标' in src, "坐标拒绝的报错文案不见了"
     assert 'ADJACENCY_KINDS' in src, "通行档闭集不见了"
+
+
+# ---------- B-4 v2（S1–S3）：把拓扑接到三处消费者上 ----------
+#
+# 裁决：接受递增 RULES_VERSION（0.1 → 0.2）。核心纪律：**未声明 regions / hop_delay_seconds
+# （或来源未声明 region）的世界包，行为必须与接入前逐字节相同**——这正是「纯增量」的判据。
+
+
+def _source(ident: str, **over) -> dict:
+    item = {"id": ident, "name": ident, "reach": "公开", "delay_seconds": 0}
+    item.update(over)
+    return item
+
+
+def _propagation_package(*, source_region: str | None = None, hop_delay_seconds: int = 86400) -> dict:
+    package = _chain_package()
+    package["sources"] = [_source("src-1", **({"region": source_region} if source_region else {}))]
+    package["events"] = {**(package.get("events") or {}), "hop_delay_seconds": hop_delay_seconds}
+    return package
+
+
+def _claims_for(package: dict, *, target_region: str, at: int = 1000) -> list[dict]:
+    from isekai_core.runtime import events
+
+    event = {"id": "ev-x", "summary": "某件事", "template": "", "effects": [
+        {"kind": "route_blocked", "target": target_region},
+    ]}
+    return events.claim_rows(
+        event, package=package, instance_id="in-1", timeline_id="tl-1",
+        event_ident="ev-x", world_seconds=at, calendar=None,
+        regions=(package["world"] or {}).get("regions"),
+        hop_delay_seconds=int((package.get("events") or {}).get("hop_delay_seconds") or 0),
+    )
+
+
+def events_scope(card: dict, targets: set[str], regions) -> bool:
+    """对 B-4 v2 的判定函数直测（`grants` 的亲历判定用的就是它）。"""
+    from isekai_core.runtime import events
+
+    return bool(events._region_in_scope(card, targets, regions))
+
+
+def test_source_region_must_be_a_declared_region() -> None:
+    """S1：来源声明了 `region` 就必须是已登记区域（不静默降级成自由文本）。"""
+    errors = validate_package(_propagation_package(source_region="pl-不存在"))
+    assert any("sources[0].region" in item for item in errors), errors
+    assert not [item for item in validate_package(_propagation_package(source_region="pl-2"))
+                if "sources" in item], "合法声明不得报错"
+
+
+def test_hop_delay_must_be_a_positive_integer() -> None:
+    for bad in (0, -1, 1.5, True, "86400"):
+        package = _propagation_package(source_region="pl-2")
+        package["events"]["hop_delay_seconds"] = bad
+        errors = validate_package(package)
+        assert any("hop_delay_seconds" in item for item in errors), (bad, errors)
+
+
+def test_propagation_delay_grows_with_hops() -> None:
+    """S2：`earliest_world = world_seconds + delay_seconds + 跳数 × 每跳延迟`。"""
+    hop = 86400
+    # pl-1 → pl-2 相邻（代价 1）；pl-1 → pl-3 代价 3（1+2）
+    near = _claims_for(_propagation_package(source_region="pl-2"), target_region="pl-1")[0]
+    far = _claims_for(_propagation_package(source_region="pl-3"), target_region="pl-1")[0]
+    assert near["earliest_world"] == 1000 + 1 * hop, near
+    assert far["earliest_world"] == 1000 + 3 * hop, far
+    assert far["earliest_world"] > near["earliest_world"], "更远的区域必须更晚到达"
+
+
+def test_propagation_is_unchanged_when_no_binding_is_declared() -> None:
+    """**回归判据**：未声明 region / 未声明 hop_delay ⇒ 与接入前逐字节相同。"""
+    plain = sample_package()
+    baseline = _claims_for(plain, target_region="pl-1")[0]
+    assert baseline["earliest_world"] == 1000, "无绑定时不得凭空增加延迟"
+
+    # 有区域、有每跳延迟，但来源没声明 region ⇒ 同样不增加
+    no_source_region = _claims_for(_propagation_package(), target_region="pl-1")[0]
+    assert no_source_region["earliest_world"] == 1000
+
+    # 有 region，但没有每跳延迟 ⇒ 同样不增加
+    no_hop = _claims_for(
+        _propagation_package(source_region="pl-3", hop_delay_seconds=0), target_region="pl-1"
+    )[0]
+    assert no_hop["earliest_world"] == 1000
+
+
+def test_event_scope_reaches_nearby_regions_not_only_the_exact_one() -> None:
+    """S3：影响范围由「零跳」扩展为「可达集合」——相邻区域的角色也算受影响。"""
+    from isekai_core.runtime import events
+
+    package = _propagation_package(source_region="pl-1")
+    regions = package["world"]["regions"]
+    event = {"id": "ev-y", "instance_id": "in-1", "timeline_id": "tl-1", "summary": "河口出事",
+             "effects": [{"kind": "route_blocked", "target": "pl-2"}]}
+    card_near = {"meta": {"card_id": "cc-near"}, "region": "pl-1"}     # 相邻（代价 1）
+    card_same = {"meta": {"card_id": "cc-same"}, "region": "pl-2"}     # 就在区域内
+    card_far = {"meta": {"card_id": "cc-far"}, "region": "pl-4"}       # 受阻/太远
+    same = events.grants(event, [], card_same, world_seconds=1000, calendar=None, regions=regions)
+    near = events.grants(event, [], card_near, world_seconds=1000, calendar=None, regions=regions)
+    far = events.grants(event, [], card_far, world_seconds=1000, calendar=None, regions=regions)
+    assert same and near, "区域内与相邻区域的角色都应算受影响"
+    assert far == [], "受阻的边不得算受影响"
+
+    # 不传 regions ⇒ 退回零跳判定（只有就在区域内的角色算受影响）
+    legacy = events.grants(event, [], card_near, world_seconds=1000, calendar=None)
+    assert legacy == [], "未接入拓扑时必须保持零跳判定"
+
+
+def test_region_scope_helper_only_expands_over_declared_regions() -> None:
+    """**反例守卫**：可达扩展只对**区域标识**生效。
+
+    `effects[].target` 混装区域 / 角色 / 职位 / 环境；把角色 id 当区域查会静默得到空集合
+    （A-9b 那一类「静默丢数据」）。这里直接测那个判定函数，把边界钉死。
+    """
+    package = _propagation_package(source_region="pl-1")
+    regions = package["world"]["regions"]
+
+    inside = {"meta": {"card_id": "cc-a"}, "region": "pl-2"}
+    adjacent = {"meta": {"card_id": "cc-b"}, "region": "pl-1"}
+    too_far = {"meta": {"card_id": "cc-c"}, "region": "pl-4"}
+
+    # 区域 target：区域内与相邻区域都算受影响（这就是 S3 的扩展本身）
+    assert events_scope(inside, {"pl-2"}, regions) is True
+    assert events_scope(adjacent, {"pl-2"}, regions) is True
+    assert events_scope(too_far, {"pl-2"}, regions) is False
+
+    # 非区域 target（角色 id）：**不得**因为「同区域可达」而算受影响
+    assert events_scope(adjacent, {"cc-某人"}, regions) is False, (
+        "角色 id 不是区域，不得被当成可达目标——否则会把旁人也算成被打的人"
+    )
+
+
+def test_region_scope_falls_back_to_exact_match_without_regions() -> None:
+    """未声明 regions ⇒ 退回零跳判定（`region_of(card) in targets`），与接入前相同。"""
+    card = {"meta": {"card_id": "cc-d"}, "region": "pl-1"}
+    assert events_scope(card, {"pl-1"}, None) is True
+    assert events_scope(card, {"pl-2"}, None) is False
