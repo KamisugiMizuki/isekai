@@ -2150,12 +2150,32 @@ class RuntimeService:
             if str(item.get("stage")) in ("waiting", "deferred")
         ]
         source_refs = sorted({item["ref"] for item in observations} | {item["ref"] for item in claims})
+        # B-2 v2 第二步：关系进认知投影，但**必须按「是否获知」过滤**（人类裁决 2026-10-10）。
+        # 判据（两条同时成立）：
+        #   ① 她是关系的**持有者**（`from_id = 她`）——别人的关系不进她的认知；
+        #   ② 该关系的**依据**（`basis` = 那条事件标识）已经在她的获知集合里
+        #      （`knowledge.target` 指向事件，或 `knowledge.id` 就是它）。
+        # ⇒ 没见证过的事**不会**给她一段关系：「她的世界」里只有她知情的那部分社会拓扑。
+        # 这条纪律防的是**串材料**：把世界真相直接灌进角色视角。
+        known_refs = {str(item.get("target") or "") for item in claims}
+        known_refs |= {str(item.get("ref") or "") for item in claims}
+        relations = [
+            {
+                "to": str(row["to_id"]),
+                "axis": str(row["axis"]),
+                "strength": int(row["strength"]),
+                "basis": str(row.get("basis") or ""),
+            }
+            for row in self.store.relation_list(instance_id, timeline_id, from_id=observer)
+            if str(row.get("basis") or "") in known_refs and str(row.get("basis") or "")
+        ]
         return self.envelope(instance_id, timeline_id, extra={
             "observer_id": observer,
             "purpose": purpose,
             "observed_revision": until,
             "observations": observations,
             "claims": claims,
+            "relations": relations,
             "known_unknowns": known_unknowns,
             "source_refs": source_refs,
         })

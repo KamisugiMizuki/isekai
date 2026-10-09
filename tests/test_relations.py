@@ -105,17 +105,93 @@ def test_relation_is_cleared_on_rollback(store, world) -> None:  # noqa: ANN001,
     assert not store.relation_list(info["id"], timeline_id), "回滚必须清空关系"
 
 
-def test_relations_are_not_exposed_through_cognition_in_v1() -> None:
-    """边界断言：v1 明确**不接认知投影**——认知取数路径不得出现 `relation_list`。
+def test_relations_enter_cognition_only_when_the_observer_has_learned_the_basis() -> None:
+    """B-2 v2 第二步：关系进认知投影，但**必须按「是否获知」过滤**。
 
-    第二步（按「是否获知」过滤后再进认知）单独验收：串材料的风险集中在那一处，不能混进同一次发布。
+    这条替换了 v1 的边界断言（`relation_list` 不得出现在认知路径里）——那一条的作用是
+    **把第二步挡在 v1 之外**；第二步既然已被人类裁决放行，就该换成守住新不变量：
+
+    ① 只含**她持有**的关系（`from_id = observer`）；
+    ② 只含**依据已在她获知集合里**的关系（没见证过的事不会凭空给她一段关系）。
+
+    这里是**源码级**检查（认知路径必须同时出现这两道闸）；行为级检查在下一个测试里。
     """
     src = io.open('isekai_core/runtime/service.py', encoding='utf-8').read()
     start = src.find('def cognition_project')
     assert start > 0, '未找到 cognition_project'
     end = src.find('\n    def ', start + 10)
     segment = src[start:end if end > 0 else len(src)]
-    assert 'relation_list' not in segment, "v1 不接认知投影：关系不得出现在认知取数路径里"
+    assert 'relation_list' in segment, "第二步：关系应当接进认知投影"
+    assert 'from_id=observer' in segment, "① 只允许她持有的关系"
+    assert 'known_refs' in segment and 'basis' in segment, "② 必须按「依据是否已获知」过滤"
+
+
+def test_unknown_basis_relations_are_hidden_from_cognition(store, world) -> None:  # noqa: F811
+    """**行为级守卫**：依据未被获知的关系**不得**出现在认知投影里（防串材料）。
+
+    构造两段关系：一段的依据在获知集合里，一段不在。只有前者该被看见。
+    """
+    from test_memory import _service
+
+    info, timeline_id, character_id = make_instance(store, world)
+    service = _service(store)
+    service.activate(info["id"], timeline_id, now_real=1.7e9)
+    service.advance(info["id"], timeline_id, now_real=1.7e9 + 2 * DAY, max_batches=1)
+
+    # 两段关系：依据分别是 KNOWN 与 SECRET
+    for basis, to_id, axis, grade in (
+        ("ev-known", "cc-潮生", "恩情", "深"),
+        ("ev-secret", "cc-远山", "宿怨", "极"),
+    ):
+        store.relation_set(
+            {
+                "instance_id": info["id"], "timeline_id": timeline_id,
+                "from_id": character_id, "to_id": to_id, "axis": axis,
+                "strength": RELATION_GRADES[grade],
+            },
+            basis=basis, world_seconds=0,
+        )
+    # 只把 ev-known 放进她的获知集合
+    store.knowledge_put(
+        {
+            "id": "kn-known", "instance_id": info["id"], "timeline_id": timeline_id,
+            "character_id": character_id, "world_seconds": 0, "kind": "observation",
+            "target": "ev-known", "source": "亲历", "stance": "recorded", "text": "她亲眼所见",
+        }
+    )
+
+    view = service.cognition_project(info["id"], timeline_id, observer_id=character_id)
+    visible = {(str(row["to"]), str(row["axis"])) for row in view.get("relations") or []}
+    assert ("cc-潮生", "恩情") in visible, "依据已获知的关系必须可见"
+    assert ("cc-远山", "宿怨") not in visible, "依据未获知的关系**不得**进入认知（防串材料）"
+
+
+def test_other_peoples_relations_never_enter_cognition(store, world) -> None:  # noqa: F811
+    """① 只含她自己持有的关系：别人的关系（`from_id` 是别人）一律不可见。"""
+    from test_memory import _service
+
+    info, timeline_id, character_id = make_instance(store, world)
+    service = _service(store)
+    service.activate(info["id"], timeline_id, now_real=1.7e9)
+    service.advance(info["id"], timeline_id, now_real=1.7e9 + 2 * DAY, max_batches=1)
+
+    store.relation_set(
+        {
+            "instance_id": info["id"], "timeline_id": timeline_id,
+            "from_id": "cc-别人", "to_id": character_id, "axis": "宿怨",
+            "strength": RELATION_GRADES["中"],
+        },
+        basis="ev-x", world_seconds=0,
+    )
+    store.knowledge_put(
+        {
+            "id": "kn-x", "instance_id": info["id"], "timeline_id": timeline_id,
+            "character_id": character_id, "world_seconds": 0, "kind": "observation",
+            "target": "ev-x", "source": "亲历", "stance": "recorded", "text": "她看到了",
+        }
+    )
+    view = service.cognition_project(info["id"], timeline_id, observer_id=character_id)
+    assert view.get("relations") == [], "别人的关系不得进她的认知（哪怕依据已获知）"
 
 
 # ---------- B-2 v2 第一步：由事件效果改变关系（**仍不接认知**） ----------
