@@ -128,7 +128,8 @@ def _known_event_ids(
     """
     known = {str(row.get("target") or "") for row in knowledge}
     known |= {str(row.get("id") or "") for row in knowledge}
-    for claim in store.claim_list(instance_id, timeline_id):
+    # 只查她**已掌握**的那些说法（§2.6）：原实现无窗口地取该线全部说法，代价随世界年龄线性增长
+    for claim in store.claim_list(instance_id, timeline_id, ids=known):
         if str(claim.get("id") or "") in known:
             known.add(str(claim.get("event_id") or ""))
     known.discard("")
@@ -159,6 +160,7 @@ class RuntimeService:
         memory_brief_tokens: int = 900,
         memory_candidate_limit: int = 2000,
         memory_decay_per_day: float = 0.02,
+        memory_decay_batch: int = 256,
         memory_archived_recall_min: float = 0.82,
         memory_embedding_model: str = "",
         memory_embedding_base_url: str = "",
@@ -166,6 +168,7 @@ class RuntimeService:
         autocommit_enabled: bool = True,
         autocommit_minutes: int = 60,
         autocommit_events: int = 50,
+        autocommit_min_gap_seconds: float = 30.0,
     ) -> None:
         self.store = store
         #: 倍率上限：全局统一、仅开发者可配置（§2.2），默认 2592000 世界秒 / 现实秒
@@ -200,6 +203,9 @@ class RuntimeService:
         #: 召回候选规模上界（§5.1）：先按水位取最近 N 条再排序；0 = 不限（仅供对照测量）
         self.memory_candidate_limit = max(0, int(memory_candidate_limit))
         self.memory_decay_per_day = max(0.0, min(1.0, float(memory_decay_per_day)))
+        #: 每批**有界清扫**的记忆条数（MEMORY_SPEC §十）：值由读时惰性结算保证精确，
+        #: 这里只决定 `memory.state` 这个缓存列多快被刷新；0 = 不限（仅供对照与测试）。
+        self.memory_decay_batch = max(0, int(memory_decay_batch))
         self.memory_archived_recall_min = max(0.0, min(1.0, float(memory_archived_recall_min)))
         #: 远程 embedding（MEMORY_SPEC §5.2）：缺配置即退化全文召回
         self.embedding_model = str(memory_embedding_model or "")
@@ -214,6 +220,10 @@ class RuntimeService:
         self.autocommit_enabled = bool(autocommit_enabled)
         self.autocommit_minutes = max(1, int(autocommit_minutes))
         self.autocommit_events = max(1, int(autocommit_events))
+        #: A-4 第一片：自动提交的**现实时间下界**（秒）。0 = 关闭该闸（仅测试与对照用）。
+        #: 高倍率下「新增事件 ≥ 阈值」会在每批满足 ⇒ 一次推进内反复全量提交；这道闸把提交频率
+        #: 与现实时间挂钩，代价是**回滚粒度变粗**（见任务清单 A-4 的语义与兼容性登记）。
+        self.autocommit_min_gap_seconds = max(0.0, float(autocommit_min_gap_seconds))
         #: TRPG 战役运行时（TRPG_CAMPAIGN_RUNTIME_SPEC）：战役编排 + 规则状态托管 + 联合提交
         self.campaign = trpg_runtime.CampaignRuntime(store, self)
 
@@ -741,6 +751,10 @@ class RuntimeService:
         elapsed = float(now_real) - float(state.get("last_commit_at") or 0.0)
         due = elapsed >= self.autocommit_minutes * 60 or events_since >= self.autocommit_events
         if not due:
+            return None
+        # A-4 第一片：**现实时间下界**。事件数阈值在高倍率下每批都满足，会让一次 advance 里反复提交
+        # （提交是「全量 dump + 物化上一条快照」，实测 86~115 ms/次）。现实时间间隔触发（上万秒）不受影响。
+        if self.autocommit_min_gap_seconds and elapsed < self.autocommit_min_gap_seconds:
             return None
         return self.commit(instance_id, timeline_id, kind="auto", note="自动提交")
 
@@ -1650,7 +1664,9 @@ class RuntimeService:
         for item in self.disclosed_fragments(instance_id, timeline_id, character_id, until=int(world_seconds)):
             entry = disclosure.transcribe_entry(item)
             entries = entries + [{
-                "id": f"mm-disc-{item['disclosure_id'][-6:]}-{abs(hash(item['ref'])) % 10000}",
+                # 转述条目 id 必须**确定性**（§2.2#14）：原实现用内置 `hash()`（受 PYTHONHASHSEED 影响），
+                # 同一授权转述在不同进程会得到不同 id ⇒ 召回结果与导出件不可逐字节复现。
+                "id": f"mm-disc-{item['disclosure_id'][-6:]}-{events.stable_key(item['ref'])[:8]}",
                 "text": entry["text"],
                 "kind": entry["kind"],
                 "sources": json.dumps(entry["sources"], ensure_ascii=False),
@@ -1673,6 +1689,7 @@ class RuntimeService:
             now_world=int(world_seconds),
             day_seconds=day_seconds,
             vector_scores=vector_scores,
+            per_day=self.memory_decay_per_day,
         )
         for item in ranked:
             item["source_label"] = memory_mod.source_label(json.loads(item.get("sources") or "[]"))
@@ -1696,10 +1713,13 @@ class RuntimeService:
     ) -> int:
         """一轮被实际采纳后按 id 强化，同轮幂等（§5.3）。"""
         strengthened = 0
+        instance = self.store.instance_get(instance_id)
+        day_seconds = self.calendar(instance).day_seconds if instance else 0
         for memory_id in memory_ids:
             if self.store.memory_cite(
                 turn_id, memory_id, timeline_id=timeline_id, character_id=character_id,
-                world_seconds=int(world_seconds),
+                world_seconds=int(world_seconds), instance_id=instance_id,
+                day_seconds=day_seconds, per_day=self.memory_decay_per_day,
             ):
                 strengthened += 1
         return strengthened
@@ -1712,7 +1732,7 @@ class RuntimeService:
         day_seconds = self.calendar(self.store.instance_get(str(line["instance_id"]))).day_seconds
         return self.store.memory_decay(
             timeline_id=timeline_id, to_world=int(to_world), day_seconds=day_seconds,
-            per_day=self.memory_decay_per_day,
+            per_day=self.memory_decay_per_day, limit=self.memory_decay_batch,
         )
 
     def _display_name(self, instance_id: str, timeline_id: str, character_id: str) -> str:
@@ -1825,7 +1845,9 @@ class RuntimeService:
         if isinstance(raw, dict):  # 调用方已经把设定解析好了
             return raw
         key = str(instance.get("id") or "")
-        stamp = hash(raw or "")
+        # 指纹用**稳定哈希**（§2.2#14）：原实现用内置 `hash()`，它受 `PYTHONHASHSEED` 进程随机化影响 ⇒
+        # 同一实例换一个进程启动必然缓存未命中，且「同设定 → 同指纹」不成立。
+        stamp = events.stable_key(str(raw or ""))[:16]
         cached = self._setting_cache.get(key)
         if cached is not None and cached[0] == stamp:
             return cached[1]
@@ -1836,7 +1858,7 @@ class RuntimeService:
     def calendar(self, instance: dict[str, Any]) -> Calendar:
         """历法（§2.1）：由锁定设定派生，按同样的指纹缓存。"""
         key = str(instance.get("id") or "")
-        stamp = hash(instance.get("setting") or "")
+        stamp = events.stable_key(str(instance.get("setting") or ""))[:16]
         cached = self._calendar_cache.get(key)
         if cached is not None and cached[0] == stamp:
             return cached[1]
@@ -2010,10 +2032,13 @@ class RuntimeService:
             return self.envelope(instance_id, timeline_id, status="not_ready", extra={
                 "reason": f"时间线当前是 {timeline['state']}", "snapshot_id": "", "payload": {},
             })
-        if self._catching(row):
-            return self.envelope(instance_id, timeline_id, status="not_ready", extra={
-                "reason": f"还在追赶：水位 {processed} < 目标 {target}", "snapshot_id": "", "payload": {},
-            })
+        # A-10（**人类裁决：改**，见任务清单「裁决已定」第 1 项）：追赶中**不再拒绝读取**，
+        # 而是返回已提交水位的稳定投影，并把「落后多少」显式告知调用方。
+        # 依据：快照每个字段都取自 `processed_world`（最后一次整批提交的水位），不存在读到未提交中间态；
+        # 原 `not_ready` 是**策略选择**而非正确性所需，且它把「落后量」这一关键信息藏在一句 reason 里。
+        # §4.2 的意图是「不冒充当前状态」——标明水位与落后量比拒绝更忠实地实现了这个意图。
+        # 冻结线 / 持久化阻断**仍然**返回 `not_ready`（那是真的没有可用水位）。
+        catching = self._catching(row)
         includes = [str(item) for item in (request.get("include") or [])] or list(self.SNAPSHOT_INCLUDES)
         unknown = [item for item in includes if item not in self.SNAPSHOT_INCLUDES]
         unsupported = [key for key in ("topics", "entities") if request.get(key)]
@@ -2042,6 +2067,11 @@ class RuntimeService:
             "revision": processed,
             "expires_at": now + max(0, int(ttl_seconds)),
             "payload": payload,
+            # A-10：投影锚定在哪个水位、以及离目标还有多远（追赶中不再是拒绝，而是显式状态）
+            "catching_up": catching,
+            "watermark": processed,
+            "target": target,
+            "lag_world_seconds": max(0, int(target) - int(processed)),
         })
 
     #: §4.3 purpose 闭集
@@ -2220,13 +2250,16 @@ class RuntimeService:
             since=since, kind=wanted_kind or None, source=wanted_source or None,
             subject=wanted_subject or None, before=before,
         )
+        # 说法侧**只取本页事件的说法**（§4.5）：既语义正确（页 = 事件 + 它们的说法），
+        # 也天然有界——原实现取了该窗口内**全部**说法（实测 limit=50 时返回 882 条）。
+        page_event_ids = [str(item["id"]) for item in events]
         claims = [
             {"ref": str(item["id"]), "event_id": str(item["event_id"]), "text": str(item["text"]),
              "source": str(item["source_id"]), "audience": str(item["audience"]),
              "world_seconds": int(item["earliest_world"]), "kind": "claim"}
-            for item in self.store.claim_list(
-                instance_id, timeline_id,
-                at_least=since, until=upper, audience=wanted_audience or None,
+            for item in (
+                self.store.claim_list(instance_id, timeline_id, event_ids=page_event_ids)
+                if page_event_ids else []
             )
         ]
         items = [
@@ -2777,12 +2810,88 @@ class RuntimeService:
         #: 墙钟时间盒：None = 用服务配置；0 = 只用批数上限（测试与对照用）
         span = self.catch_up_budget_seconds if budget_seconds is None else max(0.0, float(budget_seconds))
         deadline = time.monotonic() + span if span > 0 else None
+        work_started = time.monotonic()  # A-11：排水能力的测量起点（本次推进的实际耗时）
         produced = 0
         batches = 0
         # 本批共用一份「仍有效的后果」（§六）：三个子步骤原先各查一次、还按角色再查一次，
         # 而批内没有任何写入落库，读到的一定是同一份——一次查询往下传，语义不变、代价 O(1) 次。
         # 跨批也只在第一次查库：追加与解除都来自我们自己写的批次（P0-2 的「候选集每批取一次」）。
-        active_effects = self.store.effect_window(instance_id, timeline_id, until=processed)
+        # 方案②（实测头号成本）：推进路径只取消费方真正读的四个字段，不再 SELECT * 全量转字典。
+        # 方案①：再把 target 空间下推——取「角色键空间 ∪ 打算声明的效果目标」的并集。
+        # 依据（第 1560 日实测）：活跃后果只落在 env-1/off-2/env-2/cus-1/src-1 五个 target 上，
+        # 而 `life.effect_note` 与 `intents.blockers` **都是按 target 匹配**，所以并集之外的后果对它们毫无作用。
+        # 反过来，若只按角色键空间下推，会漏掉打算目标上的阻碍（实测打算声明的是 `src-1`）——所以并集是必须的。
+        constraint_targets: set[str] = set()
+        for card in cards:
+            character_id = str((card.get("meta") or {}).get("card_id") or "")
+            if character_id:
+                constraint_targets.add(character_id)
+            role_id = str(card.get("role_id") or "")
+            if role_id:
+                constraint_targets.add(role_id)
+            region = region_of(card)
+            if region:
+                constraint_targets.add(region)
+            if not character_id:
+                continue
+            for row in self.store.intent_list(
+                instance_id, timeline_id, character_id, stages=("adopted", "waiting", "deferred")
+            ):
+                try:
+                    declared = json.loads(str(row.get("effect") or "{}"))
+                except json.JSONDecodeError:
+                    continue
+                declared_target = str((declared or {}).get("target") or "")
+                if declared_target:
+                    constraint_targets.add(declared_target)
+        # B-1 v2：还须把**已声明的压力量**并进下推集合。
+        # 压力量有自己的命名空间（不是角色 / 角色位 / 区域），它由 `pressure_change` 后果消费；
+        # 不并进来的话，`effect_constraints` 的 `target IN (...)` 会把这些后果挡在取数之外，
+        # `pressure_state` 就永远不会有行——**表建了，写入方却拿不到数据**（A-9b 那一类错误）。
+        for item in ((self.setting(instance)["world_package"] or {}).get("pressures") or []):
+            if isinstance(item, dict) and str(item.get("id") or ""):
+                constraint_targets.add(str(item["id"]))
+        active_effects = self.store.effect_constraints(
+            instance_id, timeline_id, until=processed, targets=tuple(sorted(constraint_targets))
+        )
+        # 倒排索引与 `active_effects` 同源、同步增量维护：批内不重建（否则每批都是 O(活跃后果)）
+        effects_by_target: dict[str, list[dict[str, Any]]] = {}
+        for _item in active_effects:
+            effects_by_target.setdefault(str(_item.get("target") or ""), []).append(_item)
+        # B-3+B-9：域外账本的**写入方**——按世界包声明补齐缺失键（幂等，只补不覆盖）。
+        # 没有这一步，「声明了账本却没人写」就是 A-9b 那一类的空状态域。
+        # 单次 SELECT + 仅在缺键时写入，因此稳态下每批成本是一次小查询。
+        declared_ledger = [
+            item for item in ((self.setting(instance)["world_package"] or {}).get("ledger") or [])
+            if isinstance(item, dict)
+        ]
+        if declared_ledger:
+            self.store.ledger_init(instance_id, timeline_id, declared_ledger, world_seconds=processed)
+        # B-2：关系事实层的**写入方**——按世界包声明补齐缺失关系（幂等、只补不覆盖）。
+        declared_relations = list(
+            ((self.setting(instance)["world_package"] or {}).get("relations") or {}).get("initial") or []
+        )
+        if declared_relations:
+            self.store.relation_init(
+                instance_id, timeline_id, declared_relations, world_seconds=processed
+            )
+        # B-1 v2：压力增量的**写入方**。Δ 是既有后果（`kind='pressure_change'`）的**纯函数**，
+        # 因此这里是覆盖写、幂等（同一条后果重算多少次结果都一样）；未声明 `pressures` 的世界包
+        # 走不到这里（`declared_pressures` 为空 ⇒ 不建行、不读表），行为与 v1 逐字节相同。
+        declared_pressures = {
+            str(item.get("id") or "")
+            for item in ((self.setting(instance)["world_package"] or {}).get("pressures") or [])
+            if isinstance(item, dict) and str(item.get("id") or "")
+        }
+        if declared_pressures:
+            pressure_delta = self._pressure_delta(
+                active_effects, declared=declared_pressures, until=processed
+            )
+            self.store.pressure_apply(
+                instance_id, timeline_id, pressure_delta, world_seconds=processed
+            )
+        else:
+            pressure_delta = {}
         while processed < target and batches < budget:
             day = calendar.day_index(processed)
             stop = min(target, (day + 1) * calendar.day_seconds)
@@ -2794,12 +2903,22 @@ class RuntimeService:
                 from_world=processed,
                 to_world=stop,
                 active_effects=active_effects,
+                effect_index=effects_by_target,
             )
             world_rows = self._world_event_rows(
-                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
+                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop,
+                pressure_delta=pressure_delta,
             )
+            # B-5：仍有效的 `casualty` + `死亡` 档位 ⇒ 本批的致命后果（按目标聚成 character_id → 时刻）
+            lethal_targets = {
+                str(item.get("target") or ""): int(item.get("from_world") or 0)
+                for item in active_effects
+                if str(item.get("kind") or "") == "casualty" and str(item.get("value") or "") == "死亡"
+                and str(item.get("target") or "")
+            }
             death_rows = self._death_rows(
-                instance, instance_id, timeline_id, cards, calendar, from_world=processed, to_world=stop
+                instance, instance_id, timeline_id, cards, calendar,
+                from_world=processed, to_world=stop, lethal=lethal_targets,
             )
             prelim_intents = self._revise_intents(
                 instance,
@@ -2825,7 +2944,11 @@ class RuntimeService:
                 instance_id,
                 timeline_id,
                 calendar,
-                world_rows["effects"] + [dict(item) for item in []],
+                # A-9b 修复（**改语义**，见任务清单 A-9b 的版本与兼容性登记）：
+                # 原实现是 `world_rows["effects"] + [dict(item) for item in []]`——空列表死代码，
+                # 于是「角色打算行动产生的环境效果」被**静默丢弃**（制度侧一直是对的，只有环境侧漏了）。
+                # 现在与 `_institution_rows` 同口径：世界事件效果 + 打算行动效果。
+                world_rows["effects"] + prelim_intents["effects"],
                 from_world=processed,
                 to_world=stop,
             )
@@ -2883,16 +3006,41 @@ class RuntimeService:
             # 所以「查一次 + 增量维护」与「每批重查」等价（§2.6 候选集每批取一次向下传递）
             cleared_ids = {str(item[0]) for item in (spread.get("clear_effects") or [])}
             added_effects = (world_rows["effects"] or []) + (intent_rows["effects"] or [])
+            if cleared_ids:
+                # 先在**过滤前**的列表里定位被解除项所在的桶，再逐桶剔除（桶数少、只在该批真有解除时才扫一次）
+                for _target in {str(item.get("target") or "") for item in active_effects
+                                if str(item.get("id")) in cleared_ids}:
+                    _bucket = effects_by_target.get(_target)
+                    if _bucket is not None:
+                        _bucket[:] = [it for it in _bucket if str(it.get("id")) not in cleared_ids]
             active_effects = [
                 item for item in active_effects
                 if str(item.get("id")) not in cleared_ids
             ] + [{**item} for item in added_effects if str(item.get("id")) not in cleared_ids]
+            # 倒排索引与上面同步：新增项按 target 入桶，不再整表重建（P0 成本）
+            for _item in added_effects:
+                _ident = str(_item.get("id") or "")
+                if _ident and _ident not in cleared_ids:
+                    effects_by_target.setdefault(str(_item.get("target") or ""), []).append({**_item})
             # 记忆按世界时长衰减（§六）：冻结期间不推进即不衰减，幂等
             self.decay_memories(timeline_id, to_world=stop)
             self.apply_due_pending_events(instance_id, timeline_id, to_world=stop)
             # 时间盒：本批已经完整落盘，到这里才允许因预算退出（不会留半批）
             if deadline is not None and time.monotonic() >= deadline:
                 break
+        # A-11（**只测量与上报，不硬拒绝**）：排水能力 = 本次推进实际排掉的世界日 / 实际耗时。
+        # 规范口径是 `rate_max = floor(0.25 × 排水能力)`（DESIGN.md §5.3 / WORLD_RUNTIME_SPEC §2.2），
+        # 但排水能力**随世界年龄与角色数下降**（第 1 批实测：第 10 日 1.26 ms/世界日、第 1500 日 6.97 ms/世界日）。
+        # 硬拒绝会破坏既有用法（测试与「先设高倍率再补算」的既有口径），所以这里把**有效上限**如实上报，
+        # 由配置层与管理面决定是否接受；长期停留在 `catching_up` 时这就是「配置不自洽」的证据。
+        spent = max(1e-6, time.monotonic() - work_started)
+        drain_days = batches / spent
+        effective_rate_max = int(0.25 * drain_days * calendar.day_seconds)
+        if batches and effective_rate_max < int(row.get("rate") or 0) and processed < target:
+            log.warning(
+                "drain below configured rate timeline=%s effective_rate_max=%s rate=%s batches=%s spent=%.3fs",
+                timeline_id, effective_rate_max, int(row.get("rate") or 0), batches, spent,
+            )
         return {
             "state": "current" if processed >= target else "catching_up",
             "processed_world": processed,
@@ -2900,6 +3048,10 @@ class RuntimeService:
             "batches": batches,
             "experiences": produced,
             "limited": limited and processed < target,
+            # A-11：可观测的排水能力与有效倍率上限（供管理面显示与配置自检）
+            "drain_days_per_real_second": round(drain_days, 4),
+            "effective_rate_max": effective_rate_max,
+            "drain_seconds": round(spent, 4),
         }
 
     def consume_time(
@@ -2971,6 +3123,7 @@ class RuntimeService:
         from_world: int,
         to_world: int,
         active_effects: list[dict[str, Any]] | None = None,
+        effect_index: dict[str, list[dict[str, Any]]] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """收集一批事实转移（不落盘）：事件与后果、次日计划、单元衰减、已完成窗口的经历。"""
         plans: list[dict[str, Any]] = []
@@ -2985,13 +3138,32 @@ class RuntimeService:
             else self.store.effect_window(instance_id, timeline_id, until=to_world)
         )
         dead = self._archived_ids(instance_id, timeline_id, until=to_world)
+        # 后果按 `target` 的倒排由调用方**按 advance 建一次**并增量维护（P0 成本）：原实现是
+        # 「每个角色 × 全部活跃后果」的 Python 过滤，且过滤表达式里每个元素都要重算 `region_of(card)`
+        # ——第 1520 日实测 7,993 次/批；而每批重建倒排本身也是 O(活跃后果)。判定不变。
+        effects_by_target = effect_index
+        if effects_by_target is None:
+            effects_by_target = {}
+            for item in shared_effects:
+                effects_by_target.setdefault(str(item.get("target") or ""), []).append(item)
         for card in cards:
             character_id = str((card.get("meta") or {}).get("card_id") or "")
             if not character_id or character_id in dead:
                 continue  # 已身故的角色不再产生计划与经历
-            # 当前日与下一日的计划（世界日界由历法决定，不由入睡重新定义）
-            for day_index in {calendar.day_index(from_world), calendar.day_index(to_world)}:
-                if self.store.plan_get(instance_id, timeline_id, character_id, day_index) is None:
+            # 当前日与下一日的计划（世界日界由历法决定，不由入睡重新定义）。
+            # S-1：这两个循环原先各按日查一次 `plan_get`（每角色 4 次、每批 8 次语句），
+            # 现合并为**一次** `plan_list`（`day_index IN (...)`）——只减语句数，取数范围与判定不变。
+            day_today = calendar.day_index(from_world)
+            day_next = calendar.day_index(to_world)
+            plan_by_day = {
+                int(row["day_index"]): row
+                for row in self.store.plan_list(
+                    instance_id, timeline_id, character_id,
+                    sorted({day_today, day_next, day_today - 1, day_next - 1}),
+                )
+            }
+            for day_index in {day_today, day_next}:
+                if plan_by_day.get(day_index) is None:
                     plans.append(
                         life.expand_plan(
                             card,
@@ -3010,21 +3182,31 @@ class RuntimeService:
                     )
                 )
             # 收割昨日与今日的计划：跨日窗口属于昨日，其尾部落在今日（§11 附录 B #7）
-            day_here = calendar.day_index(from_world)
-            constraints = [
-                item
-                for item in shared_effects
-                if str(item.get("target"))
-                in {character_id, str(card.get("role_id") or ""), region_of(card)}
-            ]
+            day_here = day_today
+            region = region_of(card)
+            role_id = str(card.get("role_id") or "")
+            keys = tuple(dict.fromkeys((character_id, role_id, region)))
+            constraints = [item for key in keys for item in effects_by_target.get(key, ())]
+            if constraints:
+                # 与 effect_window 的稳定顺序一致（from_world, seq, id）：倒排打乱了跨 target 的相对次序
+                constraints.sort(key=lambda item: (
+                    int(item.get("from_world") or 0), int(item.get("seq") or 0), str(item.get("id") or "")
+                ))
             note = life.effect_note(
                 constraints,
                 character_id,
-                str(card.get("role_id") or ""),
-                region_of(card),
+                role_id,
+                region,
             )
+            # B-5：身体后果**改变计划本身**（此前只进约束说明）。只改写本批**新建**的计划——
+            # 计划按世界日一次写定，已固化的当日计划不回改（回改会让「过去的活动」被追溯改写）。
+            grade = life.casualty_grade(constraints, character_id)
+            if grade:
+                for _index, _plan in enumerate(plans):
+                    if str(_plan.get("character_id")) == character_id:
+                        plans[_index] = life.apply_casualty(_plan, grade)
             for day_index in (day_here - 1, day_here):
-                plan = self.store.plan_get(instance_id, timeline_id, character_id, day_index)
+                plan = plan_by_day.get(day_index)
                 if plan is None:
                     continue
                 try:
@@ -3817,7 +3999,10 @@ class RuntimeService:
             if not character_id:
                 continue
             dead = character_id in archived
-            for row in self.store.intent_list(instance_id, timeline_id, character_id):
+            for row in self.store.intent_list(
+                instance_id, timeline_id, character_id,
+                stages=("adopted", "waiting", "deferred"),
+            ):
                 if str(row["stage"]) in ("done", "abandoned"):
                     continue
                 if dead:
@@ -3903,6 +4088,37 @@ class RuntimeService:
                     rows["intents"].append(updated)
         return rows
 
+    def _pressure_delta(
+        self,
+        active_effects: list[dict[str, Any]],
+        *,
+        declared: set[str],
+        until: int,
+    ) -> dict[str, int]:
+        """把仍有效的 `pressure_change` 后果折算成各压力的**累积增量** Δ（B-1 v2）。
+
+        只认**已声明的压力量**与**整数值**：未声明的目标直接忽略（校验器会在创建期拒掉，
+        这里再兜一层）；值不是整数的也忽略，绝不猜测。
+
+        Δ 是**后果的纯函数**（不累加历史、不依赖调用次数）⇒ 覆盖写即可幂等，
+        分批推进与一次性推进得到同一个 Δ。
+        """
+        totals: dict[str, int] = {}
+        for item in active_effects:
+            if str(item.get("kind") or "") != "pressure_change":
+                continue
+            ident = str(item.get("target") or "")
+            if ident not in declared:
+                continue
+            raw = item.get("value")
+            try:
+                delta = int(raw)
+            except (TypeError, ValueError):
+                continue
+            totals[ident] = totals.get(ident, 0) + delta
+        del until  # 生效窗口已由 `effect_constraints` 的 `from_world<=until` 决定
+        return totals
+
     def _world_event_rows(
         self,
         instance: dict[str, Any],
@@ -3913,6 +4129,7 @@ class RuntimeService:
         *,
         from_world: int,
         to_world: int,
+        pressure_delta: dict[str, int] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """当日世界级事件：固定节庆先占名额 → 随机候选 → 前置条件（§3.1、§四）。
 
@@ -3934,6 +4151,7 @@ class RuntimeService:
             calendar=calendar,
             events=known_events,
             effects=known_effects,
+            pressure_delta=pressure_delta,
         ):
             ident = events.event_id(seed, rules, day_index, str(candidate["slot"]))
             at = events.event_moment(seed, rules, day_index, str(candidate["slot"]), calendar.day_seconds)
@@ -4025,8 +4243,13 @@ class RuntimeService:
         *,
         from_world: int,
         to_world: int,
+        lethal: dict[str, int] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """寿终事件（§四）：由寿命模型与世界时刻推出，单独记账、可产生死讯说法。
+
+        `lethal` 是 B-5 新增的**致命后果**（`character_id → 身亡世界时刻`），由仍有效的
+        `casualty` + `死亡` 档位推出。走同一条路径 ⇒「死亡事件与归档态同批原子」这条既有义务自动成立；
+        事件骨架复用 `events.death_event`（死因表述差异化是后续项）。
 
         归档态与死亡事件**同一批**置位（§六）：状态位让「已归档」不再依赖有界事件窗，
         窗口判法保留为一致性断言（历史库未回填时仍能识别）。
@@ -4042,9 +4265,20 @@ class RuntimeService:
                 continue
             if character_id in archived:
                 continue
-            moment = events.death_moment(card, package, calendar)
-            if moment is None or not (from_world < moment <= to_world):
-                continue
+            lethal_moment = (lethal or {}).get(character_id)
+            if lethal_moment is not None:
+                # 身体后果致死：身亡时刻取**后果施加时刻**（不是批边界），留档可复算。
+                # 若该时刻不晚于本批起点（后果在更早批次就已有效、或被注入时即为当前水位），
+                # 则在本批置位——否则「已致死的后果」会被 `from_world < moment` 永久挡在门外。
+                moment = int(lethal_moment)
+                if moment <= from_world:
+                    moment = int(to_world)
+                elif moment > to_world:
+                    continue
+            else:
+                moment = events.death_moment(card, package, calendar)
+                if moment is None or not (from_world < moment <= to_world):
+                    continue
             row = events.death_event(
                 card,
                 instance_id=instance_id,
@@ -4152,16 +4386,24 @@ class RuntimeService:
                 if grant is not None:
                     rows["knowledge"].append(grant)
         day_seconds = calendar.day_seconds
-        # 同族的后续事件（自然恢复的判定依据）：取**最早**那一条，解除时刻记它的世界时刻
+        # 同族的后续事件（自然恢复的判定依据）：取**最早**那一条，解除时刻记它的世界时刻。
+        # **只需看「上一次检查之后才固化」的事件**：更早的同族事件若曾匹配某个仍有效的后果，
+        # 那一批就已经把它解除了；而比后果更早的事件不满足 `moment > started`。
+        # 因此窗口收窄到 `(上一日, to_world]`——原实现每批取最近 200 条再全量比对（P0 成本）。
         family_moments: dict[str, list[int]] = {}
-        for item in self.store.event_window(instance_id, timeline_id, until=to_world, limit=200):
+        for item in self.store.event_window(
+            instance_id, timeline_id, until=to_world, since=int(from_world) - int(day_seconds), limit=200
+        ):
             family = str(item.get("family") or "")
             if family:
                 family_moments.setdefault(family, []).append(int(item["world_seconds"]))
-        for effect in (
-            active_effects
-            if active_effects is not None
-            else self.store.effect_window(instance_id, timeline_id, until=to_world)
+        # 只取**本批可能解除**的后果（§2.6「候选集每批取一次」的收紧版）：
+        #   `with_cause` 的解除时刻 = from_world + 一天，只有已到期的才可能解除；
+        #   `natural_recovery` 只在本批确实出现同族后续事件时才有依据。
+        # 原实现每批遍历**全部活跃后果**（第 1520 日实测 4,300+ 条）——判定完全一致，只是不再全扫。
+        for effect in self.store.effects_due(
+            instance_id, timeline_id, to_world=int(to_world),
+            day_seconds=int(day_seconds), families=tuple(family_moments),
         ):
             expiry = str(effect.get("expiry"))
             started = int(effect["from_world"])
@@ -4176,6 +4418,7 @@ class RuntimeService:
                 # 同族在该后果之后仍有新事件 → 声明的自然条件成立；没有依据就保持有效
                 if later:
                     rows["clear_effects"].append((str(effect["id"]), instance_id, min(later)))
+        _ = active_effects
         _ = instance
         return rows
 
@@ -4382,7 +4625,7 @@ class RuntimeService:
     def backfill(self, instance_id: str, timeline_id: str) -> int:
         """历史回填（§3.3）：把包内既定的史料与初始事实落成历史条目，不施加效果、不产生获知。"""
         instance, _ = self._rows(instance_id, timeline_id)
-        if self.store.event_ids(instance_id, timeline_id):
+        if self.store.has_events(instance_id, timeline_id):
             return 0
         rows, claims = events.backfill_rows(
             self.setting(instance)["world_package"],

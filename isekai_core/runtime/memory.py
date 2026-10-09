@@ -69,6 +69,42 @@ def state_for(strength: float) -> str:
     return "active"
 
 
+def effective_strength(
+    row: dict[str, Any],
+    *,
+    now_world: int,
+    day_seconds: int,
+    per_day: float = DECAY_PER_DAY,
+) -> float:
+    """**读时惰性衰减**（MEMORY_SPEC §十）：行内 `strength` 是 `decay_world` 时刻的值。
+
+    不变量：`memory.strength` 在 `memory.decay_world` 时刻是新鲜的（写入 / 强化 / 清扫都会把
+    `decay_world` 一起推到位）。因此任意时刻的有效强度 = 从 `decay_world` 衰减到 `now_world`。
+    衰减是指数可组合的（`s·e^{-p·a}·e^{-p·b} = s·e^{-p·(a+b)}`），所以「晚一点结算」与
+    「每批结算」在数值上等价——这正是把每批全表 UPDATE 换成有界清扫 + 惰性读取的依据。
+    """
+    return decayed_strength(
+        float(row.get("strength") or 0.0),
+        from_world=int(row.get("decay_world") or 0),
+        to_world=int(now_world),
+        day_seconds=int(day_seconds),
+        per_day=float(per_day),
+    )
+
+
+def effective_state(
+    row: dict[str, Any],
+    *,
+    now_world: int,
+    day_seconds: int,
+    per_day: float = DECAY_PER_DAY,
+) -> str:
+    """由有效强度派生的状态（§三）：`memory.state` 只是缓存，判定以本函数为准。"""
+    return state_for(
+        effective_strength(row, now_world=now_world, day_seconds=day_seconds, per_day=per_day)
+    )
+
+
 def reinforce(strength: float, *, step: float = REINFORCE_STEP) -> float:
     """被成功采纳的一轮实际用到才强化，只改易被想起程度、不改采信（§5.3）。"""
     return max(0.0, min(STRENGTH_CAP, float(strength) + step))
@@ -102,8 +138,13 @@ def rank(
     vector_scores: dict[str, float] | None = None,
     recency_weight: float = 0.2,
     strength_weight: float = 0.3,
+    per_day: float = DECAY_PER_DAY,
 ) -> list[dict[str, Any]]:
-    """排序（§5.1）：全文与向量**先归一或秩融合**，再加强度与适度时间权重；同分用稳定标识。"""
+    """排序（§5.1）：全文与向量**先归一或秩融合**，再加强度与适度时间权重；同分用稳定标识。
+
+    强度**在读时惰性结算到 `now_world`**（`effective_strength`）：存储值可能滞后于清扫进度，
+    但排序用的始终是当前水位的有效强度（§十「读时惰性计算」）。
+    """
     vec = dict(vector_scores or {})
 
     def _norm(values: dict[str, float]) -> dict[str, float]:
@@ -126,8 +167,15 @@ def rank(
         base = sum(parts) / len(parts)
         age_days = max(0.0, (int(now_world) - int(item.get("learned_world") or 0)) / max(1, int(day_seconds)))
         recency = 1.0 / (1.0 + age_days / 30.0)
-        score = base + strength_weight * float(item.get("strength") or 0.0) + recency_weight * recency
-        scored.append({**item, "score": round(score, 6), "relevance": round(base, 6)})
+        live_strength = effective_strength(
+            item, now_world=int(now_world), day_seconds=int(day_seconds), per_day=per_day
+        )
+        score = base + strength_weight * live_strength + recency_weight * recency
+        scored.append({
+            **item, "score": round(score, 6), "relevance": round(base, 6),
+            "strength": round(live_strength, 6),
+            "state": state_for(live_strength),
+        })
     scored.sort(key=lambda item: (-item["score"], str(item["id"])))
     return scored
 

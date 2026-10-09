@@ -221,13 +221,17 @@ def test_recall_brief_is_budgeted_and_carries_source_cues(store) -> None:
     """简报按预算打包、带来源与确信线索；只进上下文（验收：§5.1）。"""
     world_service = _service(store, memory_brief_tokens=120, memory_recall_limit=2)
     info, timeline_id, character_id = _ready(store, world_service)
+    # 记录水位用**当前时钟**（生产路径即如此：`recorded_world = watermark`，见 SERVICE §5.2 提取写入）。
+    # 若在这里写 `recorded_world=0`，就等于声称「记忆记录于世界日 0」，而此刻时钟已在世界日 1502——
+    # 那是一条自相矛盾的夹具，惰性衰减（§十）会据此把它判为已归档，掩盖本用例真正要测的是「简报预算」。
+    watermark = int(store.clock_get(timeline_id)["processed_world"])
     for index in range(6):
         store.memory_add({
             "id": f"mm-{index}", "instance_id": info["id"], "timeline_id": timeline_id,
             "character_id": character_id, "text": f"潮位与信报的事，第 {index} 回", "kind": "fact",
             "sources": [{"kind": "claim", "ref": f"cl-{index}", "via": "驿站"}],
-            "happened_world": index, "learned_world": index, "recorded_world": index,
-            "semantic_watermark": index, "strength": 0.6, "confidence": 0.4,
+            "happened_world": index, "learned_world": index, "recorded_world": watermark,
+            "semantic_watermark": watermark, "strength": 0.6, "confidence": 0.4,
         })
     recalled = world_service.recall(info["id"], timeline_id, character_id, topic="潮位 信报")
     assert recalled["ids"] and len(recalled["ids"]) <= 2
@@ -278,6 +282,73 @@ def test_decay_follows_the_watermark_and_freezes(store) -> None:
     world_service.advance(info["id"], timeline_id, now_real=1.7e9 + 48 * DAY)
     after = float(store.memory_get("mm-decay")["strength"])
     assert after < frozen, "激活后按世界时长继续衰减"
+
+
+def test_decay_sweep_is_bounded_and_lazy_reads_are_equivalent(store) -> None:
+    """有界清扫 + 读时惰性（§十）：单批成本与在位记忆数无关，且有效强度与全量结算等价。
+
+    - 每批最多改 `memory_decay_batch` 条（原实现是每批全表 ⇒ O(在位记忆 × 批数)）；
+    - 未被清扫到的行保持 `(strength, decay_world)` 自洽，`effective_strength` 读出来仍然精确；
+    - 反复调用能把队列排干（每行最终都被结算），且结算值与「一次全量」相同（指数可组合）。
+    """
+    batch = 10
+    world_service = _service(store, memory_decay_per_day=0.5, memory_decay_batch=batch)
+    info, timeline_id, character_id = _ready(store, world_service)
+    watermark = int(store.clock_get(timeline_id)["processed_world"])
+    total = 25
+    # 用**互不相同的事实**，否则会命中 `memory_add` 的同事实去重（那是正确行为，不是本用例要测的）
+    nouns = ("盐场", "驿站", "堤坝", "灯塔", "渡口", "盐仓", "水尺", "碑文", "航标", "渔汛",
+             "潮沟", "滩涂", "闸门", "堤吏", "仓吏", "驿马", "铜钱", "盐引", "海图", "沙洲",
+             "候风", "更鼓", "灯火", "帆影", "网具")
+    for index in range(total):
+        store.memory_add({
+            "id": f"mm-bulk-{index}", "instance_id": info["id"], "timeline_id": timeline_id,
+            "character_id": character_id,
+            "text": f"{nouns[index]}{index}",
+            "kind": "fact",
+            "sources": [{"kind": "experience", "ref": f"ex-{index}"}],
+            "happened_world": watermark, "learned_world": watermark, "recorded_world": watermark,
+            "semantic_watermark": watermark, "strength": 0.8, "confidence": 0.9,
+        })
+    assert store.memory_count(info["id"], timeline_id, character_id) == total, "夹具本身要真的写进 25 条"
+    to_world = watermark + 2 * DAY
+    first = world_service.decay_memories(timeline_id, to_world=to_world)
+    assert first == batch, f"单批必须有界：{first} != {batch}"
+    swept = first
+    guard = 0
+    while True:
+        step = world_service.decay_memories(timeline_id, to_world=to_world)
+        if step == 0:
+            break
+        assert step <= batch, "每批不得超过上限"
+        swept += step
+        guard += 1
+        assert guard < 100, "清扫队列没有排干"
+    assert swept == total, f"排干后应覆盖全部在位记忆：{swept} != {total}"
+
+    expected = memory_mod.decayed_strength(
+        0.8, from_world=watermark, to_world=to_world, day_seconds=DAY, per_day=0.5
+    )
+    row = store.memory_get("mm-bulk-0")
+    assert abs(float(row["strength"]) - expected) < 1e-9, "清扫值与一次全量结算等价"
+    assert int(row["decay_world"]) == to_world, "清扫要同步推进 decay_world（读时惰性的锚点）"
+    assert memory_mod.effective_strength(
+        row, now_world=to_world, day_seconds=DAY, per_day=0.5
+    ) == float(row["strength"]), "同一水位下有效强度 == 已结算强度（读时惰性不外溢）"
+
+    # 中间态：再推 3 天、只清扫一批，未被清扫的行仍能读出精确值
+    later = to_world + 3 * DAY
+    world_service.decay_memories(timeline_id, to_world=later)
+    pending = store.memory_get("mm-bulk-9")
+    if int(pending["decay_world"]) < later:
+        lazy = memory_mod.effective_strength(
+            pending, now_world=later, day_seconds=DAY, per_day=0.5
+        )
+        direct = memory_mod.decayed_strength(
+            float(pending["strength"]), from_world=int(pending["decay_world"]),
+            to_world=later, day_seconds=DAY, per_day=0.5,
+        )
+        assert abs(lazy - direct) < 1e-12, "读时惰性与清扫使用同一函数、同一锚点"
 
 
 def test_turn_context_injects_brief_and_returns_ids(store) -> None:

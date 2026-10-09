@@ -1043,7 +1043,7 @@ def dispatch(
         if op == "claim.coverage":
             instance_id, timeline_id = str(args.get("instance_id") or ""), str(args.get("timeline_id") or "")
             claim_id = str(args.get("claim_id") or "")
-            rows = [item for item in store.claim_list(instance_id, timeline_id) if str(item["id"]) == claim_id]
+            rows = [item for item in [store.claim_get(instance_id, timeline_id, claim_id)] if item]
             if not rows:
                 raise UmpError(Err.NOT_FOUND, f"没有该记载：{claim_id}", retryable=False)
             coverage = store.claim_coverage_get(instance_id, timeline_id, claim_id) or {
@@ -2220,7 +2220,7 @@ async def _expand_claim(cfg: Config, llm: Any, store: Store | None, args: dict[s
     instance_id, timeline_id = str(args.get("instance_id") or ""), str(args.get("timeline_id") or "")
     claim_id, character_id = str(args.get("claim_id") or ""), str(args.get("character_id") or "")
     question = str(args.get("question") or "这条记载还写了什么？")
-    rows = [item for item in store.claim_list(instance_id, timeline_id) if str(item["id"]) == claim_id]
+    rows = [item for item in [store.claim_get(instance_id, timeline_id, claim_id)] if item]
     if not rows:
         raise UmpError(Err.INVALID, f"没有该记载：{claim_id}", retryable=False)
     original = rows[0]

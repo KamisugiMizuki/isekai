@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .events import stable_key
+
 MODES = ("anchor", "event", "dialog", "time")
 
 #: 初始置信度区间（生成区间，不是终身硬下限）
@@ -143,7 +145,10 @@ def apply_drive(
         seeded = _clamp(high * max(0.2, strength) if positive else low * 0.5)
         updated.append(
             {
-                "id": f"u-{abs(hash((source_key, semantic))) % (10**10):010d}",
+                # 单元 id 必须**确定性**（§2.2#14）：原实现用内置 `hash()`，它受 `PYTHONHASHSEED`
+                # 进程随机化影响 ⇒ 跨进程推进同一实例会得到不同 id（导出件不可逐字节复现）。
+                # 身份取决于「同一来源键 + 同一语义」，故用稳定哈希派生。
+                "id": f"u-{stable_key(source_key, semantic)[:12]}",
                 "instance_id": (identity or {}).get("instance_id")
                 or (rows[0]["instance_id"] if rows else ""),
                 "timeline_id": (identity or {}).get("timeline_id") or (rows[0]["timeline_id"] if rows else ""),

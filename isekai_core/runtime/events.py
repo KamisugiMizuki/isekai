@@ -38,6 +38,11 @@ EFFECT_PRIORITY: dict[str, int] = {
     "environment_state": 60,
     "activity_constraint": 70,
     "route_blocked": 80,
+    # B-5：身体后果应压过通行 / 制度 / 环境类——它直接改变角色能否行动
+    "casualty": 90,
+    # B-1 v2：压力变化是**世界局势**层面的量，压在环境 / 制度之上但不改变角色可否行动，
+    # 因此排在 casualty 之下、environment_state 之上。
+    "pressure_change": 65,
 }
 DEFAULT_EFFECT_PRIORITY = 0
 
@@ -109,14 +114,80 @@ def _templates(package: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(out, key=lambda item: str(item.get("id")))  # 稳定顺序：不随 dict 顺序漂移
 
 
+#: B-1：权重调制的**写死形式**——`weight = base × (1000 + k × pressure) // 1000`，`k` 是千分比整数。
+#: **刻意不支持表达式语言**：可自由编写的表达式等于在核心里开一个脚本引擎入口（与「不做 HP 系统」同类的滑坡）。
+WEIGHT_SCALE = 1000
+
+
+def pressure_values(
+    package: dict[str, Any], *, day_index: int, delta: dict[str, int] | None = None
+) -> dict[str, int]:
+    """声明的压力量在当前世界日的取值（**纯函数、确定性**）。
+
+    基线来源是「自然变化」：`value = clamp(初始值 + drift × 世界日, 下限, 上限)`。
+    B-1 v2 起，另加一个**累积增量** `Δ`（由事件效果折算，见 `store.pressure_apply`）：
+    生效值 = `clamp(基线 + Δ, 下限, 上限)`。
+
+    `delta` 缺省 / 为空 ⇒ 与 v1 **逐值相同**（纯增量，既有世界包不受影响）。
+    注意 `Δ` 是**增量**而不是绝对值——基线公式仍是这一处，不复制到存储层。
+    """
+    out: dict[str, int] = {}
+    for item in package.get("pressures") or []:
+        if not isinstance(item, dict):
+            continue
+        ident = str(item.get("id") or "")
+        if not ident:
+            continue
+        low = int(item.get("下限") if item.get("下限") is not None else item.get("min") or 0)
+        high = int(item.get("上限") if item.get("上限") is not None else item.get("max") or 0)
+        base = int(item.get("初始值") if item.get("初始值") is not None else item.get("initial") or 0)
+        drift = int(item.get("drift") or 0)
+        value = base + drift * int(day_index)
+        if delta:
+            value += int(delta.get(ident, 0))
+        if high > low:
+            value = max(low, min(high, value))
+        out[ident] = value
+    return out
+
+
+def modulated_weight(template: dict[str, Any], pressures: dict[str, int]) -> int:
+    """模板的生效权重：`base × (1000 + k × pressure) // 1000`（**只此一种形式**）。
+
+    模板用 `pressure: {id, k}` 声明读哪个压力量、系数多少；未声明则权重不变。
+    权重下限为 0（不允许负权重：负权重会让「稳定选择」的语义不可解释）。
+    """
+    base = max(0, int(template.get("weight") or 1))
+    declared = template.get("pressure")
+    if not isinstance(declared, dict):
+        return base
+    ident = str(declared.get("id") or "")
+    if ident not in pressures:
+        return base
+    k = int(declared.get("k") or 0)
+    value = int(pressures[ident])
+    return max(0, base * (WEIGHT_SCALE + k * value) // WEIGHT_SCALE)
+
+
 def draw_slot(
-    package: dict[str, Any], *, seed: str, rules_version: str, day_index: int, slot_index: int
+    package: dict[str, Any],
+    *,
+    seed: str,
+    rules_version: str,
+    day_index: int,
+    slot_index: int,
+    pressure_delta: dict[str, int] | None = None,
 ) -> dict[str, Any] | None:
-    """一个槽 → 一个候选模板（按权重稳定选择）；候选相同不等于结果相同（§3.1）。"""
+    """一个槽 → 一个候选模板（按权重稳定选择）；候选相同不等于结果相同（§3.1）。
+
+    `pressure_delta` 是 B-1 v2 的累积增量（缺省 ⇒ 与 v1 逐值相同）。
+    """
     templates = _templates(package)
     if not templates:
         return None
-    weights = [max(0, int(item.get("weight") or 1)) for item in templates]
+    # B-1：权重按声明的压力量调制（写死线性形式）；未声明压力量的世界包权重逐值不变
+    pressures = pressure_values(package, day_index=int(day_index), delta=pressure_delta)
+    weights = [modulated_weight(item, pressures) for item in templates]
     total = sum(weights)
     if total <= 0:
         return None
@@ -166,8 +237,12 @@ def plan_day(
     calendar: Any,
     events: Any,
     effects: Any,
+    pressure_delta: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """当日候选：固定事件先占名额，再用剩余额度取随机槽；前置条件不足者不发生（§四）。"""
+    """当日候选：固定事件先占名额，再用剩余额度取随机槽；前置条件不足者不发生（§四）。
+
+    `pressure_delta` 是 B-1 v2 的累积增量（缺省 ⇒ 与 v1 逐值相同）。
+    """
     density = str((package.get("events") or {}).get("density") or "稀疏")
     budget = daily_budget(seed, rules_version, day_index, density)
     chosen = list(fixed_events(package, day_index=day_index, calendar=calendar))[:budget]
@@ -176,7 +251,12 @@ def plan_day(
         if len(chosen) >= budget:
             break
         candidate = draw_slot(
-            package, seed=seed, rules_version=rules_version, day_index=day_index, slot_index=slot_index
+            package,
+            seed=seed,
+            rules_version=rules_version,
+            day_index=day_index,
+            slot_index=slot_index,
+            pressure_delta=pressure_delta,
         )
         if candidate is None or candidate["slot"] in {item["slot"] for item in chosen}:
             continue
@@ -230,6 +310,36 @@ def effect_rows(
     return out
 
 
+def _claim_variants(package: dict[str, Any], template_id: str) -> dict[str, str]:
+    """B-6.1：取事件模板声明的「每来源表述骨架」（`template["claims"] = {source_id: 文本}`）。
+
+    找不到模板、或模板没声明 `claims`、或声明形态不对时一律返回空映射——调用方据此回退到事件摘要，
+    所以**未声明该字段的既有世界包行为完全不变**。
+    """
+    if not template_id:
+        return {}
+    # 包内形态是 `events = {density, calendar, families: [{templates: [...]}]}`
+    # （早期/别处也出现过裸列表形态，两种都认，避免因形态差异静默失配）
+    events_block = package.get("events")
+    if isinstance(events_block, dict):
+        families = events_block.get("families") or []
+    elif isinstance(events_block, list):
+        families = events_block
+    else:
+        return {}
+    for family in families:
+        if not isinstance(family, dict):
+            continue
+        for template in family.get("templates") or []:
+            if not isinstance(template, dict) or str(template.get("id") or "") != template_id:
+                continue
+            declared = template.get("claims")
+            if isinstance(declared, dict):
+                return {str(key): str(value) for key, value in declared.items()}
+            return {}
+    return {}
+
+
 def claim_rows(
     event: dict[str, Any],
     *,
@@ -246,8 +356,13 @@ def claim_rows(
     需要时再经 LLM 在骨架约束内产出，不能反过来决定事件事实。
     """
     sources = [item for item in package.get("sources") or [] if isinstance(item, dict)]
+    # B-6.1（**纯增量**）：事件模板可声明 `claims`（`source_id → 该来源的表述骨架`），
+    # 让同一事件的不同来源说不同的话。未声明时**照旧**回退到事件摘要 ⇒ 既有世界包逐字节不变。
+    # 原状是每个来源都拿 `event["summary"]`——1500 世界日实测 9147 条说法只有 8 句不同文本。
+    variants = _claim_variants(package, str(event.get("template") or ""))
     out: list[dict[str, Any]] = []
     for index, source in enumerate(sources):
+        source_id = str(source.get("id") or "")
         delay = int(source.get("delay_seconds") or 0)
         out.append(
             {
@@ -255,8 +370,8 @@ def claim_rows(
                 "instance_id": instance_id,
                 "timeline_id": timeline_id,
                 "event_id": event_ident,
-                "source_id": str(source.get("id") or ""),
-                "text": str(event.get("summary") or ""),
+                "source_id": source_id,
+                "text": variants.get(source_id) or str(event.get("summary") or ""),
                 "audience": str(source.get("audience") or "公开"),
                 "earliest_world": int(world_seconds) + max(0, delay),
                 "credibility": "recorded",

@@ -18,11 +18,16 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import store_state_domains as state_domains
 from .log import get_logger
 from .version import DATA_FORMAT_VERSION
 
 log = get_logger("isekai.store")
 SCHEMA_VERSION = 1
+
+#: B-7：**设值型**后果（语义是「把该目标设为某个值」，彼此取代）；
+#: 其余 kind（含未归类的）一律按**累加型**保守处理，不进取代式退休。
+SETTING_EFFECT_KINDS: tuple[str, ...] = ("environment_state", "custom_state", "institution_state")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -491,6 +496,17 @@ CREATE TABLE IF NOT EXISTS reaction(
   PRIMARY KEY(instance_id, timeline_id, character_id, id)
 );
 CREATE INDEX IF NOT EXISTS ix_reaction_stage ON reaction(instance_id, timeline_id, stage, started_world);
+-- 阶段推进按 `timeline_id` 取数（`apply_runtime_batch` 只拿到线标识，没有实例标识）：
+-- 上面那条索引首列是 instance_id ⇒ 该查询用不上它，会退化成 SCAN reaction（实测第 1500 日 3,002 行/批）。
+-- `timeline_id` 本身全局唯一，所以这条索引足以覆盖，且让 OR 的三个分支都能走索引。
+CREATE INDEX IF NOT EXISTS ix_reaction_timeline_stage ON reaction(timeline_id, stage, started_world);
+-- 后果解除后推进受影响反应的那条取数（`apply_runtime_batch`）：
+--   `WHERE timeline_id=? AND stage IN ('active','fading') AND source_ref IN (...)`。
+-- 只有上面那条 `(timeline_id, stage, started_world)` 时，计划是 `SEARCH ... (timeline_id=? AND stage=?)`，
+-- 于是要把该线 **3,406 条 active/fading 行逐行过滤** `source_ref`（实测返回 0–6 行）。
+-- 实测单条 **0.4172 → 0.0187 ms（22×）**（同进程交替 7 轮 × 100 次中位数，`.hermes/lead_s3_reaction_idx.py`）。
+-- S-4 的原则是「没有查询命中就是纯维护成本」——这条索引有明确命中，因此**默认创建**（不挂开关）。
+CREATE INDEX IF NOT EXISTS ix_reaction_source_ref ON reaction(timeline_id, source_ref);
 
 -- 叙事中介层（NARRATIVE_LAYER_SPEC §7）：派生记录——已固化消息引用的叙事单元 / 暂缓标记 / 审计结果。
 -- 候选与排序是可重建的中间产物，不落库；落库的只有「她讲过什么、没讲出口什么」这件事。
@@ -584,6 +600,75 @@ CREATE TABLE IF NOT EXISTS effect_state(
   PRIMARY KEY(instance_id, timeline_id, id)
 );
 CREATE INDEX IF NOT EXISTS ix_effect_active ON effect_state(instance_id, timeline_id, active, from_world);
+-- 「本批可能解除」的后果按失效方式取数（§六）：补算不该每批扫全部活跃后果
+CREATE INDEX IF NOT EXISTS ix_effect_expiry ON effect_state(instance_id, timeline_id, expiry, active, from_world);
+
+
+-- B-7 取代式退休（人类裁决 2026-10-10）：同一 (target, kind, family) 上的**设值型**后果只保留最近一条
+-- 参与热路径，其余记在这张表里。**独立表而非 effect_state 新列**：`CREATE TABLE IF NOT EXISTS` 对既有库
+-- 自动生效，不需要一次 `ALTER TABLE` 迁移（少一个会在生产库上出错的环节）。
+-- 语义区分（务必不要混淆）：`effect_state.active=0` = 已被解除（不再有效）；
+-- 本表里的行 = **仍然有效**，只是被同类后续后果取代、不再参与热路径。退休**不删事实**。
+CREATE TABLE IF NOT EXISTS effect_superseded(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  effect_id TEXT NOT NULL,
+  superseded_by TEXT NOT NULL,
+  at_world INTEGER NOT NULL,
+  PRIMARY KEY(instance_id, timeline_id, effect_id)
+);
+
+-- B-3+B-9（人类裁决 2026-10-10）：**域外账本**——区域 / 组织 / 制度的计数器与比率。
+-- 它是「域外」状态的唯一落点：不参与角色认知，只参与世界推进与推导（Songs of Syx 的教训：
+-- 域外是账本、域内是个体，两者靠少量显式事件耦合）。
+-- 登记：已按 A-7 纪律进 `store_state_domains.CLEARED_ON_ROLLBACK`（回滚必须清，否则旧账本会覆盖新线）。
+CREATE TABLE IF NOT EXISTS world_ledger(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  scope_kind TEXT NOT NULL,              -- region / org / institution
+  scope_id TEXT NOT NULL,
+  key TEXT NOT NULL,                     -- 计数器 / 比率名（世界包声明，不允许临场发明）
+  value INTEGER NOT NULL DEFAULT 0,
+  unit TEXT NOT NULL DEFAULT "",
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, scope_kind, scope_id, key)
+);
+CREATE INDEX IF NOT EXISTS ix_ledger_scope ON world_ledger(instance_id, timeline_id, scope_kind, scope_id);
+
+-- B-2 第一步（人类裁决 2026-10-10）：角色间关系进入**事实状态**。
+-- 关系轴是闭集（亲属 / 同僚 / 恩情 / 债务 / 宿怨 / 隶属），强度是 0…1000 的**千分比整数**
+-- （不用浮点：浮点会引入不可解释的漂移，也让「只沿依据变化」难以验收）。
+-- `basis` 记**依据来源**（事件 / 说法 id）：没有依据的变化不允许发生。
+-- 本表**不参与角色认知**——认知投影要按「是否获知」过滤，那属第二步，v1 明确不做。
+-- 登记：已按 A-7 纪律进 `store_state_domains.CLEARED_ON_ROLLBACK`。
+CREATE TABLE IF NOT EXISTS relation_state(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  from_id TEXT NOT NULL,                 -- 关系持有者（角色）
+  to_id TEXT NOT NULL,                   -- 关系的对方（角色 / 组织）
+  axis TEXT NOT NULL,                    -- 闭集：亲属 / 同僚 / 恩情 / 债务 / 宿怨 / 隶属
+  strength INTEGER NOT NULL DEFAULT 0,   -- 0…1000 千分比
+  basis TEXT NOT NULL DEFAULT "",        -- 依据来源（事件 / 说法 id）
+  from_world INTEGER NOT NULL DEFAULT 0,
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, from_id, to_id, axis)
+);
+CREATE INDEX IF NOT EXISTS ix_relation_from ON relation_state(instance_id, timeline_id, from_id);
+
+-- B-1 v2（人类裁决 2026-10-10）：由**事件效果**改变压力量。存的是**累积增量** `Δ`，
+-- 不是绝对压力值：生效值 = `clamp(基线 + Δ, 下限, 上限)`，基线仍由 `events.pressure_values`
+-- （世界时间的纯函数）给出 ⇒ 基线公式保持单一真源，不出现第二份实现。
+-- `Δ` 本身是既有后果（`effect_state` 里 `kind='pressure_change'`）的**纯函数**：
+-- 因此写入是幂等的（`pressure_apply` 覆盖写），回滚也不需要特殊逻辑（后果行随回滚清空 ⇒ Δ 回到当时值）。
+-- 登记：已按 A-7 纪律进 `store_state_domains.CLEARED_ON_ROLLBACK`。
+CREATE TABLE IF NOT EXISTS pressure_state(
+  instance_id TEXT NOT NULL,
+  timeline_id TEXT NOT NULL,
+  pressure_id TEXT NOT NULL,             -- 必须是世界包 pressures[] 里声明的标识
+  delta INTEGER NOT NULL DEFAULT 0,      -- 累积增量（整数，可为负）
+  updated_world INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(instance_id, timeline_id, pressure_id)
+);
 
 -- 补卡：角色在某个世界时刻加入该线（实例设定锁死，加入记录只进运行层，§九 / 附录 B #18）
 CREATE TABLE IF NOT EXISTS character_join(
@@ -1146,6 +1231,19 @@ class Store:
         self._lock = threading.RLock()
         self._local = threading.local()
         self._connections: list[sqlite3.Connection] = []
+        # P0 ①：上一条提交的**内存快照副本**（键 = (实例, 线)）。
+        # 提交时要与上一条快照做差量，原先每次都 `commit_snapshot_get` 沿链物化——
+        # 而调用方手里刚刚就有那份完整快照（实测随链长线性增长：第 6 次提交 4.8 s）。
+        # 等价性由 `tests/test_snapshot_equivalence.py` 保证：差量存储读回 == 提交时内容。
+        self._last_snapshot: dict[tuple[str, str], dict[str, Any]] = {}
+        # ④ 第二刀：本线当前的**差量链长**（性能提示，非正确性依赖）。
+        # 提交后若链长未接近阈值，就不必每次调 `commit_snapshot_compress` 沿链走一遍
+        # （温态实测那次走链约 80 ms）。计数器失准最坏只是让链长一点（物化变慢），不影响正确性。
+        self._delta_chain: dict[tuple[str, str], int] = {}
+        # B-7 取代式退休的**实验开关**（受控 A/B 用；默认关）。
+        # 之所以做成开关：跨实例、跨时刻的测量漂移达 ±1.5 ms/世界日，只有
+        # 「同一份实例、同一次运行内交替对照」才能判定它的真实收益。
+        self.effect_retire_enabled = str(os.environ.get("ISEKAI_EFFECT_RETIRE", "0")).strip() == "1"
         self._pool_lock = threading.Lock()
         self._conn.execute("PRAGMA synchronous=NORMAL")
 
@@ -1158,6 +1256,15 @@ class Store:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=8000")
+            # 页缓存与 mmap（实测有效，与语义无关）：库体随世界年龄增长后，**单条语句的成本**上升
+            # ——第 1500 日（库 15 MB）每批 84.7 条语句耗时 9.97 ms，而第 3 日（库 664 KB）73.3 条只要 2.38 ms，
+            # 语句条数几乎不变、单条贵了约 3.6×，说明差距在**页访问**而不是工作量。
+            # 实测（第 1500 日实例，各推进 10 批、前置预热 1 批）：
+            #   默认（cache ≈ 2 MB）7.56 ms/世界日 → cache_size=64 MB **6.30 ms（−17%）**；
+            #   mmap_size=256 MB **6.39 ms（−15%）**。两项同时给到，取更省事的那一份收益。
+            conn.execute("PRAGMA cache_size=-65536")      # 64 MB 页缓存（负值 = KiB）
+            conn.execute("PRAGMA mmap_size=268435456")    # 256 MB 内存映射
+            conn.execute("PRAGMA temp_store=MEMORY")      # 临时 B 树（排序 / GROUP BY）不落盘
             self._local.conn = conn
             with self._pool_lock:
                 self._connections.append(conn)
@@ -1784,6 +1891,28 @@ class Store:
     def ensure_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # S-4 索引瘦身（**依据实测，不是猜的**）：每个索引都要为每次写入付维护成本，
+            # 所以「没有任何查询使用」的索引是纯成本。盘点结论（`.hermes/index_audit.py` + `EXPLAIN QUERY PLAN`）：
+            #   ① `ix_effect_target` **从未被命中**——窄取数走 `ix_effect_active`（`active=1 AND from_world<=?`
+            #      的选择性更强），`target IN (...)` 只作为过滤条件 ⇒ 在 8,000+ 行的表上纯维护成本，删除；
+            #   ② `ix_effect_retire` / `ix_effect_superseded_by` 只服务 B-7 的取代式退休，而 B-7 经受控 A/B
+            #      **判定净负、默认停用** ⇒ 仅在开关打开时创建，停用状态下不再白付维护成本。
+            #   注：`ix_effect_expiry`（effects_due 在用）与 `ix_claim_window`（claim_list 在用）经实测**保留**。
+            self._conn.execute("DROP INDEX IF EXISTS ix_effect_target")
+            if str(os.environ.get("ISEKAI_EFFECT_RETIRE", "0")).strip() == "1":
+                self._conn.executescript(
+                    "CREATE INDEX IF NOT EXISTS ix_effect_retire ON effect_state"
+                    "(instance_id, timeline_id, active, target, kind, family, expiry);"
+                    "CREATE INDEX IF NOT EXISTS ix_effect_superseded_by ON effect_superseded"
+                    "(instance_id, timeline_id, superseded_by);"
+                )
+            else:
+                # 关闭时**连既有库里的也删掉**：只在「不再创建」这一步停住是不够的——
+                # 旧库上这两个索引已经建好了，会继续白付维护成本（自审正是这样发现的）。
+                self._conn.executescript(
+                    "DROP INDEX IF EXISTS ix_effect_retire;"
+                    "DROP INDEX IF EXISTS ix_effect_superseded_by;"
+                )
             self._migrate_memory_tables()
             self._migrate_disclosure_pk()
             self._migrate_runtime_tables()
@@ -2843,7 +2972,22 @@ class Store:
                     (row["id"], row["instance_id"], payload, len(payload), time.time(), base_id),
                 )
         if payload is not None:
-            self.commit_snapshot_compress(str(row["id"]))  # §8：链太长就把这条物化成全量
+            # P0 ①：把这份快照留在内存里，供下一次提交做差量基准（不沿链重新物化）
+            key = (row.get("instance_id"), row.get("timeline_id"))
+            self._last_snapshot[key] = snapshot
+            from .runtime import versioning as versioning_mod
+
+            # ④ 第二刀：差量提交链长 +1，全量提交归零；只有接近阈值时才真正走链压缩
+            if base_id:
+                depth = self._delta_chain.get(key, 0) + 1
+            else:
+                depth = 0
+            self._delta_chain[key] = depth
+            if depth == 0 or depth > versioning_mod.MAX_DELTA_CHAIN:
+                self.commit_snapshot_compress(str(row["id"]))  # §8：链太长就把这条物化成全量
+                if depth > versioning_mod.MAX_DELTA_CHAIN:
+                    # 压缩后这条成为新的链首（全量）⇒ 链长归零
+                    self._delta_chain[key] = 0
         return row
 
     def _snapshot_payload_for(self, row: dict[str, Any], snapshot: dict[str, Any]) -> tuple[str, str]:
@@ -2860,7 +3004,10 @@ class Store:
             (row["instance_id"], row["timeline_id"]),
         ).fetchone()
         base_id = str(previous["id"]) if previous is not None else ""
-        base = self.commit_snapshot_get(base_id) if base_id else None
+        # P0 ①：优先用内存副本（正常情况下它就是上一条提交的内容），避免沿链逐段物化
+        base = self._last_snapshot.get((row.get("instance_id"), row.get("timeline_id"))) if base_id else None
+        if base is None:
+            base = self.commit_snapshot_get(base_id) if base_id else None
         if base is None:
             return versioning_mod.dump_snapshot(snapshot), ""
         delta = versioning_mod.encode_delta(base, snapshot)
@@ -2918,8 +3065,12 @@ class Store:
         ).fetchone()
         if row is None:
             return {"compressed": False, "reason": "没有该提交的快照"}
-        kind, _base = versioning_mod.snapshot_kind(row["payload"])
-        if kind != versioning_mod.SNAPSHOT_DELTA:
+        # ④：形态与依赖看**列** `base_commit_id`（空 = 全量，非空 = 差量），不再解析整段 payload JSON。
+        # 实测：payload 可能是整份快照（第 1500 日实例上 14,310,957 字节），
+        # 而 `snapshot_kind(payload)` 每次提交都要把它解析一遍（温态 62.7 ms）。
+        # 老库未回填 `base_commit_id` 时会被判成全量而**跳过压缩**——只延迟压缩、不改变可观察状态
+        # （`ensure_schema` 里的回填会补上；`tests/test_snapshot_equivalence.py` 4 条护栏守住内容不变）。
+        if str(row["base_commit_id"] or "").strip() == "":
             return {"compressed": False, "depth": 0}
         depth = self.commit_snapshot_depth(commit_id)
         if depth < 0 or depth <= versioning_mod.MAX_DELTA_CHAIN:
@@ -3136,31 +3287,20 @@ class Store:
             )
 
     def timeline_clear_state(self, timeline_id: str) -> None:
-        """回滚 / 分叉前清空该线的运行状态（保留线身份与时钟）。"""
-        for table in (
-            "unit", "life_plan", "experience", "claim", "knowledge", "effect_state", "intent",
-            "event", "environment_state", "institution_state", "custom_state",
-            "proactive_log",   # 回滚撤销还没投出去的主动消息与素材消费（§5.3 末条）
-            "session_notice",  # 回滚撤销通告资格
-            # 注意：`first_contact` **不在这里**——「初见已完成」记号属控制状态，不随回滚倒退（§5.6）
-            # 注意：`character_join` **不在这里**——成员资格记录要留着并转为 revoked（§3.7 末条：
-            # 回滚后再次补入必须用新的加入版本，不能复活被撤销的旧记录），撤销由回滚流程显式执行。
-            "memory", "memory_task", "memory_citation",
-            "rate_command",     # 历史里的待生效倍率不是现时控制命令（§七）
-            "pending_event",    # 回滚撤销待执行状态及其后果（§八 末条）
-            "disclosure",       # 回滚同时撤销授权与依赖它的派生（§7.2）
-            "reaction",         # 短期反应随线版本化：回滚撤销派生状态（§11.1 / 附录B#17）
-            "character_state",  # 归档态随线版本化（§六 / P1-3）：回滚后由快照回写恢复当时的值
-            "narrative_unit",   # 叙事单元 / 暂缓标记 / 审计结果同样是派生状态（NARRATIVE_LAYER §7.2）
-            # 战役运行时：场景 / 行动 / 选择是派生编排状态，随回滚撤销；战役与规则状态由
-            # 快照回写给出「提交那一刻」的值（TRPG_CAMPAIGN_RUNTIME_SPEC §十七）
-            "trpg_scene",
-            "trpg_action",
-            "trpg_choice",
-            "trpg_campaign",
-            "trpg_rule_state",
-            "trpg_commit",
-        ):
+        """回滚 / 分叉前清空该线的运行状态（保留线身份与时钟）。
+
+        表清单来自 `isekai_core.store_state_domains`（**单一声明**）：新增一类状态域只登记一次，
+        不再需要在这里手工加表名——漏加正是「回滚后脏数据残留」的成因。
+        `tests/test_state_domains.py` 会锁住「带 `timeline_id` 的新表必须登记」。
+        """
+        # P0 ①：回滚后世界状态回到过去，内存里的「上一条快照」必须一并作废，
+        # 否则下一次提交会拿**未来**的快照当差量基准。
+        for key in [item for item in self._last_snapshot if item[1] == timeline_id]:
+            self._last_snapshot.pop(key, None)
+        # ④ 第二刀：链长计数同样必须作废（否则回滚后会误以为链还长，跳过应有的压缩）
+        for key in [item for item in self._delta_chain if item[1] == timeline_id]:
+            self._delta_chain.pop(key, None)
+        for table in state_domains.cleared_tables():
             self._conn.execute(f"DELETE FROM {table} WHERE timeline_id=?", (timeline_id,))
         # 向量表两种形态都清：按线（新）与按 memory 归属（兼容早期没有 timeline_id 的行）
         self._conn.execute("DELETE FROM memory_embedding WHERE timeline_id=?", (timeline_id,))
@@ -3396,11 +3536,39 @@ class Store:
                          basis=:basis, expiry_condition=:expiry_condition, updated_world=:updated_world""",
                     merged,
                 )
-            # 阶段推进：纯函数，按新水位与解除集合重算该线所有反应（行数少，直接全算）
-            for raw in self._conn.execute(
-                "SELECT * FROM reaction WHERE timeline_id=?", (timeline_id,)
-            ).fetchall():
-                current = _row_to_dict(raw)
+            # 阶段推进（§11.1）：纯函数，按新水位与解除集合重算——**只取可能迁移的行**（P0 成本：原先是全表）。
+            # 「可能迁移」的集合由 `reaction.advance` 的判定唯一决定，这里只改取数、不改判定：
+            #   candidate 且已到水位 → adopted；adopted → active；adopted/active 且依据被解除 → fading；fading 且依据仍被解除 → expired。
+            # paused / expired / long_term 不被 advance 改动 ⇒ 不取。
+            # 新增阶段时必须同步本条件（阶段闭集是 reaction.STAGES 这一单一真源）。
+            # 取数用**三条独立查询**而不是一条 OR：实测 OR 版本只用到索引首列
+            # （`ix_reaction_timeline_stage` 的 `timeline_id`），于是要对这条线的 3,000+ 行做扫描，
+            # 还要额外付一次 `ORDER BY character_id, id` 的临时 B 树。三条查询各自 seek 到对应阶段，
+            # 行序对逐行独立推进没有影响 ⇒ 去掉排序，也去掉那次 B 树。
+            stage_queries: list[tuple[str, list[Any]]] = [
+                (
+                    "SELECT * FROM reaction WHERE timeline_id=? AND stage='candidate'"
+                    " AND started_world<=?",
+                    [timeline_id, int(processed_world)],
+                ),
+                ("SELECT * FROM reaction WHERE timeline_id=? AND stage='adopted'", [timeline_id]),
+            ]
+            if cleared_ids:
+                marks = ",".join("?" for _ in cleared_ids)
+                stage_queries.append(
+                    (
+                        "SELECT * FROM reaction WHERE timeline_id=? AND stage IN ('active','fading')"
+                        f" AND source_ref IN ({marks})",
+                        [timeline_id, *sorted(str(item) for item in cleared_ids)],
+                    )
+                )
+            # 按主键 (character_id, id) 去重：三条查询的集合可能相交
+            stage_rows: dict[tuple[str, str], dict[str, Any]] = {}
+            for stage_query, stage_query_args in stage_queries:
+                for raw in self._conn.execute(stage_query, stage_query_args).fetchall():
+                    item = _row_to_dict(raw)
+                    stage_rows.setdefault((str(item.get("character_id")), str(item.get("id"))), item)
+            for current in stage_rows.values():
                 advanced = reaction_mod.advance(
                     current, watermark=int(processed_world), cleared=cleared_ids
                 )
@@ -3433,6 +3601,8 @@ class Store:
                        ON CONFLICT(instance_id, timeline_id, id) DO NOTHING""",
                     row,
                 )
+                if self.effect_retire_enabled:
+                    self._supersede_prior_effects(row)
             for row in character_states:
                 # 归档态是版本化角色状态（§六）：与死亡事件同一批、同一事务落盘
                 payload = {
@@ -3509,11 +3679,23 @@ class Store:
                     cleared_at = int(item[2]) if len(item) > 2 and item[2] is not None else int(processed_world)
                 else:
                     effect_id, instance_id_, cleared_at = item, None, int(processed_world)
-                self._conn.execute(
-                    """UPDATE effect_state SET active=0, cleared_at=?
-                       WHERE id=? AND timeline_id=? AND active=1 AND (? IS NULL OR instance_id=?)""",
-                    (cleared_at, effect_id, timeline_id, instance_id_, instance_id_),
-                )
+                # 有意分成两条语句：`(? IS NULL OR instance_id=?)` 这种写法让 SQLite **用不上主键索引**，
+                # 实测退化为 `SCAN effect_state`（全表 8,846 行），单条 0.313 ms；而推进路径每批要跑约 2.6 条
+                # ⇒ 单这一条语句占老实例每世界日约 7.3 ms。改成主键全列等值后计划是
+                # `SEARCH effect_state USING INDEX sqlite_autoindex_effect_state_1`，单条 0.167 ms。
+                # 语义完全不变（只在 instance_id 缺省时走原来的兜底分支）。
+                if instance_id_:
+                    self._conn.execute(
+                        """UPDATE effect_state SET active=0, cleared_at=?
+                           WHERE instance_id=? AND id=? AND timeline_id=? AND active=1""",
+                        (cleared_at, instance_id_, effect_id, timeline_id),
+                    )
+                else:
+                    self._conn.execute(
+                        """UPDATE effect_state SET active=0, cleared_at=?
+                           WHERE id=? AND timeline_id=? AND active=1""",
+                        (cleared_at, effect_id, timeline_id),
+                    )
             self._conn.execute(
                 """UPDATE timeline_clock SET processed_world=?, catching_up=?, limited=?
                    WHERE timeline_id=? AND generation=?""",
@@ -4622,8 +4804,15 @@ class Store:
         timeline_id: str,
         character_id: str,
         world_seconds: int,
+        day_seconds: int = 0,
+        per_day: float = 0.0,
     ) -> bool:
-        """实际被采纳一轮用到的条目才强化：同一轮幂等（§5.3）。"""
+        """实际被采纳一轮用到的条目才强化：同一轮幂等（§5.3）。
+
+        **先结算再强化**：存储的 `strength` 是 `decay_world` 时刻的值，而清扫是有界的（可能滞后），
+        所以强化必须以**本轮的 `world_seconds` 有效强度**为基准，并把 `decay_world` 一起推到 `world_seconds`
+        ——否则会把「已经衰减掉的部分」重新补回来（等于变相取消衰减）。
+        """
         from .runtime import memory as memory_mod
 
         with self._lock, self._conn:
@@ -4637,18 +4826,28 @@ class Store:
                 return False
             if instance_id:
                 row = self._conn.execute(
-                    "SELECT strength FROM memory WHERE instance_id=? AND timeline_id=? AND id=?",
+                    "SELECT strength, decay_world FROM memory WHERE instance_id=? AND timeline_id=? AND id=?",
                     (instance_id, timeline_id, memory_id),
                 ).fetchone()
             else:
-                row = self._conn.execute("SELECT strength FROM memory WHERE id=?", (memory_id,)).fetchone()
+                row = self._conn.execute(
+                    "SELECT strength, decay_world FROM memory WHERE id=?", (memory_id,)
+                ).fetchone()
             if row is None:
                 return False
-            strength = memory_mod.reinforce(float(row["strength"]))
+            base = float(row["strength"])
+            start = int(row["decay_world"] or 0)
+            if day_seconds > 0 and per_day > 0 and int(world_seconds) > start:
+                base = memory_mod.decayed_strength(
+                    base, from_world=start, to_world=int(world_seconds),
+                    day_seconds=int(day_seconds), per_day=float(per_day),
+                )
+            strength = memory_mod.reinforce(base)
             self._conn.execute(
-                "UPDATE memory SET strength=?, state=? WHERE instance_id=? AND timeline_id=? AND id=?",
-                (strength, memory_mod.state_for(strength), instance_id or self._scope_instance(memory_id),
-                 timeline_id, memory_id),
+                """UPDATE memory SET strength=?, state=?, decay_world=?
+                   WHERE instance_id=? AND timeline_id=? AND id=?""",
+                (strength, memory_mod.state_for(strength), int(world_seconds),
+                 instance_id or self._scope_instance(memory_id), timeline_id, memory_id),
             )
         return True
 
@@ -4697,16 +4896,37 @@ class Store:
             scores[str(row["memory_id"])] = dot / (norm * other)
         return scores
 
-    def memory_decay(self, *, timeline_id: str, to_world: int, day_seconds: int, per_day: float) -> int:
-        """按世界时长衰减（§六）：从每条的 decay_world 推到 to_world；同一水位重跑无副作用。"""
+    def memory_decay(
+        self,
+        *,
+        timeline_id: str,
+        to_world: int,
+        day_seconds: int,
+        per_day: float,
+        limit: int = 0,
+    ) -> int:
+        """按世界时长衰减（§六）：从每条的 `decay_world` 推到 `to_world`；同一水位重跑无副作用。
+
+        **有界清扫**（MEMORY_SPEC §十「读时惰性计算或按 `decay_world` 区间批量更新」）：
+        原实现每批把全部在位记忆逐行 UPDATE，而 `decay_world` 被推到批界后下一批条件对整个集合
+        再次成立 ⇒ O(在位记忆 × 批数)（8000 条实测 +45~56 ms/批）。
+
+        现在**只清扫最旧的一批**（`ORDER BY decay_world LIMIT ?`，`limit=0` 表示不限，仅供对照与测试）：
+        - 值仍然**精确**：每行都从它自己的 `decay_world` 按实际经过时长结算，而衰减是指数可组合的，
+          「晚结算」与「每批结算」数值等价（`runtime/memory.effective_strength` 的读时惰性同理）；
+        - 不在本批的行保持 `(strength, decay_world)` 这一对**自洽**，因此读路径照旧正确；
+        - 队列按 `decay_world` 升序轮转，每行最终都会被清扫到，且单批成本与在位记忆数无关。
+        """
         from .runtime import memory as memory_mod
 
-        rows = self._conn.execute(
-            """SELECT id, strength, decay_world, state FROM memory
-               WHERE timeline_id=? AND state<>'archived' AND decay_world<?
-               ORDER BY decay_world""",
-            (timeline_id, int(to_world)),
-        ).fetchall()
+        sql = """SELECT id, strength, decay_world, state FROM memory
+                 WHERE timeline_id=? AND state<>'archived' AND decay_world<?
+                 ORDER BY decay_world, id"""
+        args: list[Any] = [timeline_id, int(to_world)]
+        if int(limit or 0) > 0:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        rows = self._conn.execute(sql, args).fetchall()
         changed = 0
         with self._lock, self._conn:
             for row in rows:
@@ -5024,20 +5244,26 @@ class Store:
             )
 
     def intent_list(
-        self, instance_id: str, timeline_id: str, character_id: str | None = None
+        self,
+        instance_id: str,
+        timeline_id: str,
+        character_id: str | None = None,
+        *,
+        stages: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
-        if character_id is None:
-            rows = self._conn.execute(
-                """SELECT * FROM intent WHERE instance_id=? AND timeline_id=?
-                   ORDER BY character_id, id""",
-                (instance_id, timeline_id),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                """SELECT * FROM intent WHERE instance_id=? AND timeline_id=? AND character_id=?
-                   ORDER BY id""",
-                (instance_id, timeline_id, character_id),
-            ).fetchall()
+        """该角色（或该线）的打算。`stages` 下推（§2.6）：调用方只关心活跃阶段时，
+        不该把 `done` / `abandoned` 的**全部历史**取回来再在 Python 里 `continue`——打算只增不减。"""
+        sql = "SELECT * FROM intent WHERE instance_id=? AND timeline_id=?"
+        args: list[Any] = [instance_id, timeline_id]
+        if character_id is not None:
+            sql += " AND character_id=?"
+            args.append(character_id)
+        wanted = [str(item) for item in (stages or ()) if str(item)]
+        if wanted:
+            sql += f" AND stage IN ({','.join('?' for _ in wanted)})"
+            args.extend(wanted)
+        sql += " ORDER BY character_id, id" if character_id is None else " ORDER BY id"
+        rows = self._conn.execute(sql, args).fetchall()
         return [_row_to_dict(r) for r in rows]
 
     # ---------- 事件 / 说法 / 获知 / 效果 ----------
@@ -5099,12 +5325,54 @@ class Store:
         return row is not None
 
     def effect_active_exists(self, instance_id: str, timeline_id: str, effect_id: str) -> bool:
-        """单条后果是否仍有效（§六）：同样走主键索引。"""
+        """单条后果**是否仍然有效**（§六）：走主键索引。
+
+        **本方法按设计不过滤 B-7 的「被取代」**——被取代 ≠ 被解除：
+        `effect_state.active=0` 是「已被解除（不再有效）」，而 `effect_superseded` 里的行是
+        「**仍然有效**，只是被同类后续后果取代、不再参与热路径」（表注释见 `effect_superseded` 的 DDL）。
+        所以这里只问 `active=1`；问「是否还在热路径上」请用 `effect_window` / `effect_constraints`。
+        （旧文档字符串曾写「被取代的后果不再算参与热路径」，与实现不符，第 59 轮据实修正。）
+        """
         row = self._conn.execute(
-            "SELECT 1 FROM effect_state WHERE instance_id=? AND timeline_id=? AND id=? AND active=1 LIMIT 1",
+            """SELECT 1 FROM effect_state WHERE instance_id=? AND timeline_id=? AND id=? AND active=1 LIMIT 1""",
             (instance_id, timeline_id, str(effect_id)),
         ).fetchone()
         return row is not None
+
+    def _supersede_prior_effects(self, row: dict[str, Any]) -> None:
+        """B-7 取代式退休：**设值型** + `until_cleared` 的后果，取代同 `(target, kind, family)` 上此前的后果。
+
+        「设值型」= 语义为「把该目标设为某个值」，彼此是**取代关系**：
+        `environment_state` / `custom_state` / `institution_state`。
+        **累加型**（`activity_constraint` / `route_blocked` / `source_delay` / `rumor_spread` / `public_notice`
+        以及任何未归类的 kind）**不进这里**——它们叠加有意义，保守处理。
+
+        只记「被谁取代」，**不动 `active`、不删行**：被取代的后果仍然有效，只是不再参与热路径。
+        实测依据（1500 世界日）：活跃 `until_cleared` 后果 3,980 条全部堆在 4 个包内永久目标上
+        （`cus-1` 1039 / `off-2` 986 / `env-2` 986 / `env-1` 969），它们是同一目标的历史设定值，没有任何一条指向角色。
+        """
+        if str(row.get("kind") or "") not in SETTING_EFFECT_KINDS:
+            return
+        if str(row.get("expiry") or "until_cleared") != "until_cleared":
+            return
+        self._conn.execute(
+            """INSERT INTO effect_superseded(instance_id, timeline_id, effect_id, superseded_by, at_world)
+               SELECT instance_id, timeline_id, id, ?, ?
+                 FROM effect_state
+                WHERE instance_id=? AND timeline_id=? AND active=1 AND expiry='until_cleared'
+                  AND target=? AND kind=? AND family=? AND id<>?
+               ON CONFLICT(instance_id, timeline_id, effect_id) DO NOTHING""",
+            (
+                str(row.get("id") or ""),
+                int(row.get("from_world") or 0),
+                str(row.get("instance_id") or ""),
+                str(row.get("timeline_id") or ""),
+                str(row.get("target") or ""),
+                str(row.get("kind") or ""),
+                str(row.get("family") or ""),
+                str(row.get("id") or ""),
+            ),
+        )
 
     def claim_list(
         self,
@@ -5112,21 +5380,40 @@ class Store:
         timeline_id: str,
         *,
         event_id: str | None = None,
+        event_ids: Iterable[str] | None = None,
+        ids: Iterable[str] | None = None,
         since: int | None = None,
         until: int | None = None,
         at_least: int | None = None,
         audience: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """说法集合。给了 `since`/`until` 就按（`since`, `until`] 取 `earliest_world` 落在窗口内的部分：
         补算每个世界日只该看**这一段新增**的说法，不必每批重扫全部历史（§2.6）。
 
         `at_least` 是含下界（历史分页用 `[at_least, until]`）；`audience` 过滤同样下推。
+
+        **有界取数（§2.6 / §4.5「选择器要么实现要么删除」）**：分页页、单条查找、按已知 id 批量取
+        都必须下推（`limit` / `event_ids` / `ids`），否则读代价会随世界年龄线性增长——
+        `history_read(limit=50)` 曾经返回该窗口**全部**说法（实测 882 条）。
         """
         sql = "SELECT * FROM claim WHERE instance_id=? AND timeline_id=?"
         args: list[Any] = [instance_id, timeline_id]
         if event_id is not None:
             sql += " AND event_id=?"
             args.append(event_id)
+        wanted_events = [str(item) for item in (event_ids or ()) if str(item)]
+        if wanted_events:
+            sql += f" AND event_id IN ({','.join('?' for _ in wanted_events)})"
+            args.extend(wanted_events)
+        wanted_ids = [str(item) for item in (ids or ()) if str(item)]
+        if wanted_ids:
+            sql += f" AND id IN ({','.join('?' for _ in wanted_ids)})"
+            args.extend(wanted_ids)
+        if limit is not None and int(limit) > 0:
+            args_limit = int(limit)
+        else:
+            args_limit = 0
         if since is not None:
             sql += " AND earliest_world>?"
             args.append(int(since))
@@ -5136,11 +5423,246 @@ class Store:
         if until is not None:
             sql += " AND earliest_world<=?"
             args.append(int(until))
-        if audience:
+        if audience is not None:
             sql += " AND audience=?"
             args.append(str(audience))
-        rows = self._conn.execute(sql + " ORDER BY earliest_world, id", args).fetchall()
+        sql += " ORDER BY earliest_world, id"
+        if args_limit:
+            sql += " LIMIT ?"
+            args.append(args_limit)
+        rows = self._conn.execute(sql, args).fetchall()
         return [_row_to_dict(r) for r in rows]
+
+    #: B-2：关系轴闭集（单一声明——运行期与包校验共用，避免两处各写一份）
+    RELATION_AXES: tuple[str, ...] = ("亲属", "同僚", "恩情", "债务", "宿怨", "隶属")
+    #: 档位 → 千分比强度（固定映射；不接受自由数值，避免不可解释的漂移）
+    RELATION_GRADES: dict[str, int] = {"淡": 200, "中": 500, "深": 800, "极": 1000}
+
+    def relation_list(
+        self, instance_id: str, timeline_id: str,
+        *, from_id: str | None = None, to_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """角色间关系（B-2 事实层）：按持有者下推，不整表取回。"""
+        sql = "SELECT * FROM relation_state WHERE instance_id=? AND timeline_id=?"
+        args: list[Any] = [instance_id, timeline_id]
+        if from_id is not None:
+            sql += " AND from_id=?"
+            args.append(str(from_id))
+        if to_id is not None:
+            sql += " AND to_id=?"
+            args.append(str(to_id))
+        sql += " ORDER BY from_id, to_id, axis"
+        return [_row_to_dict(row) for row in self._conn.execute(sql, args).fetchall()]
+
+    def relation_set(self, row: dict[str, Any], *, basis: str, world_seconds: int) -> None:
+        """写一条关系。**必须带依据**：没有依据的变化不允许发生（与性格单元同一纪律）。"""
+        if not str(basis or "").strip():
+            raise ValueError("关系变化必须带依据（basis）：不允许无来源的数值漂移")
+        strength = max(0, min(1000, int(row.get("strength") or 0)))
+        self._conn.execute(
+            """INSERT INTO relation_state(instance_id, timeline_id, from_id, to_id, axis, strength,
+                                          basis, from_world, updated_world)
+               VALUES(:instance_id, :timeline_id, :from_id, :to_id, :axis, :strength,
+                      :basis, :from_world, :updated_world)
+               ON CONFLICT(instance_id, timeline_id, from_id, to_id, axis) DO UPDATE SET
+                 strength=:strength, basis=:basis, updated_world=:updated_world""",
+            {
+                "basis": str(basis), "from_world": int(world_seconds),
+                "updated_world": int(world_seconds), "strength": strength, **row,
+            },
+        )
+
+    def relation_init(self, instance_id: str, timeline_id: str, declared: list[dict[str, Any]],
+                      *, world_seconds: int) -> int:
+        """按世界包声明**补齐缺失关系**（幂等、只补不覆盖）——关系的写入方。
+
+        没有它，「声明了关系却没人写」就是 A-9b 那一类空状态域。
+        """
+        existing = {
+            (str(row["from_id"]), str(row["to_id"]), str(row["axis"]))
+            for row in self.relation_list(instance_id, timeline_id)
+        }
+        written = 0
+        for item in declared:
+            if not isinstance(item, dict):
+                continue
+            from_id = str(item.get("from") or "")
+            to_id = str(item.get("to") or "")
+            axis = str(item.get("axis") or "")
+            if not (from_id and to_id and axis) or (from_id, to_id, axis) in existing:
+                continue
+            grade = str(item.get("档位") or item.get("grade") or "中")
+            self.relation_set(
+                {
+                    "instance_id": instance_id, "timeline_id": timeline_id,
+                    "from_id": from_id, "to_id": to_id, "axis": axis,
+                    "strength": self.RELATION_GRADES.get(grade, 500),
+                },
+                basis=f"package:{from_id}->{to_id}:{axis}",
+                world_seconds=int(world_seconds),
+            )
+            written += 1
+        return written
+
+    def ledger_list(
+        self, instance_id: str, timeline_id: str,
+        *, scope_kind: str | None = None, scope_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """域外账本（B-9）：区域 / 组织 / 制度的计数器与比率。有界取数（按作用域下推）。"""
+        sql = "SELECT * FROM world_ledger WHERE instance_id=? AND timeline_id=?"
+        args: list[Any] = [instance_id, timeline_id]
+        if scope_kind is not None:
+            sql += " AND scope_kind=?"
+            args.append(str(scope_kind))
+        if scope_id is not None:
+            sql += " AND scope_id=?"
+            args.append(str(scope_id))
+        sql += " ORDER BY scope_kind, scope_id, key"
+        return [_row_to_dict(row) for row in self._conn.execute(sql, args).fetchall()]
+
+    def ledger_put(self, row: dict[str, Any]) -> None:
+        """写一条账本记录（幂等：同键覆盖值）。账本数字只能经这里变更，不得旁路派生。"""
+        self._conn.execute(
+            """INSERT INTO world_ledger(instance_id, timeline_id, scope_kind, scope_id, key, value, unit,
+                                        updated_world)
+               VALUES(:instance_id, :timeline_id, :scope_kind, :scope_id, :key, :value, :unit, :updated_world)
+               ON CONFLICT(instance_id, timeline_id, scope_kind, scope_id, key) DO UPDATE SET
+                 value=:value, unit=:unit, updated_world=:updated_world""",
+            {
+                "unit": "", "value": 0, "updated_world": 0, **row,
+            },
+        )
+
+    def ledger_init(self, instance_id: str, timeline_id: str, declared: list[dict[str, Any]],
+                    *, world_seconds: int) -> int:
+        """按世界包声明**补齐缺失键**（幂等）：只在键不存在时写入初始值，已存在的值不动。
+
+        这是账本的写入方：没有它，「声明了账本却没人写」就是 A-9b 那一类空状态域。
+        """
+        existing = {
+            (str(row["scope_kind"]), str(row["scope_id"]), str(row["key"]))
+            for row in self.ledger_list(instance_id, timeline_id)
+        }
+        written = 0
+        for item in declared:
+            if not isinstance(item, dict):
+                continue
+            scope_kind = str(item.get("scope_kind") or "")
+            scope_id = str(item.get("scope_id") or "")
+            key = str(item.get("key") or "")
+            if not (scope_kind and scope_id and key):
+                continue
+            if (scope_kind, scope_id, key) in existing:
+                continue
+            self.ledger_put({
+                "instance_id": instance_id, "timeline_id": timeline_id,
+                "scope_kind": scope_kind, "scope_id": scope_id, "key": key,
+                "value": int(item.get("初始值") or item.get("initial") or 0),
+                "unit": str(item.get("单位") or item.get("unit") or ""),
+                "updated_world": int(world_seconds),
+            })
+            written += 1
+        return written
+
+    def ledger_derived(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        declared: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """账本的**推导值**（B-3+B-9 v2）：按声明式纯函数算出，**不落库**。
+
+        与 `ledger_list` 的区别（这条区别就是「单一事实源」本身）：
+        `ledger_list` 返回**存储的**账本行；本方法返回**算出来的**行，它们**不存在于 `world_ledger` 里**，
+        因此不参与快照 / 回滚 / 导入导出，也不可能与存储值打架。
+
+        `declared` 由调用方给出（存储层不反向依赖设定解析）；
+        求值与算子闭集在 `runtime/ledger.py`（纯函数，**没有表达式语言**）。
+        缺省 / 空 ⇒ 返回 `[]`（未声明推导式的世界包零影响）。
+        """
+        if not declared:
+            return []
+        from .runtime import ledger as ledger_mod  # 延迟导入：存储层不反向依赖运行层
+
+        stored = self.ledger_list(instance_id, timeline_id)
+        values: dict[tuple[str, str], dict[str, int]] = {}
+        for row in stored:
+            scope = (str(row["scope_kind"]), str(row["scope_id"]))
+            values.setdefault(scope, {})[str(row["key"])] = int(row["value"])
+
+        out: list[dict[str, Any]] = []
+        for scope, scope_values in sorted(values.items()):
+            specs = [
+                item for item in declared
+                if isinstance(item, dict)
+                and (str(item.get("scope_kind") or ""), str(item.get("scope_id") or "")) == scope
+            ]
+            if not specs:
+                continue
+            computed = ledger_mod.evaluate(specs, scope_values)
+            for spec in specs:
+                ident = str(spec.get("id") or "")
+                if ident not in computed:
+                    continue
+                out.append({
+                    "scope_kind": scope[0], "scope_id": scope[1], "key": ident,
+                    "value": int(computed[ident]), "unit": str(spec.get("unit") or ""),
+                    "derived": True,
+                })
+        return out
+
+    def claim_get(self, instance_id: str, timeline_id: str, claim_id: str) -> dict[str, Any] | None:
+        """按主键取一条说法（§2.6）：不要为了找一条把整表拉进 Python。"""
+        row = self._conn.execute(
+            "SELECT * FROM claim WHERE instance_id=? AND timeline_id=? AND id=?",
+            (instance_id, timeline_id, str(claim_id)),
+        ).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def has_events(self, instance_id: str, timeline_id: str) -> bool:
+        """该线是否已有事件（§2.6）：判空走 EXISTS，不把全部事件 id 取进内存。"""
+        row = self._conn.execute(
+            "SELECT 1 FROM event WHERE instance_id=? AND timeline_id=? LIMIT 1",
+            (instance_id, timeline_id),
+        ).fetchone()
+        return row is not None
+
+    # ---------- B-1 v2：由事件效果改变压力量（累积增量） ----------
+
+    def pressure_list(self, instance_id: str, timeline_id: str) -> dict[str, int]:
+        """该线各压力的**累积增量** `Δ`（B-1 v2）。
+
+        返回的是**增量**，不是绝对值：生效值 = `clamp(基线 + Δ, 下限, 上限)`，
+        基线仍由 `events.pressure_values`（世界时间的纯函数）给出 ⇒ **基线公式保持单一真源**。
+        """
+        rows = self._conn.execute(
+            "SELECT pressure_id, delta FROM pressure_state WHERE instance_id=? AND timeline_id=?",
+            (instance_id, timeline_id),
+        ).fetchall()
+        return {str(row["pressure_id"]): int(row["delta"]) for row in rows}
+
+    def pressure_apply(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        deltas: dict[str, int],
+        *,
+        world_seconds: int,
+    ) -> None:
+        """把本批由后果折算出的增量**幂等**写入（B-1 v2）。
+
+        `Δ` 是既有后果（`effect_state` 里 `kind='pressure_change'`）的**纯函数**，
+        所以这里用**覆盖写**而不是累加写：同一条后果被重算多少次，结果都一样。
+        这也让回滚不需要特殊逻辑——后果行随回滚清空，`Δ` 自然回到当时值。
+        """
+        for ident, delta in sorted(deltas.items()):
+            self._conn.execute(
+                """INSERT INTO pressure_state(instance_id, timeline_id, pressure_id, delta, updated_world)
+                   VALUES(?, ?, ?, ?, ?)
+                   ON CONFLICT(instance_id, timeline_id, pressure_id) DO UPDATE SET
+                     delta=excluded.delta, updated_world=excluded.updated_world""",
+                (instance_id, timeline_id, str(ident), int(delta), int(world_seconds)),
+            )
 
     def knowledge_window(
         self, instance_id: str, timeline_id: str, character_id: str, *, until: int, limit: int = 40
@@ -5169,19 +5691,105 @@ class Store:
     def effect_window(
         self, instance_id: str, timeline_id: str, *, until: int, targets: Iterable[str] | None = None
     ) -> list[dict[str, Any]]:
-        """仍有效的后果（§六）：过期或已解除的不再参与因果。"""
+        """仍有效的后果（§六）：过期或已解除的不再参与因果。
+
+        `targets` **下推到 SQL**（走 `ix_effect_target`）：调用方只要「命中该角色 / 角色位 / 区域的几条」时，
+        不该把整条线的活跃后果全拉进 Python——第 1520 日实测活跃后果约 4,000 条，其中绝大多数与这位角色无关。
+        """
+        wanted = sorted({str(item) for item in targets}) if targets else None
+        sql = ("""SELECT * FROM effect_state WHERE instance_id=? AND timeline_id=? AND active=1
+                  AND from_world<=?""")
+        if self.effect_retire_enabled:
+            sql += ("\n                  AND NOT EXISTS (SELECT 1 FROM effect_superseded s"
+                    "\n                                   WHERE s.instance_id=effect_state.instance_id"
+                    "\n                                     AND s.timeline_id=effect_state.timeline_id"
+                    "\n                                     AND s.effect_id=effect_state.id)")
+        args: list[Any] = [instance_id, timeline_id, int(until)]
+        if wanted:
+            marks = ",".join("?" for _ in wanted)
+            sql += f" AND target IN ({marks})"
+            args.extend(wanted)
+        sql += " ORDER BY from_world, seq, id"
+        rows = self._conn.execute(sql, args).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def effect_constraints(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        until: int,
+        targets: tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        """**推进路径专用的窄取数**（`effect_window` 的消费方只需要四个字段）。
+
+        逐条语句计时实测：`effect_window` 的取数是**头号成本**——第 1560 日 5.09 / 9.73 ms 每世界日（52%），
+        每次 advance 约 15 ms，因为它 `SELECT *` 把它们全部转成字典。
+        而推进路径的消费方只读：
+        `life.effect_note` → `target` / `kind`；`intents.blockers` → `target` / `event_id`；
+        A-2 的倒排索引 → `target` / `id`；`_propagate_and_clear` 已改用 `effects_due`，不再读这份列表。
+        所以这里只取这几个字段（**字段集经逐处核对**，不是猜的）；B-5 落地 `死亡` 档位后，
+    再加回 `value`（档位）与 `from_world`（身亡时刻），供死亡路径判定。
+
+        需要完整行的调用方（管理面、快照、审计）继续用 `effect_window`。
+
+        B-7 过滤（第 59 轮补）：开关启用时同样要排除**被取代**的后果——否则「退休」只作用于
+        `effect_window`（管理面 / 快照 / 回退路径），而**真正的推进路径仍然看得见全部历史后果**，
+        于是转正也不产生任何热路径收益。这正是第二十四轮受控 A/B 判为净负的结构性原因
+        （被判定净负的那一侧收益从未在这里兑现）。默认停用 ⇒ 行为逐字节不变。
+        """
+        sql = """SELECT id, event_id, target, kind, value, from_world FROM effect_state
+                 WHERE instance_id=? AND timeline_id=? AND active=1 AND from_world<=?"""
+        args: list[Any] = [instance_id, timeline_id, int(until)]
+        if self.effect_retire_enabled:
+            sql += ("\n                 AND NOT EXISTS (SELECT 1 FROM effect_superseded s"
+                    "\n                                  WHERE s.instance_id=effect_state.instance_id"
+                    "\n                                    AND s.timeline_id=effect_state.timeline_id"
+                    "\n                                    AND s.effect_id=effect_state.id)")
+        wanted = [str(item) for item in (targets or ()) if str(item)]
+        if wanted:
+            # 方案①：按「角色键空间 ∪ 打算声明的效果目标」下推（两个空间的并集由调用方组装）
+            sql += f" AND target IN ({','.join('?' for _ in wanted)})"
+            args.extend(wanted)
+        sql += " ORDER BY from_world, seq, id"
+        rows = self._conn.execute(sql, args).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def effects_due(
+        self,
+        instance_id: str,
+        timeline_id: str,
+        *,
+        to_world: int,
+        day_seconds: int,
+        families: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        """**本批可能解除**的后果（§六）：`with_cause` 已到期的 + 本批确有同族后续事件的 `natural_recovery`。
+
+        判定与「遍历全部活跃后果」完全一致（见 `service._propagate_and_clear`），
+        但不再把该线全部活跃后果拉出来扫一遍——第 1520 日实测活跃 4,300+ 条，其中本批可能解除的是个位数。
+        两条分支各自走 `ix_effect_expiry`，规模由「到期数」与「该族自然恢复后果数」决定，与世界年龄无关。
+        """
+        out: list[dict[str, Any]] = []
         rows = self._conn.execute(
-            """SELECT * FROM effect_state WHERE instance_id=? AND timeline_id=? AND active=1
-               AND from_world<=? ORDER BY from_world, seq, id""",
-            (instance_id, timeline_id, until),
+            """SELECT * FROM effect_state
+               WHERE instance_id=? AND timeline_id=? AND active=1 AND expiry='with_cause'
+                 AND from_world<=?
+               ORDER BY from_world, seq, id""",
+            (instance_id, timeline_id, int(to_world) - int(day_seconds)),
         ).fetchall()
-        wanted = {str(item) for item in targets} if targets else None
-        out = []
-        for row in rows:
-            item = _row_to_dict(row)
-            if wanted is not None and str(item.get("target")) not in wanted:
-                continue
-            out.append(item)
+        out.extend(_row_to_dict(row) for row in rows)
+        wanted = tuple(str(item) for item in families if str(item))
+        if wanted:
+            marks = ",".join("?" for _ in wanted)
+            rows = self._conn.execute(
+                f"""SELECT * FROM effect_state
+                    WHERE instance_id=? AND timeline_id=? AND active=1 AND expiry='natural_recovery'
+                      AND family IN ({marks})
+                    ORDER BY from_world, seq, id""",
+                (instance_id, timeline_id, *wanted),
+            ).fetchall()
+            out.extend(_row_to_dict(row) for row in rows)
         return out
 
     # ---------- 补卡 ----------
@@ -5494,6 +6102,25 @@ class Store:
                           :windows, :state, :created_world, :note)""",
                 row,
             )
+
+    def plan_list(self, instance_id: str, timeline_id: str, character_id: str,
+                  day_indices: list[int] | tuple[int, ...]) -> list[dict[str, Any]]:
+        """一次取多个世界日的计划（S-1：`_collect_batch` 原先每角色要 4 次 `plan_get`，
+        每批合计 8 次语句——合并成一次 `day_index IN (...)`）。
+
+        逐条语句计时里 `life_plan` 查询是 8 次/批、约 0.26 ms/世界日；语句数是那部分成本的主因，
+        所以这里只减少**语句条数**，判定与取数范围完全不变。
+        """
+        wanted = sorted({int(item) for item in (day_indices or []) if item is not None})
+        if not wanted:
+            return []
+        marks = ",".join("?" for _ in wanted)
+        rows = self._conn.execute(
+            f"""SELECT * FROM life_plan WHERE instance_id=? AND timeline_id=? AND character_id=?
+                AND day_index IN ({marks}) ORDER BY day_index""",
+            (instance_id, timeline_id, character_id, *wanted),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
 
     def plan_get(self, instance_id: str, timeline_id: str, character_id: str, day_index: int) -> dict[str, Any] | None:
         row = self._conn.execute(

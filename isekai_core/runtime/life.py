@@ -9,10 +9,10 @@
 from __future__ import annotations
 
 import json
-import secrets
 from typing import Any
 
 from .calendar import Calendar
+from .events import stable_key
 
 
 def expand_plan(
@@ -57,7 +57,10 @@ def expand_plan(
             )
     windows.sort(key=lambda item: item["start"])
     return {
-        "id": f"lp-{secrets.token_hex(6)}",
+        # 计划 id 必须**确定性**（§2.2#14「同设定 + 前序状态 → 同答案」）：原实现用 `secrets.token_hex`，
+        # 同一实例、同一世界日重跑会得到不同 id ⇒ 导出件不可逐字节复现，回滚 / 重放也会「同一天两个计划」。
+        # 计划真正的主键是 (实例, 线, 角色, 世界日)，所以直接用稳定哈希派生。
+        "id": f"lp-{stable_key(instance_id, timeline_id, character_id, int(day_index))[:12]}",
         "instance_id": instance_id,
         "timeline_id": timeline_id,
         "character_id": character_id,
@@ -101,17 +104,91 @@ def describe_plan(plan: dict[str, Any] | None, calendar: Calendar, world_seconds
     }
 
 
+#: B-5：身体后果档位的**严重度顺序**（从轻到重）；取该角色身上最重的一档
+CASUALTY_ORDER: tuple[str, ...] = ("轻伤", "重伤", "失能", "死亡")
+
+
+def casualty_grade(effects: list[dict[str, Any]] | None, character_id: str) -> str:
+    """该角色身上最重的身体后果档位（没有则返回空串）。纯函数、只看 target 与 value。"""
+    grades = {
+        str(item.get("value") or "")
+        for item in effects or []
+        if str(item.get("kind")) == "casualty" and str(item.get("target")) == character_id
+    }
+    for grade in reversed(CASUALTY_ORDER):
+        if grade in grades:
+            return grade
+    return ""
+
+
+def apply_casualty(plan: dict[str, Any], grade: str) -> dict[str, Any]:
+    """B-5：身体后果**改变计划本身**，而不只是出现在约束说明里。纯函数、确定性（同一输入同一结果）。
+
+    - `轻伤`：不改活动窗口（说明里已带档位）；
+    - `重伤`：保留原窗口，但**清空备选**并标注——受了重伤就不该还留着「或去别处」的活动弹性；
+    - `失能` / `死亡`：整日窗口合并为**静养**，不再外出（`死亡` 由归档路径接管，这里只做兜底）。
+
+    说明：只改写**本批新建**的计划（计划按世界日一次写定，已固化的当日计划不回改）。
+    """
+    if grade not in ("重伤", "失能", "死亡"):
+        return plan
+    # `expand_plan` 落库时把窗口序列化成 JSON 字符串（`_collect_batch` 用 `json.loads` 读回），
+    # 所以这里两种形态都要认：列表（内存态）与字符串（持久化态），改写后按原形态写回。
+    # 持久化形态是 `{"windows": [...]}`（`_collect_batch` 用 `json.loads(...).get("windows")` 读回），
+    # 内存态则是裸列表——两种都要认，且改写后**按原形态写回**，否则读回方会解析失败。
+    raw_windows = plan.get("windows")
+    wrapped = isinstance(raw_windows, str)
+    if wrapped:
+        try:
+            body = json.loads(raw_windows or "{}")
+        except json.JSONDecodeError:
+            return plan
+        windows = list(body.get("windows") or []) if isinstance(body, dict) else list(body or [])
+    else:
+        windows = list(raw_windows or [])
+    if not windows:
+        return plan
+    if grade in ("失能", "死亡"):
+        start = min(int(item.get("start") or 0) for item in windows)
+        end = max(int(item.get("end") or 0) for item in windows)
+        rewritten = [{
+            "start": start,
+            "end": end,
+            "activity": "静养",
+            "alternatives": [],
+            "note": f"身体后果：{grade}（活动窗口合并为静养）",
+        }]
+    else:
+        rewritten = [
+            {
+                **item,
+                "alternatives": [],
+                "note": (f"{item.get('note') or ''}（重伤：活动受限）").strip(),
+            }
+            for item in windows
+        ]
+    if wrapped:
+        return {**plan, "windows": json.dumps({"windows": rewritten}, ensure_ascii=False)}
+    return {**plan, "windows": rewritten}
+
+
 def effect_note(effects: list[dict[str, Any]] | None, character_id: str, role_id: str, region: str) -> str:
     """仍有效的后果对该角色当前活动的约束说明（§六）：只影响描述与经历，不改计划本身。"""
     targets = {character_id, role_id, region}
-    kinds = sorted(
-        {
-            str(item.get("kind"))
-            for item in effects or []
-            if str(item.get("target")) in targets and str(item.get("kind"))
-        }
-    )
-    return "、".join(kinds)
+    # B-5：身体后果要**带上档位**才读得出约束强度（只印 `casualty` 无法区分轻伤与失能）
+    labels: set[str] = set()
+    for item in effects or []:
+        if str(item.get("target")) not in targets:
+            continue
+        kind = str(item.get("kind") or "")
+        if not kind:
+            continue
+        if kind == "casualty":
+            grade = str(item.get("value") or "")
+            labels.add(f"casualty:{grade}" if grade else kind)
+        else:
+            labels.add(kind)
+    return "、".join(sorted(labels))
 
 
 def activity_label(window: dict[str, Any] | None) -> str:
