@@ -43,6 +43,8 @@ EFFECT_PRIORITY: dict[str, int] = {
     # B-1 v2：压力变化是**世界局势**层面的量，压在环境 / 制度之上但不改变角色可否行动，
     # 因此排在 casualty 之下、environment_state 之上。
     "pressure_change": 65,
+    # B-2 v2 第一步：关系变化与人际承诺同层，压在环境 / 制度之上、身体后果之下。
+    "relation_change": 75,
 }
 DEFAULT_EFFECT_PRIORITY = 0
 

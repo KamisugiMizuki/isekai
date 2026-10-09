@@ -871,6 +871,8 @@ SUPPORTED_EFFECTS: dict[str, str] = {
     "environment_state": "环境状态（只改已声明的环境类型与取值域）",
     # B-1 v2：由事件效果改变压力量（**整数增量**，只作用于已声明的压力量；无表达式入口）
     "pressure_change": "压力变化（整数增量，只作用于已声明的压力量）",
+    # B-2 v2 第一步：由事件效果改变关系（**档位闭集**，不接受自由数值）
+    "relation_change": "关系变化（对方 = target，value = {轴, 档位}）",
 }
 
 
@@ -1105,6 +1107,48 @@ def _validate_events(
                             f" {'/'.join(CASUALTY_GRADES)} 之一（收到 {grade!r}）；"
                             "本内核不建立数值型健康量，「死亡」档位待死亡路径同批落地后启用"
                         )
+                if str(effect.get("kind")) == "relation_change":
+                    # B-2 v2 第一步：`target` = 关系的**对方**，`value` = `{持有者, 轴, 档位}` 结构体。
+                    # 只允许这三个键——**档位闭集**（不接受自由数值），这正是防止关系退化成
+                    # 「随便调的数字」的那条纪律（与 B-1 的 `k`、B-5 的档位同源）。
+                    value = effect.get("value")
+                    if not isinstance(value, dict):
+                        errors.append(
+                            f"{t_where}.effects[{e_index}].value: relation_change 的 value 必须是"
+                            " 「{持有者, 轴, 档位}」结构体（不要把三件事挤进一个字符串）"
+                        )
+                    else:
+                        extra = set(value) - {"持有者", "轴", "档位"}
+                        if extra:
+                            errors.append(
+                                f"{t_where}.effects[{e_index}].value: 只允许 持有者 / 轴 / 档位 三个键"
+                                f"（收到多余键 {sorted(extra)}）；关系不接受自由数值"
+                            )
+                        # **持有者必须显式声明**：`target` 是「对方」，拿它反推会静默建立一段
+                        # 反过来的关系——那比报错更糟（错误方向且无人发现）。
+                        owner = str(value.get("持有者") or "")
+                        if not owner:
+                            errors.append(
+                                f"{t_where}.effects[{e_index}].value.持有者: 必填——"
+                                "target 是「对方」，持有者必须显式声明（不从 target 反推）"
+                            )
+                        elif owner not in targets:
+                            errors.append(
+                                f"{t_where}.effects[{e_index}].value.持有者: 未登记对象 {owner!r}"
+                            )
+                        axis = str(value.get("轴") or "")
+                        if axis not in RELATION_AXES:
+                            errors.append(
+                                f"{t_where}.effects[{e_index}].value.轴: 必须是 "
+                                f"{' / '.join(RELATION_AXES)} 之一（收到 {axis!r}）"
+                            )
+                        grade = str(value.get("档位") or "")
+                        if grade not in RELATION_GRADES:
+                            errors.append(
+                                f"{t_where}.effects[{e_index}].value.档位: 必须是 "
+                                f"{' / '.join(RELATION_GRADES)} 之一（收到 {grade!r}）；"
+                                "不接受自由数值（档位 → 千分比是固定映射）"
+                            )
                 if str(effect.get("kind")) == "pressure_change":
                     # B-1 v2：只允许 {kind, target, value}——多一个键就拒绝（不给表达式入口）。
                     # `target` 必须是已声明的压力量；`value` 必须是整数增量，且不得超过该量声明域的宽度

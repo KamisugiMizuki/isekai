@@ -315,8 +315,13 @@ def test_additive_kinds_are_never_superseded(make_store, kind: str) -> None:
 
 
 def test_setting_kind_classification_matches_the_ruling() -> None:
-    """代码里的「设值型」集合必须与文档第 471 行逐字一致，且与累加型名单不相交。"""
-    assert tuple(SETTING_EFFECT_KINDS) == SETTING_KINDS
+    """代码里的「设值型」集合必须与裁决一致，且与累加型名单不相交。
+
+    第 62 轮起，B-2 v2 第一步把 `relation_change` 也归入设值型（「当前关系」是设值语义，
+    同一 `(持有者, 对方, 轴)` 上只应有一条生效）——所以这里的期望值**显式包含它**，
+    并注明它来自哪一次裁决，避免以后有人看到「多了一项」就去删。
+    """
+    assert set(SETTING_EFFECT_KINDS) == set(SETTING_KINDS) | {"relation_change"}
     assert set(ADDITIVE_KINDS) & set(SETTING_EFFECT_KINDS) == set()
 
 

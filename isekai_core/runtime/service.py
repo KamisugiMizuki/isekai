@@ -2892,6 +2892,15 @@ class RuntimeService:
             )
         else:
             pressure_delta = {}
+        # B-2 v2 第一步：关系变化的**消费方**（声明与消费同批，A-9b 的教训）。
+        # 关系效果的 target 是**角色标识**，本来就在 `constraint_targets` 里 ⇒ 不需要改下推。
+        # 依据一律取事件标识 ⇒ 满足「关系变化必须有依据」这条纪律。
+        self._apply_relation_changes(
+            active_effects,
+            instance_id=instance_id,
+            timeline_id=timeline_id,
+            world_seconds=processed,
+        )
         while processed < target and batches < budget:
             day = calendar.day_index(processed)
             stop = min(target, (day + 1) * calendar.day_seconds)
@@ -4118,6 +4127,64 @@ class RuntimeService:
             totals[ident] = totals.get(ident, 0) + delta
         del until  # 生效窗口已由 `effect_constraints` 的 `from_world<=until` 决定
         return totals
+
+    def _apply_relation_changes(
+        self,
+        active_effects: list[dict[str, Any]],
+        *,
+        instance_id: str,
+        timeline_id: str,
+        world_seconds: int,
+    ) -> int:
+        """把仍有效的 `relation_change` 后果落成 `relation_state`（B-2 v2 第一步）。
+
+        形状：`kind='relation_change'`，`target` = 关系的**对方**，`value` = `{"持有者": …, "轴": …, "档位": …}`。
+        三个键各司其职——**持有者必须显式声明**，不从 `target` 反推：
+        `target` 是「对方」，拿它当持有者会**静默建立一段反过来的关系**（比报错更糟）。
+
+        **依据 = 事件标识**：`relation_set` 要求 `basis` 非空（无依据不允许变化），
+        用事件标识既满足这条纪律，又让「这段关系为什么变成这样」可追溯。
+
+        写入是 `ON CONFLICT DO UPDATE` ⇒ 同一条效果重算多少次结果相同（幂等）。
+        返回落成的条数（供测试与审计核对；未声明 `relation_change` 的世界包恒为 0）。
+        """
+        applied = 0
+        # 排序保证确定性：不随 effects 的容器顺序漂移
+        for item in sorted(active_effects, key=lambda row: str(row.get("id") or "")):
+            if str(item.get("kind") or "") != "relation_change":
+                continue
+            to_id = str(item.get("target") or "")
+            raw = item.get("value")
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+            if not to_id or not isinstance(raw, dict):
+                continue
+            axis = str(raw.get("轴") or "")
+            grade = str(raw.get("档位") or "")
+            if axis not in self.store.RELATION_AXES or grade not in self.store.RELATION_GRADES:
+                continue  # 校验器已在创建期拒绝；这里再兜一层，绝不猜测
+            holder = str((raw or {}).get("持有者") or "")
+            if not holder:
+                # 校验器要求在创建期声明 `持有者`；这里再兜一层。
+                # **刻意不猜**：`target` 是「对方」，用它当持有者会静默建立一段反过来的关系（比报错更糟）。
+                continue
+            self.store.relation_set(
+                {
+                    "instance_id": instance_id,
+                    "timeline_id": timeline_id,
+                    "from_id": holder,
+                    "to_id": to_id,
+                    "axis": axis,
+                    "strength": self.store.RELATION_GRADES[grade],
+                },
+                basis=str(item.get("event_id") or ""),
+                world_seconds=int(world_seconds),
+            )
+            applied += 1
+        return applied
 
     def _spatial(self, package: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
         """B-4 v2：把「区域邻接」与「每跳延迟」取出来，传给说法与影响范围的消费方。

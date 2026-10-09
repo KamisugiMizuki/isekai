@@ -27,7 +27,12 @@ SCHEMA_VERSION = 1
 
 #: B-7：**设值型**后果（语义是「把该目标设为某个值」，彼此取代）；
 #: 其余 kind（含未归类的）一律按**累加型**保守处理，不进取代式退休。
-SETTING_EFFECT_KINDS: tuple[str, ...] = ("environment_state", "custom_state", "institution_state")
+SETTING_EFFECT_KINDS: tuple[str, ...] = (
+    "environment_state", "custom_state", "institution_state",
+    # B-2 v2 第一步：关系变化是**设值语义**——同一 (持有者, 对方, 轴) 上只应有一条「当前关系」生效，
+    # 与「环境被设为某个值」同族（而不是叠加）。放进这里后 B-7 的取代式退休会一并覆盖它。
+    "relation_change",
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
