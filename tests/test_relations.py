@@ -279,3 +279,91 @@ def test_relation_change_effect_writes_relation_state_end_to_end(store, world) -
     assert str(target[0]["axis"]) == "恩情"
     assert int(target[0]["strength"]) == RELATION_GRADES["深"], "档位必须映射成固定千分比"
     assert str(target[0]["basis"]) == "ev-rel-1", "依据必须指向事件标识（不允许空依据）"
+
+# ---------- B-2 v2 第二步的尾巴：关系上限 + 渲染（人类裁决 2026-10-10） ----------
+
+
+def test_relation_list_limit_keeps_the_most_recently_updated(store) -> None:  # noqa: F811
+    """**上限按「最近更新」取**，不是随便截断——否则会把最新那段关系丢掉。
+
+    这是与 `knowledge_window` 同一条纪律：投影必须有界，但不能丢最新的。
+    """
+    for index in range(5):
+        store.relation_set(
+            {
+                "instance_id": "in-lim", "timeline_id": "tl-lim",
+                "from_id": "cc-a", "to_id": f"cc-{index}", "axis": "同僚",
+                "strength": RELATION_GRADES["中"],
+            },
+            basis=f"ev-{index}", world_seconds=index,   # 越后写入 ⇒ updated_world 越大
+        )
+    rows = store.relation_list("in-lim", "tl-lim", from_id="cc-a", limit=2)
+    assert [str(row["to_id"]) for row in rows] == ["cc-4", "cc-3"], (
+        f"必须取最近更新的两条，实际 {[r['to_id'] for r in rows]}"
+    )
+    # 不给 limit ⇒ 仍然是全量（既有调用方的行为不变）
+    assert len(store.relation_list("in-lim", "tl-lim", from_id="cc-a")) == 5
+    assert store.relation_list("in-lim", "tl-lim", from_id="cc-a", limit=0) == []
+
+
+def test_cognition_relation_limit_is_bounded_and_applied() -> None:
+    """认知投影必须有界：常量存在、为正、且真的被传给了取数。"""
+    from isekai_core.runtime.service import RuntimeService
+
+    limit = RuntimeService.COGNITION_RELATION_LIMIT
+    assert isinstance(limit, int) and limit > 0
+    src = io.open('isekai_core/runtime/service.py', encoding='utf-8').read()
+    start = src.find('def cognition_project')
+    end = src.find('\n    def ', start + 10)
+    segment = src[start:end if end > 0 else len(src)]
+    assert 'COGNITION_RELATION_LIMIT' in segment, "上限必须真的用在这一处取数上"
+
+
+def test_relation_label_resolves_ids_and_never_invents() -> None:
+    """渲染层：标识 → 可读名称；查不到就**原样返回**，不编造。"""
+    from isekai_core.runtime import cognition
+    from isekai_core.world.example import example_card
+
+    package = _relations_package()
+    card = example_card(package)
+    package["cards"] = [card]
+    assert cognition.relation_label(package, "cc-堤禾") == "堤禾", "角色卡标识必须换成名字"
+    assert cognition.relation_label(_relations_package(), "pl-1") == "南堤城邦的盐滩一带", "区域也认"
+    assert cognition.relation_label(package, "cc-查不到") == "cc-查不到", "查不到不得编造"
+    assert cognition.relation_label(package, "") == ""
+
+
+def test_grade_label_is_the_inverse_of_the_grade_map() -> None:
+    """千分比 → 档位名：四个档位各自还原；越界夹到端点（不产生第五个档位）。"""
+    from isekai_core.runtime import cognition
+
+    for name, value in RELATION_GRADES.items():
+        assert cognition.grade_label(value) == name, (name, value)
+    assert cognition.grade_label(0) == "淡"
+    assert cognition.grade_label(1500) == "极"
+    assert cognition.grade_label(-5) == "淡"
+    assert cognition.grade_label(999) == "极", "取最接近而不是向下取整"
+
+
+def test_relations_are_rendered_into_the_prompt() -> None:
+    """关系进提示词，且强度以**档位名**出现（不暴露千分比数字）。"""
+    from isekai_core.runtime import cognition
+
+    context = {
+        "character": {},
+        "relations": [{"to": "潮生", "axis": "恩情", "strength": RELATION_GRADES["深"]}],
+    }
+    text = cognition.render_prompt(context)
+    assert "对 潮生：恩情（深）" in text
+    assert "800" not in text, "不得把千分比数字渲染给角色看"
+
+
+def test_render_prompt_takes_relations_as_given_and_fetches_nothing() -> None:
+    """**边界纪律**：渲染层只渲染传进来的东西，**不取数、不过滤**。
+
+    过滤闸在 `cognition_project`（按「她持有 + 依据已获知」）。这里断言渲染层没有取数调用，
+    否则「未获知的关系」可能从渲染层被带进提示词——那正是要防的串材料。
+    """
+    src = io.open('isekai_core/runtime/cognition.py', encoding='utf-8').read()
+    assert 'relation_list' not in src, "渲染层不得自行取关系（过滤闸不在这里）"
+    assert 'relation_set' not in src, "渲染层是只读的"

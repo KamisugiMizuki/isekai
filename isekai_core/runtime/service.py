@@ -2077,6 +2077,11 @@ class RuntimeService:
     #: §4.3 purpose 闭集
     COGNITION_PURPOSES = ("dialogue", "player_observation", "narrative_candidate", "audit")
 
+    #: B-2 v2 第二步：认知投影里关系的**上限**（按最近更新取）。
+    #: 与 `knowledge_window` 同一纪律——投影必须有界，且**不静默丢掉最新的**。
+    #: 取 50 与 `knowledge_window` 的窗口量级一致；关系数量达到万级时这里应当变成可配参数。
+    COGNITION_RELATION_LIMIT = 50
+
     def cognition_project(
         self,
         instance_id: str,
@@ -2166,7 +2171,10 @@ class RuntimeService:
                 "strength": int(row["strength"]),
                 "basis": str(row.get("basis") or ""),
             }
-            for row in self.store.relation_list(instance_id, timeline_id, from_id=observer)
+            # 上限：按**最近更新**取前 N 条（与 `knowledge_window` 同一纪律：有界，且不丢掉最新的）
+            for row in self.store.relation_list(
+                instance_id, timeline_id, from_id=observer, limit=self.COGNITION_RELATION_LIMIT
+            )
             if str(row.get("basis") or "") in known_refs and str(row.get("basis") or "")
         ]
         return self.envelope(instance_id, timeline_id, extra={

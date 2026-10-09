@@ -44,6 +44,51 @@ def region_label(package: dict[str, Any], region: str) -> str:
     return key
 
 
+def relation_label(package: dict[str, Any], entity_id: str) -> str:
+    """关系另一方 / 持有者的引用键 → 显示名（B-2 v2 第二步的渲染层）。
+
+    与 `region_label` 同一纪律：进提示词前**必须**把标识换成可读名称；
+    查不到就**原样返回**，不编造、不改写匹配用的标识。
+    查找顺序：登记实体（`entities`）→ 角色卡（`cards`，补卡后落在设定里）→ 区域 → 原样。
+    """
+    key = str(entity_id or "")
+    if not key:
+        return ""
+    for item in package.get("entities") or []:
+        if isinstance(item, dict) and str(item.get("id") or "") == key:
+            return str(item.get("name") or key)
+    cards = package.get("cards")
+    if isinstance(cards, list):
+        for item in cards:
+            if not isinstance(item, dict):
+                continue
+            if str((item.get("meta") or {}).get("card_id") or "") == key:
+                return str((item.get("identity") or {}).get("name") or key)
+    world = package.get("world") if isinstance(package.get("world"), dict) else {}
+    for item in world.get("regions") or []:
+        if isinstance(item, dict) and str(item.get("id") or "") == key:
+            return str(item.get("name") or key)
+    return key
+
+
+def axis_label(axis: str) -> str:
+    """关系轴直接就是中文闭集（`亲属 / 同僚 / 恩情 / 债务 / 宿怨 / 隶属`）⇒ 原样使用。"""
+    return str(axis or "")
+
+
+def grade_label(strength: int) -> str:
+    """千分比强度 → **档位名**（`淡 / 中 / 深 / 极`）。
+
+    取**最接近**的档位：强度只由档位映射产生（`RELATION_GRADES`），所以这一步是它的逆；
+    取最接近而不是「向下取整」，避免 `极`（1000）被读成 `深`。越界一律夹到端点。
+    """
+    from ..store import Store
+
+    grades = Store.RELATION_GRADES
+    value = max(0, min(1000, int(strength or 0)))
+    return min(grades, key=lambda name: (abs(grades[name] - value), name))
+
+
 def _index(items: Any) -> dict[str, dict[str, Any]]:
     return {str(item.get("id")): item for item in items or [] if isinstance(item, dict)}
 
@@ -249,6 +294,17 @@ def render_prompt(context: dict[str, Any]) -> str:
             lines.append(f"- [{item.get('source')}｜{item.get('stance')}] {item.get('text')}")
     else:
         lines.append("她没有掌握任何世界内信息，只能凭自身经历与联络者的话作答。")
+    # B-2 v2 第二步：关系渲染。**只渲染传进来的那些**——上游 `cognition_project` 已按
+    # 「她持有 + 依据已获知」过滤过；这里不做任何取数，因此不可能把未获知的关系带进来。
+    relations = context.get("relations") or []
+    if relations:
+        lines.append("她对下列的人/组织有自己的态度（这些是她**自己知道**的，可以说、也可以藏）：")
+        for item in relations:
+            who = str(item.get("to") or "")
+            axis = axis_label(str(item.get("axis") or ""))
+            grade = grade_label(int(item.get("strength") or 0))
+            if who or axis:
+                lines.append(f"- 对 {who}：{axis}（{grade}）")
     lines.extend(
         [
             "约束：不确定就说不确定，不知道就说不知道；不要提到你未列出的世界内幕、他人私聊或未来事件；",
@@ -270,6 +326,7 @@ def play_context(
     knowledge: list[dict[str, Any]] | None = None,
     intents: list[dict[str, Any]] | None = None,
     observations: list[dict[str, Any]] | None = None,
+    relations: list[dict[str, Any]] | None = None,
     units: list[dict[str, Any]] | None = None,
     experiences: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -337,4 +394,15 @@ def play_context(
             knowledge=knowledge,
             topic=topic,
         ),
+        # B-2 v2 第二步的**渲染层**：只把传进来的关系换成可读名称，**不取数、不过滤**。
+        # 调用方必须传 `cognition_project` 的输出（那里才是过滤闸），
+        # 否则会把未获知的关系渲染进提示词 —— 这条边界写在这里，避免以后被误用。
+        "relations": [
+            {
+                "to": relation_label(package, str(item.get("to") or "")),
+                "axis": axis_label(str(item.get("axis") or "")),
+                "strength": int(item.get("strength") or 0),
+            }
+            for item in relations or []
+        ],
     }

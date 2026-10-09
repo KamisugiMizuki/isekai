@@ -5445,9 +5445,13 @@ class Store:
 
     def relation_list(
         self, instance_id: str, timeline_id: str,
-        *, from_id: str | None = None, to_id: str | None = None,
+        *, from_id: str | None = None, to_id: str | None = None, limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """角色间关系（B-2 事实层）：按持有者下推，不整表取回。"""
+        """角色间关系（B-2 事实层）：按持有者下推，不整表取回。
+
+        `limit`（可选）：只取**最近更新**的若干条（`updated_world DESC, from_id, to_id, axis` 稳定排序）。
+        认知投影用它加上限——**按最近更新取**而不是随便截断，避免把最新的关系丢掉。
+        """
         sql = "SELECT * FROM relation_state WHERE instance_id=? AND timeline_id=?"
         args: list[Any] = [instance_id, timeline_id]
         if from_id is not None:
@@ -5456,7 +5460,12 @@ class Store:
         if to_id is not None:
             sql += " AND to_id=?"
             args.append(str(to_id))
-        sql += " ORDER BY from_id, to_id, axis"
+        if limit is not None:
+            # 稳定的「最近优先」：updated_world 相同时用标识排序，不随容器顺序漂移
+            sql += " ORDER BY updated_world DESC, from_id, to_id, axis LIMIT ?"
+            args.append(max(0, int(limit)))
+        else:
+            sql += " ORDER BY from_id, to_id, axis"
         return [_row_to_dict(row) for row in self._conn.execute(sql, args).fetchall()]
 
     def relation_set(self, row: dict[str, Any], *, basis: str, world_seconds: int) -> None:
