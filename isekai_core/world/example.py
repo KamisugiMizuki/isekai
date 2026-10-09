@@ -240,6 +240,52 @@ def example_package(name: str = "灰潮纪", *, moment: int = DAY * 1500) -> dic
     return package
 
 
+def example_topology_package(name: str = "三港纪", *, moment: int = DAY * 1500) -> dict[str, Any]:
+    """**多区域样例包**（B-4 v2 的内容供给；2026-10-10 人类裁决第 ③ 项）。
+
+    为什么需要它：主样例世界 `灰潮纪` 只有 `pl-1` 一个区域、**没有任何邻接**，
+    于是 B-4 v2 的拓扑传播在它上面是**空转**的——机制有测试守着，但看不到真实效果。
+    本包把「区域邻接 + 通行代价档 + 每跳传播延迟」填成一份**可通过校验**的内容：
+
+    | 区域 | 邻接（代价） |
+    |---|---|
+    | `pl-1` 南港 | → `pl-2` 河口（1） |
+    | `pl-2` 河口 | → `pl-1`（1）、`pl-3` 内陆（2） |
+    | `pl-3` 内陆 | → `pl-2`（2）、`pl-4` 远山（受阻） |
+    | `pl-4` 远山 | 不可达（唯一的路受阻） |
+
+    来源各带 `region`：驿站信报在河口（`pl-2`）、堤岸榜文在南港（`pl-1`）、山民口信在内陆（`pl-3`）。
+    `events.hop_delay_seconds = 6 小时`：**消息每多隔一跳就晚到 6 小时**。
+
+    它与主样例包**互不影响**（独立函数、独立测试），因此不动任何既有测试的靶子。
+    """
+    package = example_package(name, moment=moment)
+    package["meta"]["description"] = "三处港岸靠一条内河相连，远山的路已断。"
+    package["world"]["regions"] = [
+        {"id": "pl-1", "name": "南港", "description": "潮水可到的外港，商船在此卸货。",
+         "adjacent": [{"to": "pl-2", "通行": "可通行", "代价": 1}]},
+        {"id": "pl-2", "name": "河口", "description": "内河入海处，驿站与税关所在。",
+         "adjacent": [{"to": "pl-1", "通行": "可通行", "代价": 1},
+                      {"to": "pl-3", "通行": "可通行", "代价": 2}]},
+        {"id": "pl-3", "name": "内陆", "description": "沿河的田与集镇。",
+         "adjacent": [{"to": "pl-2", "通行": "可通行", "代价": 2},
+                      {"to": "pl-4", "通行": "受阻"}]},
+        {"id": "pl-4", "name": "远山", "description": "山路自去年崩后就断了，只能绕远。",
+         "adjacent": []},
+    ]
+    package["sources"] = [
+        {"id": "src-1", "name": "驿站信报", "kind": "official", "region": "pl-2",
+         "reach": "在河口驿站停留并支付铜钱即可取阅", "delay_seconds": 0},
+        {"id": "src-2", "name": "堤岸榜文", "kind": "document", "region": "pl-1",
+         "reach": "潮退后在南港堤口抄录", "delay_seconds": 0},
+        {"id": "src-3", "name": "山民口信", "kind": "informal", "region": "pl-3",
+         "reach": "在集镇上向入山的脚夫打听", "delay_seconds": 0},
+    ]
+    # 每多隔一跳，消息晚到 6 小时（不声明它 ⇒ 退回接入前的行为，本包**显式声明**以便观察）
+    package["events"] = {**(package.get("events") or {}), "hop_delay_seconds": DAY // 4}
+    return package
+
+
 def example_card(
     package: dict[str, Any], *, name: str = "堤禾", born: int | None = None, confirmed: bool = True
 ) -> dict[str, Any]:
