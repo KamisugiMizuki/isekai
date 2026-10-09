@@ -287,12 +287,52 @@ def _validate_regions(regions: Any, errors: list[str]) -> None:
         errors.append("world.regions: 必须是列表")
         return
     _check_unique(regions, "world.regions", errors)
+    known_ids = set(_ids(regions))
+    #: B-4：拓扑只允许「邻接 + 通行档 + 代价」，**任何坐标 / 距离类字段一律拒绝**（防「拓扑 → 路网」滑坡）
+    coordinate_like = {"x", "y", "lat", "lon", "lng", "坐标", "distance", "距离", "position", "位置"}
     for index, region in enumerate(regions):
         if not isinstance(region, dict):
             errors.append(f"world.regions[{index}]: 条目必须是对象")
             continue
         if not _text(region.get("name")):
             errors.append(f"world.regions[{index}].name: 缺少区域名称")
+        bad_keys = sorted(set(region) & coordinate_like)
+        if bad_keys:
+            errors.append(
+                f"world.regions[{index}]: 不允许坐标 / 距离类字段 {bad_keys}；"
+                "B-4 是拓扑（邻接 + 通行档 + 代价），不是坐标或路网系统"
+            )
+        adjacent = region.get("adjacent")
+        if adjacent is None:
+            continue
+        if not isinstance(adjacent, list):
+            errors.append(f"world.regions[{index}].adjacent: 必须是列表")
+            continue
+        for a_index, edge in enumerate(adjacent):
+            where_a = f"world.regions[{index}].adjacent[{a_index}]"
+            if not isinstance(edge, dict):
+                errors.append(f"{where_a}: 条目必须是对象")
+                continue
+            extra = sorted(set(edge) - {"to", "通行", "代价", "kind", "cost"})
+            if extra:
+                errors.append(
+                    f"{where_a}: 只允许 to / 通行 / 代价（收到 {extra}）；拓扑不承载坐标、距离或路径"
+                )
+            to_id = str(edge.get("to") or "")
+            if not to_id:
+                errors.append(f"{where_a}.to: 缺少相邻区域标识")
+            elif to_id not in known_ids:
+                errors.append(f"{where_a}.to: 指向未登记区域 {to_id!r}（拓扑必须是引用闭集）")
+            if to_id == str(region.get("id") or ""):
+                errors.append(f"{where_a}.to: 不得指向自身")
+            kind = str(edge.get("通行") or edge.get("kind") or "可通行")
+            if kind not in ADJACENCY_KINDS:
+                errors.append(f"{where_a}.通行: 必须是 {' / '.join(ADJACENCY_KINDS)} 之一")
+            cost = edge.get("代价") if edge.get("代价") is not None else edge.get("cost")
+            if cost is None:
+                cost = 1
+            if isinstance(cost, bool) or not isinstance(cost, int) or not (1 <= cost <= 3):
+                errors.append(f"{where_a}.代价: 必须是 1…3 的整数（代价档，不是连续距离）")
 
 
 def region_ids(package: dict[str, Any]) -> set[str]:
@@ -523,6 +563,111 @@ def _validate_races_entities(package: dict[str, Any], errors: list[str]) -> None
         errors.extend(lifespan_errors(lifespan, f"races[{index}].lifespan"))
     race_ids = set(_ids(races))
 
+    # B-2：关系声明（可选段）。轴是闭集；强度用**档位**而不是自由数值（可解释、可校验）。
+    # v1 只声明**初始关系**；由事件改变关系属 v2（需要效果 schema 承载 主体/对方/轴/档位）。
+    relations = package.get("relations")
+    if relations is not None:
+        if not isinstance(relations, dict):
+            errors.append("relations: 必须是映射（axes + initial）")
+        else:
+            extra_keys = sorted(set(relations) - {"axes", "initial"})
+            if extra_keys:
+                errors.append(f"relations: 只允许 axes / initial（收到 {extra_keys}）")
+            axes = relations.get("axes")
+            if not isinstance(axes, list) or not axes:
+                errors.append("relations.axes: 至少声明一个启用的关系轴")
+                axes = []
+            for axis in axes:
+                if str(axis) not in RELATION_AXES:
+                    errors.append(f"relations.axes: 未知关系轴 {axis!r}（可用：{' / '.join(RELATION_AXES)}）")
+            initial = relations.get("initial")
+            if initial is not None and not isinstance(initial, list):
+                errors.append("relations.initial: 必须是列表")
+                initial = []
+            for index, item in enumerate(initial or []):
+                where_r = f"relations.initial[{index}]"
+                if not isinstance(item, dict):
+                    continue
+                for field_name in ("from", "to", "axis"):
+                    if not _text(item.get(field_name)):
+                        errors.append(f"{where_r}.{field_name}: 缺少标识")
+                if str(item.get("axis") or "") and str(item.get("axis")) not in [str(a) for a in axes]:
+                    errors.append(f"{where_r}.axis: 该轴未在 relations.axes 里启用")
+                grade = str(item.get("档位") or item.get("grade") or "中")
+                if grade not in RELATION_GRADES:
+                    errors.append(
+                        f"{where_r}.档位: 必须是 {' / '.join(RELATION_GRADES)} 之一（强度用档位，不用自由数值）"
+                    )
+                extra = sorted(set(item) - {"from", "to", "axis", "档位", "grade"})
+                if extra:
+                    errors.append(f"{where_r}: 只允许 from / to / axis / 档位（收到 {extra}）")
+
+    # B-3+B-9：域外账本声明（可选段）。只允许**声明式键**——不允许临场发明计数器。
+    # v1 只允许存储键；v2 另允许 `derived[]` 里的**声明式推导键**（它们**不落库**，只是只读派生视图）。
+    ledger = package.get("ledger")
+    if ledger is not None:
+        if not isinstance(ledger, list):
+            errors.append("ledger: 必须是列表")
+            ledger = []
+        for index, item in enumerate(ledger):
+            where_l = f"ledger[{index}]"
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("scope_kind") or "") not in ("region", "org", "institution"):
+                errors.append(f"{where_l}.scope_kind: 必须是 region / org / institution 之一")
+            if not _text(item.get("scope_id")):
+                errors.append(f"{where_l}.scope_id: 缺少作用域标识")
+            if not _text(item.get("key")):
+                errors.append(f"{where_l}.key: 缺少计数器 / 比率名")
+            initial = item.get("初始值") if item.get("初始值") is not None else item.get("initial")
+            if initial is None or isinstance(initial, bool) or not isinstance(initial, int):
+                errors.append(f"{where_l}.初始值: 必须是整数（账本是计数器与比率，不存文本）")
+            extra = sorted(set(item) - {"scope_kind", "scope_id", "key", "初始值", "initial", "单位", "unit"})
+            if extra:
+                errors.append(
+                    f"{where_l}: 只允许 scope_kind / scope_id / key / 初始值 / 单位（收到 {extra}）；"
+                    "账本存储键的数字只能由声明的键承载（推导值请放 derived[]，且它们不落库）"
+                )
+
+    # B-3+B-9 v2：账本**推导式**（可选段）。只做**声明式纯函数**，算子闭集，操作数必须是已声明的键。
+    _validate_ledger_derived(package, errors)
+
+    # B-1：压力量声明（可选段）。v1 只支持「自然变化」这一来源，且**权重形式写死**。
+    pressures = package.get("pressures")
+    pressure_ids: set[str] = set()
+    if pressures is not None:
+        if not isinstance(pressures, list):
+            errors.append("pressures: 必须是列表")
+            pressures = []
+        _check_unique(pressures, "pressures", errors)
+        for index, item in enumerate(pressures):
+            where_p = f"pressures[{index}]"
+            if not isinstance(item, dict):
+                continue
+            ident = str(item.get("id") or "")
+            if not _text(ident):
+                errors.append(f"{where_p}.id: 缺少标识")
+            else:
+                pressure_ids.add(ident)
+            if not _text(item.get("name")):
+                errors.append(f"{where_p}.name: 缺少名称")
+            low = item.get("下限")
+            high = item.get("上限")
+            base = item.get("初始值")
+            for field_name, value in (("下限", low), ("上限", high), ("初始值", base)):
+                if value is None or isinstance(value, bool) or not isinstance(value, int):
+                    errors.append(f"{where_p}.{field_name}: 必须是整数")
+            if isinstance(low, int) and isinstance(high, int) and not isinstance(low, bool) \
+                    and not isinstance(high, bool) and high < low:
+                errors.append(f"{where_p}: 上限不得小于下限（{high} < {low}）")
+            if isinstance(base, int) and isinstance(low, int) and isinstance(high, int) \
+                    and not any(isinstance(x, bool) for x in (base, low, high)) \
+                    and not (low <= base <= high):
+                errors.append(f"{where_p}.初始值: 必须落在一开始声明的区间内（{low}…{high}）")
+            drift = item.get("drift")
+            if drift is not None and (isinstance(drift, bool) or not isinstance(drift, int)):
+                errors.append(f"{where_p}.drift: 必须是整数（每个世界日的自然变化量）")
+
     entities = package.get("entities")
     if not isinstance(entities, list):
         errors.append("entities: 缺少名册列表")
@@ -541,6 +686,20 @@ def _validate_races_entities(package: dict[str, Any], errors: list[str]) -> None
             errors.append(f"{where}.kind: 必须是 {'/'.join(ENTITY_KINDS)} 之一")
         if item.get("race_id") is not None:
             _check_refs([item.get("race_id")], race_ids, f"{where}.race_id", errors)
+        # A-9c（**向后不兼容的校验收紧**，见任务清单 A-9c 的登记）：`born` / `died` 原先不被校验，
+        # 但运行期把它们当真值消费——`service` 据此推出身故事件（名册实体的寿终）与年龄。
+        # 于是「包校验放行 → 运行期当真值用」：`born: "很久以前"` 这类值会让年龄算出垃圾。
+        # 现在要求：可选、但必须是整数世界秒；`died` 不得早于 `born`。
+        for field in ("born", "died"):
+            value = item.get(field)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                errors.append(f"{where}.{field}: 必须是整数世界秒（缺省表示未登记）")
+        born, died = item.get("born"), item.get("died")
+        if isinstance(born, int) and isinstance(died, int) and not isinstance(born, bool) \
+                and not isinstance(died, bool) and died < born:
+            errors.append(f"{where}.died: 不得早于 born（{died} < {born}）")
 
 
 def _validate_historiography(package: dict[str, Any], known: set[str], errors: list[str]) -> None:
@@ -673,6 +832,19 @@ DENSITY_TARGETS: dict[str, tuple[int, int]] = {"稀疏": (0, 1), "常规": (1, 3
 #: 效果失效方式（EVENT_ENGINE_SPEC §二：三类须可区分）
 EXPIRY_KINDS: tuple[str, ...] = ("with_cause", "until_cleared", "natural_recovery")
 
+#: B-5：身体后果的**枚举档位**（人类裁决 2026-10-10）。
+#: `死亡` 也在列：它的消费路径（死亡事件与 `character_state.archived` **同批原子**）已落地，
+#: 复用既有寿终路径的形状，因此不再是「声明了没人消费」的空效果。
+CASUALTY_GRADES: tuple[str, ...] = ("轻伤", "重伤", "失能", "死亡")
+
+#: B-2：关系轴闭集与「档位 → 千分比强度」映射。**与 `store.Store` 上的同名常量保持一致**：
+#: 包校验与运行期必须共用一这份声明，否则会出现「校验放行、运行期按别的表取值」。
+#: B-4：通行档闭集（相邻 / 可通行 / 受阻）。**只有档位与代价档，没有连续距离。**
+ADJACENCY_KINDS: tuple[str, ...] = ("相邻", "可通行", "受阻")
+
+RELATION_AXES: tuple[str, ...] = ("亲属", "同僚", "恩情", "债务", "宿怨", "隶属")
+RELATION_GRADES: dict[str, int] = {"淡": 200, "中": 500, "深": 800, "极": 1000}
+
 #: 首版受支持的事实效果闭集（EVENT_ENGINE_SPEC §六 / §十一）：未声明的类型必须被拒绝，
 #: 不能让生成器临场发明数值系统或未被支持的效果。
 SUPPORTED_EFFECTS: dict[str, str] = {
@@ -682,8 +854,12 @@ SUPPORTED_EFFECTS: dict[str, str] = {
     "public_notice": "公开通告",
     "rumor_spread": "风闻流传",
     "institution_state": "制度状态（只改已声明的职位与在任者）",
+    # B-5：身体类后果只按题材选枚举档位，不建立任何数值型健康量（见 EVENT_ENGINE_SPEC §六 档位纪律）
+    "casualty": "身体后果（枚举档位：轻伤 / 重伤 / 失能 / 死亡）",
     "custom_state": "文化惯例的现行做法（须落在声明的允许范围内）",
     "environment_state": "环境状态（只改已声明的环境类型与取值域）",
+    # B-1 v2：由事件效果改变压力量（**整数增量**，只作用于已声明的压力量；无表达式入口）
+    "pressure_change": "压力变化（整数增量，只作用于已声明的压力量）",
 }
 
 
@@ -724,6 +900,87 @@ def _validate_environment_observers(
                 errors.append(f"{where}.observers: 引用不存在的标识 {value!r}")
 
 
+def _validate_ledger_derived(package: dict[str, Any], errors: list[str]) -> None:
+    """B-3+B-9 v2：账本推导式的校验。
+
+    **这是「不给表达式语言」这条纪律的守卫**：算子闭集、操作数必须是已声明的账本键、
+    推导键不得与存储键重名、只能引用更早声明的推导键（结构上无环）、多一个键即拒。
+    """
+    from ..runtime.ledger import DERIVED_OPS  # 单一真源：算子闭集定义在纯函数模块里
+
+    derived = package.get("derived")
+    if derived is None:
+        return
+    if not isinstance(derived, list):
+        errors.append("derived: 必须是列表")
+        return
+
+    stored_keys: set[tuple[str, str, str]] = set()
+    for item in package.get("ledger") or []:
+        if isinstance(item, dict):
+            stored_keys.add((
+                str(item.get("scope_kind") or ""),
+                str(item.get("scope_id") or ""),
+                str(item.get("key") or ""),
+            ))
+
+    declared_derived: set[tuple[str, str, str]] = set()
+    for index, item in enumerate(derived):
+        where = f"derived[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{where}: 必须是映射")
+            continue
+        extra = sorted(set(item) - {
+            "id", "scope_kind", "scope_id", "op", "a", "b", "scale", "unit",
+        })
+        if extra:
+            errors.append(
+                f"{where}: 只允许 id / scope_kind / scope_id / op / a / b / scale / unit"
+                f"（收到 {extra}）；本内核不给表达式语言，算子闭集只有 {'/'.join(DERIVED_OPS)}"
+            )
+        ident = str(item.get("id") or "")
+        if not _text(ident):
+            errors.append(f"{where}.id: 缺少标识")
+        scope_kind = str(item.get("scope_kind") or "")
+        scope_id = str(item.get("scope_id") or "")
+        if scope_kind not in ("region", "org", "institution"):
+            errors.append(f"{where}.scope_kind: 必须是 region / org / institution 之一")
+        if not _text(scope_id):
+            errors.append(f"{where}.scope_id: 缺少作用域标识")
+
+        op = str(item.get("op") or "")
+        if op not in DERIVED_OPS:
+            errors.append(
+                f"{where}.op: 未支持的算子 {op!r}（闭集只有 {'/'.join(DERIVED_OPS)}）"
+            )
+        scale = item.get("scale")
+        if scale is not None and (isinstance(scale, bool) or not isinstance(scale, int) or scale <= 0):
+            errors.append(f"{where}.scale: 必须是正整数（千分比分母）")
+
+        # 不得与存储键重名：否则「哪个是真的」不可解释（单一事实源）
+        if ident and (scope_kind, scope_id, ident) in stored_keys:
+            errors.append(
+                f"{where}.id: {ident!r} 与同作用域下的**存储账本键**重名——"
+                "推导值不落库，重名会让「哪个是真的」不可解释"
+            )
+        key = (scope_kind, scope_id, ident)
+        if ident and key in declared_derived:
+            errors.append(f"{where}.id: 同一作用域下推导键 {ident!r} 重复")
+        for operand in ("a", "b"):
+            reference = str(item.get(operand) or "")
+            if not _text(reference):
+                errors.append(f"{where}.{operand}: 缺少操作数（必须是已声明的账本键）")
+                continue
+            ref_key = (scope_kind, scope_id, reference)
+            if ref_key not in stored_keys and ref_key not in declared_derived:
+                errors.append(
+                    f"{where}.{operand}: 未声明的账本键 {reference!r}"
+                    "（只能引用存储键或**更早声明的**推导键）"
+                )
+        if ident:
+            declared_derived.add(key)
+
+
 def _validate_events(
     package: dict[str, Any], known: set[str], errors: list[str], *, registered: set[str] | None = None
 ) -> None:
@@ -755,6 +1012,59 @@ def _validate_events(
             t_where = f"{where}.templates[{t_index}]"
             if not _text(template.get("summary")):
                 errors.append(f"{t_where}.summary: 缺少事件描述")
+            # B-1：权重只能声明「读哪个压力量 + 千分比系数」，**不接受任何表达式**（防脚本引擎入口）
+            declared_p = template.get("pressure")
+            if declared_p is not None:
+                if not isinstance(declared_p, dict):
+                    errors.append(f"{t_where}.pressure: 必须是 {{id, k}} 映射（不支持表达式）")
+                else:
+                    extra = sorted(set(declared_p) - {"id", "k"})
+                    if extra:
+                        errors.append(
+                            f"{t_where}.pressure: 只允许 id / k 两个键（收到 {extra}）；"
+                            "权重形式写死为 base×(1000+k×pressures)//1000，不支持表达式语言"
+                        )
+                    # 局部取一次：本函数与名册校验不是同一个函数，跨函数作用域拿不到 `pressure_ids`
+                    local_pressures = {
+                        str(item.get("id") or "")
+                        for item in (package.get("pressures") or [])
+                        if isinstance(item, dict)
+                    }
+                    pid = str(declared_p.get("id") or "")
+                    if pid and pid not in local_pressures:
+                        errors.append(f"{t_where}.pressure.id: 未声明的压力量 {pid!r}")
+                    k_value = declared_p.get("k")
+                    if k_value is None or isinstance(k_value, bool) or not isinstance(k_value, int):
+                        errors.append(f"{t_where}.pressure.k: 必须是整数千分比系数")
+            # B-6.2（**校验收紧，向后不兼容**）：声明了 `claims`（每来源表述）就必须**名实相符**——
+            # 键要是已登记来源、值要是非空文本，且各来源文本必须**互异**。
+            # 理由：B-6.1 让「同源异文」在机制上可写，但「可写」不等于「会写」；
+            # 若允许同文，包作者可以声明了一堆 claims 却全是同一句，差异化名存实亡
+            # （这正是 1500 世界日实测「9147 条说法只有 8 句不同文本」的形态）。
+            declared_claims = template.get("claims")
+            if declared_claims is not None:
+                if not isinstance(declared_claims, dict):
+                    errors.append(f"{t_where}.claims: 必须是「来源标识 → 表述文本」的映射")
+                else:
+                    local_sources = set(
+                        _ids(package.get("sources") if isinstance(package.get("sources"), list) else [])
+                    )
+                    texts: dict[str, str] = {}
+                    for key, value in declared_claims.items():
+                        if str(key) not in local_sources:
+                            errors.append(f"{t_where}.claims.{key}: 未登记的来源（来源必须在 sources 里声明）")
+                        if not _text(value):
+                            errors.append(f"{t_where}.claims.{key}: 表述文本不能为空")
+                        texts[str(key)] = str(value)
+                    seen_text: dict[str, str] = {}
+                    for key, value in texts.items():
+                        if value in seen_text:
+                            errors.append(
+                                f"{t_where}.claims: {key} 与 {seen_text[value]} 的表述完全相同——"
+                                "声明多版本说法就要真的不同，同文不构成差异化"
+                            )
+                        else:
+                            seen_text[value] = key
             effects = template.get("effects")
             if not isinstance(effects, list) or not effects:
                 errors.append(f"{t_where}.effects: 至少一个事实效果")
@@ -762,10 +1072,63 @@ def _validate_events(
                 if not isinstance(effect, dict) or not _text(effect.get("kind")):
                     errors.append(f"{t_where}.effects[{e_index}]: 效果缺少类型")
                     continue
-                # 效果目标必须是已登记对象，不能指向未登记的名字（附录 C #10）
+                # 效果目标必须是已登记对象，不能指向未登记的名字（附录 C #10）。
+                # **`pressure_change` 是例外**：它引用的压力量有**自己的命名空间**（`pressures[]`），
+                # 不是「在册对象」——它的目标在下面的压力分支里单独校验。
+                kind_now = str(effect.get("kind"))
                 target = effect.get("target")
-                if target is not None and target not in targets:
+                if target is not None and target not in targets and kind_now != "pressure_change":
                     errors.append(f"{t_where}.effects[{e_index}].target: 指向未登记对象 {target!r}")
+                if str(effect.get("kind")) == "casualty":
+                    # B-5：档位必须是枚举值（**不引入任何数值**：无 HP / 无健康值 / 无伤情分值）
+                    grade = str(effect.get("value") or "")
+                    if grade not in CASUALTY_GRADES:
+                        errors.append(
+                            f"{t_where}.effects[{e_index}].value: 身体后果档位必须是"
+                            f" {'/'.join(CASUALTY_GRADES)} 之一（收到 {grade!r}）；"
+                            "本内核不建立数值型健康量，「死亡」档位待死亡路径同批落地后启用"
+                        )
+                if str(effect.get("kind")) == "pressure_change":
+                    # B-1 v2：只允许 {kind, target, value}——多一个键就拒绝（不给表达式入口）。
+                    # `target` 必须是已声明的压力量；`value` 必须是整数增量，且不得超过该量声明域的宽度
+                    # （否则一条效果就能把世界掀翻）。
+                    extra = set(effect) - {"kind", "target", "value"}
+                    if extra:
+                        errors.append(
+                            f"{t_where}.effects[{e_index}]: pressure_change 只允许 kind / target / value"
+                            f" 三个键（收到多余键 {sorted(extra)}）；本内核不提供表达式语言"
+                        )
+                    declared_pressure: dict[str, dict[str, Any]] = {
+                        str(item.get("id") or ""): item
+                        for item in (package.get("pressures") or [])
+                        if isinstance(item, dict) and str(item.get("id") or "")
+                    }
+                    pid = str(effect.get("target") or "")
+                    if pid not in declared_pressure:
+                        errors.append(
+                            f"{t_where}.effects[{e_index}].target: 未声明的压力量 {pid!r}"
+                            "（必须先在 pressures 段声明）"
+                        )
+                    else:
+                        raw_value = effect.get("value")
+                        if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+                            errors.append(
+                                f"{t_where}.effects[{e_index}].value: 压力增量必须是整数"
+                                f"（收到 {raw_value!r}）"
+                            )
+                        else:
+                            spec = declared_pressure[pid]
+                            low = int(
+                                spec.get("下限") if spec.get("下限") is not None else spec.get("min") or 0
+                            )
+                            high = int(
+                                spec.get("上限") if spec.get("上限") is not None else spec.get("max") or 0
+                            )
+                            if high > low and abs(int(raw_value)) > (high - low):
+                                errors.append(
+                                    f"{t_where}.effects[{e_index}].value: 增量 {raw_value} 超过压力量"
+                                    f" {pid!r} 声明域的宽度 {high - low}——一条效果不得把世界掀翻"
+                                )
                 if str(effect.get("kind")) not in SUPPORTED_EFFECTS:
                     errors.append(
                         f"{t_where}.effects[{e_index}].kind: 未支持的效果类型 {effect.get('kind')!r}"
