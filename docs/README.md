@@ -35,6 +35,8 @@ isekai 的根目标是完整、持续运行的异世界模拟。文档按产品�
 - [协议附录](worldruntime/CHANNEL_PROTOCOL_APPENDIX.md)
 - [世界包附录](worldruntime/WORLD_PACKAGE_APPENDIX.md)
 - [安卓一致性](worldruntime/ANDROID_SPEC.md)
+- [世界模拟内核设计迭代（2026-10-09）](worldruntime/SIMULATION_KERNEL_ITERATION_2026-10-09.md)：五作（RimWorld / Dwarf Fortress / Elin / BG3 / Songs of Syx）对照 + 内核改动与优化提案 + 游戏化缺口与体裁推荐。**性质是提案与判断记录，不改变任何 SPEC 义务**
+- [内核优化可执行任务清单（2026-10-10）](worldruntime/KERNEL_OPTIMIZATION_TASKS_2026-10-10.md)：把上一份的提案拆成分批任务，含原状 / 改动 / 落点 / 验收 / 风险 / 状态与实施记录
 - [历史存档](worldruntime/archive/)
 
 ## OC 故事层

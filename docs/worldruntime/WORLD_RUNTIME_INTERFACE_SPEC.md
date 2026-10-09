@@ -490,7 +490,7 @@ Writing Assistant：
 
 | 错误 | 含义 | 高级模块处理 |
 |---|---|---|
-| `not_ready` | 追赶、冻结、持久化阻断或未完成初始化 | 显示状态或只读，不能使用旧快照冒充当前 |
+| `not_ready` | 冻结、持久化阻断或未完成初始化 | 显示状态或只读，不能使用旧快照冒充当前。**「追赶中」不属于此列**——见 `runtime.snapshot.read` 行：追赶中返回 `ok` 并显式给出水位与落后量 |
 | `conflict` | 预期版本与当前版本不同 | 丢弃预览，重新读取快照并重新计算 |
 | `stale` | 异步结果来自旧世代 / 旧水位 | 不提交，可保存为失败原因 |
 | `rejected` | 目标、权限、效果、时间或因果非法 | 向用户显示可理解原因，不局部重试同一非法请求 |
@@ -546,7 +546,7 @@ Writing Assistant：
 | 设计名（本文） | 实现 | 状态 | 读数来源 |
 |---|---|---|---|
 | `runtime.scope.inspect` | `RuntimeService.scope_inspect` | 原生 | 字段族齐（三个来自信封、五个来自 scope） |
-| `runtime.snapshot.read` | `RuntimeService.read_snapshot` | 原生 | 冻结线返回 `not_ready`，未知 include 返回 `rejected` |
+| `runtime.snapshot.read` | `RuntimeService.read_snapshot` | 原生 | 冻结线返回 `not_ready`，未知 include 返回 `rejected`；**追赶中返回 `ok`**，并带 `catching_up` / `watermark` / `target` / `lag_world_seconds`（投影锚定在最后一次整批提交的水位，不得冒充当前） |
 | `runtime.cognition.project` | `RuntimeService.cognition_project` | 原生 | 陌生人拿空投影，不串他人材料 |
 | `runtime.subject.state.read` | `RuntimeService.subject_state` | 原生 | GM 拿全份，公开面只给公开字段族 |
 | `runtime.history.read` | `RuntimeService.history_read` | 原生 | 游标 `世界秒:序号` 往回翻不重复；过滤按 source/kind/time_range |
